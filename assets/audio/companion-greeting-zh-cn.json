@@ -1,0 +1,9 @@
+{
+    "text":  "你好，我在这里。今天想先聊点什么？",
+    "voice":  "Microsoft Huihui Desktop",
+    "sample_rate":  16000,
+    "channels":  1,
+    "sample_width_bytes":  2,
+    "duration_seconds":  5.39,
+    "sha256":  "7f1aa3efd1632a903f2c799171960872f4f709b133a9b9d5f867ecc728b9f2dd"
+}
