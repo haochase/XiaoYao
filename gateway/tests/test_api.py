@@ -48,6 +48,118 @@ def test_health_does_not_claim_dependency_readiness(client: TestClient) -> None:
     }
 
 
+def test_ota_bootstrap_returns_an_enrolled_device_configuration(tmp_path) -> None:
+    token = "bootstrap-token"
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "ota.db",
+            public_websocket_url="ws://192.0.2.10:8723/v1/devices/ws",
+            ota_device_tokens={"device-test": token},
+            device_token_hashes={"device-test": sha256(token.encode()).hexdigest()},
+        )
+    )
+
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/v1/ota",
+            headers={"Device-Id": "device-test"},
+            json={"firmware": {"version": "local"}},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.json() == {
+        "websocket": {
+            "url": "ws://192.0.2.10:8723/v1/devices/ws",
+            "token": token,
+            "version": 1,
+        }
+    }
+
+
+def test_ota_bootstrap_rejects_missing_or_unknown_device(tmp_path) -> None:
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "ota-reject.db",
+            public_websocket_url="ws://192.0.2.10:8723/v1/devices/ws",
+            ota_device_tokens={"device-test": "bootstrap-token"},
+        )
+    )
+
+    with TestClient(app) as test_client:
+        missing = test_client.post("/v1/ota")
+        unknown = test_client.post(
+            "/v1/ota",
+            headers={"Device-Id": "unknown-device"},
+        )
+
+    assert missing.status_code == 400
+    assert unknown.status_code == 403
+    assert "token" not in unknown.text.lower()
+
+
+def test_ota_bootstrap_is_disabled_without_device_tokens(tmp_path) -> None:
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "ota-disabled.db",
+            public_websocket_url=None,
+            ota_device_tokens={},
+        )
+    )
+
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/v1/ota",
+            headers={"Device-Id": "device-test"},
+        )
+
+    assert response.status_code == 404
+
+
+def test_ota_bootstrap_token_authenticates_device_link(tmp_path) -> None:
+    token = "bootstrap-token"
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "ota-device-link.db",
+            public_websocket_url="ws://192.0.2.10:8723/v1/devices/ws",
+            ota_device_tokens={"device-test": token},
+            device_token_hashes={"device-test": sha256(token.encode()).hexdigest()},
+        )
+    )
+
+    with TestClient(app) as test_client:
+        bootstrap = test_client.post(
+            "/v1/ota",
+            headers={"Device-Id": "device-test"},
+        )
+        returned_token = bootstrap.json()["websocket"]["token"]
+        with test_client.websocket_connect(
+            "/v1/devices/ws",
+            headers={
+                "Authorization": f"Bearer {returned_token}",
+                "Protocol-Version": "1",
+                "Device-Id": "device-test",
+                "Client-Id": "fixture-client",
+            },
+        ) as websocket:
+            websocket.send_json(
+                {
+                    "type": "hello",
+                    "version": 1,
+                    "transport": "websocket",
+                    "audio_params": {
+                        "format": "opus",
+                        "sample_rate": 16000,
+                        "channels": 1,
+                        "frame_duration": 60,
+                    },
+                }
+            )
+            response = websocket.receive_json()
+
+    assert response["type"] == "hello"
+
+
 def test_default_app_enables_fixture_voice_only_when_configured(
     monkeypatch,
     tmp_path,

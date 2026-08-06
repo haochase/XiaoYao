@@ -1,3 +1,4 @@
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,75 @@ def test_settings_parse_optional_fake_voice_fixture_path(monkeypatch) -> None:
     assert settings.fake_voice_fixture_path == Path(
         "../assets/audio/companion-greeting-zh-cn.wav"
     )
+
+
+def test_settings_derives_a_device_digest_from_ota_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("COMPANION_DB_PATH", str(tmp_path / "gateway.db"))
+    monkeypatch.setenv(
+        "COMPANION_PUBLIC_WEBSOCKET_URL",
+        "ws://192.0.2.10:8723/v1/devices/ws",
+    )
+    monkeypatch.setenv(
+        "COMPANION_OTA_DEVICE_TOKENS",
+        '{"device-test":"bootstrap-token"}',
+    )
+
+    settings = Settings.from_environment()
+
+    assert settings.ota_device_tokens == {"device-test": "bootstrap-token"}
+    assert settings.device_token_hashes["device-test"] == sha256(
+        b"bootstrap-token"
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "public_url,ota_tokens,device_hashes",
+    [
+        (
+            "http://192.0.2.10:8723/v1/devices/ws",
+            '{"device-test":"bootstrap-token"}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/other",
+            '{"device-test":"bootstrap-token"}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/v1/devices/ws",
+            '{"device-test":""}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/v1/devices/ws",
+            '{"device-test":"bootstrap-token"}',
+            '{"device-test":"' + ("a" * 64) + '"}',
+        ),
+    ],
+)
+def test_settings_reject_invalid_ota_configuration(
+    monkeypatch,
+    public_url: str,
+    ota_tokens: str,
+    device_hashes: str,
+) -> None:
+    monkeypatch.setenv("COMPANION_PUBLIC_WEBSOCKET_URL", public_url)
+    monkeypatch.setenv("COMPANION_OTA_DEVICE_TOKENS", ota_tokens)
+    monkeypatch.setenv("COMPANION_DEVICE_TOKEN_HASHES", device_hashes)
+
+    with pytest.raises(ValueError, match="(?i)ota|websocket|token"):
+        Settings.from_environment()
+
+
+def test_settings_reject_ota_tokens_without_a_public_url(monkeypatch) -> None:
+    monkeypatch.delenv("COMPANION_PUBLIC_WEBSOCKET_URL", raising=False)
+    monkeypatch.setenv(
+        "COMPANION_OTA_DEVICE_TOKENS",
+        '{"device-test":"bootstrap-token"}',
+    )
+
+    with pytest.raises(ValueError, match="COMPANION_PUBLIC_WEBSOCKET_URL"):
+        Settings.from_environment()
 
 
 @pytest.mark.parametrize(

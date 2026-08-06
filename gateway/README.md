@@ -47,6 +47,22 @@ $env:COMPANION_DEVICE_TOKEN_HASHES='{}'
 `GET /health` reports process liveness. `GET /ready` separately reports
 database availability.
 
+## Bootstrap a Xiaozhi device
+
+For a firmware build that requests its WebSocket settings through OTA, configure
+an address reachable from the device and an environment-only token map:
+
+```powershell
+$env:COMPANION_PUBLIC_WEBSOCKET_URL = 'ws://<lan-host>:8723/v1/devices/ws'
+$env:COMPANION_OTA_DEVICE_TOKENS = '{"<device-id>":"<raw-token>"}'
+```
+
+The device sends `POST /v1/ota` with its `Device-Id` header. The gateway returns
+the matching WebSocket URL, token, and protocol version with `Cache-Control:
+no-store`. DeviceLink authentication hashes the same token in memory; raw
+tokens must never be committed or logged. Use the host's LAN address, not
+`127.0.0.1`.
+
 ## Connect a device
 
 The gateway keeps SHA-256 token digests, never plaintext device tokens.
