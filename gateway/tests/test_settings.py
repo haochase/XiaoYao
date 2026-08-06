@@ -66,8 +66,38 @@ def test_settings_derives_a_device_digest_from_ota_token(monkeypatch, tmp_path):
             "{}",
         ),
         (
+            "ws://user:password@192.0.2.10:8723/v1/devices/ws",
+            '{"device-test":"bootstrap-token"}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/v1/devices/ws?token=secret",
+            '{"device-test":"bootstrap-token"}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/v1/devices/ws#secret",
+            '{"device-test":"bootstrap-token"}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/v1/devices/ws/",
+            '{"device-test":"bootstrap-token"}',
+            "{}",
+        ),
+        (
             "ws://192.0.2.10:8723/v1/devices/ws",
             '{"device-test":""}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/v1/devices/ws",
+            '{"device-test":"bootstrap token"}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/v1/devices/ws",
+            '{"device-test":"Bearer token"}',
             "{}",
         ),
         (
@@ -100,6 +130,28 @@ def test_settings_reject_ota_tokens_without_a_public_url(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="COMPANION_PUBLIC_WEBSOCKET_URL"):
         Settings.from_environment()
+
+
+def test_direct_settings_configuration_derives_device_digest(tmp_path) -> None:
+    settings = Settings(
+        database_path=tmp_path / "direct.db",
+        public_websocket_url="ws://192.0.2.10:8723/v1/devices/ws",
+        ota_device_tokens={"device-test": "bootstrap-token"},
+    )
+
+    assert settings.device_token_hashes == {
+        "device-test": sha256(b"bootstrap-token").hexdigest()
+    }
+
+
+def test_direct_settings_configuration_rejects_conflicting_digest(tmp_path) -> None:
+    with pytest.raises(ValueError, match="conflicts"):
+        Settings(
+            database_path=tmp_path / "direct-conflict.db",
+            public_websocket_url="ws://192.0.2.10:8723/v1/devices/ws",
+            ota_device_tokens={"device-test": "bootstrap-token"},
+            device_token_hashes={"device-test": "a" * 64},
+        )
 
 
 @pytest.mark.parametrize(

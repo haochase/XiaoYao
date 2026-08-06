@@ -95,6 +95,8 @@ def test_ota_bootstrap_rejects_missing_or_unknown_device(tmp_path) -> None:
 
     assert missing.status_code == 400
     assert unknown.status_code == 403
+    assert missing.headers["Cache-Control"] == "no-store"
+    assert unknown.headers["Cache-Control"] == "no-store"
     assert "token" not in unknown.text.lower()
 
 
@@ -114,6 +116,7 @@ def test_ota_bootstrap_is_disabled_without_device_tokens(tmp_path) -> None:
         )
 
     assert response.status_code == 404
+    assert response.headers["Cache-Control"] == "no-store"
 
 
 def test_ota_bootstrap_token_authenticates_device_link(tmp_path) -> None:
@@ -123,7 +126,6 @@ def test_ota_bootstrap_token_authenticates_device_link(tmp_path) -> None:
             database_path=tmp_path / "ota-device-link.db",
             public_websocket_url="ws://192.0.2.10:8723/v1/devices/ws",
             ota_device_tokens={"device-test": token},
-            device_token_hashes={"device-test": sha256(token.encode()).hexdigest()},
         )
     )
 

@@ -111,12 +111,24 @@ def create_app(
     def ota_bootstrap(request: Request) -> JSONResponse:
         device_id = request.headers.get("Device-Id", "").strip()
         if not device_id:
-            raise HTTPException(status_code=400, detail="Device-Id header required")
+            raise HTTPException(
+                status_code=400,
+                detail="Device-Id header required",
+                headers={"Cache-Control": "no-store"},
+            )
         if not settings.public_websocket_url or not settings.ota_device_tokens:
-            raise HTTPException(status_code=404, detail="OTA bootstrap disabled")
+            raise HTTPException(
+                status_code=404,
+                detail="OTA bootstrap disabled",
+                headers={"Cache-Control": "no-store"},
+            )
         token = settings.ota_device_tokens.get(device_id)
         if token is None:
-            raise HTTPException(status_code=403, detail="device is not enrolled")
+            raise HTTPException(
+                status_code=403,
+                detail="device is not enrolled",
+                headers={"Cache-Control": "no-store"},
+            )
         return JSONResponse(
             content={
                 "websocket": {

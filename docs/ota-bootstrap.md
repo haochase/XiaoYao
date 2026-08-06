@@ -36,9 +36,10 @@ For an enrolled device, the endpoint returns:
 }
 ```
 
-The response includes `Cache-Control: no-store`. A missing device identifier is
-rejected with `400`; an unknown device or disabled bootstrap configuration is
-rejected without revealing enrolled identifiers or tokens.
+All responses from this endpoint include `Cache-Control: no-store`. A missing
+device identifier is rejected with `400`; an unknown device or disabled
+bootstrap configuration is rejected without revealing enrolled identifiers or
+tokens.
 
 ## Boundaries
 
