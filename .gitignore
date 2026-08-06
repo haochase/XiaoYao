@@ -3,6 +3,7 @@
 !.env.example
 .venv/
 .vendor/
+.worktrees/
 __pycache__/
 *.py[cod]
 .pytest_cache/
