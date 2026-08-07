@@ -33,6 +33,46 @@ def test_settings_parse_optional_fake_voice_fixture_path(monkeypatch) -> None:
     )
 
 
+def test_settings_selects_http_voice_runtime(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "http")
+    monkeypatch.setenv(
+        "COMPANION_MINICPM_O_ENDPOINT",
+        "http://127.0.0.1:9000/v1/infer",
+    )
+
+    settings = Settings.from_environment()
+
+    assert settings.voice_runtime == "http"
+    assert settings.minicpm_o_endpoint == "http://127.0.0.1:9000/v1/infer"
+
+
+def test_settings_selects_realtime_voice_runtime(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "realtime")
+    monkeypatch.setenv(
+        "COMPANION_MINICPM_O_ENDPOINT",
+        "wss://minicpm.example.test/v1/realtime?mode=audio",
+    )
+
+    settings = Settings.from_environment()
+
+    assert settings.voice_runtime == "realtime"
+
+
+def test_settings_requires_endpoint_for_http_runtime(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "http")
+    monkeypatch.delenv("COMPANION_MINICPM_O_ENDPOINT", raising=False)
+
+    with pytest.raises(ValueError, match="COMPANION_MINICPM_O_ENDPOINT"):
+        Settings.from_environment()
+
+
+def test_settings_rejects_unknown_voice_runtime(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "unknown")
+
+    with pytest.raises(ValueError, match="COMPANION_VOICE_RUNTIME"):
+        Settings.from_environment()
+
+
 def test_settings_derives_a_device_digest_from_ota_token(monkeypatch, tmp_path):
     monkeypatch.setenv("COMPANION_DB_PATH", str(tmp_path / "gateway.db"))
     monkeypatch.setenv(

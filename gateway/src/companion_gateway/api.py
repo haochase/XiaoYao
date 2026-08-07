@@ -32,13 +32,22 @@ from companion_gateway.device.transport import (
     DeviceOutboundBackpressure,
     DeviceTransport,
 )
+from companion_gateway.domain.executor import TaskExecutor
 from companion_gateway.domain.models import TaskCreate
 from companion_gateway.domain.tasks import InvalidTaskTransition, TaskEventType
 from companion_gateway.service import TaskService
 from companion_gateway.settings import Settings
 from companion_gateway.storage.sqlite import SQLiteTaskRepository
 from companion_gateway.voice.delivery import DeviceVoiceDeliveryService
-from companion_gateway.voice.fixture import create_fixture_voice_delivery
+from companion_gateway.voice.fixture import (
+    create_fixture_voice_delivery,
+    create_voice_delivery,
+)
+from companion_gateway.voice.minicpm_o import (
+    MinicpmOHttpRuntime,
+    MinicpmORealtimeRuntime,
+    ModelRuntimeError,
+)
 
 
 Reason = Annotated[
@@ -71,6 +80,7 @@ def create_app(
     repository = SQLiteTaskRepository(settings.database_path)
     repository.initialize()
     service = TaskService(repository)
+    task_executor = TaskExecutor(service)
     device_sessions = DeviceSessionRegistry()
     device_authenticator = DeviceAuthenticator(settings.device_token_hashes)
     transport = device_transport or DeviceTransport()
@@ -78,10 +88,13 @@ def create_app(
     app = FastAPI(title="XiaoYao Voice Gateway", version="0.1.0")
     app.state.repository = repository
     app.state.service = service
+    app.state.task_executor = task_executor
     app.state.device_sessions = device_sessions
     app.state.device_event_sink = sink
     app.state.device_transport = transport
     app.state.voice_delivery_service = voice_delivery_service
+    if voice_delivery_service is not None:
+        voice_delivery_service.set_task_executor(task_executor)
 
     @app.middleware("http")
     async def attach_trace_id(request: Request, call_next):
@@ -254,6 +267,30 @@ def create_app(
                                 "unsupported control message"
                             )
                         sink.on_control(session, control)
+                        if (
+                            message_type == "listen"
+                            and control.state == "stop"
+                            and voice_delivery_service is not None
+                        ):
+                            try:
+                                await voice_delivery_service.process_and_send_async(
+                                    session_id=session.session_id,
+                                )
+                            except ModelRuntimeError:
+                                voice_delivery_service.clear_pending_input()
+                                await send_device_error(
+                                    websocket,
+                                    code="model_unavailable",
+                                    trace_id=trace_id,
+                                    retryable=True,
+                                )
+                                await websocket.close(code=1011)
+                                break
+                        elif (
+                            message_type == "abort"
+                            and voice_delivery_service is not None
+                        ):
+                            voice_delivery_service.clear_pending_input()
                     except (
                         json.JSONDecodeError,
                         ValidationError,
@@ -366,6 +403,8 @@ def create_app(
         except WebSocketDisconnect:
             pass
         finally:
+            if voice_delivery_service is not None:
+                voice_delivery_service.clear_pending_input()
             if outbound_sender is not None:
                 outbound_sender.cancel()
                 with suppress(asyncio.CancelledError):
@@ -444,9 +483,33 @@ def create_default_app() -> FastAPI:
     settings = Settings.from_environment()
     transport = DeviceTransport()
     voice_delivery_service = None
-    if settings.fake_voice_fixture_path is not None:
+    if settings.voice_runtime == "fixture":
+        if settings.fake_voice_fixture_path is None:
+            raise ValueError("fixture voice runtime requires a fixture path")
         voice_delivery_service = create_fixture_voice_delivery(
             fixture_path=settings.fake_voice_fixture_path,
+            device_transport=transport,
+        )
+    elif settings.voice_runtime == "http":
+        if settings.minicpm_o_endpoint is None:
+            raise ValueError("http voice runtime requires a MiniCPM-o endpoint")
+        voice_delivery_service = create_voice_delivery(
+            model_runtime=MinicpmOHttpRuntime(
+                endpoint=settings.minicpm_o_endpoint,
+                timeout_seconds=settings.minicpm_o_timeout_seconds,
+            ),
+            device_transport=transport,
+        )
+    elif settings.voice_runtime == "realtime":
+        if settings.minicpm_o_endpoint is None:
+            raise ValueError(
+                "realtime voice runtime requires a MiniCPM-o endpoint"
+            )
+        voice_delivery_service = create_voice_delivery(
+            model_runtime=MinicpmORealtimeRuntime(
+                endpoint=settings.minicpm_o_endpoint,
+                timeout_seconds=settings.minicpm_o_timeout_seconds,
+            ),
             device_transport=transport,
         )
     return create_app(

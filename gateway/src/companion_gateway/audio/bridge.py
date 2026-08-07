@@ -150,6 +150,12 @@ class AudioBridge:
                 return None
             return self._uplink_queue.popleft()
 
+    def drain_uplink(self) -> tuple[Pcm16Mono, ...]:
+        with self._lock:
+            frames = tuple(self._uplink_queue)
+            self._uplink_queue.clear()
+            return frames
+
     def queued_uplink(self) -> Iterator[Pcm16Mono]:
         with self._lock:
             return iter(tuple(self._uplink_queue))

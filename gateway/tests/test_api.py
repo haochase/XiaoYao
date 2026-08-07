@@ -11,6 +11,10 @@ from companion_gateway.audio.bridge import Pcm16Mono, resample_pcm16_mono
 from companion_gateway.audio.pyav_opus import PyAvOpusCodec
 from companion_gateway.domain.tasks import TaskEventType
 from companion_gateway.settings import Settings
+from companion_gateway.voice.minicpm_o import (
+    MinicpmOHttpRuntime,
+    MinicpmORealtimeRuntime,
+)
 
 
 def task_payload() -> dict[str, object]:
@@ -181,6 +185,39 @@ def test_default_app_enables_fixture_voice_only_when_configured(
     assert app.state.voice_delivery_service is not None
 
 
+def test_default_app_selects_minicpm_o_http_runtime(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("COMPANION_DB_PATH", str(tmp_path / "http-runtime.db"))
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "http")
+    monkeypatch.setenv(
+        "COMPANION_MINICPM_O_ENDPOINT",
+        "http://127.0.0.1:9000/v1/infer",
+    )
+
+    app = create_default_app()
+
+    delivery = app.state.voice_delivery_service
+    assert delivery is not None
+    assert isinstance(delivery._voice_turn_service._model_runtime, MinicpmOHttpRuntime)
+
+
+def test_default_app_selects_minicpm_o_realtime_runtime(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("COMPANION_DB_PATH", str(tmp_path / "realtime-runtime.db"))
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "realtime")
+    monkeypatch.setenv(
+        "COMPANION_MINICPM_O_ENDPOINT",
+        "wss://127.0.0.1:9000/v1/realtime?mode=audio",
+    )
+
+    app = create_default_app()
+
+    delivery = app.state.voice_delivery_service
+    assert delivery is not None
+    assert isinstance(
+        delivery._voice_turn_service._model_runtime,
+        MinicpmORealtimeRuntime,
+    )
+
+
 def test_default_app_fixture_voice_returns_a_full_tts_stream(
     monkeypatch,
     tmp_path,
@@ -241,6 +278,13 @@ def test_default_app_fixture_voice_returns_a_full_tts_stream(
                 }
             )
             websocket.send_bytes(uplink_packet)
+            websocket.send_json(
+                {
+                    "type": "listen",
+                    "state": "stop",
+                    "session_id": server_hello["session_id"],
+                }
+            )
 
             assert websocket.receive_json()["state"] == "start"
             frames = [websocket.receive_bytes() for _ in range(90)]

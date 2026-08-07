@@ -11,6 +11,7 @@ from companion_gateway.device.events import BoundedDeviceEventSink
 from companion_gateway.device.transport import DeviceTransport
 from companion_gateway.settings import Settings
 from companion_gateway.voice.delivery import DeviceVoiceDeliveryService
+from companion_gateway.voice.minicpm_o import ModelRuntimeError
 from companion_gateway.voice.runtime import FakeModelRuntime
 from companion_gateway.voice.service import VoiceTurnService
 
@@ -60,6 +61,11 @@ class VoiceLoopCodec:
 class RejectingVoiceLoopCodec(VoiceLoopCodec):
     def decode_uplink(self, payload: bytes) -> Pcm16Mono:
         raise AudioFrameRejected("malformed opus")
+
+
+class UnavailableRuntime:
+    def respond(self, pcm: Pcm16Mono):
+        raise ModelRuntimeError("MiniCPM-o request failed")
 
 
 @pytest.fixture
@@ -265,6 +271,13 @@ def test_uplink_audio_can_complete_an_injected_fake_voice_turn(tmp_path) -> None
                 }
             )
             websocket.send_bytes(b"inbound-opus")
+            websocket.send_json(
+                {
+                    "type": "listen",
+                    "state": "stop",
+                    "session_id": server_hello["session_id"],
+                }
+            )
 
             assert websocket.receive_json() == {
                 "type": "tts",
@@ -277,6 +290,121 @@ def test_uplink_audio_can_complete_an_injected_fake_voice_turn(tmp_path) -> None
                 "state": "stop",
                 "session_id": server_hello["session_id"],
             }
+
+
+def test_voice_turn_waits_for_listen_stop_before_model_response(tmp_path) -> None:
+    transport = DeviceTransport()
+    bridge = AudioBridge(
+        codec=VoiceLoopCodec(),
+        model_sample_rate=16_000,
+        queue_capacity=8,
+    )
+    runtime = FakeModelRuntime(
+        response_text="鎴戝湪杩欓噷锛屾參鎱㈣銆?",
+        response_pcm=Pcm16Mono(sample_rate=16_000, payload=b"\x02\x00" * 960),
+    )
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "voice-stop-boundary.db",
+            device_token_hashes={
+                DEVICE_ID: sha256(DEVICE_TOKEN.encode("utf-8")).hexdigest()
+            },
+        ),
+        device_transport=transport,
+        voice_delivery_service=DeviceVoiceDeliveryService(
+            voice_turn_service=VoiceTurnService(
+                audio_bridge=bridge,
+                model_runtime=runtime,
+            ),
+            device_transport=transport,
+        ),
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/v1/devices/ws",
+            headers=websocket_headers(),
+        ) as websocket:
+            websocket.send_json(hello_payload())
+            server_hello = websocket.receive_json()
+            websocket.send_json(
+                {
+                    "type": "listen",
+                    "state": "start",
+                    "session_id": server_hello["session_id"],
+                }
+            )
+            websocket.send_bytes(b"first-opus")
+            websocket.send_bytes(b"second-opus")
+
+            assert runtime.received_inputs == []
+
+            websocket.send_json(
+                {
+                    "type": "listen",
+                    "state": "stop",
+                    "session_id": server_hello["session_id"],
+                }
+            )
+            assert websocket.receive_json()["state"] == "start"
+            assert websocket.receive_bytes() == b"voice-loop-opus"
+            assert websocket.receive_json()["state"] == "stop"
+
+    assert len(runtime.received_inputs) == 1
+    assert runtime.received_inputs[0].sample_count == 1_920
+
+
+def test_model_unavailable_returns_a_retryable_device_error(tmp_path) -> None:
+    transport = DeviceTransport()
+    bridge = AudioBridge(
+        codec=VoiceLoopCodec(),
+        model_sample_rate=16_000,
+        queue_capacity=8,
+    )
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "voice-model-error.db",
+            device_token_hashes={
+                DEVICE_ID: sha256(DEVICE_TOKEN.encode("utf-8")).hexdigest()
+            },
+        ),
+        device_transport=transport,
+        voice_delivery_service=DeviceVoiceDeliveryService(
+            voice_turn_service=VoiceTurnService(
+                audio_bridge=bridge,
+                model_runtime=UnavailableRuntime(),
+            ),
+            device_transport=transport,
+        ),
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/v1/devices/ws",
+            headers=websocket_headers(),
+        ) as websocket:
+            websocket.send_json(hello_payload())
+            server_hello = websocket.receive_json()
+            websocket.send_json(
+                {
+                    "type": "listen",
+                    "state": "start",
+                    "session_id": server_hello["session_id"],
+                }
+            )
+            websocket.send_bytes(b"inbound-opus")
+            websocket.send_json(
+                {
+                    "type": "listen",
+                    "state": "stop",
+                    "session_id": server_hello["session_id"],
+                }
+            )
+            error = websocket.receive_json()
+
+    assert error["type"] == "error"
+    assert error["code"] == "model_unavailable"
+    assert error["retryable"] is True
 
 
 def test_injected_voice_turn_rejects_malformed_opus_without_server_error(

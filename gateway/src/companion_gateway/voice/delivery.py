@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Protocol
 
 from companion_gateway.device.transport import MAX_TTS_FRAMES
+from companion_gateway.domain.executor import TaskExecutor
 from companion_gateway.voice.service import VoiceTurn, VoiceTurnService
 
 
@@ -25,7 +27,7 @@ class DeviceVoiceDeliveryService:
         self._device_transport = device_transport
 
     def process_and_send(self, *, session_id: str) -> VoiceTurn | None:
-        turn = self._voice_turn_service.process_next_input()
+        turn = self._voice_turn_service.process_pending_turn()
         if turn is None:
             return None
         for offset in range(0, len(turn.device_opus_frames), MAX_TTS_FRAMES):
@@ -35,6 +37,12 @@ class DeviceVoiceDeliveryService:
             )
         return turn
 
+    async def process_and_send_async(self, *, session_id: str) -> VoiceTurn | None:
+        return await asyncio.to_thread(
+            self.process_and_send,
+            session_id=session_id,
+        )
+
     def accept_and_send(
         self,
         *,
@@ -42,4 +50,10 @@ class DeviceVoiceDeliveryService:
         opus_frame: bytes,
     ) -> VoiceTurn | None:
         self._voice_turn_service.accept_opus_uplink(opus_frame)
-        return self.process_and_send(session_id=session_id)
+        return None
+
+    def clear_pending_input(self) -> None:
+        self._voice_turn_service.clear_pending_input()
+
+    def set_task_executor(self, task_executor: TaskExecutor) -> None:
+        self._voice_turn_service.set_task_executor(task_executor)

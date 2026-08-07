@@ -148,6 +148,26 @@ class SQLiteTaskRepository:
             ).fetchone()
         return self._task_from_row(row) if row is not None else None
 
+    def list_due_tasks(self, *, now: datetime) -> list[TaskRecord]:
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM tasks
+                WHERE status IN (?, ?)
+                ORDER BY scheduled_at, rowid
+                """,
+                (TaskStatus.SCHEDULED.value, TaskStatus.PENDING_DELIVERY.value),
+            ).fetchall()
+        current = now.astimezone(UTC)
+        due = []
+        for row in rows:
+            scheduled_at = datetime.fromisoformat(row["scheduled_at"])
+            if scheduled_at.astimezone(UTC) <= current:
+                due.append(self._task_from_row(row))
+        return due
+
     def list_events(self, task_id: str) -> list[TaskEvent]:
         with self._connect() as connection:
             rows = connection.execute(

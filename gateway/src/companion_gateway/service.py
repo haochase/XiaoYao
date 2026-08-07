@@ -51,6 +51,9 @@ class TaskService:
     def get_events(self, task_id: str) -> list[TaskEvent]:
         return self._repository.list_events(task_id)
 
+    def list_due_tasks(self, *, now: datetime) -> list[TaskRecord]:
+        return self._repository.list_due_tasks(now=now)
+
     def record_event(
         self,
         task_id: str,

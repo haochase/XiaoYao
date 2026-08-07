@@ -102,3 +102,38 @@ tests. To regenerate it on Windows:
 
 Set `COMPANION_FAKE_VOICE_FIXTURE_PATH` to the generated WAV file to enable a
 deterministic local response. It is intended for protocol testing only.
+
+## Voice runtime selection
+
+The default runtime is `none`, which keeps the gateway available for protocol
+and task tests without pretending that a model is configured. Select the local
+fixture explicitly for deterministic audio replay:
+
+```powershell
+$env:COMPANION_VOICE_RUNTIME = 'fixture'
+$env:COMPANION_FAKE_VOICE_FIXTURE_PATH = '..\assets\audio\companion-greeting-zh-cn.wav'
+```
+
+To use the official MiniCPM-o Realtime API on an Ascend host, select the
+WebSocket adapter:
+
+```powershell
+$env:COMPANION_VOICE_RUNTIME = 'realtime'
+$env:COMPANION_MINICPM_O_ENDPOINT = 'wss://<ascend-host>:9000/v1/realtime?mode=audio'
+$env:COMPANION_MINICPM_O_TIMEOUT_SECONDS = '20'
+```
+
+The realtime adapter converts the complete stopped turn to base64 float32 PCM
+at 16 kHz, waits for text and audio delta events, converts returned 24 kHz
+float32 PCM to device Opus, and closes the session. An optional `http` mode is
+also available for a local wrapper service using the PCM16 JSON contract in
+`voice/minicpm_o.py`. The gateway never imports CANN or `torch_npu`; the
+Ascend service is a separate deployment boundary. A gateway-side wrapper may
+add a `response.output.delta` event with `kind=task`; that task is validated
+before it can enter the local task state machine.
+
+Audio is buffered between `listen.start` and `listen.stop`, so one turn causes
+one model request. A runtime failure returns a retryable `model_unavailable`
+device error and discards the pending audio. A validated model task is created
+idempotently and enters the `scheduled` state; `TaskExecutor.execute_due` can
+then advance it through delivery states using a device delivery callback.

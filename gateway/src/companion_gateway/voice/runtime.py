@@ -4,12 +4,14 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from companion_gateway.audio.bridge import Pcm16Mono
+from companion_gateway.domain.models import TaskCreate
 
 
 @dataclass(frozen=True)
 class ModelResponse:
     text: str
     pcm: Pcm16Mono
+    task: TaskCreate | None = None
 
     def __post_init__(self) -> None:
         if not self.text.strip():
