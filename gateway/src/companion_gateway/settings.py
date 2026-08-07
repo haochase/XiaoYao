@@ -171,6 +171,33 @@ def _normalize_minicpm_o_endpoint(endpoint: str | None) -> str | None:
     return normalized
 
 
+def _normalize_minicpm_o_auth_token(token: str | None) -> str | None:
+    if token is None or token == "":
+        return None
+    if not isinstance(token, str) or token != token.strip() or any(
+        character.isspace()
+        or ord(character) < 32
+        or ord(character) == 127
+        for character in token
+    ):
+        raise ValueError(
+            "COMPANION_MINICPM_O_AUTH_TOKEN must be a non-empty token "
+            "without whitespace"
+        )
+    return token
+
+
+def _parse_bool(value: str | None, *, name: str, default: bool) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be true or false")
+
+
 @dataclass(frozen=True)
 class Settings:
     database_path: Path
@@ -180,7 +207,10 @@ class Settings:
     ota_device_tokens: Mapping[str, str] = field(default_factory=dict)
     voice_runtime: VoiceRuntimeMode = "none"
     minicpm_o_endpoint: str | None = None
+    minicpm_o_auth_token: str | None = None
     minicpm_o_timeout_seconds: float = 20.0
+    task_scheduler_enabled: bool = False
+    task_scheduler_interval_seconds: float = 1.0
     device_hello_timeout_seconds: float = 10.0
     device_audio_frame_max_bytes: int = 4096
 
@@ -195,6 +225,9 @@ class Settings:
             ota_tokens,
         )
         normalized_endpoint = _normalize_minicpm_o_endpoint(self.minicpm_o_endpoint)
+        normalized_auth_token = _normalize_minicpm_o_auth_token(
+            self.minicpm_o_auth_token
+        )
         configured_runtime = self.voice_runtime
         if configured_runtime == "none" and self.fake_voice_fixture_path is not None:
             configured_runtime = "fixture"
@@ -205,11 +238,16 @@ class Settings:
         )
         if self.minicpm_o_timeout_seconds <= 0:
             raise ValueError("COMPANION_MINICPM_O_TIMEOUT_SECONDS must be positive")
+        if self.task_scheduler_interval_seconds <= 0:
+            raise ValueError(
+                "COMPANION_TASK_SCHEDULER_INTERVAL_SECONDS must be positive"
+            )
         object.__setattr__(self, "ota_device_tokens", ota_tokens)
         object.__setattr__(self, "public_websocket_url", normalized_url)
         object.__setattr__(self, "device_token_hashes", normalized_hashes)
         object.__setattr__(self, "voice_runtime", normalized_runtime)
         object.__setattr__(self, "minicpm_o_endpoint", normalized_endpoint)
+        object.__setattr__(self, "minicpm_o_auth_token", normalized_auth_token)
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -217,9 +255,19 @@ class Settings:
         configured_fixture = os.environ.get("COMPANION_FAKE_VOICE_FIXTURE_PATH")
         configured_runtime = os.environ.get("COMPANION_VOICE_RUNTIME")
         configured_endpoint = os.environ.get("COMPANION_MINICPM_O_ENDPOINT")
+        configured_auth_token = os.environ.get("COMPANION_MINICPM_O_AUTH_TOKEN")
         configured_timeout = os.environ.get(
             "COMPANION_MINICPM_O_TIMEOUT_SECONDS",
             "20",
+        )
+        task_scheduler_enabled = _parse_bool(
+            os.environ.get("COMPANION_TASK_SCHEDULER_ENABLED"),
+            name="COMPANION_TASK_SCHEDULER_ENABLED",
+            default=False,
+        )
+        configured_scheduler_interval = os.environ.get(
+            "COMPANION_TASK_SCHEDULER_INTERVAL_SECONDS",
+            "1",
         )
         public_websocket_url = os.environ.get("COMPANION_PUBLIC_WEBSOCKET_URL")
         ota_tokens_json = os.environ.get("COMPANION_OTA_DEVICE_TOKENS", "{}")
@@ -237,6 +285,12 @@ class Settings:
             raise ValueError(
                 "COMPANION_MINICPM_O_TIMEOUT_SECONDS must be a number"
             ) from exc
+        try:
+            task_scheduler_interval_seconds = float(configured_scheduler_interval)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_TASK_SCHEDULER_INTERVAL_SECONDS must be a number"
+            ) from exc
         return cls(
             database_path=(
                 Path(configured_path) if configured_path else Path("data/companion.db")
@@ -249,5 +303,8 @@ class Settings:
             ota_device_tokens=ota_tokens,
             voice_runtime=voice_runtime,
             minicpm_o_endpoint=configured_endpoint,
+            minicpm_o_auth_token=configured_auth_token,
             minicpm_o_timeout_seconds=minicpm_o_timeout_seconds,
+            task_scheduler_enabled=task_scheduler_enabled,
+            task_scheduler_interval_seconds=task_scheduler_interval_seconds,
         )

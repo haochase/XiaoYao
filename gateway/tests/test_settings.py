@@ -58,6 +58,38 @@ def test_settings_selects_realtime_voice_runtime(monkeypatch) -> None:
     assert settings.voice_runtime == "realtime"
 
 
+def test_settings_loads_minicpm_o_auth_token(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "ascend-runtime-token")
+
+    settings = Settings.from_environment()
+
+    assert settings.minicpm_o_auth_token == "ascend-runtime-token"
+
+
+def test_settings_rejects_minicpm_o_auth_token_with_whitespace(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "token with spaces")
+
+    with pytest.raises(ValueError, match="COMPANION_MINICPM_O_AUTH_TOKEN"):
+        Settings.from_environment()
+
+
+def test_settings_parse_task_scheduler_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_TASK_SCHEDULER_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_TASK_SCHEDULER_INTERVAL_SECONDS", "2.5")
+
+    settings = Settings.from_environment()
+
+    assert settings.task_scheduler_enabled is True
+    assert settings.task_scheduler_interval_seconds == 2.5
+
+
+def test_settings_reject_invalid_task_scheduler_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_TASK_SCHEDULER_ENABLED", "sometimes")
+
+    with pytest.raises(ValueError, match="COMPANION_TASK_SCHEDULER_ENABLED"):
+        Settings.from_environment()
+
+
 def test_settings_requires_endpoint_for_http_runtime(monkeypatch) -> None:
     monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "http")
     monkeypatch.delenv("COMPANION_MINICPM_O_ENDPOINT", raising=False)

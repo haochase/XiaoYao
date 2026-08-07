@@ -66,6 +66,7 @@ def test_minicpm_o_runtime_posts_pcm_and_decodes_response(monkeypatch) -> None:
                 "url": request.full_url,
                 "timeout": timeout,
                 "body": json.loads(request.data),
+                "authorization": request.get_header("Authorization"),
             }
         )
         return FakeResponse(response_payload())
@@ -88,6 +89,7 @@ def test_minicpm_o_runtime_posts_pcm_and_decodes_response(monkeypatch) -> None:
                 "format": "pcm_s16le",
                 "audio_base64": base64.b64encode(input_pcm().payload).decode(),
             },
+            "authorization": None,
         }
     ]
     assert response.text == "I am here."
@@ -131,11 +133,30 @@ def test_minicpm_o_runtime_maps_transport_failure(monkeypatch) -> None:
         runtime.respond(input_pcm())
 
 
+def test_minicpm_o_http_runtime_sends_bearer_token(monkeypatch) -> None:
+    authorization: list[str | None] = []
+
+    def fake_urlopen(request, *, timeout):
+        authorization.append(request.get_header("Authorization"))
+        return FakeResponse(response_payload())
+
+    monkeypatch.setattr(minicpm_o, "urlopen", fake_urlopen)
+    runtime = MinicpmOHttpRuntime(
+        endpoint="http://ascend.example.test/v1/infer",
+        auth_token="runtime-token",
+    )
+
+    runtime.respond(input_pcm())
+
+    assert authorization == ["Bearer runtime-token"]
+
+
 class FakeRealtimeSocket:
     def __init__(self, events: list[dict[str, object]]) -> None:
         self._events = iter(events)
         self.sent: list[dict[str, object]] = []
         self.closed = False
+        self.headers: list[str] | None = None
 
     def send(self, payload: str) -> None:
         self.sent.append(json.loads(payload))
@@ -174,11 +195,11 @@ def test_minicpm_o_realtime_runtime_completes_one_audio_turn(monkeypatch) -> Non
             {"type": "response.output.delta", "kind": "listen"},
         ]
     )
-    monkeypatch.setattr(
-        minicpm_o.websocket,
-        "create_connection",
-        lambda endpoint, timeout, header: socket,
-    )
+    def create_connection(endpoint, *, timeout, header):
+        socket.headers = header
+        return socket
+
+    monkeypatch.setattr(minicpm_o.websocket, "create_connection", create_connection)
     runtime = minicpm_o.MinicpmORealtimeRuntime(
         endpoint="wss://ascend.example.test/v1/realtime?mode=audio",
         auth_token="runtime-token",
@@ -198,4 +219,5 @@ def test_minicpm_o_realtime_runtime_completes_one_audio_turn(monkeypatch) -> Non
     ]
     assert socket.sent[0]["payload"] == {}
     assert socket.sent[1]["input"]["audio"]
+    assert socket.headers == ["Authorization: Bearer runtime-token"]
     assert socket.closed is True

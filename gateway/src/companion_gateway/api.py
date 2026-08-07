@@ -31,9 +31,11 @@ from companion_gateway.device.transport import (
     DeviceNotConnected,
     DeviceOutboundBackpressure,
     DeviceTransport,
+    OutboundTask,
 )
 from companion_gateway.domain.executor import TaskExecutor
-from companion_gateway.domain.models import TaskCreate
+from companion_gateway.domain.models import TaskCreate, TaskRecord
+from companion_gateway.domain.scheduler import TaskScheduler
 from companion_gateway.domain.tasks import InvalidTaskTransition, TaskEventType
 from companion_gateway.service import TaskService
 from companion_gateway.settings import Settings
@@ -85,6 +87,22 @@ def create_app(
     device_authenticator = DeviceAuthenticator(settings.device_token_hashes)
     transport = device_transport or DeviceTransport()
     sink = device_event_sink or BoundedDeviceEventSink()
+
+    def deliver_task(task: TaskRecord) -> bool:
+        session = device_sessions.get(task.target_device_id)
+        if session is None:
+            return False
+        try:
+            transport.send_task(session.session_id, task)
+        except (DeviceNotConnected, DeviceOutboundBackpressure):
+            return False
+        return True
+
+    task_scheduler = TaskScheduler(
+        executor=task_executor,
+        deliver=deliver_task,
+        interval_seconds=settings.task_scheduler_interval_seconds,
+    )
     app = FastAPI(title="XiaoYao Voice Gateway", version="0.1.0")
     app.state.repository = repository
     app.state.service = service
@@ -93,8 +111,12 @@ def create_app(
     app.state.device_event_sink = sink
     app.state.device_transport = transport
     app.state.voice_delivery_service = voice_delivery_service
+    app.state.task_scheduler = task_scheduler
     if voice_delivery_service is not None:
         voice_delivery_service.set_task_executor(task_executor)
+    if settings.task_scheduler_enabled:
+        app.add_event_handler("startup", task_scheduler.start)
+        app.add_event_handler("shutdown", task_scheduler.stop)
 
     @app.middleware("http")
     async def attach_trace_id(request: Request, call_next):
@@ -219,9 +241,19 @@ def create_app(
             await websocket.send_json(server_hello(session.session_id))
             transport.register(session.session_id)
 
-            async def forward_tts() -> None:
+            async def forward_outbound() -> None:
                 while True:
-                    message = await transport.next_tts(session.session_id)
+                    message = await transport.next_outbound(session.session_id)
+                    if isinstance(message, OutboundTask):
+                        await websocket.send_json(
+                            {
+                                "type": "task",
+                                "state": "notify",
+                                "session_id": message.session_id,
+                                "task": jsonable_encoder(message.task),
+                            }
+                        )
+                        continue
                     await websocket.send_json(
                         {
                             "type": "tts",
@@ -239,7 +271,7 @@ def create_app(
                         }
                     )
 
-            outbound_sender = asyncio.create_task(forward_tts())
+            outbound_sender = asyncio.create_task(forward_outbound())
 
             while True:
                 message = await websocket.receive()
@@ -496,6 +528,7 @@ def create_default_app() -> FastAPI:
         voice_delivery_service = create_voice_delivery(
             model_runtime=MinicpmOHttpRuntime(
                 endpoint=settings.minicpm_o_endpoint,
+                auth_token=settings.minicpm_o_auth_token,
                 timeout_seconds=settings.minicpm_o_timeout_seconds,
             ),
             device_transport=transport,
@@ -508,6 +541,7 @@ def create_default_app() -> FastAPI:
         voice_delivery_service = create_voice_delivery(
             model_runtime=MinicpmORealtimeRuntime(
                 endpoint=settings.minicpm_o_endpoint,
+                auth_token=settings.minicpm_o_auth_token,
                 timeout_seconds=settings.minicpm_o_timeout_seconds,
             ),
             device_transport=transport,

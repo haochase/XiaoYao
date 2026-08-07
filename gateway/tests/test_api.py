@@ -9,7 +9,8 @@ from fastapi.testclient import TestClient
 from companion_gateway.api import create_app, create_default_app
 from companion_gateway.audio.bridge import Pcm16Mono, resample_pcm16_mono
 from companion_gateway.audio.pyav_opus import PyAvOpusCodec
-from companion_gateway.domain.tasks import TaskEventType
+from companion_gateway.domain.models import TaskCreate
+from companion_gateway.domain.tasks import TaskEventType, TaskStatus
 from companion_gateway.settings import Settings
 from companion_gateway.voice.minicpm_o import (
     MinicpmOHttpRuntime,
@@ -216,6 +217,78 @@ def test_default_app_selects_minicpm_o_realtime_runtime(monkeypatch, tmp_path) -
         delivery._voice_turn_service._model_runtime,
         MinicpmORealtimeRuntime,
     )
+
+
+def test_default_app_passes_minicpm_o_auth_token_to_runtime(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("COMPANION_DB_PATH", str(tmp_path / "auth-runtime.db"))
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "realtime")
+    monkeypatch.setenv(
+        "COMPANION_MINICPM_O_ENDPOINT",
+        "wss://127.0.0.1:9000/v1/realtime?mode=audio",
+    )
+    monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "runtime-token")
+
+    app = create_default_app()
+
+    runtime = app.state.voice_delivery_service._voice_turn_service._model_runtime
+    assert runtime._auth_token == "runtime-token"
+
+
+def test_enabled_task_scheduler_notifies_connected_target_device(tmp_path) -> None:
+    device_id = "scheduler-device"
+    device_token = "scheduler-device-token"
+    client_id = "scheduler-client"
+    settings = Settings(
+        database_path=tmp_path / "scheduler-api.db",
+        device_token_hashes={
+            device_id: sha256(device_token.encode("utf-8")).hexdigest()
+        },
+        task_scheduler_enabled=True,
+        task_scheduler_interval_seconds=0.01,
+    )
+    app = create_app(settings)
+    command = task_payload()
+    command["target_device_id"] = device_id
+    task, _ = app.state.task_executor.create_and_schedule(
+        TaskCreate.model_validate(command),
+        trace_id="trace-scheduler-api",
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/v1/devices/ws",
+            headers={
+                "Authorization": f"Bearer {device_token}",
+                "Protocol-Version": "1",
+                "Device-Id": device_id,
+                "Client-Id": client_id,
+            },
+        ) as websocket:
+            websocket.send_json(
+                {
+                    "type": "hello",
+                    "version": 1,
+                    "transport": "websocket",
+                    "audio_params": {
+                        "format": "opus",
+                        "sample_rate": 16000,
+                        "channels": 1,
+                        "frame_duration": 60,
+                    },
+                }
+            )
+            session_hello = websocket.receive_json()
+            notification = websocket.receive_json()
+
+    assert notification["type"] == "task"
+    assert notification["state"] == "notify"
+    assert notification["session_id"] == session_hello["session_id"]
+    assert notification["task"]["task_id"] == task.task_id
+    assert notification["task"]["status"] == TaskStatus.PENDING_DELIVERY.value
+    assert app.state.service.get_task(task.task_id).status is TaskStatus.DELIVERED
 
 
 def test_default_app_fixture_voice_returns_a_full_tts_stream(

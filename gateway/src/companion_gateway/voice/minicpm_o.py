@@ -36,6 +36,7 @@ class MinicpmOHttpRuntime:
         self,
         *,
         endpoint: str,
+        auth_token: str | None = None,
         timeout_seconds: float = 20.0,
     ) -> None:
         parsed = urlparse(endpoint)
@@ -46,6 +47,7 @@ class MinicpmOHttpRuntime:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         self._endpoint = endpoint
+        self._auth_token = auth_token
         self._timeout_seconds = timeout_seconds
 
     def respond(self, pcm: Pcm16Mono) -> ModelResponse:
@@ -58,13 +60,16 @@ class MinicpmOHttpRuntime:
             "format": "pcm_s16le",
             "audio_base64": base64.b64encode(pcm.payload).decode("ascii"),
         }
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        if self._auth_token:
+            headers["Authorization"] = f"Bearer {self._auth_token}"
         request = Request(
             self._endpoint,
             data=json.dumps(request_payload, separators=(",", ":")).encode("utf-8"),
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             method="POST",
         )
         try:

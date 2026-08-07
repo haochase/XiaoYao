@@ -9,6 +9,13 @@ from companion_gateway.api import create_app
 from companion_gateway.audio.bridge import AudioBridge, AudioFrameRejected, Pcm16Mono
 from companion_gateway.device.events import BoundedDeviceEventSink
 from companion_gateway.device.transport import DeviceTransport
+from companion_gateway.domain.models import (
+    ConfirmationPolicy,
+    TaskCreate,
+    TaskKind,
+    TaskPayload,
+    TaskSchedule,
+)
 from companion_gateway.settings import Settings
 from companion_gateway.voice.delivery import DeviceVoiceDeliveryService
 from companion_gateway.voice.minicpm_o import ModelRuntimeError
@@ -196,6 +203,43 @@ def test_active_device_receives_a_multi_frame_tts_stream(
         assert websocket.receive_bytes() == b"first-opus"
         assert websocket.receive_bytes() == b"second-opus"
         assert websocket.receive_json()["state"] == "stop"
+
+
+def test_active_device_receives_a_task_notification(
+    client: TestClient,
+    app_and_sink,
+) -> None:
+    app, _ = app_and_sink
+    task, _ = app.state.task_executor.create_and_schedule(
+        TaskCreate(
+            actor_id="voice-user",
+            target_device_id=DEVICE_ID,
+            kind=TaskKind.REMINDER,
+            schedule=TaskSchedule(
+                at="2026-08-07T20:00:00+08:00",
+                timezone="Asia/Shanghai",
+            ),
+            payload=TaskPayload(text="take medicine"),
+            confirmation_policy=ConfirmationPolicy.REQUIRED,
+            idempotency_key="notify:websocket:1",
+        ),
+        trace_id="trace-task-notify",
+    )
+
+    with client.websocket_connect(
+        "/v1/devices/ws",
+        headers=websocket_headers(),
+    ) as websocket:
+        websocket.send_json(hello_payload())
+        server_hello = websocket.receive_json()
+        app.state.device_transport.send_task(server_hello["session_id"], task)
+
+        assert websocket.receive_json() == {
+            "type": "task",
+            "state": "notify",
+            "session_id": server_hello["session_id"],
+            "task": task.model_dump(mode="json"),
+        }
 
 
 def test_replacement_session_keeps_the_new_tts_transport(

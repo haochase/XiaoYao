@@ -120,6 +120,7 @@ WebSocket adapter:
 ```powershell
 $env:COMPANION_VOICE_RUNTIME = 'realtime'
 $env:COMPANION_MINICPM_O_ENDPOINT = 'wss://<ascend-host>:9000/v1/realtime?mode=audio'
+$env:COMPANION_MINICPM_O_AUTH_TOKEN = '<runtime-token>'
 $env:COMPANION_MINICPM_O_TIMEOUT_SECONDS = '20'
 ```
 
@@ -137,3 +138,35 @@ one model request. A runtime failure returns a retryable `model_unavailable`
 device error and discards the pending audio. A validated model task is created
 idempotently and enters the `scheduled` state; `TaskExecutor.execute_due` can
 then advance it through delivery states using a device delivery callback.
+
+## Task scheduler
+
+The scheduler is disabled by default. Enable it only after the target device is
+reachable and the task notification extension is understood by the firmware:
+
+```powershell
+$env:COMPANION_TASK_SCHEDULER_ENABLED = 'true'
+$env:COMPANION_TASK_SCHEDULER_INTERVAL_SECONDS = '1'
+```
+
+Due tasks are delivered as an additive WebSocket message with
+`type=task,state=notify`. Delivery is retried on later ticks while the target
+device is offline or its bounded queue is full.
+
+## Repeatable voice check
+
+Install the gateway dependencies, then configure the device endpoint and token
+through the process environment. The token is never included in the JSON result:
+
+```powershell
+$env:PYTHONPATH = 'gateway\src'
+$env:COMPANION_DEVICE_ENDPOINT = 'ws://<gateway-host>:8723/v1/devices/ws'
+$env:COMPANION_DEVICE_ID = '<device-id>'
+$env:COMPANION_DEVICE_TOKEN = '<device-token>'
+python tools/voice_mainline_check.py --turns 3
+```
+
+The command replays the checked-in WAV fixture, performs three complete
+`hello -> listen.start -> audio -> listen.stop -> tts` turns, and prints JSON
+with turn count, returned TTS frame count, and elapsed milliseconds. It does
+not access serial ports or change firmware.
