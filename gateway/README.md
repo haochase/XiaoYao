@@ -317,6 +317,21 @@ contains metadata and a digest, never image bytes or an absolute path. The
 ESP32 audio WebSocket and model runtime remain audio-only until a separate
 multimodal adapter contract is added.
 
+## Narrow agent tools
+
+The local policy layer exposes only two tool routes:
+
+- `POST /v1/agent/tools/query_task_status` reads a task only when the supplied
+  actor and target device match the stored task.
+- `POST /v1/agent/tools/create_reminder` creates a future reminder in
+  `awaiting_confirmation` with `confirmation_policy=required` and an
+  idempotency key.
+
+Neither route sends Feishu, writes memory, controls a device, calls an external
+URL, or enables automatic execution. See
+[`docs/verification/agent-tools-local.md`](../docs/verification/agent-tools-local.md)
+for the local policy check.
+
 ## Repeatable voice check
 
 Install the gateway dependencies, then configure the device endpoint and token

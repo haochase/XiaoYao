@@ -14,6 +14,12 @@ from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
 from starlette.websockets import WebSocketDisconnect
 
 from companion_gateway.audio.bridge import AudioFrameRejected, AudioQueueFull
+from companion_gateway.agent.service import (
+    AgentToolNotAllowed,
+    AgentToolRequest,
+    AgentToolService,
+    AgentToolTimeout,
+)
 from companion_gateway.device.events import (
     BoundedDeviceEventSink,
     DeviceBackpressure,
@@ -144,6 +150,7 @@ def create_app(
     medication_notifier: MedicationNotifier | None = None,
     memory_clock: Callable[[], datetime] = utc_now,
     vision_clock: Callable[[], datetime] = utc_now,
+    agent_clock: Callable[[], datetime] = utc_now,
 ) -> FastAPI:
     repository = SQLiteTaskRepository(settings.database_path)
     repository.initialize()
@@ -241,6 +248,11 @@ def create_app(
         interval_seconds=settings.vision_cleanup_interval_seconds,
         clock=vision_clock,
     )
+    agent_tool_service = AgentToolService(
+        task_service=service,
+        task_executor=task_executor,
+        clock=agent_clock,
+    )
     medication_scheduler = MedicationScheduler(
         service=medication_service,
         interval_seconds=settings.task_scheduler_interval_seconds,
@@ -261,6 +273,7 @@ def create_app(
     app.state.memory_scheduler = memory_scheduler
     app.state.vision_service = vision_service
     app.state.vision_scheduler = vision_scheduler
+    app.state.agent_tool_service = agent_tool_service
     if voice_delivery_service is not None:
         voice_delivery_service.set_task_executor(task_executor)
         voice_delivery_service.set_medication_service(medication_service)
@@ -374,6 +387,36 @@ def create_app(
         if not deleted:
             raise HTTPException(status_code=404, detail="vision observation not found")
         return {"deleted": True}
+
+    @app.post("/v1/agent/tools/{tool_name}")
+    def execute_agent_tool(
+        tool_name: str,
+        body: AgentToolRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        if tool_name not in AgentToolService.policies():
+            raise HTTPException(status_code=404, detail="agent tool not found")
+        try:
+            result = agent_tool_service.execute(
+                tool_name,
+                actor_id=body.actor_id,
+                target_device_id=body.target_device_id,
+                arguments=body.arguments,
+                trace_id=_request_trace_id(request),
+            )
+        except AgentToolNotAllowed as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except AgentToolTimeout as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "result": {
+                "tool": result.tool,
+                **jsonable_encoder(result.result),
+                "auto_executed": result.auto_executed,
+            }
+        }
 
     @app.post("/v1/ota")
     def ota_bootstrap(request: Request) -> JSONResponse:
