@@ -65,6 +65,10 @@ _TRANSITIONS = {
         TaskStatus.PENDING_DELIVERY,
         TaskEventType.DELIVERING,
     ): TaskStatus.DELIVERING,
+    (
+        TaskStatus.PENDING_DELIVERY,
+        TaskEventType.PENDING_DELIVERY,
+    ): TaskStatus.PENDING_DELIVERY,
     (TaskStatus.PENDING_DELIVERY, TaskEventType.EXPIRED): TaskStatus.EXPIRED,
     (TaskStatus.DELIVERING, TaskEventType.DELIVERED): TaskStatus.DELIVERED,
     (TaskStatus.DELIVERING, TaskEventType.FAILED): TaskStatus.FAILED,

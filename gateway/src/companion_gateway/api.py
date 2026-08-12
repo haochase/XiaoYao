@@ -45,7 +45,7 @@ from companion_gateway.device.transport import (
     OutboundTask,
 )
 from companion_gateway.domain.memory import MemoryCandidate, MemoryCategory, utc_now
-from companion_gateway.domain.executor import TaskExecutor
+from companion_gateway.domain.executor import TaskDeliveryAttempt, TaskExecutor
 from companion_gateway.domain.medication import MedicationPlanCreate
 from companion_gateway.domain.models import (
     ContentText,
@@ -168,7 +168,7 @@ def create_app(
     transport = device_transport or DeviceTransport()
     sink = device_event_sink or BoundedDeviceEventSink()
 
-    def deliver_task(task: TaskRecord) -> bool:
+    def deliver_task(task: TaskRecord) -> TaskDeliveryAttempt:
         session = device_sessions.get(task.target_device_id)
         if session is None:
             logger.info(
@@ -176,7 +176,7 @@ def create_app(
                 redact_device_id(task.target_device_id),
                 task.task_id,
             )
-            return False
+            return TaskDeliveryAttempt.failed("device_offline")
         try:
             if medication_service.is_medication_task(task.task_id):
                 if voice_delivery_service is None:
@@ -186,7 +186,7 @@ def create_app(
                         redact_device_id(task.target_device_id),
                         task.task_id,
                     )
-                    return False
+                    return TaskDeliveryAttempt.failed("voice_synthesis_unavailable")
                 voice_delivery_service.synthesize_and_send(
                     session_id=session.session_id,
                     text=task.payload.text,
@@ -204,7 +204,7 @@ def create_app(
                 redact_device_id(task.target_device_id),
                 task.task_id,
             )
-            return False
+            return TaskDeliveryAttempt.failed("device_offline")
         except DeviceOutboundBackpressure:
             logger.info(
                 "task_delivery_failed device=%s task=%s "
@@ -212,20 +212,20 @@ def create_app(
                 redact_device_id(task.target_device_id),
                 task.task_id,
             )
-            return False
+            return TaskDeliveryAttempt.failed("outbound_backpressure")
         except (ModelRuntimeError, RuntimeError, ValueError):
             logger.info(
                 "task_delivery_failed device=%s task=%s reason=voice_synthesis_failed",
                 redact_device_id(task.target_device_id),
                 task.task_id,
             )
-            return False
+            return TaskDeliveryAttempt.failed("voice_synthesis_failed")
         logger.info(
             "task_delivery_succeeded device=%s task=%s",
             redact_device_id(task.target_device_id),
             task.task_id,
         )
-        return True
+        return TaskDeliveryAttempt.succeeded()
 
     task_scheduler = TaskScheduler(
         executor=task_executor,

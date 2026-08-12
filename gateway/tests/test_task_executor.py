@@ -12,7 +12,7 @@ from companion_gateway.domain.models import (
 from companion_gateway.domain.tasks import TaskEventType, TaskStatus
 from companion_gateway.service import TaskService
 from companion_gateway.storage.sqlite import SQLiteTaskRepository
-from companion_gateway.domain.executor import TaskExecutor
+from companion_gateway.domain.executor import TaskDeliveryAttempt, TaskExecutor
 
 
 def task_command(
@@ -111,3 +111,20 @@ def test_task_executor_keeps_undeliverable_due_task_pending(tmp_path) -> None:
 
     assert result == []
     assert repository.get_task(task.task_id).status is TaskStatus.PENDING_DELIVERY
+
+
+def test_task_executor_records_retryable_delivery_failure_reason(tmp_path) -> None:
+    repository = SQLiteTaskRepository(tmp_path / "executor-delivery-reason.db")
+    repository.initialize()
+    executor = TaskExecutor(TaskService(repository))
+    task, _ = executor.create_and_schedule(task_command(), trace_id="trace-create")
+
+    result = executor.execute_due(
+        now=datetime(2026, 8, 7, 12, 1, tzinfo=UTC),
+        deliver=lambda _task: TaskDeliveryAttempt.failed("voice_synthesis_failed"),
+        trace_id="trace-due",
+    )
+
+    assert result == []
+    assert repository.get_task(task.task_id).status is TaskStatus.PENDING_DELIVERY
+    assert repository.list_events(task.task_id)[-1].reason == "voice_synthesis_failed"

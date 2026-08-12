@@ -5,7 +5,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from companion_gateway.domain.executor import TaskExecutor
+from companion_gateway.domain.executor import TaskDeliveryAttempt, TaskExecutor
 from companion_gateway.domain.models import TaskRecord
 
 
@@ -28,7 +28,7 @@ class TaskScheduler:
         self,
         *,
         executor: TaskExecutor,
-        deliver: Callable[[TaskRecord], bool],
+        deliver: Callable[[TaskRecord], bool | TaskDeliveryAttempt],
         interval_seconds: float,
         clock: Clock = _utc_now,
         trace_factory: TraceFactory = _new_trace_id,

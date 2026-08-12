@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 
 from companion_gateway.domain.models import (
@@ -8,6 +9,22 @@ from companion_gateway.domain.models import (
 )
 from companion_gateway.domain.tasks import TaskEventType, TaskStatus
 from companion_gateway.service import TaskService
+
+
+@dataclass(frozen=True)
+class TaskDeliveryAttempt:
+    delivered: bool
+    failure_reason: str | None = None
+
+    @classmethod
+    def succeeded(cls) -> "TaskDeliveryAttempt":
+        return cls(delivered=True)
+
+    @classmethod
+    def failed(cls, reason: str) -> "TaskDeliveryAttempt":
+        if not reason.strip():
+            raise ValueError("delivery failure reason must not be empty")
+        return cls(delivered=False, failure_reason=reason)
 
 
 class TaskExecutor:
@@ -45,7 +62,7 @@ class TaskExecutor:
         self,
         *,
         now: datetime,
-        deliver: Callable[[TaskRecord], bool],
+        deliver: Callable[[TaskRecord], bool | TaskDeliveryAttempt],
         trace_id: str,
     ) -> list[TaskRecord]:
         delivered: list[TaskRecord] = []
@@ -64,10 +81,23 @@ class TaskExecutor:
                     trace_id=trace_id,
                 )
             try:
-                is_delivered = deliver(task)
+                outcome = deliver(task)
             except Exception:
-                is_delivered = False
-            if not is_delivered:
+                outcome = TaskDeliveryAttempt.failed("delivery_callback_failed")
+            if isinstance(outcome, bool):
+                outcome = (
+                    TaskDeliveryAttempt.succeeded()
+                    if outcome
+                    else TaskDeliveryAttempt.failed("delivery_unsuccessful")
+                )
+            if not outcome.delivered:
+                if outcome.failure_reason != "delivery_unsuccessful":
+                    self._service.record_event(
+                        task.task_id,
+                        TaskEventType.PENDING_DELIVERY,
+                        reason=outcome.failure_reason,
+                        trace_id=trace_id,
+                    )
                 continue
             task, _ = self._service.record_event(
                 task.task_id,

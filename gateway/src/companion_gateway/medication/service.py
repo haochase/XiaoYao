@@ -335,9 +335,27 @@ class MedicationReminderService:
         key = f"{plan_id}:{local_date.isoformat()}:{local_time:%H:%M}"
         return f"med_occ_{sha256(key.encode()).hexdigest()[:32]}"
 
-    @staticmethod
-    def _fallback_text(occurrence: MedicationOccurrence) -> str:
+    def _fallback_text(self, occurrence: MedicationOccurrence) -> str:
         if occurrence.status is MedicationOccurrenceStatus.SCHEDULED:
+            failure_reason = None
+            if occurrence.task_id is not None:
+                events = self._task_service.get_events(occurrence.task_id)
+                failure_reason = events[-1].reason if events else None
+            if failure_reason == "voice_synthesis_failed":
+                return (
+                    f"语音合成失败，提醒未能投递：{occurrence.local_date.isoformat()} "
+                    f"{occurrence.local_time:%H:%M}。请确认是否已服药。"
+                )
+            if failure_reason == "voice_synthesis_unavailable":
+                return (
+                    f"语音服务不可用，提醒未能投递：{occurrence.local_date.isoformat()} "
+                    f"{occurrence.local_time:%H:%M}。请确认是否已服药。"
+                )
+            if failure_reason == "outbound_backpressure":
+                return (
+                    f"设备语音队列繁忙，提醒未能投递：{occurrence.local_date.isoformat()} "
+                    f"{occurrence.local_time:%H:%M}。请确认是否已服药。"
+                )
             return (
                 f"设备离线，语音通知失败：{occurrence.local_date.isoformat()} "
                 f"{occurrence.local_time:%H:%M}。请确认是否已服药。"

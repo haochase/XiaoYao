@@ -5,7 +5,7 @@ from companion_gateway.domain.medication import (
     MedicationPlanCreate,
     MedicationOccurrenceStatus,
 )
-from companion_gateway.domain.executor import TaskExecutor
+from companion_gateway.domain.executor import TaskDeliveryAttempt, TaskExecutor
 from companion_gateway.domain.scheduler import TaskScheduler
 from companion_gateway.domain.tasks import TaskStatus
 from companion_gateway.medication.service import MedicationReminderService
@@ -149,6 +149,32 @@ def test_undelivered_occurrence_sends_device_offline_fallback(tmp_path) -> None:
     assert len(notifier.calls) == 1
     assert notifier.calls[0][0].startswith("设备离线，语音通知失败")
     assert occurrence.status is MedicationOccurrenceStatus.ESCALATED
+    assert task_service.get_task(occurrence.task_id).status is TaskStatus.PENDING_DELIVERY
+
+
+def test_voice_synthesis_failure_uses_an_accurate_fallback(tmp_path) -> None:
+    notifier = FakeNotifier()
+    repository, task_service, executor, service, _plan = create_service(
+        tmp_path,
+        notifier=notifier,
+    )
+    due = datetime(2026, 8, 11, 0, tzinfo=UTC)
+    service.tick(now=due, trace_id="trace-schedule-synthesis-failure")
+    TaskScheduler(
+        executor=executor,
+        deliver=lambda _task: TaskDeliveryAttempt.failed("voice_synthesis_failed"),
+        interval_seconds=1,
+    ).tick(now=due)
+
+    service.tick(
+        now=datetime(2026, 8, 11, 0, 10, tzinfo=UTC),
+        trace_id="trace-fallback-synthesis-failure",
+    )
+
+    assert len(notifier.calls) == 1
+    assert "语音合成失败" in notifier.calls[0][0]
+    assert "设备离线" not in notifier.calls[0][0]
+    occurrence = repository.list_medication_occurrences()[0]
     assert task_service.get_task(occurrence.task_id).status is TaskStatus.PENDING_DELIVERY
 
 
