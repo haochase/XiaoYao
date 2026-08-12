@@ -53,6 +53,15 @@ tokens.
 - This interface does not add a model runtime, task scheduler, or external
   messaging channel.
 
+## Hardware compatibility note
+
+Hardware acceptance is intentionally kept separate from this public contract.
+The gateway can verify transport, authentication, the server `hello`, and the
+subsequent `listen`/audio exchange, but a successful OTA response alone is not
+proof that a board completed a voice round trip. Private acceptance records
+must keep serial-port names, LAN addresses, device identifiers, firmware
+versions, tokens, and model credentials out of this repository.
+
 ## Verification
 
 Automated tests cover configuration validation, enrolled and rejected OTA

@@ -58,6 +58,60 @@ def test_settings_selects_realtime_voice_runtime(monkeypatch) -> None:
     assert settings.voice_runtime == "realtime"
 
 
+def test_settings_loads_minicpm_retry_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MINICPM_O_MAX_RETRIES", "4")
+    monkeypatch.setenv("COMPANION_MINICPM_O_RETRY_BACKOFF_SECONDS", "0.25")
+
+    settings = Settings.from_environment()
+
+    assert settings.minicpm_o_max_retries == 4
+    assert settings.minicpm_o_retry_backoff_seconds == 0.25
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("minicpm_o_max_retries", -1, "MAX_RETRIES"),
+        ("minicpm_o_retry_backoff_seconds", -0.1, "RETRY_BACKOFF_SECONDS"),
+    ],
+)
+def test_settings_rejects_negative_minicpm_retry_values(
+    field: str, value: float, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        Settings(database_path=Path("data/test.db"), **{field: value})
+
+
+def test_settings_loads_mimo_runtime_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "mimo")
+    monkeypatch.setenv("COMPANION_MIMO_API_KEY", "example-token")
+    monkeypatch.setenv("COMPANION_AUDIO_QUEUE_CAPACITY", "96")
+    monkeypatch.setenv("COMPANION_MIMO_MAX_RETRIES", "3")
+    monkeypatch.setenv("COMPANION_MIMO_RETRY_BACKOFF_SECONDS", "0.25")
+
+    settings = Settings.from_environment()
+
+    assert settings.voice_runtime == "mimo"
+    assert settings.mimo_openai_base_url == (
+        "https://token-plan-cn.xiaomimimo.com/v1"
+    )
+    assert settings.mimo_anthropic_base_url == (
+        "https://token-plan-cn.xiaomimimo.com/anthropic"
+    )
+    assert settings.mimo_api_key == "example-token"
+    assert settings.audio_queue_capacity == 96
+    assert settings.mimo_max_retries == 3
+    assert settings.mimo_retry_backoff_seconds == 0.25
+
+
+def test_settings_requires_mimo_api_key(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "mimo")
+    monkeypatch.delenv("COMPANION_MIMO_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="COMPANION_MIMO_API_KEY"):
+        Settings.from_environment()
+
+
 def test_settings_loads_minicpm_o_auth_token(monkeypatch) -> None:
     monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "ascend-runtime-token")
 
@@ -81,6 +135,71 @@ def test_settings_parse_task_scheduler_configuration(monkeypatch) -> None:
 
     assert settings.task_scheduler_enabled is True
     assert settings.task_scheduler_interval_seconds == 2.5
+
+
+def test_settings_loads_feishu_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test_app")
+    monkeypatch.setenv("COMPANION_FEISHU_APP_SECRET", "secret_test_value")
+    monkeypatch.setenv("COMPANION_FEISHU_RECEIVER_OPEN_ID", "ou_test_receiver")
+    monkeypatch.setenv("COMPANION_FEISHU_MAX_RETRIES", "3")
+    monkeypatch.setenv("COMPANION_FEISHU_RETRY_BACKOFF_SECONDS", "0.25")
+
+    settings = Settings.from_environment()
+
+    assert settings.feishu_configured is True
+    assert settings.feishu_app_id == "cli_test_app"
+    assert settings.feishu_receiver_open_id == "ou_test_receiver"
+    assert settings.feishu_max_retries == 3
+    assert settings.feishu_retry_backoff_seconds == 0.25
+
+
+def test_settings_loads_memory_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MEMORY_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_MEMORY_RETENTION_DAYS", "45")
+    monkeypatch.setenv("COMPANION_MEMORY_QUOTA_BYTES", "1234")
+
+    settings = Settings.from_environment()
+
+    assert settings.memory_enabled is True
+    assert settings.memory_retention_days == 45
+    assert settings.memory_quota_bytes == 1234
+
+
+def test_settings_loads_memory_proposal_ttl(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MEMORY_PROPOSAL_TTL_SECONDS", "90")
+
+    settings = Settings.from_environment()
+
+    assert settings.memory_proposal_ttl_seconds == 90
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("COMPANION_MEMORY_ENABLED", "sometimes"),
+        ("COMPANION_MEMORY_RETENTION_DAYS", "0"),
+        ("COMPANION_MEMORY_QUOTA_BYTES", "0"),
+        ("COMPANION_MEMORY_PROPOSAL_TTL_SECONDS", "0"),
+    ],
+)
+def test_settings_rejects_invalid_memory_configuration(
+    monkeypatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        Settings.from_environment()
+
+
+def test_settings_rejects_partial_feishu_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test_app")
+    monkeypatch.delenv("COMPANION_FEISHU_APP_SECRET", raising=False)
+    monkeypatch.delenv("COMPANION_FEISHU_RECEIVER_OPEN_ID", raising=False)
+
+    with pytest.raises(ValueError, match="COMPANION_FEISHU"):
+        Settings.from_environment()
 
 
 def test_settings_reject_invalid_task_scheduler_configuration(monkeypatch) -> None:

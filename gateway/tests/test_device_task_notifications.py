@@ -1,6 +1,8 @@
 import asyncio
 from datetime import datetime
 
+import companion_gateway.device.transport as transport_module
+
 from companion_gateway.device.transport import (
     DeviceTransport,
     OutboundTask,
@@ -64,5 +66,38 @@ def test_device_transport_preserves_tts_and_task_when_both_are_ready() -> None:
         )
 
         assert {type(first), type(second)} == {OutboundTts, OutboundTask}
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_outbound_wait_cleans_up_both_internal_waiters(
+    monkeypatch,
+) -> None:
+    created_waiters: list[asyncio.Task[object]] = []
+    original_create_task = asyncio.create_task
+
+    def capture_waiter(coroutine) -> asyncio.Task[object]:
+        waiter = original_create_task(coroutine)
+        created_waiters.append(waiter)
+        return waiter
+
+    monkeypatch.setattr(transport_module.asyncio, "create_task", capture_waiter)
+
+    async def scenario() -> None:
+        transport = DeviceTransport()
+        transport.register("ses-cancel")
+        waiting = original_create_task(transport.next_outbound("ses-cancel"))
+        await asyncio.sleep(0)
+
+        waiting.cancel()
+        try:
+            await waiting
+        except asyncio.CancelledError:
+            pass
+
+        await asyncio.sleep(0)
+        assert len(created_waiters) == 2
+        assert all(waiter.done() for waiter in created_waiters)
+        assert all(waiter.cancelled() for waiter in created_waiters)
 
     asyncio.run(scenario())

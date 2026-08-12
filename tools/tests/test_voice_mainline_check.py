@@ -60,6 +60,7 @@ class FakeSocket:
 
 def test_run_check_replays_one_turn_and_reports_tts(monkeypatch) -> None:
     socket = FakeSocket()
+    sleep_calls: list[float] = []
 
     class FakeWebSocket:
         class ABNF:
@@ -70,6 +71,7 @@ def test_run_check_replays_one_turn_and_reports_tts(monkeypatch) -> None:
             return socket
 
     monkeypatch.setattr(voice_mainline_check, "websocket", FakeWebSocket)
+    monkeypatch.setattr(voice_mainline_check.time, "sleep", sleep_calls.append)
 
     result = run_check(
         endpoint="ws://gateway.example.test/v1/devices/ws",
@@ -82,4 +84,5 @@ def test_run_check_replays_one_turn_and_reports_tts(monkeypatch) -> None:
 
     assert result.turns == 1
     assert result.tts_frames == 1
+    assert sleep_calls == [0.06] * (len(build_uplink_packets(FIXTURE)) - 1)
     assert all("secret-token" not in str(item) for item in result.as_dict().values())

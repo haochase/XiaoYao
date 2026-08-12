@@ -1,10 +1,13 @@
 import asyncio
 import json
+import logging
+from collections.abc import Callable
 from contextlib import suppress
+from datetime import UTC, datetime
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
@@ -26,6 +29,7 @@ from companion_gateway.device.session import (
     DeviceSession,
     DeviceSessionRegistry,
     InvalidDevicePhase,
+    redact_device_id,
 )
 from companion_gateway.device.transport import (
     DeviceNotConnected,
@@ -33,9 +37,26 @@ from companion_gateway.device.transport import (
     DeviceTransport,
     OutboundTask,
 )
+from companion_gateway.domain.memory import MemoryCandidate, MemoryCategory, utc_now
 from companion_gateway.domain.executor import TaskExecutor
-from companion_gateway.domain.models import TaskCreate, TaskRecord
+from companion_gateway.domain.medication import MedicationPlanCreate
+from companion_gateway.domain.models import ContentText, Identifier, TaskCreate, TaskRecord
 from companion_gateway.domain.scheduler import TaskScheduler
+from companion_gateway.medication.scheduler import MedicationScheduler
+from companion_gateway.medication.service import (
+    MedicationNotifier,
+    MedicationReminderService,
+    UnconfiguredMedicationNotifier,
+)
+from companion_gateway.memory.service import (
+    MemoryConsentRequired,
+    MemoryFeatureDisabled,
+    MemoryNotFound,
+    MemoryOwnershipError,
+    MemoryQuotaExceeded,
+    MemoryService,
+)
+from companion_gateway.notifications.feishu import FeishuNotifier
 from companion_gateway.domain.tasks import InvalidTaskTransition, TaskEventType
 from companion_gateway.service import TaskService
 from companion_gateway.settings import Settings
@@ -50,6 +71,7 @@ from companion_gateway.voice.minicpm_o import (
     MinicpmORealtimeRuntime,
     ModelRuntimeError,
 )
+from companion_gateway.voice.mimo_v25 import MimoV25Runtime
 
 
 Reason = Annotated[
@@ -64,8 +86,38 @@ class EventRequest(BaseModel):
     reason: Reason
 
 
+class MedicationOwnershipRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor_id: str
+    target_device_id: str
+
+
+class MemoryConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory_id: Identifier | None = None
+    subject_id: Identifier
+    category: MemoryCategory
+    value: ContentText
+    confirmed: bool
+
+
+class MemoryProposalConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subject_id: Identifier
+
+
 class UnsupportedDeviceControl(ValueError):
     pass
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    logger.addHandler(logging.StreamHandler())
+logger.propagate = False
 
 
 def _request_trace_id(request: Request) -> str:
@@ -78,6 +130,8 @@ def create_app(
     device_event_sink: BoundedDeviceEventSink | None = None,
     device_transport: DeviceTransport | None = None,
     voice_delivery_service: DeviceVoiceDeliveryService | None = None,
+    medication_notifier: MedicationNotifier | None = None,
+    memory_clock: Callable[[], datetime] = utc_now,
 ) -> FastAPI:
     repository = SQLiteTaskRepository(settings.database_path)
     repository.initialize()
@@ -91,16 +145,73 @@ def create_app(
     def deliver_task(task: TaskRecord) -> bool:
         session = device_sessions.get(task.target_device_id)
         if session is None:
+            logger.info(
+                "task_delivery_failed device=%s task=%s reason=device_offline",
+                redact_device_id(task.target_device_id),
+                task.task_id,
+            )
             return False
         try:
             transport.send_task(session.session_id, task)
-        except (DeviceNotConnected, DeviceOutboundBackpressure):
+        except DeviceNotConnected:
+            logger.info(
+                "task_delivery_failed device=%s task=%s reason=device_offline",
+                redact_device_id(task.target_device_id),
+                task.task_id,
+            )
             return False
+        except DeviceOutboundBackpressure:
+            logger.info(
+                "task_delivery_failed device=%s task=%s "
+                "reason=outbound_backpressure",
+                redact_device_id(task.target_device_id),
+                task.task_id,
+            )
+            return False
+        logger.info(
+            "task_delivery_succeeded device=%s task=%s",
+            redact_device_id(task.target_device_id),
+            task.task_id,
+        )
         return True
 
     task_scheduler = TaskScheduler(
         executor=task_executor,
         deliver=deliver_task,
+        interval_seconds=settings.task_scheduler_interval_seconds,
+    )
+    if medication_notifier is None and settings.feishu_configured:
+        if (
+            settings.feishu_app_id is None
+            or settings.feishu_app_secret is None
+            or settings.feishu_receiver_open_id is None
+        ):
+            raise ValueError("Feishu settings are incomplete")
+        medication_notifier = FeishuNotifier(
+            app_id=settings.feishu_app_id,
+            app_secret=settings.feishu_app_secret,
+            receiver_open_id=settings.feishu_receiver_open_id,
+            base_url=settings.feishu_base_url,
+            timeout_seconds=settings.feishu_timeout_seconds,
+            max_retries=settings.feishu_max_retries,
+            retry_backoff_seconds=settings.feishu_retry_backoff_seconds,
+        )
+    medication_service = MedicationReminderService(
+        repository=repository,
+        task_service=service,
+        task_executor=task_executor,
+        notifier=medication_notifier or UnconfiguredMedicationNotifier(),
+    )
+    memory_service = MemoryService(
+        repository,
+        enabled=settings.memory_enabled,
+        retention_days=settings.memory_retention_days,
+        quota_bytes=settings.memory_quota_bytes,
+        proposal_ttl_seconds=settings.memory_proposal_ttl_seconds,
+        clock=memory_clock,
+    )
+    medication_scheduler = MedicationScheduler(
+        service=medication_service,
         interval_seconds=settings.task_scheduler_interval_seconds,
     )
     app = FastAPI(title="XiaoYao Voice Gateway", version="0.1.0")
@@ -112,11 +223,19 @@ def create_app(
     app.state.device_transport = transport
     app.state.voice_delivery_service = voice_delivery_service
     app.state.task_scheduler = task_scheduler
+    app.state.medication_service = medication_service
+    app.state.medication_scheduler = medication_scheduler
+    app.state.medication_notifier = medication_notifier
+    app.state.memory_service = memory_service
     if voice_delivery_service is not None:
         voice_delivery_service.set_task_executor(task_executor)
+        voice_delivery_service.set_medication_service(medication_service)
+        voice_delivery_service.set_memory_service(memory_service)
     if settings.task_scheduler_enabled:
         app.add_event_handler("startup", task_scheduler.start)
         app.add_event_handler("shutdown", task_scheduler.stop)
+        app.add_event_handler("startup", medication_scheduler.start)
+        app.add_event_handler("shutdown", medication_scheduler.stop)
 
     @app.middleware("http")
     async def attach_trace_id(request: Request, call_next):
@@ -141,6 +260,10 @@ def create_app(
             status_code=200 if database_ready else 503,
             content=content,
         )
+
+    @app.get("/v1/devices/{device_id}/status")
+    def device_status(device_id: Identifier) -> dict[str, object]:
+        return {"device": jsonable_encoder(device_sessions.status(device_id))}
 
     @app.post("/v1/ota")
     def ota_bootstrap(request: Request) -> JSONResponse:
@@ -222,7 +345,10 @@ def create_app(
         await websocket.accept()
         session: DeviceSession | None = None
         outbound_sender: asyncio.Task[None] | None = None
+        close_code: int | None = None
+        close_reason_length = 0
         trace_id = f"trc_{uuid4().hex}"
+        logger.info("device_ws_accepted device=%s", redact_device_id(device_id))
         try:
             raw_hello = await asyncio.wait_for(
                 websocket.receive_json(),
@@ -233,6 +359,15 @@ def create_app(
                 device_id=device_id,
                 client_id=client_id,
                 hello=hello,
+            )
+            logger.info(
+                "device_ws_hello device=%s session=%s audio=%s/%s/%s/%sms",
+                redact_device_id(device_id),
+                session.session_id,
+                hello.audio_params.format,
+                hello.audio_params.sample_rate,
+                hello.audio_params.channels,
+                hello.audio_params.frame_duration,
             )
             previous = device_sessions.connect(session)
             if previous is not None:
@@ -276,6 +411,19 @@ def create_app(
             while True:
                 message = await websocket.receive()
                 if message["type"] == "websocket.disconnect":
+                    close_code = message.get("code")
+                    close_reason_length = len(message.get("reason") or "")
+                    logger.info(
+                        "device_ws_peer_closed device=%s session=%s code=%s "
+                        "reason_length=%s phase=%s frames=%s mode=%s",
+                        redact_device_id(device_id),
+                        session.session_id,
+                        close_code,
+                        close_reason_length,
+                        session.phase.value,
+                        session.audio_frames_received,
+                        session.listening_mode,
+                    )
                     break
                 session.touch()
 
@@ -298,6 +446,15 @@ def create_app(
                             raise UnsupportedDeviceControl(
                                 "unsupported control message"
                             )
+                        logger.info(
+                            "device_ws_control device=%s session=%s type=%s state=%s "
+                            "mode=%s",
+                            redact_device_id(device_id),
+                            session.session_id,
+                            message_type,
+                            getattr(control, "state", None),
+                            getattr(control, "mode", None),
+                        )
                         sink.on_control(session, control)
                         if (
                             message_type == "listen"
@@ -307,9 +464,12 @@ def create_app(
                             try:
                                 await voice_delivery_service.process_and_send_async(
                                     session_id=session.session_id,
+                                    target_device_id=session.device_id,
                                 )
                             except ModelRuntimeError:
-                                voice_delivery_service.clear_pending_input()
+                                voice_delivery_service.clear_pending_input(
+                                    session_id=session.session_id,
+                                )
                                 await send_device_error(
                                     websocket,
                                     code="model_unavailable",
@@ -322,7 +482,9 @@ def create_app(
                             message_type == "abort"
                             and voice_delivery_service is not None
                         ):
-                            voice_delivery_service.clear_pending_input()
+                            voice_delivery_service.clear_pending_input(
+                                session_id=session.session_id,
+                            )
                     except (
                         json.JSONDecodeError,
                         ValidationError,
@@ -379,6 +541,15 @@ def create_app(
                     break
                 try:
                     session.accept_audio_frame()
+                    if session.audio_frames_received in (1, 10) or (
+                        session.audio_frames_received % 50 == 0
+                    ):
+                        logger.info(
+                            "device_ws_audio device=%s session=%s frames=%s",
+                            redact_device_id(device_id),
+                            session.session_id,
+                            session.audio_frames_received,
+                        )
                     sink.on_audio(session, audio_frame)
                     if voice_delivery_service is not None:
                         voice_delivery_service.accept_and_send(
@@ -430,13 +601,34 @@ def create_app(
                     )
                     await websocket.close(code=1013)
                     break
-        except (asyncio.TimeoutError, json.JSONDecodeError, ValidationError):
+        except (asyncio.TimeoutError, json.JSONDecodeError, ValidationError) as exc:
+            logger.warning(
+                "device_ws_protocol_error device=%s error=%s",
+                redact_device_id(device_id),
+                type(exc).__name__,
+            )
             await reject_websocket(websocket, 1003)
-        except WebSocketDisconnect:
-            pass
+        except WebSocketDisconnect as exc:
+            close_code = exc.code
+            logger.info(
+                "device_ws_disconnect device=%s code=%s",
+                redact_device_id(device_id),
+                exc.code,
+            )
         finally:
-            if voice_delivery_service is not None:
-                voice_delivery_service.clear_pending_input()
+            phase_before_close = session.phase.value if session is not None else "none"
+            duration_ms = (
+                max(
+                    0,
+                    int((datetime.now(UTC) - session.connected_at).total_seconds() * 1000),
+                )
+                if session is not None
+                else 0
+            )
+            if voice_delivery_service is not None and session is not None:
+                voice_delivery_service.clear_pending_input(
+                    session_id=session.session_id,
+                )
             if outbound_sender is not None:
                 outbound_sender.cancel()
                 with suppress(asyncio.CancelledError):
@@ -444,6 +636,19 @@ def create_app(
             if session is not None:
                 transport.unregister(session.session_id)
                 device_sessions.disconnect(session)
+            logger.info(
+                "device_ws_closed device=%s session=%s frames=%s "
+                "phase_before_close=%s close_code=%s reason_length=%s "
+                "duration_ms=%s mode=%s",
+                redact_device_id(device_id),
+                session.session_id if session is not None else "none",
+                session.audio_frames_received if session is not None else 0,
+                phase_before_close,
+                close_code,
+                close_reason_length,
+                duration_ms,
+                session.listening_mode if session is not None else None,
+            )
 
     @app.post("/v1/tasks")
     def create_task(command: TaskCreate, request: Request) -> JSONResponse:
@@ -495,6 +700,32 @@ def create_app(
             request,
         )
 
+    @app.post("/v1/tasks/{task_id}/confirm")
+    def confirm_task(
+        task_id: str,
+        body: EventRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        return apply_event(
+            task_id,
+            TaskEventType.CONFIRMED,
+            body,
+            request,
+        )
+
+    @app.post("/v1/tasks/{task_id}/reject")
+    def reject_task(
+        task_id: str,
+        body: EventRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        return apply_event(
+            task_id,
+            TaskEventType.REJECTED,
+            body,
+            request,
+        )
+
     @app.post("/v1/tasks/{task_id}/cancel")
     def cancel_task(
         task_id: str,
@@ -507,6 +738,197 @@ def create_app(
             body,
             request,
         )
+
+    @app.post("/v1/medication/plans")
+    def create_medication_plan(
+        plan: MedicationPlanCreate,
+        request: Request,
+    ) -> JSONResponse:
+        if not settings.feishu_configured:
+            raise HTTPException(
+                status_code=503,
+                detail="Feishu fallback is not configured",
+            )
+        created_plan, created = service.create_medication_plan(
+            plan,
+            trace_id=_request_trace_id(request),
+        )
+        return JSONResponse(
+            status_code=201 if created else 200,
+            content=jsonable_encoder({"created": created, "plan": created_plan}),
+        )
+
+    @app.get("/v1/medication/plans")
+    def list_medication_plans() -> dict[str, object]:
+        return {"plans": service.list_medication_plans()}
+
+    @app.post("/v1/medication/plans/{plan_id}/disable")
+    def disable_medication_plan(
+        plan_id: str,
+        body: MedicationOwnershipRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        try:
+            plan = medication_service.disable_plan(
+                plan_id,
+                actor_id=body.actor_id,
+                target_device_id=body.target_device_id,
+                occurred_at=datetime.now(UTC),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="medication plan not found") from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail="medication plan ownership mismatch") from exc
+        return {"plan": plan, "trace_id": _request_trace_id(request)}
+
+    @app.get("/v1/medication/occurrences")
+    def list_medication_occurrences() -> dict[str, object]:
+        return {"occurrences": service.list_medication_occurrences()}
+
+    @app.post("/v1/medication/occurrences/{occurrence_id}/ack")
+    def acknowledge_medication_occurrence(
+        occurrence_id: str,
+        body: MedicationOwnershipRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        try:
+            occurrence = medication_service.acknowledge_occurrence(
+                occurrence_id,
+                actor_id=body.actor_id,
+                target_device_id=body.target_device_id,
+                occurred_at=datetime.now(UTC),
+                trace_id=_request_trace_id(request),
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail="medication occurrence not found",
+            ) from exc
+        except PermissionError as exc:
+            raise HTTPException(
+                status_code=403,
+                detail="medication occurrence ownership mismatch",
+            ) from exc
+        except (ValueError, InvalidTaskTransition) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"occurrence": occurrence}
+
+    @app.post("/v1/memory/confirm")
+    def confirm_memory(
+        body: MemoryConfirmRequest,
+        request: Request,
+    ) -> JSONResponse:
+        try:
+            memory = memory_service.confirm(
+                MemoryCandidate(
+                    memory_id=body.memory_id,
+                    subject_id=body.subject_id,
+                    category=body.category,
+                    value=body.value,
+                    confirmed=body.confirmed,
+                ),
+                source=_request_trace_id(request),
+            )
+        except MemoryFeatureDisabled as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except MemoryConsentRequired as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except MemoryOwnershipError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except MemoryQuotaExceeded as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse(
+            status_code=200,
+            content=jsonable_encoder({"memory": memory}),
+        )
+
+    @app.get("/v1/memory")
+    def list_memory(
+        subject_id: Identifier,
+        query: str | None = Query(default=None, max_length=2000),
+        limit: int = Query(default=20, ge=1, le=50),
+    ) -> dict[str, object]:
+        try:
+            memories = memory_service.list(
+                subject_id=subject_id,
+                query=query,
+                limit=limit,
+            )
+        except MemoryFeatureDisabled as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {"memories": memories}
+
+    @app.get("/v1/memory/export")
+    def export_memory(subject_id: Identifier) -> dict[str, object]:
+        try:
+            memories = memory_service.export(subject_id=subject_id)
+        except MemoryFeatureDisabled as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {"memories": memories}
+
+    @app.get("/v1/memory/proposals")
+    def list_memory_proposals(subject_id: Identifier) -> dict[str, object]:
+        try:
+            proposals = memory_service.list_proposals(subject_id=subject_id)
+        except MemoryFeatureDisabled as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {"proposals": proposals}
+
+    @app.post("/v1/memory/proposals/{proposal_id}/confirm")
+    def confirm_memory_proposal(
+        proposal_id: Identifier,
+        body: MemoryProposalConfirmRequest,
+        request: Request,
+    ) -> JSONResponse:
+        try:
+            memory = memory_service.confirm_proposal(
+                subject_id=body.subject_id,
+                proposal_id=proposal_id,
+                source=_request_trace_id(request),
+            )
+        except MemoryFeatureDisabled as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except MemoryNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except MemoryQuotaExceeded as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse(
+            status_code=200,
+            content=jsonable_encoder({"memory": memory}),
+        )
+
+    @app.delete("/v1/memory/proposals/{proposal_id}")
+    def reject_memory_proposal(
+        proposal_id: Identifier,
+        subject_id: Identifier,
+    ) -> dict[str, bool]:
+        try:
+            deleted = memory_service.reject_proposal(
+                subject_id=subject_id,
+                proposal_id=proposal_id,
+            )
+        except MemoryFeatureDisabled as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if not deleted:
+            raise HTTPException(status_code=404, detail="memory proposal not found")
+        return {"deleted": True}
+
+    @app.delete("/v1/memory/{memory_id}")
+    def delete_memory(memory_id: Identifier, subject_id: Identifier) -> dict[str, bool]:
+        try:
+            deleted = memory_service.delete(
+                subject_id=subject_id,
+                memory_id=memory_id,
+            )
+        except MemoryFeatureDisabled as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if not deleted:
+            raise HTTPException(status_code=404, detail="memory not found")
+        return {"deleted": True}
 
     return app
 
@@ -521,6 +943,7 @@ def create_default_app() -> FastAPI:
         voice_delivery_service = create_fixture_voice_delivery(
             fixture_path=settings.fake_voice_fixture_path,
             device_transport=transport,
+            queue_capacity=settings.audio_queue_capacity,
         )
     elif settings.voice_runtime == "http":
         if settings.minicpm_o_endpoint is None:
@@ -530,8 +953,13 @@ def create_default_app() -> FastAPI:
                 endpoint=settings.minicpm_o_endpoint,
                 auth_token=settings.minicpm_o_auth_token,
                 timeout_seconds=settings.minicpm_o_timeout_seconds,
+                max_retries=settings.minicpm_o_max_retries,
+                retry_backoff_seconds=settings.minicpm_o_retry_backoff_seconds,
             ),
             device_transport=transport,
+            model_sample_rate=16_000,
+            response_sample_rate=24_000,
+            queue_capacity=settings.audio_queue_capacity,
         )
     elif settings.voice_runtime == "realtime":
         if settings.minicpm_o_endpoint is None:
@@ -545,6 +973,29 @@ def create_default_app() -> FastAPI:
                 timeout_seconds=settings.minicpm_o_timeout_seconds,
             ),
             device_transport=transport,
+            model_sample_rate=16_000,
+            response_sample_rate=24_000,
+            queue_capacity=settings.audio_queue_capacity,
+        )
+    elif settings.voice_runtime == "mimo":
+        if settings.mimo_api_key is None:
+            raise ValueError("mimo voice runtime requires COMPANION_MIMO_API_KEY")
+        voice_delivery_service = create_voice_delivery(
+            model_runtime=MimoV25Runtime(
+                openai_base_url=settings.mimo_openai_base_url,
+                api_key=settings.mimo_api_key,
+                model=settings.mimo_model,
+                tts_model=settings.mimo_tts_model,
+                tts_voice=settings.mimo_tts_voice,
+                timeout_seconds=settings.mimo_timeout_seconds,
+                max_retries=settings.mimo_max_retries,
+                retry_backoff_seconds=settings.mimo_retry_backoff_seconds,
+                memory_proposals_enabled=settings.memory_enabled,
+            ),
+            device_transport=transport,
+            model_sample_rate=16_000,
+            response_sample_rate=24_000,
+            queue_capacity=settings.audio_queue_capacity,
         )
     return create_app(
         settings,

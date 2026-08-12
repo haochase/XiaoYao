@@ -5,6 +5,7 @@ from enum import StrEnum
 from hashlib import sha256
 from secrets import compare_digest
 from threading import RLock
+from typing import Literal
 from uuid import uuid4
 
 from companion_gateway.device.models import AbortControl, DeviceHello, ListenControl
@@ -22,6 +23,18 @@ class DevicePhase(StrEnum):
     LISTENING = "listening"
     SPEAKING = "speaking"
     CLOSED = "closed"
+
+
+@dataclass(frozen=True)
+class DeviceStatusSnapshot:
+    device_id: str
+    status: Literal["online", "offline"]
+    session_id: str | None = None
+    connected_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    phase: DevicePhase | None = None
+    listening_mode: str | None = None
+    audio_frames_received: int = 0
 
 
 class InvalidDevicePhase(ValueError):
@@ -53,6 +66,7 @@ class DeviceSession:
     last_seen_at: datetime
     phase: DevicePhase = DevicePhase.IDLE
     audio_frames_received: int = 0
+    listening_mode: str | None = None
 
     @classmethod
     def create(
@@ -85,6 +99,7 @@ class DeviceSession:
                 raise InvalidDevicePhase(
                     f"cannot start listening while {self.phase.value}"
                 )
+            self.listening_mode = control.mode
             self.phase = DevicePhase.LISTENING
             return
 
@@ -100,6 +115,8 @@ class DeviceSession:
             raise InvalidDevicePhase(
                 f"cannot report wake word while {self.phase.value}"
             )
+        if control.mode is not None:
+            self.listening_mode = control.mode
 
     def accept_audio_frame(self) -> None:
         if self.phase is not DevicePhase.LISTENING:
@@ -154,6 +171,25 @@ class DeviceSessionRegistry:
     def get(self, device_id: str) -> DeviceSession | None:
         with self._lock:
             return self._sessions.get(device_id)
+
+    def status(self, device_id: str) -> DeviceStatusSnapshot:
+        with self._lock:
+            session = self._sessions.get(device_id)
+            if session is None:
+                return DeviceStatusSnapshot(
+                    device_id=device_id,
+                    status="offline",
+                )
+            return DeviceStatusSnapshot(
+                device_id=session.device_id,
+                status="online",
+                session_id=session.session_id,
+                connected_at=session.connected_at,
+                last_seen_at=session.last_seen_at,
+                phase=session.phase,
+                listening_mode=session.listening_mode,
+                audio_frames_received=session.audio_frames_received,
+            )
 
 
 def redact_device_id(device_id: str) -> str:

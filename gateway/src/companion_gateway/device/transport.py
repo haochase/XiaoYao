@@ -88,23 +88,27 @@ class DeviceTransport:
 
         tts_waiter = asyncio.create_task(channel.queue.get())
         task_waiter = asyncio.create_task(channel.task_queue.get())
-        done, pending = await asyncio.wait(
-            (tts_waiter, task_waiter),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for waiter in pending:
-            waiter.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        selected = next(iter(done))
-        for waiter in done:
-            if waiter is selected:
-                continue
-            message = waiter.result()
-            if isinstance(message, OutboundTask):
-                channel.task_queue.put_nowait(message)
-            else:
-                channel.queue.put_nowait(message)
-        return selected.result()
+        waiters = (tts_waiter, task_waiter)
+        try:
+            done, _ = await asyncio.wait(
+                waiters,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            selected = next(iter(done))
+            for waiter in done:
+                if waiter is selected:
+                    continue
+                message = waiter.result()
+                if isinstance(message, OutboundTask):
+                    channel.task_queue.put_nowait(message)
+                else:
+                    channel.queue.put_nowait(message)
+            return selected.result()
+        finally:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
 
     def send_tts(self, session_id: str, opus_frame: bytes) -> None:
         self.send_tts_stream(session_id, (opus_frame,))

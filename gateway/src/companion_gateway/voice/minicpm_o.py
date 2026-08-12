@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import logging
 import struct
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -25,6 +27,9 @@ from companion_gateway.domain.models import TaskCreate
 from companion_gateway.voice.runtime import ModelResponse
 
 
+logger = logging.getLogger(__name__)
+
+
 class ModelRuntimeError(RuntimeError):
     """Raised when the configured model runtime cannot complete a turn."""
 
@@ -38,6 +43,8 @@ class MinicpmOHttpRuntime:
         endpoint: str,
         auth_token: str | None = None,
         timeout_seconds: float = 20.0,
+        max_retries: int = 2,
+        retry_backoff_seconds: float = 1.0,
     ) -> None:
         parsed = urlparse(endpoint)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -46,9 +53,15 @@ class MinicpmOHttpRuntime:
             raise ValueError("MiniCPM-o endpoint must not contain userinfo")
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if max_retries < 0:
+            raise ValueError("max_retries must not be negative")
+        if retry_backoff_seconds < 0:
+            raise ValueError("retry_backoff_seconds must not be negative")
         self._endpoint = endpoint
         self._auth_token = auth_token
         self._timeout_seconds = timeout_seconds
+        self._max_retries = max_retries
+        self._retry_backoff_seconds = retry_backoff_seconds
 
     def respond(self, pcm: Pcm16Mono) -> ModelResponse:
         if pcm.sample_rate != 16_000:
@@ -66,22 +79,78 @@ class MinicpmOHttpRuntime:
         }
         if self._auth_token:
             headers["Authorization"] = f"Bearer {self._auth_token}"
-        request = Request(
-            self._endpoint,
-            data=json.dumps(request_payload, separators=(",", ":")).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=self._timeout_seconds) as response:
-                status = getattr(response, "status", 200)
-                body = response.read()
-        except (HTTPError, URLError, OSError, TimeoutError) as exc:
-            raise ModelRuntimeError("MiniCPM-o request failed") from exc
-
-        if status < 200 or status >= 300:
-            raise ModelRuntimeError(f"MiniCPM-o returned HTTP {status}")
+        body = self._request(request_payload, headers)
         return self._decode_response(body)
+
+    def _request(
+        self,
+        payload: dict[str, object],
+        headers: dict[str, str],
+    ) -> bytes:
+        encoded_payload = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        for attempt in range(self._max_retries + 1):
+            started = time.monotonic()
+            request = Request(
+                self._endpoint,
+                data=encoded_payload,
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urlopen(request, timeout=self._timeout_seconds) as response:
+                    status = int(getattr(response, "status", 200))
+                    body = response.read()
+            except HTTPError as exc:
+                status = exc.code
+                self._log_attempt(
+                    attempt=attempt,
+                    status=status,
+                    started=started,
+                )
+                if self._should_retry(status, attempt):
+                    time.sleep(self._retry_delay(attempt))
+                    continue
+                raise ModelRuntimeError(
+                    f"MiniCPM-o returned HTTP {status}"
+                ) from exc
+            except (URLError, OSError, TimeoutError) as exc:
+                logger.info(
+                    "minicpm_http_attempt runtime=minicpm_http attempt=%s "
+                    "transport_error=%s duration_ms=%s",
+                    attempt + 1,
+                    type(exc).__name__,
+                    self._duration_ms(started),
+                )
+                raise ModelRuntimeError("MiniCPM-o request failed") from exc
+
+            self._log_attempt(attempt=attempt, status=status, started=started)
+            if 200 <= status < 300:
+                return body
+            if self._should_retry(status, attempt):
+                time.sleep(self._retry_delay(attempt))
+                continue
+            raise ModelRuntimeError(f"MiniCPM-o returned HTTP {status}")
+        raise ModelRuntimeError("MiniCPM-o retry budget exhausted")
+
+    def _should_retry(self, status: int, attempt: int) -> bool:
+        return (status == 429 or 500 <= status <= 599) and attempt < self._max_retries
+
+    def _retry_delay(self, attempt: int) -> float:
+        return self._retry_backoff_seconds * (2**attempt)
+
+    @staticmethod
+    def _duration_ms(started: float) -> int:
+        return max(0, int((time.monotonic() - started) * 1000))
+
+    @classmethod
+    def _log_attempt(cls, *, attempt: int, status: int, started: float) -> None:
+        logger.info(
+            "minicpm_http_attempt runtime=minicpm_http attempt=%s status=%s "
+            "duration_ms=%s",
+            attempt + 1,
+            status,
+            cls._duration_ms(started),
+        )
 
     @staticmethod
     def _decode_response(body: bytes) -> ModelResponse:

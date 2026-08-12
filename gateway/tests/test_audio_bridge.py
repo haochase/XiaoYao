@@ -63,6 +63,24 @@ def test_model_pcm_is_resampled_to_24khz_before_opus_encoding() -> None:
     assert codec.encoded[0].duration_ms == pytest.approx(60.0)
 
 
+def test_model_input_and_response_rates_can_differ() -> None:
+    codec = StubOpusCodec(pcm_ramp(sample_rate=16_000, sample_count=960))
+    bridge = AudioBridge(
+        codec=codec,
+        model_sample_rate=16_000,
+        response_sample_rate=24_000,
+        queue_capacity=2,
+    )
+
+    encoded = bridge.encode_downlink(
+        pcm_ramp(sample_rate=24_000, sample_count=1_440)
+    )
+
+    assert encoded.startswith(b"opus:")
+    assert codec.encoded[0].sample_rate == 24_000
+    assert codec.encoded[0].sample_count == 1_440
+
+
 @pytest.mark.parametrize("payload", [b"", b"truncated"])
 def test_invalid_uplink_frames_are_rejected(payload: bytes) -> None:
     codec = StubOpusCodec(pcm_ramp(sample_rate=16_000, sample_count=960))

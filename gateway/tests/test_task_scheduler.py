@@ -25,7 +25,7 @@ def task_command() -> TaskCreate:
             timezone="Asia/Shanghai",
         ),
         payload=TaskPayload(text="take medicine"),
-        confirmation_policy=ConfirmationPolicy.REQUIRED,
+        confirmation_policy=ConfirmationPolicy.OPTIONAL,
         idempotency_key="scheduler:1",
     )
 

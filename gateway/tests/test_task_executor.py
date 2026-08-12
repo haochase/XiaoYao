@@ -15,7 +15,9 @@ from companion_gateway.storage.sqlite import SQLiteTaskRepository
 from companion_gateway.domain.executor import TaskExecutor
 
 
-def task_command() -> TaskCreate:
+def task_command(
+    confirmation_policy: ConfirmationPolicy = ConfirmationPolicy.OPTIONAL,
+) -> TaskCreate:
     return TaskCreate(
         actor_id="voice-user",
         target_device_id="living-room",
@@ -25,7 +27,7 @@ def task_command() -> TaskCreate:
             timezone="Asia/Shanghai",
         ),
         payload=TaskPayload(text="take medicine"),
-        confirmation_policy=ConfirmationPolicy.REQUIRED,
+        confirmation_policy=confirmation_policy,
         idempotency_key="voice:turn:1",
     )
 
@@ -52,6 +54,29 @@ def test_task_executor_creates_and_schedules_once(tmp_path) -> None:
         TaskEventType.CREATED,
         TaskEventType.SCHEDULED,
     ]
+
+
+def test_task_executor_holds_required_task_until_confirmation(tmp_path) -> None:
+    repository = SQLiteTaskRepository(tmp_path / "executor-confirmation.db")
+    repository.initialize()
+    executor = TaskExecutor(TaskService(repository))
+
+    task, created = executor.create_and_schedule(
+        task_command(ConfirmationPolicy.REQUIRED),
+        trace_id="trace-proposal",
+    )
+
+    assert created is True
+    assert task.status.value == "awaiting_confirmation"
+    assert [event.type.value for event in repository.list_events(task.task_id)] == [
+        "created",
+        "awaiting_confirmation",
+    ]
+    assert executor.execute_due(
+        now=datetime(2026, 8, 7, 12, 1, tzinfo=UTC),
+        deliver=lambda _task: True,
+        trace_id="trace-due",
+    ) == []
 
 
 def test_task_executor_delivers_due_task_and_records_terminal_event(tmp_path) -> None:

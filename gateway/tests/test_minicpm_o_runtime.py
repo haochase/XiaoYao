@@ -3,6 +3,9 @@ from __future__ import annotations
 import base64
 import json
 import struct
+import time
+from io import BytesIO
+from urllib.error import HTTPError
 
 import pytest
 
@@ -131,6 +134,85 @@ def test_minicpm_o_runtime_maps_transport_failure(monkeypatch) -> None:
 
     with pytest.raises(ModelRuntimeError, match="request failed"):
         runtime.respond(input_pcm())
+
+
+def test_minicpm_http_retries_429_and_5xx_with_exponential_backoff(
+    monkeypatch,
+) -> None:
+    responses = iter(
+        [
+            HTTPError(
+                "http://ascend.example.test/v1/infer",
+                429,
+                "rate limited",
+                hdrs=None,
+                fp=BytesIO(),
+            ),
+            FakeResponse(b"", status=503),
+            FakeResponse(response_payload()),
+        ]
+    )
+    delays: list[float] = []
+
+    def fake_urlopen(request, *, timeout):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(minicpm_o, "urlopen", fake_urlopen)
+    monkeypatch.setattr(time, "sleep", delays.append)
+    runtime = MinicpmOHttpRuntime(
+        endpoint="http://ascend.example.test/v1/infer",
+        max_retries=2,
+        retry_backoff_seconds=1.0,
+    )
+
+    response = runtime.respond(input_pcm())
+
+    assert response.text == "I am here."
+    assert delays == [1.0, 2.0]
+
+
+def test_minicpm_http_does_not_retry_authentication_failure(monkeypatch) -> None:
+    calls = 0
+
+    def fake_urlopen(request, *, timeout):
+        nonlocal calls
+        calls += 1
+        return FakeResponse(b"", status=401)
+
+    monkeypatch.setattr(minicpm_o, "urlopen", fake_urlopen)
+    runtime = MinicpmOHttpRuntime(
+        endpoint="http://ascend.example.test/v1/infer",
+        max_retries=3,
+    )
+
+    with pytest.raises(ModelRuntimeError, match="HTTP 401"):
+        runtime.respond(input_pcm())
+
+    assert calls == 1
+
+
+def test_minicpm_http_attempt_logs_exclude_payloads(monkeypatch, caplog) -> None:
+    monkeypatch.setattr(
+        minicpm_o,
+        "urlopen",
+        lambda request, *, timeout: FakeResponse(response_payload()),
+    )
+    runtime = MinicpmOHttpRuntime(
+        endpoint="http://ascend.example.test/v1/infer",
+        auth_token="secret-runtime-token",
+    )
+
+    with caplog.at_level("INFO", logger="companion_gateway.voice.minicpm_o"):
+        runtime.respond(input_pcm())
+
+    message = " ".join(record.getMessage() for record in caplog.records)
+    assert "minicpm_http_attempt" in message
+    assert "secret-runtime-token" not in message
+    assert "I am here." not in message
+    assert "audio_base64" not in message
 
 
 def test_minicpm_o_http_runtime_sends_bearer_token(monkeypatch) -> None:

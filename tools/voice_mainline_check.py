@@ -125,11 +125,14 @@ def run_check(
     audio_wav: Path,
     turns: int,
     timeout_seconds: float,
+    frame_interval_seconds: float = 0.06,
 ) -> VoiceCheckResult:
     if turns < 1:
         raise ValueError("turns must be positive")
     if timeout_seconds <= 0:
         raise ValueError("timeout must be positive")
+    if frame_interval_seconds < 0:
+        raise ValueError("frame interval must not be negative")
     if websocket is None:
         raise RuntimeError("websocket-client is required for the acceptance check")
 
@@ -174,8 +177,13 @@ def run_check(
                 socket,
                 {"type": "listen", "state": "start", "session_id": session_id},
             )
-            for packet in packets:
+            for packet_index, packet in enumerate(packets):
                 socket.send(packet, opcode=websocket.ABNF.OPCODE_BINARY)
+                if (
+                    frame_interval_seconds > 0
+                    and packet_index < len(packets) - 1
+                ):
+                    time.sleep(frame_interval_seconds)
             _send_json(
                 socket,
                 {"type": "listen", "state": "stop", "session_id": session_id},
@@ -212,6 +220,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--audio-wav", type=Path, default=DEFAULT_AUDIO_WAV)
     parser.add_argument("--turns", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--frame-interval", type=float, default=0.06)
     return parser
 
 
@@ -225,6 +234,7 @@ def main() -> int:
             audio_wav=args.audio_wav,
             turns=args.turns,
             timeout_seconds=args.timeout,
+            frame_interval_seconds=args.frame_interval,
         )
     except Exception as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))

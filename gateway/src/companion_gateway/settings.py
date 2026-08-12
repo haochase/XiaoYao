@@ -10,7 +10,9 @@ from urllib.parse import urlparse
 
 
 _DEVICE_WS_PATH = "/v1/devices/ws"
-VoiceRuntimeMode = Literal["none", "fixture", "http", "realtime"]
+_DEFAULT_MIMO_OPENAI_BASE_URL = "https://token-plan-cn.xiaomimimo.com/v1"
+_DEFAULT_MIMO_ANTHROPIC_BASE_URL = "https://token-plan-cn.xiaomimimo.com/anthropic"
+VoiceRuntimeMode = Literal["none", "fixture", "http", "realtime", "mimo"]
 
 
 def _validate_device_id(device_id: object) -> bool:
@@ -119,9 +121,10 @@ def _normalize_voice_runtime(
     minicpm_o_endpoint: str | None,
 ) -> VoiceRuntimeMode:
     mode = configured.strip().lower()
-    if mode not in {"none", "fixture", "http", "realtime"}:
+    if mode not in {"none", "fixture", "http", "realtime", "mimo"}:
         raise ValueError(
-            "COMPANION_VOICE_RUNTIME must be one of none, fixture, http, or realtime"
+            "COMPANION_VOICE_RUNTIME must be one of none, fixture, http, realtime, "
+            "or mimo"
         )
     if mode == "fixture" and fixture_path is None:
         raise ValueError(
@@ -187,6 +190,35 @@ def _normalize_minicpm_o_auth_token(token: str | None) -> str | None:
     return token
 
 
+def _normalize_mimo_base_url(url: str, *, path: str) -> str:
+    normalized = url.strip()
+    parsed = urlparse(normalized)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path.rstrip("/") != path
+    ):
+        raise ValueError(f"MiMo base URL must be an HTTP URL ending in {path}")
+    return normalized.rstrip("/")
+
+
+def _normalize_mimo_api_key(key: str | None) -> str | None:
+    if key is None or key == "":
+        return None
+    if key != key.strip() or any(
+        character.isspace()
+        or ord(character) < 32
+        or ord(character) == 127
+        for character in key
+    ):
+        raise ValueError("COMPANION_MIMO_API_KEY must not contain whitespace")
+    return key
+
+
 def _parse_bool(value: str | None, *, name: str, default: bool) -> bool:
     if value is None:
         return default
@@ -196,6 +228,33 @@ def _parse_bool(value: str | None, *, name: str, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be true or false")
+
+
+def _normalize_optional_feishu_value(
+    value: str | None,
+    *,
+    name: str,
+) -> str | None:
+    if value is None or value == "":
+        return None
+    if value != value.strip() or any(character.isspace() for character in value):
+        raise ValueError(f"{name} must not contain whitespace")
+    return value
+
+
+def _normalize_feishu_base_url(value: str) -> str:
+    normalized = value.strip()
+    parsed = urlparse(normalized)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("COMPANION_FEISHU_BASE_URL must be an HTTP URL")
+    return normalized.rstrip("/")
 
 
 @dataclass(frozen=True)
@@ -209,10 +268,33 @@ class Settings:
     minicpm_o_endpoint: str | None = None
     minicpm_o_auth_token: str | None = None
     minicpm_o_timeout_seconds: float = 20.0
+    minicpm_o_max_retries: int = 2
+    minicpm_o_retry_backoff_seconds: float = 1.0
+    mimo_openai_base_url: str = _DEFAULT_MIMO_OPENAI_BASE_URL
+    mimo_anthropic_base_url: str = _DEFAULT_MIMO_ANTHROPIC_BASE_URL
+    mimo_api_key: str | None = None
+    mimo_model: str = "mimo-v2.5"
+    mimo_tts_model: str = "mimo-v2.5-tts"
+    mimo_tts_voice: str = "mimo_default"
+    mimo_timeout_seconds: float = 30.0
+    mimo_max_retries: int = 2
+    mimo_retry_backoff_seconds: float = 1.0
+    feishu_app_id: str | None = None
+    feishu_app_secret: str | None = None
+    feishu_receiver_open_id: str | None = None
+    feishu_base_url: str = "https://open.feishu.cn"
+    feishu_timeout_seconds: float = 10.0
+    feishu_max_retries: int = 2
+    feishu_retry_backoff_seconds: float = 1.0
+    memory_enabled: bool = False
+    memory_retention_days: int = 60
+    memory_quota_bytes: int = 50_000_000
+    memory_proposal_ttl_seconds: int = 600
     task_scheduler_enabled: bool = False
     task_scheduler_interval_seconds: float = 1.0
     device_hello_timeout_seconds: float = 10.0
     device_audio_frame_max_bytes: int = 4096
+    audio_queue_capacity: int = 256
 
     def __post_init__(self) -> None:
         ota_tokens = _normalize_ota_tokens(self.ota_device_tokens)
@@ -228,6 +310,40 @@ class Settings:
         normalized_auth_token = _normalize_minicpm_o_auth_token(
             self.minicpm_o_auth_token
         )
+        normalized_mimo_openai_base_url = _normalize_mimo_base_url(
+            self.mimo_openai_base_url,
+            path="/v1",
+        )
+        normalized_mimo_anthropic_base_url = _normalize_mimo_base_url(
+            self.mimo_anthropic_base_url,
+            path="/anthropic",
+        )
+        normalized_mimo_api_key = _normalize_mimo_api_key(self.mimo_api_key)
+        normalized_feishu_app_id = _normalize_optional_feishu_value(
+            self.feishu_app_id,
+            name="COMPANION_FEISHU_APP_ID",
+        )
+        normalized_feishu_app_secret = _normalize_optional_feishu_value(
+            self.feishu_app_secret,
+            name="COMPANION_FEISHU_APP_SECRET",
+        )
+        normalized_feishu_receiver_open_id = _normalize_optional_feishu_value(
+            self.feishu_receiver_open_id,
+            name="COMPANION_FEISHU_RECEIVER_OPEN_ID",
+        )
+        feishu_values = (
+            normalized_feishu_app_id,
+            normalized_feishu_app_secret,
+            normalized_feishu_receiver_open_id,
+        )
+        if any(value is not None for value in feishu_values) and not all(
+            value is not None for value in feishu_values
+        ):
+            raise ValueError(
+                "COMPANION_FEISHU_APP_ID, COMPANION_FEISHU_APP_SECRET, and "
+                "COMPANION_FEISHU_RECEIVER_OPEN_ID must be configured together"
+            )
+        normalized_feishu_base_url = _normalize_feishu_base_url(self.feishu_base_url)
         configured_runtime = self.voice_runtime
         if configured_runtime == "none" and self.fake_voice_fixture_path is not None:
             configured_runtime = "fixture"
@@ -236,8 +352,51 @@ class Settings:
             fixture_path=self.fake_voice_fixture_path,
             minicpm_o_endpoint=normalized_endpoint,
         )
+        if normalized_runtime == "mimo" and normalized_mimo_api_key is None:
+            raise ValueError("COMPANION_MIMO_API_KEY is required for mimo runtime")
         if self.minicpm_o_timeout_seconds <= 0:
             raise ValueError("COMPANION_MINICPM_O_TIMEOUT_SECONDS must be positive")
+        if self.minicpm_o_max_retries < 0:
+            raise ValueError("COMPANION_MINICPM_O_MAX_RETRIES must not be negative")
+        if self.minicpm_o_retry_backoff_seconds < 0:
+            raise ValueError(
+                "COMPANION_MINICPM_O_RETRY_BACKOFF_SECONDS must not be negative"
+            )
+        if self.mimo_timeout_seconds <= 0:
+            raise ValueError("COMPANION_MIMO_TIMEOUT_SECONDS must be positive")
+        if self.mimo_max_retries < 0:
+            raise ValueError("COMPANION_MIMO_MAX_RETRIES must not be negative")
+        if self.mimo_retry_backoff_seconds < 0:
+            raise ValueError(
+                "COMPANION_MIMO_RETRY_BACKOFF_SECONDS must not be negative"
+            )
+        if self.feishu_timeout_seconds <= 0:
+            raise ValueError("COMPANION_FEISHU_TIMEOUT_SECONDS must be positive")
+        if self.feishu_max_retries < 0:
+            raise ValueError("COMPANION_FEISHU_MAX_RETRIES must not be negative")
+        if self.feishu_retry_backoff_seconds < 0:
+            raise ValueError(
+                "COMPANION_FEISHU_RETRY_BACKOFF_SECONDS must not be negative"
+            )
+        if not isinstance(self.memory_enabled, bool):
+            raise ValueError("COMPANION_MEMORY_ENABLED must be true or false")
+        if self.memory_retention_days <= 0:
+            raise ValueError("COMPANION_MEMORY_RETENTION_DAYS must be positive")
+        if self.memory_quota_bytes <= 0:
+            raise ValueError("COMPANION_MEMORY_QUOTA_BYTES must be positive")
+        if self.memory_proposal_ttl_seconds <= 0:
+            raise ValueError(
+                "COMPANION_MEMORY_PROPOSAL_TTL_SECONDS must be positive"
+            )
+        if self.audio_queue_capacity < 1:
+            raise ValueError("COMPANION_AUDIO_QUEUE_CAPACITY must be positive")
+        for value, name in (
+            (self.mimo_model, "COMPANION_MIMO_MODEL"),
+            (self.mimo_tts_model, "COMPANION_MIMO_TTS_MODEL"),
+            (self.mimo_tts_voice, "COMPANION_MIMO_TTS_VOICE"),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must not be empty")
         if self.task_scheduler_interval_seconds <= 0:
             raise ValueError(
                 "COMPANION_TASK_SCHEDULER_INTERVAL_SECONDS must be positive"
@@ -248,6 +407,36 @@ class Settings:
         object.__setattr__(self, "voice_runtime", normalized_runtime)
         object.__setattr__(self, "minicpm_o_endpoint", normalized_endpoint)
         object.__setattr__(self, "minicpm_o_auth_token", normalized_auth_token)
+        object.__setattr__(
+            self,
+            "mimo_openai_base_url",
+            normalized_mimo_openai_base_url,
+        )
+        object.__setattr__(
+            self,
+            "mimo_anthropic_base_url",
+            normalized_mimo_anthropic_base_url,
+        )
+        object.__setattr__(self, "mimo_api_key", normalized_mimo_api_key)
+        object.__setattr__(self, "feishu_app_id", normalized_feishu_app_id)
+        object.__setattr__(self, "feishu_app_secret", normalized_feishu_app_secret)
+        object.__setattr__(
+            self,
+            "feishu_receiver_open_id",
+            normalized_feishu_receiver_open_id,
+        )
+        object.__setattr__(self, "feishu_base_url", normalized_feishu_base_url)
+
+    @property
+    def feishu_configured(self) -> bool:
+        return all(
+            value is not None
+            for value in (
+                self.feishu_app_id,
+                self.feishu_app_secret,
+                self.feishu_receiver_open_id,
+            )
+        )
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -256,9 +445,71 @@ class Settings:
         configured_runtime = os.environ.get("COMPANION_VOICE_RUNTIME")
         configured_endpoint = os.environ.get("COMPANION_MINICPM_O_ENDPOINT")
         configured_auth_token = os.environ.get("COMPANION_MINICPM_O_AUTH_TOKEN")
+        configured_mimo_openai_base_url = os.environ.get(
+            "COMPANION_MIMO_OPENAI_BASE_URL",
+            _DEFAULT_MIMO_OPENAI_BASE_URL,
+        )
+        configured_mimo_anthropic_base_url = os.environ.get(
+            "COMPANION_MIMO_ANTHROPIC_BASE_URL",
+            _DEFAULT_MIMO_ANTHROPIC_BASE_URL,
+        )
+        configured_mimo_api_key = os.environ.get("COMPANION_MIMO_API_KEY")
+        configured_mimo_model = os.environ.get(
+            "COMPANION_MIMO_MODEL",
+            "mimo-v2.5",
+        )
+        configured_mimo_tts_model = os.environ.get(
+            "COMPANION_MIMO_TTS_MODEL",
+            "mimo-v2.5-tts",
+        )
+        configured_mimo_tts_voice = os.environ.get(
+            "COMPANION_MIMO_TTS_VOICE",
+            "mimo_default",
+        )
+        configured_mimo_timeout = os.environ.get(
+            "COMPANION_MIMO_TIMEOUT_SECONDS",
+            "30",
+        )
+        configured_mimo_max_retries = os.environ.get(
+            "COMPANION_MIMO_MAX_RETRIES",
+            "2",
+        )
+        configured_mimo_retry_backoff = os.environ.get(
+            "COMPANION_MIMO_RETRY_BACKOFF_SECONDS",
+            "1",
+        )
+        configured_feishu_app_id = os.environ.get("COMPANION_FEISHU_APP_ID")
+        configured_feishu_app_secret = os.environ.get("COMPANION_FEISHU_APP_SECRET")
+        configured_feishu_receiver_open_id = os.environ.get(
+            "COMPANION_FEISHU_RECEIVER_OPEN_ID"
+        )
+        configured_feishu_base_url = os.environ.get(
+            "COMPANION_FEISHU_BASE_URL",
+            "https://open.feishu.cn",
+        )
+        configured_feishu_timeout = os.environ.get(
+            "COMPANION_FEISHU_TIMEOUT_SECONDS",
+            "10",
+        )
+        configured_feishu_max_retries = os.environ.get(
+            "COMPANION_FEISHU_MAX_RETRIES",
+            "2",
+        )
+        configured_feishu_retry_backoff = os.environ.get(
+            "COMPANION_FEISHU_RETRY_BACKOFF_SECONDS",
+            "1",
+        )
         configured_timeout = os.environ.get(
             "COMPANION_MINICPM_O_TIMEOUT_SECONDS",
             "20",
+        )
+        configured_minicpm_max_retries = os.environ.get(
+            "COMPANION_MINICPM_O_MAX_RETRIES",
+            "2",
+        )
+        configured_minicpm_retry_backoff = os.environ.get(
+            "COMPANION_MINICPM_O_RETRY_BACKOFF_SECONDS",
+            "1",
         )
         task_scheduler_enabled = _parse_bool(
             os.environ.get("COMPANION_TASK_SCHEDULER_ENABLED"),
@@ -268,6 +519,27 @@ class Settings:
         configured_scheduler_interval = os.environ.get(
             "COMPANION_TASK_SCHEDULER_INTERVAL_SECONDS",
             "1",
+        )
+        memory_enabled = _parse_bool(
+            os.environ.get("COMPANION_MEMORY_ENABLED"),
+            name="COMPANION_MEMORY_ENABLED",
+            default=False,
+        )
+        configured_memory_retention_days = os.environ.get(
+            "COMPANION_MEMORY_RETENTION_DAYS",
+            "60",
+        )
+        configured_memory_quota_bytes = os.environ.get(
+            "COMPANION_MEMORY_QUOTA_BYTES",
+            "50000000",
+        )
+        configured_memory_proposal_ttl = os.environ.get(
+            "COMPANION_MEMORY_PROPOSAL_TTL_SECONDS",
+            "600",
+        )
+        configured_audio_queue_capacity = os.environ.get(
+            "COMPANION_AUDIO_QUEUE_CAPACITY",
+            "256",
         )
         public_websocket_url = os.environ.get("COMPANION_PUBLIC_WEBSOCKET_URL")
         ota_tokens_json = os.environ.get("COMPANION_OTA_DEVICE_TOKENS", "{}")
@@ -286,10 +558,74 @@ class Settings:
                 "COMPANION_MINICPM_O_TIMEOUT_SECONDS must be a number"
             ) from exc
         try:
+            minicpm_o_max_retries = int(configured_minicpm_max_retries)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_MINICPM_O_MAX_RETRIES must be an integer"
+            ) from exc
+        try:
+            minicpm_o_retry_backoff_seconds = float(configured_minicpm_retry_backoff)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_MINICPM_O_RETRY_BACKOFF_SECONDS must be a number"
+            ) from exc
+        try:
             task_scheduler_interval_seconds = float(configured_scheduler_interval)
         except ValueError as exc:
             raise ValueError(
                 "COMPANION_TASK_SCHEDULER_INTERVAL_SECONDS must be a number"
+            ) from exc
+        try:
+            mimo_timeout_seconds = float(configured_mimo_timeout)
+        except ValueError as exc:
+            raise ValueError("COMPANION_MIMO_TIMEOUT_SECONDS must be a number") from exc
+        try:
+            mimo_max_retries = int(configured_mimo_max_retries)
+        except ValueError as exc:
+            raise ValueError("COMPANION_MIMO_MAX_RETRIES must be an integer") from exc
+        try:
+            mimo_retry_backoff_seconds = float(configured_mimo_retry_backoff)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_MIMO_RETRY_BACKOFF_SECONDS must be a number"
+            ) from exc
+        try:
+            feishu_timeout_seconds = float(configured_feishu_timeout)
+        except ValueError as exc:
+            raise ValueError("COMPANION_FEISHU_TIMEOUT_SECONDS must be a number") from exc
+        try:
+            feishu_max_retries = int(configured_feishu_max_retries)
+        except ValueError as exc:
+            raise ValueError("COMPANION_FEISHU_MAX_RETRIES must be an integer") from exc
+        try:
+            feishu_retry_backoff_seconds = float(configured_feishu_retry_backoff)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_FEISHU_RETRY_BACKOFF_SECONDS must be a number"
+            ) from exc
+        try:
+            audio_queue_capacity = int(configured_audio_queue_capacity)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_AUDIO_QUEUE_CAPACITY must be an integer"
+            ) from exc
+        try:
+            memory_retention_days = int(configured_memory_retention_days)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_MEMORY_RETENTION_DAYS must be an integer"
+            ) from exc
+        try:
+            memory_quota_bytes = int(configured_memory_quota_bytes)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_MEMORY_QUOTA_BYTES must be an integer"
+            ) from exc
+        try:
+            memory_proposal_ttl_seconds = int(configured_memory_proposal_ttl)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_MEMORY_PROPOSAL_TTL_SECONDS must be an integer"
             ) from exc
         return cls(
             database_path=(
@@ -305,6 +641,29 @@ class Settings:
             minicpm_o_endpoint=configured_endpoint,
             minicpm_o_auth_token=configured_auth_token,
             minicpm_o_timeout_seconds=minicpm_o_timeout_seconds,
+            minicpm_o_max_retries=minicpm_o_max_retries,
+            minicpm_o_retry_backoff_seconds=minicpm_o_retry_backoff_seconds,
+            mimo_openai_base_url=configured_mimo_openai_base_url,
+            mimo_anthropic_base_url=configured_mimo_anthropic_base_url,
+            mimo_api_key=configured_mimo_api_key,
+            mimo_model=configured_mimo_model,
+            mimo_tts_model=configured_mimo_tts_model,
+            mimo_tts_voice=configured_mimo_tts_voice,
+            mimo_timeout_seconds=mimo_timeout_seconds,
+            mimo_max_retries=mimo_max_retries,
+            mimo_retry_backoff_seconds=mimo_retry_backoff_seconds,
+            feishu_app_id=configured_feishu_app_id,
+            feishu_app_secret=configured_feishu_app_secret,
+            feishu_receiver_open_id=configured_feishu_receiver_open_id,
+            feishu_base_url=configured_feishu_base_url,
+            feishu_timeout_seconds=feishu_timeout_seconds,
+            feishu_max_retries=feishu_max_retries,
+            feishu_retry_backoff_seconds=feishu_retry_backoff_seconds,
+            memory_enabled=memory_enabled,
+            memory_retention_days=memory_retention_days,
+            memory_quota_bytes=memory_quota_bytes,
+            memory_proposal_ttl_seconds=memory_proposal_ttl_seconds,
             task_scheduler_enabled=task_scheduler_enabled,
             task_scheduler_interval_seconds=task_scheduler_interval_seconds,
+            audio_queue_capacity=audio_queue_capacity,
         )

@@ -91,6 +91,18 @@ The first text frame is a `hello` message. Audio is accepted only after a
 `listen` start control and is returned as `tts.start`, binary Opus frames, and
 `tts.stop`.
 
+Inspect the current local session without exposing a token or audio payload:
+
+```powershell
+Invoke-RestMethod -Method Get -Uri http://127.0.0.1:8723/v1/devices/dev-living-room/status
+```
+
+The read-only response is `online` for the active session and includes its
+phase, listening mode, connection timestamps, and aggregate received-frame
+count. An unknown device returns an `offline` snapshot with HTTP 200. Delivery
+logs distinguish `device_offline` from `outbound_backpressure`; these reasons
+do not change the existing scheduler retry policy.
+
 ## Local audio fixture
 
 The checked-in fixture contains generated, non-user audio for deterministic
@@ -133,11 +145,72 @@ Ascend service is a separate deployment boundary. A gateway-side wrapper may
 add a `response.output.delta` event with `kind=task`; that task is validated
 before it can enter the local task state machine.
 
+For the HTTP adapter, configure bounded retries in the ignored `gateway/.env`
+file or the process environment:
+
+```text
+COMPANION_MINICPM_O_MAX_RETRIES=2
+COMPANION_MINICPM_O_RETRY_BACKOFF_SECONDS=1
+```
+
+Only HTTP 429 and 500-599 responses are retried. The default allows two retries
+with 1s then 2s exponential backoff. Authentication errors, other 4xx
+responses, transport failures, malformed responses, and realtime failures are
+reported immediately. Attempt logs contain only status, attempt number,
+duration, or an exception class; request and response data are never logged.
+
+For adapter development without an Ascend account, a deterministic local mock
+implements the same HTTP and realtime event contracts:
+
+```powershell
+$env:PYTHONPATH='src'
+.\.venv\Scripts\python -m uvicorn companion_gateway.voice.mock_minicpm_o:app --host 127.0.0.1 --port 9000
+```
+
+Use `http://127.0.0.1:9000/v1/infer` for the HTTP adapter or
+`ws://127.0.0.1:9000/v1/realtime?mode=audio` for the realtime adapter. The
+mock returns generated audio only and must not be used as a production runtime.
+
+For pre-production voice testing with MiMo-V2.5, use the OpenAI-compatible
+Token Plan endpoint. The gateway sends the stopped 16 kHz PCM turn to
+`mimo-v2.5`, then sends the returned reply text to `mimo-v2.5-tts` and receives
+24 kHz PCM16 audio for the ESP32:
+
+```powershell
+$env:COMPANION_VOICE_RUNTIME = 'mimo'
+$env:COMPANION_MIMO_API_KEY = '<your-token-plan-key>'
+$env:COMPANION_MIMO_OPENAI_BASE_URL = 'https://token-plan-cn.xiaomimimo.com/v1'
+$env:COMPANION_MIMO_ANTHROPIC_BASE_URL = 'https://token-plan-cn.xiaomimimo.com/anthropic'
+$env:COMPANION_MIMO_MODEL = 'mimo-v2.5'
+$env:COMPANION_MIMO_TTS_MODEL = 'mimo-v2.5-tts'
+$env:COMPANION_MIMO_TTS_VOICE = 'mimo_default'
+$env:COMPANION_MIMO_MAX_RETRIES = '2'
+$env:COMPANION_MIMO_RETRY_BACKOFF_SECONDS = '1'
+$env:COMPANION_AUDIO_QUEUE_CAPACITY = '256'
+```
+
+The public endpoints and non-secret defaults are also listed in `.env.example`.
+For local development, put the real API key only in the ignored `gateway/.env`
+file (or in the current process environment as `COMPANION_MIMO_API_KEY`); do
+not add it to `.env.example`, source files, logs, test output, commits, or
+GitHub. The Anthropic-compatible URL is retained for future tool integrations;
+the current audio gateway uses the OpenAI-compatible URL because it supports
+the documented audio input and TTS request shapes.
+
+Only HTTP 429 and 500-599 responses are retried. The default policy allows two
+retries with 1s then 2s exponential backoff. Network failures, authentication
+errors, and malformed responses fail immediately as `model_unavailable`; adjust
+`COMPANION_MIMO_MAX_RETRIES` and `COMPANION_MIMO_RETRY_BACKOFF_SECONDS` for a
+different deployment policy.
+
 Audio is buffered between `listen.start` and `listen.stop`, so one turn causes
-one model request. A runtime failure returns a retryable `model_unavailable`
-device error and discards the pending audio. A validated model task is created
-idempotently and enters the `scheduled` state; `TaskExecutor.execute_due` can
-then advance it through delivery states using a device delivery callback.
+one model request. `COMPANION_AUDIO_QUEUE_CAPACITY` bounds the number of 60 ms
+uplink frames retained for one turn; the default of 256 frames supports about
+15.36 seconds of input. A runtime failure returns a retryable
+`model_unavailable` device error and discards the pending audio. A validated
+model task is created idempotently and enters the `scheduled` state;
+`TaskExecutor.execute_due` can then advance it through delivery states using a
+device delivery callback.
 
 ## Task scheduler
 
@@ -153,6 +226,85 @@ Due tasks are delivered as an additive WebSocket message with
 `type=task,state=notify`. Delivery is retried on later ticks while the target
 device is offline or its bounded queue is full.
 
+## Medication reminder and Feishu fallback
+
+The first recurring workflow is single-user medication reminder delivery. It
+uses `Asia/Shanghai`, accepts one to three daily `HH:MM` times, and defaults to
+`08:00`, `12:00`, and `20:00` when the API request omits `reminder_times`.
+Create and disable a plan through the local API:
+
+```powershell
+$body = @{
+  actor_id = 'voice-user'
+  target_device_id = 'living-room'
+  reminder_times = @('08:00', '12:00', '20:00')
+  message = '请确认服药'
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8723/v1/medication/plans -Body $body -ContentType 'application/json'
+Invoke-RestMethod -Method Get -Uri http://127.0.0.1:8723/v1/medication/occurrences
+```
+
+The plan sends an existing task notification to the ESP32 at the due time. If
+the task remains undelivered for ten minutes, the gateway sends one plain-text
+Feishu message stating that the device is offline and voice notification
+failed. If the task was delivered but remains unacknowledged for ten minutes,
+the message instead states that the voice reminder was sent but not confirmed.
+A later scheduler tick cannot send another fallback for that occurrence.
+
+Configure Feishu only in the ignored `gateway/.env` file. The public example
+contains names and non-secret defaults, never application credentials:
+
+```text
+COMPANION_FEISHU_APP_ID=<enterprise-app-id>
+COMPANION_FEISHU_APP_SECRET=<enterprise-app-secret>
+COMPANION_FEISHU_RECEIVER_OPEN_ID=<receiver-open-id>
+COMPANION_FEISHU_BASE_URL=https://open.feishu.cn
+COMPANION_FEISHU_TIMEOUT_SECONDS=10
+COMPANION_FEISHU_MAX_RETRIES=2
+COMPANION_FEISHU_RETRY_BACKOFF_SECONDS=1
+```
+
+The adapter caches `tenant_access_token` in memory and retries only transport
+errors, HTTP 429, and HTTP 5xx responses. It does not subscribe to Feishu
+events, expose a public callback, accept inbound Feishu commands, or call
+Home Assistant. The database stays on the gateway host and is never stored on
+the ESP32.
+
+## Long-term memory (local API, opt-in)
+
+The first memory slice is disabled by default and stores only explicitly
+confirmed profile values in the gateway SQLite database. It does not store raw
+audio, transcripts, images, credentials, device tokens, location history, or
+health data. When memory is enabled, only the confirmed `address` category is
+included in the model prompt, limited to one value and 256 UTF-8 bytes; pending
+proposals and all other categories are excluded.
+
+Enable it only for a local test deployment:
+
+```text
+COMPANION_MEMORY_ENABLED=true
+COMPANION_MEMORY_RETENTION_DAYS=60
+COMPANION_MEMORY_QUOTA_BYTES=50000000
+COMPANION_MEMORY_PROPOSAL_TTL_SECONDS=600
+```
+
+The local API is subject-scoped and uses the request `X-Trace-Id` as the stored
+source identifier:
+
+- `POST /v1/memory/confirm` requires `confirmed: true`.
+- `GET /v1/memory?subject_id=<id>&query=<text>&limit=20` lists active values.
+- `GET /v1/memory/export?subject_id=<id>` exports active values.
+- `DELETE /v1/memory/<memory-id>?subject_id=<id>` removes one value.
+- `GET /v1/memory/proposals?subject_id=<id>` lists model suggestions awaiting confirmation.
+- `POST /v1/memory/proposals/<proposal-id>/confirm` confirms one suggestion.
+- `DELETE /v1/memory/proposals/<proposal-id>?subject_id=<id>` rejects one suggestion.
+
+Expiry cleanup and quota enforcement happen in the gateway process. Keep the
+database on the gateway host; at-rest encryption remains a deployment concern
+and is not enabled by this local development slice. Only the `address` category
+is supplied to the model, limited to one value and 256 UTF-8 bytes; pending
+proposals expire after ten minutes.
+
 ## Repeatable voice check
 
 Install the gateway dependencies, then configure the device endpoint and token
@@ -163,10 +315,12 @@ $env:PYTHONPATH = 'gateway\src'
 $env:COMPANION_DEVICE_ENDPOINT = 'ws://<gateway-host>:8723/v1/devices/ws'
 $env:COMPANION_DEVICE_ID = '<device-id>'
 $env:COMPANION_DEVICE_TOKEN = '<device-token>'
-python tools/voice_mainline_check.py --turns 3
+python tools/voice_mainline_check.py --turns 3 --frame-interval 0.06
 ```
 
 The command replays the checked-in WAV fixture, performs three complete
 `hello -> listen.start -> audio -> listen.stop -> tts` turns, and prints JSON
 with turn count, returned TTS frame count, and elapsed milliseconds. It does
-not access serial ports or change firmware.
+not access serial ports or change firmware. Audio frames are paced at the
+declared 60 ms frame duration by default; pass `--frame-interval 0` only for a
+short synthetic test where the gateway queue is configured large enough.

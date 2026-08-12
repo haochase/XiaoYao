@@ -1,7 +1,11 @@
 from collections.abc import Callable
 from datetime import datetime
 
-from companion_gateway.domain.models import TaskCreate, TaskRecord
+from companion_gateway.domain.models import (
+    ConfirmationPolicy,
+    TaskCreate,
+    TaskRecord,
+)
 from companion_gateway.domain.tasks import TaskEventType, TaskStatus
 from companion_gateway.service import TaskService
 
@@ -21,6 +25,14 @@ class TaskExecutor:
         task, created = self._service.create_task(command, trace_id=trace_id)
         if not created:
             return task, False
+        if command.confirmation_policy is ConfirmationPolicy.REQUIRED:
+            awaiting_confirmation, _ = self._service.record_event(
+                task.task_id,
+                TaskEventType.AWAITING_CONFIRMATION,
+                reason="task_confirmation_required",
+                trace_id=trace_id,
+            )
+            return awaiting_confirmation, True
         scheduled, _ = self._service.record_event(
             task.task_id,
             TaskEventType.SCHEDULED,

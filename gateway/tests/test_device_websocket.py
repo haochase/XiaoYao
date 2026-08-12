@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+import companion_gateway.api as api_module
 from companion_gateway.api import create_app
 from companion_gateway.audio.bridge import AudioBridge, AudioFrameRejected, Pcm16Mono
 from companion_gateway.device.events import BoundedDeviceEventSink
@@ -149,6 +150,49 @@ def test_valid_hello_receives_xiaozhi_server_hello(client: TestClient) -> None:
         "channels": 1,
         "frame_duration": 60,
     }
+
+
+def test_disconnect_diagnostics_keep_listen_mode_and_protocol_state(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log_messages: list[str] = []
+
+    def capture_info(message: str, *args: object) -> None:
+        log_messages.append(message % args)
+
+    monkeypatch.setattr(api_module.logger, "info", capture_info)
+
+    with client.websocket_connect(
+        "/v1/devices/ws",
+        headers=websocket_headers(),
+    ) as websocket:
+        websocket.send_json(hello_payload())
+        websocket.receive_json()
+        websocket.send_json(
+            {"type": "listen", "state": "start", "mode": "manual"}
+        )
+        websocket.close(code=1001, reason="network-handoff")
+
+    assert any(
+        "device_ws_control" in message and "mode=manual" in message
+        for message in log_messages
+    )
+    assert any(
+        "device_ws_peer_closed" in message
+        and "code=1001" in message
+        and "reason_length=15" in message
+        and "phase=listening" in message
+        and "mode=manual" in message
+        for message in log_messages
+    )
+    assert any(
+        "device_ws_closed" in message
+        and "phase_before_close=listening" in message
+        and "duration_ms=" in message
+        and "close_code=1001" in message
+        for message in log_messages
+    )
 
 
 def test_active_device_receives_tts_control_and_binary_audio(

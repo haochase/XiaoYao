@@ -4,7 +4,25 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from companion_gateway.domain.models import TaskCreate, TaskEvent, TaskRecord
+from companion_gateway.domain.memory import (
+    Memory,
+    MemoryCategory,
+    PendingMemoryProposal,
+)
+from companion_gateway.domain.medication import (
+    FeishuFallbackStatus,
+    MedicationOccurrence,
+    MedicationOccurrenceStatus,
+    MedicationPlan,
+    MedicationPlanCreate,
+)
 from companion_gateway.domain.tasks import TaskEventType, TaskStatus, transition
+
+
+def _require_aware(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timestamp must be timezone-aware")
+    return value.astimezone(UTC)
 
 
 class SQLiteTaskRepository:
@@ -51,6 +69,75 @@ class SQLiteTaskRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_task_events_task_time
                 ON task_events(task_id, occurred_at);
+
+                CREATE TABLE IF NOT EXISTS medication_plans (
+                    plan_id TEXT PRIMARY KEY,
+                    actor_id TEXT NOT NULL,
+                    target_device_id TEXT NOT NULL,
+                    reminder_times_json TEXT NOT NULL,
+                    timezone TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_medication_plans_enabled
+                ON medication_plans(enabled, updated_at);
+
+                CREATE TABLE IF NOT EXISTS medication_occurrences (
+                    occurrence_id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    target_device_id TEXT NOT NULL,
+                    local_date TEXT NOT NULL,
+                    local_time TEXT NOT NULL,
+                    scheduled_at TEXT NOT NULL,
+                    ack_deadline_at TEXT NOT NULL,
+                    task_id TEXT,
+                    status TEXT NOT NULL,
+                    acknowledged_at TEXT,
+                    feishu_status TEXT NOT NULL,
+                    feishu_message_id TEXT,
+                    feishu_error TEXT,
+                    created_at TEXT NOT NULL,
+                    trace_id TEXT NOT NULL,
+                    UNIQUE(plan_id, local_date, local_time),
+                    FOREIGN KEY (plan_id) REFERENCES medication_plans(plan_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_medication_occurrences_status_deadline
+                ON medication_occurrences(status, ack_deadline_at);
+
+                CREATE TABLE IF NOT EXISTS memories (
+                    memory_id TEXT PRIMARY KEY,
+                    subject_id TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consent_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_memories_subject_expiry
+                ON memories(subject_id, expires_at);
+
+                CREATE INDEX IF NOT EXISTS idx_memories_subject_category
+                ON memories(subject_id, category);
+
+                CREATE TABLE IF NOT EXISTS memory_proposals (
+                    proposal_id TEXT PRIMARY KEY,
+                    subject_id TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_memory_proposals_subject_expiry
+                ON memory_proposals(subject_id, expires_at);
                 """
             )
 
@@ -60,6 +147,585 @@ class SQLiteTaskRepository:
                 return connection.execute("SELECT 1").fetchone()[0] == 1
         except sqlite3.Error:
             return False
+
+    def upsert_memory(self, memory: Memory) -> Memory:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO memories (
+                    memory_id, subject_id, category, value, source,
+                    created_at, expires_at, consent_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(memory_id) DO UPDATE SET
+                    subject_id = excluded.subject_id,
+                    category = excluded.category,
+                    value = excluded.value,
+                    source = excluded.source,
+                    created_at = excluded.created_at,
+                    expires_at = excluded.expires_at,
+                    consent_at = excluded.consent_at
+                """,
+                (
+                    memory.memory_id,
+                    memory.subject_id,
+                    memory.category.value,
+                    memory.value,
+                    memory.source,
+                    _require_aware(memory.created_at).isoformat(),
+                    _require_aware(memory.expires_at).isoformat(),
+                    _require_aware(memory.consent_at).isoformat(),
+                ),
+            )
+        return memory
+
+    def get_memory(self, memory_id: str) -> Memory | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM memories WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
+        return self._memory_from_row(row) if row is not None else None
+
+    def list_memories(
+        self,
+        *,
+        subject_id: str,
+        query: str | None = None,
+        limit: int | None = None,
+        now: datetime,
+    ) -> list[Memory]:
+        current = _require_aware(now).isoformat()
+        sql = (
+            "SELECT * FROM memories "
+            "WHERE subject_id = ? AND expires_at > ?"
+        )
+        parameters: list[object] = [subject_id, current]
+        if query:
+            escaped = (
+                query.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            sql += " AND value LIKE ? ESCAPE '\\'"
+            parameters.append(f"%{escaped}%")
+        sql += " ORDER BY created_at, memory_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(sql, tuple(parameters)).fetchall()
+        return [self._memory_from_row(row) for row in rows]
+
+    def delete_memory(self, *, subject_id: str, memory_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM memories WHERE memory_id = ? AND subject_id = ?",
+                (memory_id, subject_id),
+            )
+        return cursor.rowcount == 1
+
+    def export_memories(
+        self,
+        *,
+        subject_id: str,
+        now: datetime,
+    ) -> list[Memory]:
+        return self.list_memories(subject_id=subject_id, now=now)
+
+    def purge_expired(self, *, now: datetime) -> int:
+        current = _require_aware(now).isoformat()
+        with self._connect() as connection:
+            memory_cursor = connection.execute(
+                "DELETE FROM memories WHERE expires_at <= ?",
+                (current,),
+            )
+            proposal_cursor = connection.execute(
+                "DELETE FROM memory_proposals WHERE expires_at <= ?",
+                (current,),
+            )
+        return memory_cursor.rowcount + proposal_cursor.rowcount
+
+    def memory_usage_bytes(self, *, subject_id: str, now: datetime) -> int:
+        current = _require_aware(now).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT value FROM memories WHERE subject_id = ? AND expires_at > ?",
+                (subject_id, current),
+            ).fetchall()
+        return sum(len(row["value"].encode("utf-8")) for row in rows)
+
+    def create_memory_proposal(
+        self,
+        proposal: PendingMemoryProposal,
+    ) -> PendingMemoryProposal:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO memory_proposals (
+                    proposal_id, subject_id, category, value, source,
+                    created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(proposal_id) DO UPDATE SET
+                    subject_id = excluded.subject_id,
+                    category = excluded.category,
+                    value = excluded.value,
+                    source = excluded.source,
+                    created_at = excluded.created_at,
+                    expires_at = excluded.expires_at
+                """,
+                (
+                    proposal.proposal_id,
+                    proposal.subject_id,
+                    proposal.category.value,
+                    proposal.value,
+                    proposal.source,
+                    _require_aware(proposal.created_at).isoformat(),
+                    _require_aware(proposal.expires_at).isoformat(),
+                ),
+            )
+        return proposal
+
+    def get_memory_proposal(self, proposal_id: str) -> PendingMemoryProposal | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM memory_proposals WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+        return (
+            self._pending_memory_proposal_from_row(row)
+            if row is not None
+            else None
+        )
+
+    def list_memory_proposals(
+        self,
+        *,
+        subject_id: str,
+        now: datetime,
+    ) -> list[PendingMemoryProposal]:
+        current = _require_aware(now).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memory_proposals
+                WHERE subject_id = ? AND expires_at > ?
+                ORDER BY created_at, proposal_id
+                """,
+                (subject_id, current),
+            ).fetchall()
+        return [self._pending_memory_proposal_from_row(row) for row in rows]
+
+    def delete_memory_proposal(self, *, subject_id: str, proposal_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM memory_proposals
+                WHERE proposal_id = ? AND subject_id = ?
+                """,
+                (proposal_id, subject_id),
+            )
+        return cursor.rowcount == 1
+
+    def consume_memory_proposal(
+        self,
+        *,
+        subject_id: str,
+        proposal_id: str,
+        memory: Memory,
+        now: datetime,
+    ) -> Memory | None:
+        if memory.subject_id != subject_id:
+            return None
+        current = _require_aware(now).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                proposal = connection.execute(
+                    """
+                    SELECT proposal_id FROM memory_proposals
+                    WHERE proposal_id = ? AND subject_id = ? AND expires_at > ?
+                    """,
+                    (proposal_id, subject_id, current),
+                ).fetchone()
+                if proposal is None:
+                    connection.rollback()
+                    return None
+                existing = connection.execute(
+                    "SELECT subject_id FROM memories WHERE memory_id = ?",
+                    (memory.memory_id,),
+                ).fetchone()
+                if existing is not None and existing["subject_id"] != subject_id:
+                    connection.rollback()
+                    return None
+                connection.execute(
+                    """
+                    INSERT INTO memories (
+                        memory_id, subject_id, category, value, source,
+                        created_at, expires_at, consent_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(memory_id) DO UPDATE SET
+                        subject_id = excluded.subject_id,
+                        category = excluded.category,
+                        value = excluded.value,
+                        source = excluded.source,
+                        created_at = excluded.created_at,
+                        expires_at = excluded.expires_at,
+                        consent_at = excluded.consent_at
+                    """,
+                    (
+                        memory.memory_id,
+                        memory.subject_id,
+                        memory.category.value,
+                        memory.value,
+                        memory.source,
+                        _require_aware(memory.created_at).isoformat(),
+                        _require_aware(memory.expires_at).isoformat(),
+                        _require_aware(memory.consent_at).isoformat(),
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM memory_proposals WHERE proposal_id = ?",
+                    (proposal_id,),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return memory
+
+    def create_medication_plan(
+        self,
+        plan: MedicationPlanCreate,
+        *,
+        plan_id: str,
+        occurred_at: datetime,
+    ) -> tuple[MedicationPlan, bool]:
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            raise ValueError("occurred_at must be timezone-aware")
+        created_at = occurred_at.astimezone(UTC)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = connection.execute(
+                    "SELECT * FROM medication_plans WHERE plan_id = ?",
+                    (plan_id,),
+                ).fetchone()
+                if existing is not None:
+                    connection.commit()
+                    return self._medication_plan_from_row(existing), False
+                connection.execute(
+                    """
+                    INSERT INTO medication_plans (
+                        plan_id, actor_id, target_device_id, reminder_times_json,
+                        timezone, message, enabled, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        plan_id,
+                        plan.actor_id,
+                        plan.target_device_id,
+                        json.dumps(
+                            [item.isoformat(timespec="minutes") for item in plan.reminder_times],
+                            separators=(",", ":"),
+                        ),
+                        plan.timezone,
+                        plan.message,
+                        int(plan.enabled),
+                        created_at.isoformat(),
+                        created_at.isoformat(),
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM medication_plans WHERE plan_id = ?",
+                    (plan_id,),
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return self._medication_plan_from_row(row), True
+
+    def get_medication_plan(self, plan_id: str) -> MedicationPlan | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM medication_plans WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchone()
+        return self._medication_plan_from_row(row) if row is not None else None
+
+    def list_medication_plans(
+        self, *, enabled: bool | None = None
+    ) -> list[MedicationPlan]:
+        query = "SELECT * FROM medication_plans"
+        parameters: tuple[object, ...] = ()
+        if enabled is not None:
+            query += " WHERE enabled = ?"
+            parameters = (int(enabled),)
+        query += " ORDER BY created_at, plan_id"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [self._medication_plan_from_row(row) for row in rows]
+
+    def disable_medication_plan(
+        self, plan_id: str, *, occurred_at: datetime
+    ) -> MedicationPlan:
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            raise ValueError("occurred_at must be timezone-aware")
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE medication_plans SET enabled = 0, updated_at = ? WHERE plan_id = ?",
+                (occurred_at.astimezone(UTC).isoformat(), plan_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM medication_plans WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(plan_id)
+        return self._medication_plan_from_row(row)
+
+    def create_occurrence_if_absent(
+        self, occurrence: MedicationOccurrence
+    ) -> tuple[MedicationOccurrence, bool]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = connection.execute(
+                    """
+                    SELECT * FROM medication_occurrences
+                    WHERE plan_id = ? AND local_date = ? AND local_time = ?
+                    """,
+                    (
+                        occurrence.plan_id,
+                        occurrence.local_date.isoformat(),
+                        occurrence.local_time.isoformat(timespec="minutes"),
+                    ),
+                ).fetchone()
+                if existing is not None:
+                    connection.commit()
+                    return self._medication_occurrence_from_row(existing), False
+                connection.execute(
+                    """
+                    INSERT INTO medication_occurrences (
+                        occurrence_id, plan_id, actor_id, target_device_id,
+                        local_date, local_time, scheduled_at, ack_deadline_at,
+                        task_id, status, acknowledged_at, feishu_status,
+                        feishu_message_id, feishu_error, created_at, trace_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        occurrence.occurrence_id,
+                        occurrence.plan_id,
+                        occurrence.actor_id,
+                        occurrence.target_device_id,
+                        occurrence.local_date.isoformat(),
+                        occurrence.local_time.isoformat(timespec="minutes"),
+                        occurrence.scheduled_at.astimezone(UTC).isoformat(),
+                        occurrence.ack_deadline_at.astimezone(UTC).isoformat(),
+                        occurrence.task_id,
+                        occurrence.status.value,
+                        (
+                            occurrence.acknowledged_at.astimezone(UTC).isoformat()
+                            if occurrence.acknowledged_at is not None
+                            else None
+                        ),
+                        occurrence.feishu_status.value,
+                        occurrence.feishu_message_id,
+                        occurrence.feishu_error,
+                        occurrence.created_at.astimezone(UTC).isoformat(),
+                        occurrence.trace_id,
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return occurrence, True
+
+    def get_medication_occurrence(
+        self, occurrence_id: str
+    ) -> MedicationOccurrence | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM medication_occurrences WHERE occurrence_id = ?",
+                (occurrence_id,),
+            ).fetchone()
+        return self._medication_occurrence_from_row(row) if row is not None else None
+
+    def list_medication_occurrences(
+        self, *, statuses: tuple[MedicationOccurrenceStatus, ...] | None = None
+    ) -> list[MedicationOccurrence]:
+        query = "SELECT * FROM medication_occurrences"
+        parameters: tuple[object, ...] = ()
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            query += f" WHERE status IN ({placeholders})"
+            parameters = tuple(item.value for item in statuses)
+        query += " ORDER BY scheduled_at, occurrence_id"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [self._medication_occurrence_from_row(row) for row in rows]
+
+    def bind_occurrence_task(
+        self, occurrence_id: str, *, task_id: str
+    ) -> MedicationOccurrence:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE medication_occurrences SET task_id = ? WHERE occurrence_id = ?",
+                (task_id, occurrence_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM medication_occurrences WHERE occurrence_id = ?",
+                (occurrence_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(occurrence_id)
+        return self._medication_occurrence_from_row(row)
+
+    def mark_occurrence_delivered(self, occurrence_id: str) -> MedicationOccurrence:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE medication_occurrences
+                SET status = CASE WHEN status = ? THEN ? ELSE status END
+                WHERE occurrence_id = ?
+                """,
+                (
+                    MedicationOccurrenceStatus.SCHEDULED.value,
+                    MedicationOccurrenceStatus.DELIVERED.value,
+                    occurrence_id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM medication_occurrences WHERE occurrence_id = ?",
+                (occurrence_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(occurrence_id)
+        return self._medication_occurrence_from_row(row)
+
+    def mark_occurrence_acknowledged(
+        self, occurrence_id: str, *, occurred_at: datetime
+    ) -> MedicationOccurrence:
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            raise ValueError("occurred_at must be timezone-aware")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE medication_occurrences
+                SET status = ?, acknowledged_at = ?
+                WHERE occurrence_id = ?
+                """,
+                (
+                    MedicationOccurrenceStatus.ACKNOWLEDGED.value,
+                    occurred_at.astimezone(UTC).isoformat(),
+                    occurrence_id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM medication_occurrences WHERE occurrence_id = ?",
+                (occurrence_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(occurrence_id)
+        return self._medication_occurrence_from_row(row)
+
+    def claim_feishu_fallback(self, occurrence_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE medication_occurrences
+                SET feishu_status = ?
+                WHERE occurrence_id = ? AND feishu_status = ?
+                """,
+                (
+                    FeishuFallbackStatus.SENDING.value,
+                    occurrence_id,
+                    FeishuFallbackStatus.PENDING.value,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def complete_feishu_fallback(
+        self,
+        occurrence_id: str,
+        *,
+        status: FeishuFallbackStatus,
+        message_id: str | None,
+        error: str | None,
+    ) -> MedicationOccurrence:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM medication_occurrences WHERE occurrence_id = ?",
+                (occurrence_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(occurrence_id)
+            occurrence_status = row["status"]
+            if status is FeishuFallbackStatus.SENT and occurrence_status != (
+                MedicationOccurrenceStatus.ACKNOWLEDGED.value
+            ):
+                occurrence_status = MedicationOccurrenceStatus.ESCALATED.value
+            connection.execute(
+                """
+                UPDATE medication_occurrences
+                SET feishu_status = ?, feishu_message_id = ?, feishu_error = ?, status = ?
+                WHERE occurrence_id = ?
+                """,
+                (
+                    status.value,
+                    message_id,
+                    error,
+                    occurrence_status,
+                    occurrence_id,
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM medication_occurrences WHERE occurrence_id = ?",
+                (occurrence_id,),
+            ).fetchone()
+        return self._medication_occurrence_from_row(updated)
+
+    @staticmethod
+    def _medication_plan_from_row(row: sqlite3.Row) -> MedicationPlan:
+        return MedicationPlan.model_validate(
+            {
+                "plan_id": row["plan_id"],
+                "actor_id": row["actor_id"],
+                "target_device_id": row["target_device_id"],
+                "reminder_times": json.loads(row["reminder_times_json"]),
+                "timezone": row["timezone"],
+                "message": row["message"],
+                "enabled": bool(row["enabled"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+        )
+
+    @staticmethod
+    def _medication_occurrence_from_row(
+        row: sqlite3.Row,
+    ) -> MedicationOccurrence:
+        return MedicationOccurrence.model_validate(
+            {
+                "occurrence_id": row["occurrence_id"],
+                "plan_id": row["plan_id"],
+                "actor_id": row["actor_id"],
+                "target_device_id": row["target_device_id"],
+                "local_date": row["local_date"],
+                "local_time": row["local_time"],
+                "scheduled_at": row["scheduled_at"],
+                "ack_deadline_at": row["ack_deadline_at"],
+                "task_id": row["task_id"],
+                "status": row["status"],
+                "acknowledged_at": row["acknowledged_at"],
+                "feishu_status": row["feishu_status"],
+                "feishu_message_id": row["feishu_message_id"],
+                "feishu_error": row["feishu_error"],
+                "created_at": row["created_at"],
+                "trace_id": row["trace_id"],
+            }
+        )
 
     def create_task(
         self,
@@ -279,5 +945,36 @@ class SQLiteTaskRepository:
                 "reason": row["reason"],
                 "occurred_at": row["occurred_at"],
                 "trace_id": row["trace_id"],
+            }
+        )
+
+    @staticmethod
+    def _memory_from_row(row: sqlite3.Row) -> Memory:
+        return Memory.model_validate(
+            {
+                "memory_id": row["memory_id"],
+                "subject_id": row["subject_id"],
+                "category": MemoryCategory(row["category"]),
+                "value": row["value"],
+                "source": row["source"],
+                "created_at": row["created_at"],
+                "expires_at": row["expires_at"],
+                "consent_at": row["consent_at"],
+            }
+        )
+
+    @staticmethod
+    def _pending_memory_proposal_from_row(
+        row: sqlite3.Row,
+    ) -> PendingMemoryProposal:
+        return PendingMemoryProposal.model_validate(
+            {
+                "proposal_id": row["proposal_id"],
+                "subject_id": row["subject_id"],
+                "category": MemoryCategory(row["category"]),
+                "value": row["value"],
+                "source": row["source"],
+                "created_at": row["created_at"],
+                "expires_at": row["expires_at"],
             }
         )

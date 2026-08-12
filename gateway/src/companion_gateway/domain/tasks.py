@@ -3,6 +3,7 @@ from enum import StrEnum
 
 class TaskStatus(StrEnum):
     CREATED = "created"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
     SCHEDULED = "scheduled"
     DUE = "due"
     PENDING_DELIVERY = "pending_delivery"
@@ -17,6 +18,8 @@ class TaskStatus(StrEnum):
 
 class TaskEventType(StrEnum):
     CREATED = "created"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
+    CONFIRMED = "confirmed"
     SCHEDULED = "scheduled"
     DUE = "due"
     PENDING_DELIVERY = "pending_delivery"
@@ -35,7 +38,23 @@ class InvalidTaskTransition(ValueError):
 
 _TRANSITIONS = {
     (TaskStatus.CREATED, TaskEventType.SCHEDULED): TaskStatus.SCHEDULED,
+    (
+        TaskStatus.CREATED,
+        TaskEventType.AWAITING_CONFIRMATION,
+    ): TaskStatus.AWAITING_CONFIRMATION,
     (TaskStatus.CREATED, TaskEventType.CANCELLED): TaskStatus.CANCELLED,
+    (
+        TaskStatus.AWAITING_CONFIRMATION,
+        TaskEventType.CONFIRMED,
+    ): TaskStatus.SCHEDULED,
+    (
+        TaskStatus.AWAITING_CONFIRMATION,
+        TaskEventType.REJECTED,
+    ): TaskStatus.REJECTED,
+    (
+        TaskStatus.AWAITING_CONFIRMATION,
+        TaskEventType.CANCELLED,
+    ): TaskStatus.CANCELLED,
     (TaskStatus.SCHEDULED, TaskEventType.DUE): TaskStatus.DUE,
     (TaskStatus.SCHEDULED, TaskEventType.CANCELLED): TaskStatus.CANCELLED,
     (TaskStatus.DUE, TaskEventType.PENDING_DELIVERY): TaskStatus.PENDING_DELIVERY,
