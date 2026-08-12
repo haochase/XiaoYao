@@ -173,6 +173,14 @@ def test_settings_loads_memory_proposal_ttl(monkeypatch) -> None:
     assert settings.memory_proposal_ttl_seconds == 90
 
 
+def test_settings_loads_memory_cleanup_interval(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MEMORY_CLEANUP_INTERVAL_SECONDS", "3600")
+
+    settings = Settings.from_environment()
+
+    assert settings.memory_cleanup_interval_seconds == 3600
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [
@@ -180,6 +188,7 @@ def test_settings_loads_memory_proposal_ttl(monkeypatch) -> None:
         ("COMPANION_MEMORY_RETENTION_DAYS", "0"),
         ("COMPANION_MEMORY_QUOTA_BYTES", "0"),
         ("COMPANION_MEMORY_PROPOSAL_TTL_SECONDS", "0"),
+        ("COMPANION_MEMORY_CLEANUP_INTERVAL_SECONDS", "0"),
     ],
 )
 def test_settings_rejects_invalid_memory_configuration(

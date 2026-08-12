@@ -60,6 +60,20 @@ def test_health_does_not_claim_dependency_readiness(client: TestClient) -> None:
     }
 
 
+def test_enabled_memory_scheduler_starts_and_stops_with_app(tmp_path) -> None:
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "memory-scheduler.db",
+            memory_enabled=True,
+        )
+    )
+
+    with TestClient(app):
+        assert app.state.memory_scheduler.is_running is True
+
+    assert app.state.memory_scheduler.is_running is False
+
+
 def test_device_status_api_reports_unknown_device_as_offline(
     client: TestClient,
 ) -> None:

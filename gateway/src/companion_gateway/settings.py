@@ -290,6 +290,7 @@ class Settings:
     memory_retention_days: int = 60
     memory_quota_bytes: int = 50_000_000
     memory_proposal_ttl_seconds: int = 600
+    memory_cleanup_interval_seconds: float = 86_400.0
     task_scheduler_enabled: bool = False
     task_scheduler_interval_seconds: float = 1.0
     device_hello_timeout_seconds: float = 10.0
@@ -387,6 +388,10 @@ class Settings:
         if self.memory_proposal_ttl_seconds <= 0:
             raise ValueError(
                 "COMPANION_MEMORY_PROPOSAL_TTL_SECONDS must be positive"
+            )
+        if self.memory_cleanup_interval_seconds <= 0:
+            raise ValueError(
+                "COMPANION_MEMORY_CLEANUP_INTERVAL_SECONDS must be positive"
             )
         if self.audio_queue_capacity < 1:
             raise ValueError("COMPANION_AUDIO_QUEUE_CAPACITY must be positive")
@@ -537,6 +542,10 @@ class Settings:
             "COMPANION_MEMORY_PROPOSAL_TTL_SECONDS",
             "600",
         )
+        configured_memory_cleanup_interval = os.environ.get(
+            "COMPANION_MEMORY_CLEANUP_INTERVAL_SECONDS",
+            "86400",
+        )
         configured_audio_queue_capacity = os.environ.get(
             "COMPANION_AUDIO_QUEUE_CAPACITY",
             "256",
@@ -627,6 +636,14 @@ class Settings:
             raise ValueError(
                 "COMPANION_MEMORY_PROPOSAL_TTL_SECONDS must be an integer"
             ) from exc
+        try:
+            memory_cleanup_interval_seconds = float(
+                configured_memory_cleanup_interval
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_MEMORY_CLEANUP_INTERVAL_SECONDS must be a number"
+            ) from exc
         return cls(
             database_path=(
                 Path(configured_path) if configured_path else Path("data/companion.db")
@@ -663,6 +680,7 @@ class Settings:
             memory_retention_days=memory_retention_days,
             memory_quota_bytes=memory_quota_bytes,
             memory_proposal_ttl_seconds=memory_proposal_ttl_seconds,
+            memory_cleanup_interval_seconds=memory_cleanup_interval_seconds,
             task_scheduler_enabled=task_scheduler_enabled,
             task_scheduler_interval_seconds=task_scheduler_interval_seconds,
             audio_queue_capacity=audio_queue_capacity,

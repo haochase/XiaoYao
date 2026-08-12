@@ -56,6 +56,7 @@ from companion_gateway.memory.service import (
     MemoryQuotaExceeded,
     MemoryService,
 )
+from companion_gateway.memory.scheduler import MemoryScheduler
 from companion_gateway.notifications.feishu import FeishuNotifier
 from companion_gateway.domain.tasks import InvalidTaskTransition, TaskEventType
 from companion_gateway.service import TaskService
@@ -210,6 +211,11 @@ def create_app(
         proposal_ttl_seconds=settings.memory_proposal_ttl_seconds,
         clock=memory_clock,
     )
+    memory_scheduler = MemoryScheduler(
+        service=memory_service,
+        interval_seconds=settings.memory_cleanup_interval_seconds,
+        clock=memory_clock,
+    )
     medication_scheduler = MedicationScheduler(
         service=medication_service,
         interval_seconds=settings.task_scheduler_interval_seconds,
@@ -227,6 +233,7 @@ def create_app(
     app.state.medication_scheduler = medication_scheduler
     app.state.medication_notifier = medication_notifier
     app.state.memory_service = memory_service
+    app.state.memory_scheduler = memory_scheduler
     if voice_delivery_service is not None:
         voice_delivery_service.set_task_executor(task_executor)
         voice_delivery_service.set_medication_service(medication_service)
@@ -236,6 +243,9 @@ def create_app(
         app.add_event_handler("shutdown", task_scheduler.stop)
         app.add_event_handler("startup", medication_scheduler.start)
         app.add_event_handler("shutdown", medication_scheduler.stop)
+    if settings.memory_enabled:
+        app.add_event_handler("startup", memory_scheduler.start)
+        app.add_event_handler("shutdown", memory_scheduler.stop)
 
     @app.middleware("http")
     async def attach_trace_id(request: Request, call_next):
