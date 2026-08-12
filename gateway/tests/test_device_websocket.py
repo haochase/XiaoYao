@@ -142,6 +142,7 @@ def test_valid_hello_receives_xiaozhi_server_hello(client: TestClient) -> None:
         response = websocket.receive_json()
 
     assert response["type"] == "hello"
+    assert response["version"] == 1
     assert response["transport"] == "websocket"
     assert response["session_id"].startswith("ses_")
     assert response["audio_params"] == {

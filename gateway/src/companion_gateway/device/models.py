@@ -45,6 +45,7 @@ DeviceControl = ListenControl | AbortControl
 def server_hello(session_id: str) -> dict[str, object]:
     return {
         "type": "hello",
+        "version": 1,
         "transport": "websocket",
         "session_id": session_id,
         "audio_params": {

@@ -559,7 +559,20 @@ def create_app(
             if previous is not None:
                 previous.close()
                 transport.unregister(previous.session_id)
-            await websocket.send_json(server_hello(session.session_id))
+            response_hello = server_hello(session.session_id)
+            logger.info(
+                "device_ws_server_hello device=%s session=%s version=%s transport=%s "
+                "audio=%s/%s/%s/%sms",
+                redact_device_id(device_id),
+                session.session_id,
+                response_hello["version"],
+                response_hello["transport"],
+                response_hello["audio_params"]["format"],
+                response_hello["audio_params"]["sample_rate"],
+                response_hello["audio_params"]["channels"],
+                response_hello["audio_params"]["frame_duration"],
+            )
+            await websocket.send_json(response_hello)
             transport.register(session.session_id)
 
             async def forward_outbound() -> None:
