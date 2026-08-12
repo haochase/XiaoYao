@@ -250,10 +250,22 @@ class MimoV25Runtime:
         reply, task, action, memory_proposals = _decode_json_response(
             _text_content(chat_message)
         )
+        response_pcm = self.synthesize(reply)
+        return ModelResponse(
+            text=reply,
+            pcm=response_pcm,
+            task=task,
+            action=action,
+            memory_proposals=memory_proposals,
+        )
+
+    def synthesize(self, text: str) -> Pcm16Mono:
+        if not text.strip():
+            raise ModelRuntimeError("MiMo TTS text is required")
         tts_message = self._request(
             {
                 "model": self._tts_model,
-                "messages": [{"role": "assistant", "content": reply}],
+                "messages": [{"role": "assistant", "content": text}],
                 "audio": {"format": "pcm16", "voice": self._tts_voice},
                 "stream": False,
             }
@@ -272,13 +284,7 @@ class MimoV25Runtime:
             )
         except (binascii.Error, ValueError) as exc:
             raise ModelRuntimeError("MiMo TTS response audio is invalid") from exc
-        return ModelResponse(
-            text=reply,
-            pcm=response_pcm,
-            task=task,
-            action=action,
-            memory_proposals=memory_proposals,
-        )
+        return response_pcm
 
     def _request(self, payload: dict[str, object]) -> dict[str, object]:
         encoded_payload = json.dumps(payload, separators=(",", ":")).encode("utf-8")

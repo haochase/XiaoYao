@@ -4,6 +4,7 @@ import logging
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated
 from uuid import uuid4
 
@@ -46,7 +47,12 @@ from companion_gateway.device.transport import (
 from companion_gateway.domain.memory import MemoryCandidate, MemoryCategory, utc_now
 from companion_gateway.domain.executor import TaskExecutor
 from companion_gateway.domain.medication import MedicationPlanCreate
-from companion_gateway.domain.models import ContentText, Identifier, TaskCreate, TaskRecord
+from companion_gateway.domain.models import (
+    ContentText,
+    Identifier,
+    TaskCreate,
+    TaskRecord,
+)
 from companion_gateway.domain.scheduler import TaskScheduler
 from companion_gateway.medication.scheduler import MedicationScheduler
 from companion_gateway.medication.service import (
@@ -76,7 +82,7 @@ from companion_gateway.vision.service import (
 from companion_gateway.notifications.feishu import FeishuNotifier
 from companion_gateway.domain.tasks import InvalidTaskTransition, TaskEventType
 from companion_gateway.service import TaskService
-from companion_gateway.settings import Settings
+from companion_gateway.settings import Settings, load_environment_file
 from companion_gateway.storage.sqlite import SQLiteTaskRepository
 from companion_gateway.voice.delivery import DeviceVoiceDeliveryService
 from companion_gateway.voice.fixture import (
@@ -135,6 +141,7 @@ logger.setLevel(logging.INFO)
 if not logger.handlers:
     logger.addHandler(logging.StreamHandler())
 logger.propagate = False
+LOCAL_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 
 
 def _request_trace_id(request: Request) -> str:
@@ -171,7 +178,26 @@ def create_app(
             )
             return False
         try:
-            transport.send_task(session.session_id, task)
+            if medication_service.is_medication_task(task.task_id):
+                if voice_delivery_service is None:
+                    logger.info(
+                        "task_delivery_failed device=%s task=%s "
+                        "reason=voice_synthesis_unavailable",
+                        redact_device_id(task.target_device_id),
+                        task.task_id,
+                    )
+                    return False
+                voice_delivery_service.synthesize_and_send(
+                    session_id=session.session_id,
+                    text=task.payload.text,
+                )
+                logger.info(
+                    "medication_voice_enqueued device=%s task=%s",
+                    redact_device_id(task.target_device_id),
+                    task.task_id,
+                )
+            else:
+                transport.send_task(session.session_id, task)
         except DeviceNotConnected:
             logger.info(
                 "task_delivery_failed device=%s task=%s reason=device_offline",
@@ -183,6 +209,13 @@ def create_app(
             logger.info(
                 "task_delivery_failed device=%s task=%s "
                 "reason=outbound_backpressure",
+                redact_device_id(task.target_device_id),
+                task.task_id,
+            )
+            return False
+        except (ModelRuntimeError, RuntimeError, ValueError):
+            logger.info(
+                "task_delivery_failed device=%s task=%s reason=voice_synthesis_failed",
                 redact_device_id(task.target_device_id),
                 task.task_id,
             )
@@ -1087,6 +1120,7 @@ def create_app(
 
 
 def create_default_app() -> FastAPI:
+    load_environment_file(LOCAL_ENV_PATH)
     settings = Settings.from_environment()
     transport = DeviceTransport()
     voice_delivery_service = None

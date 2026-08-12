@@ -1,6 +1,7 @@
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from hashlib import sha256
+import os
 from pathlib import Path
 import wave
 
@@ -15,7 +16,7 @@ from companion_gateway.device.models import DeviceHello
 from companion_gateway.device.session import DeviceSession
 from companion_gateway.device.transport import DeviceOutboundBackpressure
 from companion_gateway.domain.models import TaskCreate
-from companion_gateway.domain.medication import FeishuSendResult
+from companion_gateway.domain.medication import FeishuSendResult, MedicationPlanCreate
 from companion_gateway.domain.tasks import TaskEventType, TaskStatus
 from companion_gateway.settings import Settings
 from companion_gateway.voice.minicpm_o import (
@@ -23,6 +24,23 @@ from companion_gateway.voice.minicpm_o import (
     MinicpmORealtimeRuntime,
 )
 from companion_gateway.voice.mimo_v25 import MimoV25Runtime
+
+
+class RecordingReminderVoiceDelivery:
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    def synthesize_and_send(self, *, session_id: str, text: str) -> None:
+        self.messages.append((session_id, text))
+
+    def set_task_executor(self, task_executor) -> None:
+        return None
+
+    def set_medication_service(self, medication_service) -> None:
+        return None
+
+    def set_memory_service(self, memory_service) -> None:
+        return None
 
 
 def task_payload() -> dict[str, object]:
@@ -45,6 +63,22 @@ def client(tmp_path) -> Iterator[TestClient]:
     app = create_app(Settings(database_path=tmp_path / "api.db"))
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture(autouse=True)
+def isolate_local_environment_file(monkeypatch, tmp_path) -> Iterator[None]:
+    original = {
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith("COMPANION_")
+    }
+    monkeypatch.setattr(api_module, "LOCAL_ENV_PATH", tmp_path / "missing.env")
+    yield
+    for key in tuple(os.environ):
+        if key.startswith("COMPANION_"):
+            monkeypatch.delenv(key, raising=False)
+    for key, value in original.items():
+        monkeypatch.setenv(key, value)
 
 
 def test_health_does_not_claim_dependency_readiness(client: TestClient) -> None:
@@ -240,6 +274,152 @@ def test_task_delivery_logs_outbound_backpressure(tmp_path, monkeypatch) -> None
     )
 
 
+def test_reminder_delivery_uses_voice_tts_instead_of_task_json(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    device_id = "dev-reminder"
+    voice_delivery = RecordingReminderVoiceDelivery()
+    app = create_app(
+        Settings(database_path=tmp_path / "reminder-tts.db"),
+        voice_delivery_service=voice_delivery,
+    )
+    session = DeviceSession.create(
+        device_id=device_id,
+        client_id="reminder-client",
+        hello=DeviceHello.model_validate(
+            {
+                "type": "hello",
+                "version": 1,
+                "transport": "websocket",
+                "audio_params": {
+                    "format": "opus",
+                    "sample_rate": 16_000,
+                    "channels": 1,
+                    "frame_duration": 60,
+                },
+            }
+        ),
+    )
+    app.state.device_sessions.connect(session)
+    task, _ = app.state.task_executor.create_and_schedule(
+        TaskCreate.model_validate(
+            {
+                **task_payload(),
+                "target_device_id": device_id,
+                "confirmation_policy": "optional",
+                "idempotency_key": "reminder:tts:1",
+            }
+        ),
+        trace_id="trace-reminder-tts",
+    )
+    monkeypatch.setattr(
+        app.state.medication_service,
+        "is_medication_task",
+        lambda task_id: task_id == task.task_id,
+    )
+
+    app.state.task_scheduler.tick(now=datetime(2026, 8, 6, 12, tzinfo=UTC))
+
+    assert voice_delivery.messages == [(session.session_id, "take medicine")]
+    assert app.state.service.get_task(task.task_id).status is TaskStatus.DELIVERED
+
+
+def test_medication_plan_delivery_uses_voice_tts(tmp_path) -> None:
+    device_id = "medication-device"
+    voice_delivery = RecordingReminderVoiceDelivery()
+    app = create_app(
+        Settings(database_path=tmp_path / "medication-tts.db"),
+        voice_delivery_service=voice_delivery,
+    )
+    session = DeviceSession.create(
+        device_id=device_id,
+        client_id="medication-client",
+        hello=DeviceHello.model_validate(
+            {
+                "type": "hello",
+                "version": 1,
+                "transport": "websocket",
+                "audio_params": {
+                    "format": "opus",
+                    "sample_rate": 16_000,
+                    "channels": 1,
+                    "frame_duration": 60,
+                },
+            }
+        ),
+    )
+    app.state.device_sessions.connect(session)
+    plan, _ = app.state.service.create_medication_plan(
+        MedicationPlanCreate(
+            actor_id="voice-user",
+            target_device_id=device_id,
+            reminder_times=(time(20),),
+            message="请确认已服药",
+        ),
+        trace_id="trace-medication-tts",
+    )
+    due_at = datetime(2026, 8, 6, 12, tzinfo=UTC)
+
+    app.state.medication_service.tick(now=due_at)
+    app.state.task_scheduler.tick(now=due_at)
+
+    occurrence = app.state.repository.list_medication_occurrences()[0]
+    task = app.state.service.get_task(occurrence.task_id)
+    assert plan.target_device_id == device_id
+    assert occurrence.task_id is not None
+    assert task is not None and task.status is TaskStatus.DELIVERED
+    assert voice_delivery.messages == [(session.session_id, "请确认已服药")]
+
+
+def test_medication_plan_stays_pending_without_voice_runtime(tmp_path, monkeypatch) -> None:
+    messages: list[str] = []
+
+    def capture_info(message: str, *args: object) -> None:
+        messages.append(message % args)
+
+    monkeypatch.setattr(api_module.logger, "info", capture_info)
+    device_id = "medication-no-voice"
+    app = create_app(Settings(database_path=tmp_path / "medication-no-voice.db"))
+    app.state.device_sessions.connect(
+        DeviceSession.create(
+            device_id=device_id,
+            client_id="medication-client",
+            hello=DeviceHello.model_validate(
+                {
+                    "type": "hello",
+                    "version": 1,
+                    "transport": "websocket",
+                    "audio_params": {
+                        "format": "opus",
+                        "sample_rate": 16_000,
+                        "channels": 1,
+                        "frame_duration": 60,
+                    },
+                }
+            ),
+        )
+    )
+    app.state.service.create_medication_plan(
+        MedicationPlanCreate(
+            actor_id="voice-user",
+            target_device_id=device_id,
+            reminder_times=(time(20),),
+            message="请确认已服药",
+        ),
+        trace_id="trace-medication-no-voice",
+    )
+    due_at = datetime(2026, 8, 6, 12, tzinfo=UTC)
+
+    app.state.medication_service.tick(now=due_at)
+    app.state.task_scheduler.tick(now=due_at)
+
+    occurrence = app.state.repository.list_medication_occurrences()[0]
+    task = app.state.service.get_task(occurrence.task_id)
+    assert task is not None and task.status is TaskStatus.PENDING_DELIVERY
+    assert any("reason=voice_synthesis_unavailable" in message for message in messages)
+
+
 def test_ota_bootstrap_returns_an_enrolled_device_configuration(tmp_path) -> None:
     token = "bootstrap-token"
     app = create_app(
@@ -371,6 +551,27 @@ def test_default_app_enables_fixture_voice_only_when_configured(
     app = create_default_app()
 
     assert app.state.voice_delivery_service is not None
+
+
+def test_default_app_loads_gateway_dotenv_file(tmp_path, monkeypatch) -> None:
+    environment_file = tmp_path / ".env"
+    database_path = tmp_path / "dotenv-default.db"
+    environment_file.write_text(
+        "COMPANION_VOICE_RUNTIME=mimo\n"
+        "COMPANION_MIMO_API_KEY=dotenv-token\n"
+        f"COMPANION_DB_PATH={database_path}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(api_module, "LOCAL_ENV_PATH", environment_file)
+    monkeypatch.delenv("COMPANION_VOICE_RUNTIME", raising=False)
+    monkeypatch.delenv("COMPANION_MIMO_API_KEY", raising=False)
+    monkeypatch.delenv("COMPANION_DB_PATH", raising=False)
+
+    app = create_default_app()
+
+    runtime = app.state.voice_delivery_service._voice_turn_service._model_runtime
+    assert isinstance(runtime, MimoV25Runtime)
+    assert app.state.repository._database_path == database_path
 
 
 def test_default_app_selects_minicpm_o_http_runtime(monkeypatch, tmp_path) -> None:
@@ -553,6 +754,7 @@ def test_default_app_fixture_voice_returns_a_full_tts_stream(
         "COMPANION_DEVICE_TOKEN_HASHES",
         f'{{"{device_id}":"{sha256(token.encode()).hexdigest()}"}}',
     )
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "fixture")
     monkeypatch.setenv("COMPANION_FAKE_VOICE_FIXTURE_PATH", str(fixture_path))
     with wave.open(str(fixture_path), "rb") as source:
         input_pcm = Pcm16Mono(

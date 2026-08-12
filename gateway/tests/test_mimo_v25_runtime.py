@@ -108,6 +108,32 @@ def test_mimo_runtime_sends_audio_to_chat_then_tts(monkeypatch) -> None:
     }
 
 
+def test_mimo_runtime_synthesizes_reminder_text_with_tts(monkeypatch) -> None:
+    requests: list[dict[str, object]] = []
+
+    def fake_urlopen(request, *, timeout):
+        requests.append(json.loads(request.data))
+        return FakeResponse(tts_payload())
+
+    monkeypatch.setattr(mimo_v25, "urlopen", fake_urlopen)
+    runtime = MimoV25Runtime(
+        openai_base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        api_key="example-token",
+    )
+
+    pcm = runtime.synthesize("请按时服药")
+
+    assert pcm == Pcm16Mono(sample_rate=24_000, payload=b"\x02\x00" * 1_440)
+    assert requests == [
+        {
+            "model": "mimo-v2.5-tts",
+            "messages": [{"role": "assistant", "content": "请按时服药"}],
+            "audio": {"format": "pcm16", "voice": "mimo_default"},
+            "stream": False,
+        }
+    ]
+
+
 def test_mimo_runtime_extracts_validated_task(monkeypatch) -> None:
     task = {
         "actor_id": "voice-user",

@@ -160,6 +160,11 @@ class MedicationRepository(Protocol):
         self, occurrence_id: str
     ) -> MedicationOccurrence | None: ...
 
+    def get_medication_occurrence_by_task_id(
+        self,
+        task_id: str,
+    ) -> MedicationOccurrence | None: ...
+
     def list_medication_occurrences(
         self, *, statuses: tuple[MedicationOccurrenceStatus, ...] | None = None
     ) -> list[MedicationOccurrence]: ...

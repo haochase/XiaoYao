@@ -220,6 +220,9 @@ class MedicationReminderService:
             "plan_ids": active_plan_ids,
         }
 
+    def is_medication_task(self, task_id: str) -> bool:
+        return self._repository.get_medication_occurrence_by_task_id(task_id) is not None
+
     def _ensure_today_occurrences(
         self,
         plan: MedicationPlan,

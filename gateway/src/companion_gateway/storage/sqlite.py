@@ -684,6 +684,17 @@ class SQLiteTaskRepository:
             ).fetchone()
         return self._medication_occurrence_from_row(row) if row is not None else None
 
+    def get_medication_occurrence_by_task_id(
+        self,
+        task_id: str,
+    ) -> MedicationOccurrence | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM medication_occurrences WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return self._medication_occurrence_from_row(row) if row is not None else None
+
     def list_medication_occurrences(
         self, *, statuses: tuple[MedicationOccurrenceStatus, ...] | None = None
     ) -> list[MedicationOccurrence]:

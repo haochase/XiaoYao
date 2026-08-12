@@ -111,6 +111,16 @@ class VoiceTurnService:
     def set_memory_service(self, memory_service: MemoryService) -> None:
         self._memory_service = memory_service
 
+    def synthesize_text(self, text: str) -> tuple[bytes, ...]:
+        synthesize = getattr(self._model_runtime, "synthesize", None)
+        if synthesize is None:
+            raise RuntimeError("voice runtime does not support text synthesis")
+        response_pcm = synthesize(text)
+        return tuple(
+            self._audio_bridge.encode_downlink(frame)
+            for frame in self._split_response_pcm(response_pcm)
+        )
+
     def _process_input(
         self,
         input_pcm: Pcm16Mono,

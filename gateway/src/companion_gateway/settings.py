@@ -15,6 +15,32 @@ _DEFAULT_MIMO_ANTHROPIC_BASE_URL = "https://token-plan-cn.xiaomimimo.com/anthrop
 VoiceRuntimeMode = Literal["none", "fixture", "http", "realtime", "mimo"]
 
 
+def load_environment_file(path: Path) -> set[str]:
+    """Load local defaults without overriding an explicitly exported value."""
+    if not path.is_file():
+        return set()
+
+    loaded: set[str] = set()
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").lstrip()
+        if "=" not in line:
+            raise ValueError(f"invalid environment assignment in {path.name}")
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            raise ValueError(f"invalid environment variable name in {path.name}")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+        loaded.add(key)
+    return loaded
+
+
 def _validate_device_id(device_id: object) -> bool:
     return (
         isinstance(device_id, str)

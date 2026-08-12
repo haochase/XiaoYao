@@ -459,6 +459,31 @@ def test_device_voice_delivery_sends_processed_turn_to_active_session() -> None:
     assert transport.messages == [("ses-active", (b"opus-reply",))]
 
 
+def test_device_voice_delivery_synthesizes_and_sends_reminder_text() -> None:
+    response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
+    codec = EchoOpusCodec(pcm_frame(sample_rate=16_000, sample_count=960))
+    voice_turns = VoiceTurnService(
+        audio_bridge=AudioBridge(
+            codec=codec,
+            model_sample_rate=16_000,
+            queue_capacity=1,
+        ),
+        model_runtime=FakeModelRuntime(
+            response_text="reply",
+            response_pcm=response_pcm,
+        ),
+    )
+    transport = RecordingTransport()
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=voice_turns,
+        device_transport=transport,
+    )
+
+    delivery.synthesize_and_send(session_id="ses-reminder", text="take medicine")
+
+    assert transport.messages == [("ses-reminder", (b"opus-reply",))]
+
+
 def test_device_voice_delivery_propagates_memory_service(tmp_path) -> None:
     repository = SQLiteTaskRepository(tmp_path / "delivery-memory.db")
     repository.initialize()

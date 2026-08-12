@@ -59,3 +59,8 @@ class FakeModelRuntime:
     def respond(self, pcm: Pcm16Mono) -> ModelResponse:
         self.received_inputs.append(pcm)
         return self._response
+
+    def synthesize(self, text: str) -> Pcm16Mono:
+        if not text.strip():
+            raise ValueError("speech text must not be empty")
+        return self._response.pcm

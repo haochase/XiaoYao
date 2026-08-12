@@ -1,9 +1,37 @@
 from hashlib import sha256
+import os
 from pathlib import Path
 
 import pytest
 
-from companion_gateway.settings import Settings
+from companion_gateway.settings import Settings, load_environment_file
+
+
+def test_load_environment_file_uses_file_defaults_and_preserves_process_values(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    environment_file = tmp_path / ".env"
+    environment_file.write_text(
+        "# local-only settings\n"
+        "COMPANION_VOICE_RUNTIME=mimo\n"
+        "COMPANION_MIMO_API_KEY='file-token'\n"
+        "EMPTY_VALUE=\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "fixture")
+    monkeypatch.delenv("COMPANION_MIMO_API_KEY", raising=False)
+
+    loaded = load_environment_file(environment_file)
+
+    assert loaded == {
+        "COMPANION_VOICE_RUNTIME",
+        "COMPANION_MIMO_API_KEY",
+        "EMPTY_VALUE",
+    }
+    assert os.environ["COMPANION_VOICE_RUNTIME"] == "fixture"
+    assert os.environ["COMPANION_MIMO_API_KEY"] == "file-token"
+    assert os.environ["EMPTY_VALUE"] == ""
 
 
 def test_settings_parse_valid_device_token_hashes(monkeypatch) -> None:

@@ -46,12 +46,17 @@ class DeviceVoiceDeliveryService:
             )
         if turn is None:
             return None
-        for offset in range(0, len(turn.device_opus_frames), MAX_TTS_FRAMES):
-            self._device_transport.send_tts_stream(
-                session_id,
-                turn.device_opus_frames[offset : offset + MAX_TTS_FRAMES],
-            )
+        self._send_tts_frames(
+            session_id=session_id,
+            opus_frames=turn.device_opus_frames,
+        )
         return turn
+
+    def synthesize_and_send(self, *, session_id: str, text: str) -> None:
+        self._send_tts_frames(
+            session_id=session_id,
+            opus_frames=self._voice_turn_service.synthesize_text(text),
+        )
 
     async def process_and_send_async(
         self,
@@ -91,3 +96,15 @@ class DeviceVoiceDeliveryService:
 
     def set_memory_service(self, memory_service: MemoryService) -> None:
         self._voice_turn_service.set_memory_service(memory_service)
+
+    def _send_tts_frames(
+        self,
+        *,
+        session_id: str,
+        opus_frames: tuple[bytes, ...],
+    ) -> None:
+        for offset in range(0, len(opus_frames), MAX_TTS_FRAMES):
+            self._device_transport.send_tts_stream(
+                session_id,
+                opus_frames[offset : offset + MAX_TTS_FRAMES],
+            )
