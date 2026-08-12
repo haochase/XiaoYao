@@ -16,6 +16,7 @@ from companion_gateway.domain.medication import (
     MedicationPlan,
     MedicationPlanCreate,
 )
+from companion_gateway.domain.vision import VisionObservation
 from companion_gateway.domain.tasks import TaskEventType, TaskStatus, transition
 
 
@@ -138,6 +139,22 @@ class SQLiteTaskRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_memory_proposals_subject_expiry
                 ON memory_proposals(subject_id, expires_at);
+
+                CREATE TABLE IF NOT EXISTS vision_observations (
+                    observation_id TEXT PRIMARY KEY,
+                    subject_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    content_type TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    storage_key TEXT NOT NULL,
+                    UNIQUE(subject_id, turn_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_vision_observations_subject_expiry
+                ON vision_observations(subject_id, expires_at);
                 """
             )
 
@@ -253,6 +270,121 @@ class SQLiteTaskRepository:
                 (subject_id, current),
             ).fetchall()
         return sum(len(row["value"].encode("utf-8")) for row in rows)
+
+    def create_vision_observation(
+        self,
+        observation: VisionObservation,
+    ) -> tuple[VisionObservation, bool]:
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM vision_observations WHERE subject_id = ? AND turn_id = ?",
+                (observation.subject_id, observation.turn_id),
+            ).fetchone()
+            if existing is not None:
+                return self._vision_observation_from_row(existing), False
+            connection.execute(
+                """
+                INSERT INTO vision_observations (
+                    observation_id, subject_id, turn_id, captured_at, expires_at,
+                    content_type, byte_size, sha256, storage_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    observation.observation_id,
+                    observation.subject_id,
+                    observation.turn_id,
+                    _require_aware(observation.captured_at).isoformat(),
+                    _require_aware(observation.expires_at).isoformat(),
+                    observation.content_type,
+                    observation.byte_size,
+                    observation.sha256,
+                    observation.storage_key,
+                ),
+            )
+        return observation, True
+
+    def get_vision_observation(self, observation_id: str) -> VisionObservation | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM vision_observations WHERE observation_id = ?",
+                (observation_id,),
+            ).fetchone()
+        return self._vision_observation_from_row(row) if row is not None else None
+
+    def get_vision_observation_for_turn(
+        self,
+        *,
+        subject_id: str,
+        turn_id: str,
+        now: datetime,
+    ) -> VisionObservation | None:
+        current = _require_aware(now).isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM vision_observations
+                WHERE subject_id = ? AND turn_id = ? AND expires_at > ?
+                """,
+                (subject_id, turn_id, current),
+            ).fetchone()
+        return self._vision_observation_from_row(row) if row is not None else None
+
+    def list_vision_observations(
+        self,
+        *,
+        subject_id: str,
+        now: datetime,
+    ) -> list[VisionObservation]:
+        current = _require_aware(now).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM vision_observations
+                WHERE subject_id = ? AND expires_at > ?
+                ORDER BY captured_at, observation_id
+                """,
+                (subject_id, current),
+            ).fetchall()
+        return [self._vision_observation_from_row(row) for row in rows]
+
+    def delete_vision_observation(
+        self,
+        *,
+        subject_id: str,
+        observation_id: str,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM vision_observations WHERE observation_id = ? AND subject_id = ?",
+                (observation_id, subject_id),
+            )
+        return cursor.rowcount == 1
+
+    def purge_expired_vision_observations(self, *, now: datetime) -> list[str]:
+        current = _require_aware(now).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT storage_key FROM vision_observations WHERE expires_at <= ?",
+                (current,),
+            ).fetchall()
+            connection.execute(
+                "DELETE FROM vision_observations WHERE expires_at <= ?",
+                (current,),
+            )
+        return [row["storage_key"] for row in rows]
+
+    def vision_usage_bytes(self, *, subject_id: str, now: datetime) -> int:
+        current = _require_aware(now).isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COALESCE(SUM(byte_size), 0) AS total
+                FROM vision_observations
+                WHERE subject_id = ? AND expires_at > ?
+                """,
+                (subject_id, current),
+            ).fetchone()
+        return int(row["total"])
 
     def create_memory_proposal(
         self,
@@ -976,5 +1108,21 @@ class SQLiteTaskRepository:
                 "source": row["source"],
                 "created_at": row["created_at"],
                 "expires_at": row["expires_at"],
+            }
+        )
+
+    @staticmethod
+    def _vision_observation_from_row(row: sqlite3.Row) -> VisionObservation:
+        return VisionObservation.model_validate(
+            {
+                "observation_id": row["observation_id"],
+                "subject_id": row["subject_id"],
+                "turn_id": row["turn_id"],
+                "captured_at": row["captured_at"],
+                "expires_at": row["expires_at"],
+                "content_type": row["content_type"],
+                "byte_size": row["byte_size"],
+                "sha256": row["sha256"],
+                "storage_key": row["storage_key"],
             }
         )

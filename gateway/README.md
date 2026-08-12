@@ -306,6 +306,17 @@ and is not enabled by this local development slice. Only the `address` category
 is supplied to the model, limited to one value and 256 UTF-8 bytes; pending
 proposals expire after ten minutes.
 
+## Optional single-image input
+
+Vision input is disabled by default. When enabled, a client can upload one
+JPEG, PNG, or WebP image for one voice turn to `/v1/vision/observations` with
+`X-Subject-Id`, `X-Turn-Id`, and `X-Vision-Consent: true` headers. Images are
+stored only under `COMPANION_VISION_STORAGE_PATH`, limited to 10 MB, retained
+for seven days, and removed by the opt-in cleanup loop. The upload response
+contains metadata and a digest, never image bytes or an absolute path. The
+ESP32 audio WebSocket and model runtime remain audio-only until a separate
+multimodal adapter contract is added.
+
 ## Repeatable voice check
 
 Install the gateway dependencies, then configure the device endpoint and token

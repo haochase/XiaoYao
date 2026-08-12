@@ -202,6 +202,45 @@ def test_settings_rejects_invalid_memory_configuration(
         Settings.from_environment()
 
 
+def test_settings_loads_vision_configuration(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("COMPANION_VISION_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_VISION_STORAGE_PATH", str(tmp_path / "vision"))
+    monkeypatch.setenv("COMPANION_VISION_MAX_UPLOAD_BYTES", "9000000")
+    monkeypatch.setenv("COMPANION_VISION_RETENTION_DAYS", "7")
+    monkeypatch.setenv("COMPANION_VISION_QUOTA_BYTES", "123456")
+    monkeypatch.setenv("COMPANION_VISION_CLEANUP_INTERVAL_SECONDS", "3600")
+
+    settings = Settings.from_environment()
+
+    assert settings.vision_enabled is True
+    assert settings.vision_storage_path == tmp_path / "vision"
+    assert settings.vision_max_upload_bytes == 9_000_000
+    assert settings.vision_retention_days == 7
+    assert settings.vision_quota_bytes == 123456
+    assert settings.vision_cleanup_interval_seconds == 3600
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("COMPANION_VISION_ENABLED", "sometimes"),
+        ("COMPANION_VISION_MAX_UPLOAD_BYTES", "0"),
+        ("COMPANION_VISION_RETENTION_DAYS", "0"),
+        ("COMPANION_VISION_QUOTA_BYTES", "0"),
+        ("COMPANION_VISION_CLEANUP_INTERVAL_SECONDS", "0"),
+    ],
+)
+def test_settings_rejects_invalid_vision_configuration(
+    monkeypatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        Settings.from_environment()
+
+
 def test_settings_rejects_partial_feishu_configuration(monkeypatch) -> None:
     monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test_app")
     monkeypatch.delenv("COMPANION_FEISHU_APP_SECRET", raising=False)

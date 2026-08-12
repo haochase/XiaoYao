@@ -291,6 +291,12 @@ class Settings:
     memory_quota_bytes: int = 50_000_000
     memory_proposal_ttl_seconds: int = 600
     memory_cleanup_interval_seconds: float = 86_400.0
+    vision_enabled: bool = False
+    vision_storage_path: Path = Path("data/vision")
+    vision_max_upload_bytes: int = 10_000_000
+    vision_retention_days: int = 7
+    vision_quota_bytes: int = 200_000_000
+    vision_cleanup_interval_seconds: float = 86_400.0
     task_scheduler_enabled: bool = False
     task_scheduler_interval_seconds: float = 1.0
     device_hello_timeout_seconds: float = 10.0
@@ -392,6 +398,20 @@ class Settings:
         if self.memory_cleanup_interval_seconds <= 0:
             raise ValueError(
                 "COMPANION_MEMORY_CLEANUP_INTERVAL_SECONDS must be positive"
+            )
+        if not isinstance(self.vision_enabled, bool):
+            raise ValueError("COMPANION_VISION_ENABLED must be true or false")
+        if self.vision_max_upload_bytes <= 0 or self.vision_max_upload_bytes > 10_000_000:
+            raise ValueError(
+                "COMPANION_VISION_MAX_UPLOAD_BYTES must be between 1 and 10000000"
+            )
+        if self.vision_retention_days <= 0:
+            raise ValueError("COMPANION_VISION_RETENTION_DAYS must be positive")
+        if self.vision_quota_bytes <= 0:
+            raise ValueError("COMPANION_VISION_QUOTA_BYTES must be positive")
+        if self.vision_cleanup_interval_seconds <= 0:
+            raise ValueError(
+                "COMPANION_VISION_CLEANUP_INTERVAL_SECONDS must be positive"
             )
         if self.audio_queue_capacity < 1:
             raise ValueError("COMPANION_AUDIO_QUEUE_CAPACITY must be positive")
@@ -546,6 +566,31 @@ class Settings:
             "COMPANION_MEMORY_CLEANUP_INTERVAL_SECONDS",
             "86400",
         )
+        vision_enabled = _parse_bool(
+            os.environ.get("COMPANION_VISION_ENABLED"),
+            name="COMPANION_VISION_ENABLED",
+            default=False,
+        )
+        configured_vision_storage_path = os.environ.get(
+            "COMPANION_VISION_STORAGE_PATH",
+            "data/vision",
+        )
+        configured_vision_max_upload_bytes = os.environ.get(
+            "COMPANION_VISION_MAX_UPLOAD_BYTES",
+            "10000000",
+        )
+        configured_vision_retention_days = os.environ.get(
+            "COMPANION_VISION_RETENTION_DAYS",
+            "7",
+        )
+        configured_vision_quota_bytes = os.environ.get(
+            "COMPANION_VISION_QUOTA_BYTES",
+            "200000000",
+        )
+        configured_vision_cleanup_interval = os.environ.get(
+            "COMPANION_VISION_CLEANUP_INTERVAL_SECONDS",
+            "86400",
+        )
         configured_audio_queue_capacity = os.environ.get(
             "COMPANION_AUDIO_QUEUE_CAPACITY",
             "256",
@@ -644,6 +689,32 @@ class Settings:
             raise ValueError(
                 "COMPANION_MEMORY_CLEANUP_INTERVAL_SECONDS must be a number"
             ) from exc
+        try:
+            vision_max_upload_bytes = int(configured_vision_max_upload_bytes)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_VISION_MAX_UPLOAD_BYTES must be an integer"
+            ) from exc
+        try:
+            vision_retention_days = int(configured_vision_retention_days)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_VISION_RETENTION_DAYS must be an integer"
+            ) from exc
+        try:
+            vision_quota_bytes = int(configured_vision_quota_bytes)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_VISION_QUOTA_BYTES must be an integer"
+            ) from exc
+        try:
+            vision_cleanup_interval_seconds = float(
+                configured_vision_cleanup_interval
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_VISION_CLEANUP_INTERVAL_SECONDS must be a number"
+            ) from exc
         return cls(
             database_path=(
                 Path(configured_path) if configured_path else Path("data/companion.db")
@@ -681,6 +752,12 @@ class Settings:
             memory_quota_bytes=memory_quota_bytes,
             memory_proposal_ttl_seconds=memory_proposal_ttl_seconds,
             memory_cleanup_interval_seconds=memory_cleanup_interval_seconds,
+            vision_enabled=vision_enabled,
+            vision_storage_path=Path(configured_vision_storage_path),
+            vision_max_upload_bytes=vision_max_upload_bytes,
+            vision_retention_days=vision_retention_days,
+            vision_quota_bytes=vision_quota_bytes,
+            vision_cleanup_interval_seconds=vision_cleanup_interval_seconds,
             task_scheduler_enabled=task_scheduler_enabled,
             task_scheduler_interval_seconds=task_scheduler_interval_seconds,
             audio_queue_capacity=audio_queue_capacity,

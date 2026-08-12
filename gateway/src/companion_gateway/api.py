@@ -57,6 +57,16 @@ from companion_gateway.memory.service import (
     MemoryService,
 )
 from companion_gateway.memory.scheduler import MemoryScheduler
+from companion_gateway.vision.scheduler import VisionScheduler
+from companion_gateway.vision.service import (
+    VisionConsentRequired,
+    VisionDuplicateTurn,
+    VisionFeatureDisabled,
+    VisionObservationService,
+    VisionQuotaExceeded,
+    VisionTooLarge,
+    VisionUnsupportedType,
+)
 from companion_gateway.notifications.feishu import FeishuNotifier
 from companion_gateway.domain.tasks import InvalidTaskTransition, TaskEventType
 from companion_gateway.service import TaskService
@@ -133,6 +143,7 @@ def create_app(
     voice_delivery_service: DeviceVoiceDeliveryService | None = None,
     medication_notifier: MedicationNotifier | None = None,
     memory_clock: Callable[[], datetime] = utc_now,
+    vision_clock: Callable[[], datetime] = utc_now,
 ) -> FastAPI:
     repository = SQLiteTaskRepository(settings.database_path)
     repository.initialize()
@@ -216,6 +227,20 @@ def create_app(
         interval_seconds=settings.memory_cleanup_interval_seconds,
         clock=memory_clock,
     )
+    vision_service = VisionObservationService(
+        repository=repository,
+        storage_path=settings.vision_storage_path,
+        enabled=settings.vision_enabled,
+        max_upload_bytes=settings.vision_max_upload_bytes,
+        retention_days=settings.vision_retention_days,
+        quota_bytes=settings.vision_quota_bytes,
+        clock=vision_clock,
+    )
+    vision_scheduler = VisionScheduler(
+        service=vision_service,
+        interval_seconds=settings.vision_cleanup_interval_seconds,
+        clock=vision_clock,
+    )
     medication_scheduler = MedicationScheduler(
         service=medication_service,
         interval_seconds=settings.task_scheduler_interval_seconds,
@@ -234,6 +259,8 @@ def create_app(
     app.state.medication_notifier = medication_notifier
     app.state.memory_service = memory_service
     app.state.memory_scheduler = memory_scheduler
+    app.state.vision_service = vision_service
+    app.state.vision_scheduler = vision_scheduler
     if voice_delivery_service is not None:
         voice_delivery_service.set_task_executor(task_executor)
         voice_delivery_service.set_medication_service(medication_service)
@@ -246,6 +273,9 @@ def create_app(
     if settings.memory_enabled:
         app.add_event_handler("startup", memory_scheduler.start)
         app.add_event_handler("shutdown", memory_scheduler.stop)
+    if settings.vision_enabled:
+        app.add_event_handler("startup", vision_scheduler.start)
+        app.add_event_handler("shutdown", vision_scheduler.stop)
 
     @app.middleware("http")
     async def attach_trace_id(request: Request, call_next):
@@ -274,6 +304,76 @@ def create_app(
     @app.get("/v1/devices/{device_id}/status")
     def device_status(device_id: Identifier) -> dict[str, object]:
         return {"device": jsonable_encoder(device_sessions.status(device_id))}
+
+    @app.post("/v1/vision/observations")
+    async def upload_vision_observation(request: Request) -> JSONResponse:
+        subject_id = request.headers.get("X-Subject-Id", "").strip()
+        turn_id = request.headers.get("X-Turn-Id", "").strip()
+        content_type = request.headers.get("Content-Type", "")
+        consent = request.headers.get("X-Vision-Consent", "").strip().lower() == "true"
+        if not subject_id or not turn_id:
+            raise HTTPException(status_code=400, detail="subject and turn headers required")
+        content_length = request.headers.get("Content-Length")
+        if content_length is not None:
+            try:
+                if int(content_length) > settings.vision_max_upload_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="vision image exceeds the upload limit",
+                    )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="invalid Content-Length",
+                ) from exc
+        try:
+            observation = vision_service.upload(
+                subject_id=subject_id,
+                turn_id=turn_id,
+                content_type=content_type,
+                payload=await request.body(),
+                consent=consent,
+            )
+        except VisionFeatureDisabled as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except VisionConsentRequired as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except VisionUnsupportedType as exc:
+            raise HTTPException(status_code=415, detail=str(exc)) from exc
+        except VisionTooLarge as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        except VisionDuplicateTurn as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except VisionQuotaExceeded as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        return JSONResponse(
+            status_code=201,
+            content={"observation": jsonable_encoder(observation)},
+        )
+
+    @app.get("/v1/vision/observations")
+    def list_vision_observations(subject_id: Identifier) -> dict[str, object]:
+        try:
+            observations = vision_service.list(subject_id=subject_id)
+        except VisionFeatureDisabled as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {"observations": jsonable_encoder(observations)}
+
+    @app.delete("/v1/vision/observations/{observation_id}")
+    def delete_vision_observation(
+        observation_id: Identifier,
+        subject_id: Identifier,
+    ) -> dict[str, bool]:
+        try:
+            deleted = vision_service.delete(
+                subject_id=subject_id,
+                observation_id=observation_id,
+            )
+        except VisionFeatureDisabled as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if not deleted:
+            raise HTTPException(status_code=404, detail="vision observation not found")
+        return {"deleted": True}
 
     @app.post("/v1/ota")
     def ota_bootstrap(request: Request) -> JSONResponse:
