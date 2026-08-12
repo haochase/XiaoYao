@@ -27,6 +27,10 @@ $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 See [`gateway/README.md`](gateway/README.md) for device authentication,
 WebSocket controls, and local server setup.
 
+See [`docs/verification/mimo-v25-smoke.md`](docs/verification/mimo-v25-smoke.md)
+for a public-safe runtime verification record. Hardware-specific acceptance
+records and deployment notes remain outside the public repository.
+
 ## Scope and safety
 
 This repository intentionally excludes local databases, logs, environment
