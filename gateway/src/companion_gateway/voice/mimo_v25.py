@@ -23,7 +23,7 @@ from companion_gateway.voice.minicpm_o import ModelRuntimeError
 from companion_gateway.voice.runtime import ModelResponse, VoiceAction
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.INFO)
 _INPUT_SAMPLE_RATE = 16_000
 _OUTPUT_SAMPLE_RATE = 24_000
@@ -232,7 +232,10 @@ class MimoV25Runtime:
         time_context = (
             "\nCurrent gateway time: "
             f"{current_time} (Asia/Shanghai). Use this as the authoritative "
-            "current time when the user asks for the date or time."
+            "current time when the user asks for the date or time. Always match "
+            "the user's requested precision exactly: if the user asks for only "
+            "hour and minute, do not include the year, month, day, seconds, or "
+            "weekday."
         )
         started_at = time.perf_counter()
         chat_message = self._request(

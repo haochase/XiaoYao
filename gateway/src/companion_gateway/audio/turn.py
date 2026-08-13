@@ -2,6 +2,26 @@ from dataclasses import dataclass
 
 
 @dataclass
+class ConsecutiveSilenceGate:
+    rms_threshold: float
+    consecutive_silent_frames: int
+    silent_frames: int = 0
+
+    def __post_init__(self) -> None:
+        if self.rms_threshold < 0:
+            raise ValueError("rms_threshold must not be negative")
+        if self.consecutive_silent_frames < 1:
+            raise ValueError("consecutive_silent_frames must be positive")
+
+    def observe(self, *, rms_amplitude: float) -> bool:
+        if rms_amplitude > self.rms_threshold:
+            self.silent_frames = 0
+            return False
+        self.silent_frames += 1
+        return self.silent_frames >= self.consecutive_silent_frames
+
+
+@dataclass
 class AutoTurnEndpointDetector:
     rms_threshold: float
     consecutive_silent_frames: int

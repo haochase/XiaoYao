@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import wave
 from datetime import UTC, datetime
 from io import BytesIO
-import logging
 from urllib.error import HTTPError
 
 import pytest
@@ -41,6 +41,7 @@ def fixed_clock() -> datetime:
 
 def test_mimo_runtime_enables_info_diagnostics() -> None:
     assert mimo_v25.logger.level == logging.INFO
+    assert mimo_v25.logger.name == "uvicorn.error"
 
 
 def chat_payload(content: str) -> bytes:
@@ -140,6 +141,8 @@ def test_mimo_runtime_injects_current_shanghai_time(monkeypatch) -> None:
     system_prompt = requests[0]["messages"][0]["content"]
     assert "2026-08-13T12:34:00+08:00" in system_prompt
     assert "Asia/Shanghai" in system_prompt
+    assert "match the user's requested precision exactly" in system_prompt
+    assert "only hour and minute" in system_prompt
 
 
 def test_mimo_runtime_logs_stage_durations_without_content(monkeypatch) -> None:

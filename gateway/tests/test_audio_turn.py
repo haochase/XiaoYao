@@ -1,4 +1,20 @@
-from companion_gateway.audio.turn import AutoTurnEndpointDetector
+from companion_gateway.audio.turn import (
+    AutoTurnEndpointDetector,
+    ConsecutiveSilenceGate,
+)
+
+
+def test_consecutive_silence_gate_resets_after_audible_frame() -> None:
+    gate = ConsecutiveSilenceGate(
+        rms_threshold=35.0,
+        consecutive_silent_frames=2,
+    )
+
+    assert gate.observe(rms_amplitude=10.0) is False
+    assert gate.observe(rms_amplitude=80.0) is False
+    assert gate.silent_frames == 0
+    assert gate.observe(rms_amplitude=10.0) is False
+    assert gate.observe(rms_amplitude=10.0) is True
 
 
 def test_endpoint_detector_finishes_after_configured_silent_frames() -> None:

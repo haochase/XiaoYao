@@ -691,6 +691,95 @@ def test_auto_voice_turn_resets_pcm_endpoint_for_each_listen_start(tmp_path) -> 
     assert len(runtime.received_inputs) == 1
 
 
+def test_auto_voice_turn_ignores_post_tts_echo_until_stable_silence(tmp_path) -> None:
+    transport = DeviceTransport()
+    first_speech = Pcm16Mono(sample_rate=16_000, payload=b"\x64\x00" * 960)
+    echo = Pcm16Mono(sample_rate=16_000, payload=b"\x50\x00" * 960)
+    silent = Pcm16Mono(sample_rate=16_000, payload=b"\x00\x00" * 960)
+    next_speech = Pcm16Mono(sample_rate=16_000, payload=b"\xc8\x00" * 960)
+    runtime = FakeModelRuntime(
+        response_text="received",
+        response_pcm=Pcm16Mono(sample_rate=16_000, payload=b"\x02\x00" * 960),
+    )
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "voice-post-tts-echo.db",
+            device_token_hashes={
+                DEVICE_ID: sha256(DEVICE_TOKEN.encode("utf-8")).hexdigest()
+            },
+            device_auto_turn_rms_threshold=35.0,
+            device_auto_turn_silence_frames=2,
+            device_auto_turn_min_speech_frames=1,
+            device_post_tts_silence_frames=2,
+        ),
+        device_transport=transport,
+        voice_delivery_service=DeviceVoiceDeliveryService(
+            voice_turn_service=VoiceTurnService(
+                audio_bridge=AudioBridge(
+                    codec=SequenceVoiceLoopCodec(
+                        [
+                            first_speech,
+                            silent,
+                            silent,
+                            echo,
+                            echo,
+                            silent,
+                            silent,
+                            next_speech,
+                            silent,
+                            silent,
+                        ]
+                    ),
+                    model_sample_rate=16_000,
+                    queue_capacity=16,
+                ),
+                model_runtime=runtime,
+            ),
+            device_transport=transport,
+        ),
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/v1/devices/ws",
+            headers=websocket_headers(),
+        ) as websocket:
+            websocket.send_json(hello_payload())
+            server_hello = websocket.receive_json()
+            listen_start = {
+                "type": "listen",
+                "state": "start",
+                "mode": "auto",
+                "session_id": server_hello["session_id"],
+            }
+            websocket.send_json(listen_start)
+            websocket.send_bytes(b"first-speech")
+            websocket.send_bytes(b"first-silent-1")
+            websocket.send_bytes(b"first-silent-2")
+
+            assert websocket.receive_json()["state"] == "start"
+            assert websocket.receive_bytes() == b"voice-loop-opus"
+            assert websocket.receive_json()["state"] == "stop"
+
+            websocket.send_json(listen_start)
+            websocket.send_bytes(b"echo-1")
+            websocket.send_bytes(b"echo-2")
+            websocket.send_bytes(b"guard-silent-1")
+            websocket.send_bytes(b"guard-silent-2")
+            assert len(runtime.received_inputs) == 1
+
+            websocket.send_bytes(b"next-speech")
+            websocket.send_bytes(b"next-silent-1")
+            websocket.send_bytes(b"next-silent-2")
+
+            assert websocket.receive_json()["state"] == "start"
+            assert websocket.receive_bytes() == b"voice-loop-opus"
+            assert websocket.receive_json()["state"] == "stop"
+
+    assert len(runtime.received_inputs) == 2
+    assert runtime.received_inputs[1].payload.startswith(next_speech.payload)
+
+
 def test_voice_audio_diagnostics_log_only_aggregate_pcm_metrics(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

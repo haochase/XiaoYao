@@ -16,7 +16,10 @@ from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
 from starlette.websockets import WebSocketDisconnect
 
 from companion_gateway.audio.bridge import AudioFrameRejected, AudioQueueFull
-from companion_gateway.audio.turn import AutoTurnEndpointDetector
+from companion_gateway.audio.turn import (
+    AutoTurnEndpointDetector,
+    ConsecutiveSilenceGate,
+)
 from companion_gateway.agent.service import (
     AgentToolNotAllowed,
     AgentToolRequest,
@@ -546,6 +549,8 @@ def create_app(
         audio_rms_max: float | None = None
         audio_rms_last: float | None = None
         endpoint_detector: AutoTurnEndpointDetector | None = None
+        post_tts_silence_gate: ConsecutiveSilenceGate | None = None
+        post_tts_frames_ignored = 0
         trace_id = f"trc_{uuid4().hex}"
         logger.info("device_ws_accepted device=%s", redact_device_id(device_id))
         try:
@@ -589,6 +594,7 @@ def create_app(
             transport.register(session.session_id)
 
             async def forward_outbound() -> None:
+                nonlocal post_tts_frames_ignored, post_tts_silence_gate
                 frame_duration_ms = response_hello["audio_params"]["frame_duration"]
                 while True:
                     message = await transport.next_outbound(session.session_id)
@@ -624,6 +630,14 @@ def create_app(
                                 frame_duration_ms / 1_000
                             )
                         await websocket.send_bytes(opus_frame)
+                    if settings.device_auto_turn_rms_threshold is not None:
+                        post_tts_frames_ignored = 0
+                        post_tts_silence_gate = ConsecutiveSilenceGate(
+                            rms_threshold=settings.device_auto_turn_rms_threshold,
+                            consecutive_silent_frames=(
+                                settings.device_post_tts_silence_frames
+                            ),
+                        )
                     await websocket.send_json(
                         {
                             "type": "tts",
@@ -743,6 +757,8 @@ def create_app(
                         if message_type == "listen":
                             control = ListenControl.model_validate(payload)
                             session.apply_listen(control)
+                            if control.state == "detect":
+                                post_tts_silence_gate = None
                             if control.state == "start":
                                 endpoint_detector = (
                                     AutoTurnEndpointDetector(
@@ -900,6 +916,25 @@ def create_app(
                             if audio_rms_max is None
                             else max(audio_rms_max, audio_rms_last)
                         )
+                        if post_tts_silence_gate is not None:
+                            voice_delivery_service.clear_pending_input(
+                                session_id=session.session_id,
+                            )
+                            post_tts_frames_ignored += 1
+                            if post_tts_silence_gate.observe(
+                                rms_amplitude=audio_rms_last
+                            ):
+                                logger.info(
+                                    "device_ws_post_tts_gate_opened device=%s "
+                                    "session=%s ignored_frames=%s "
+                                    "silence_frames=%s",
+                                    redact_device_id(device_id),
+                                    session.session_id,
+                                    post_tts_frames_ignored,
+                                    settings.device_post_tts_silence_frames,
+                                )
+                                post_tts_silence_gate = None
+                            continue
                         reached_pcm_endpoint = (
                             session.listening_mode == "auto"
                             and endpoint_detector is not None
