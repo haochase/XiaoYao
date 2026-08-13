@@ -137,6 +137,42 @@ def test_mimo_runtime_injects_current_shanghai_time(monkeypatch) -> None:
     assert "Asia/Shanghai" in system_prompt
 
 
+def test_mimo_runtime_logs_stage_durations_without_content(monkeypatch) -> None:
+    responses = iter(
+        [
+            FakeResponse(chat_payload('{"reply":"private reply","task":null}')),
+            FakeResponse(tts_payload()),
+        ]
+    )
+    log_messages: list[str] = []
+    timestamps = iter([10.0, 12.5, 12.5, 14.0])
+
+    monkeypatch.setattr(
+        mimo_v25,
+        "urlopen",
+        lambda request, *, timeout: next(responses),
+    )
+    monkeypatch.setattr(mimo_v25.time, "perf_counter", lambda: next(timestamps))
+    monkeypatch.setattr(
+        mimo_v25.logger,
+        "info",
+        lambda message, *args: log_messages.append(message % args),
+    )
+    runtime = MimoV25Runtime(
+        openai_base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        api_key="example-token",
+        clock=fixed_clock,
+    )
+
+    runtime.respond(input_pcm())
+
+    assert log_messages == [
+        "mimo_voice_turn_completed model=mimo-v2.5 chat_duration_ms=2500 "
+        "tts_duration_ms=1500 total_duration_ms=4000 output_audio_ms=60"
+    ]
+    assert "private reply" not in log_messages[0]
+
+
 def test_mimo_runtime_synthesizes_reminder_text_with_tts(monkeypatch) -> None:
     requests: list[dict[str, object]] = []
 

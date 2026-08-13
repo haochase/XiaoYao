@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import logging
 import time
 import wave
 from collections.abc import Callable
@@ -22,6 +23,7 @@ from companion_gateway.voice.minicpm_o import ModelRuntimeError
 from companion_gateway.voice.runtime import ModelResponse, VoiceAction
 
 
+logger = logging.getLogger(__name__)
 _INPUT_SAMPLE_RATE = 16_000
 _OUTPUT_SAMPLE_RATE = 24_000
 _RETRYABLE_STATUS_MIN = 500
@@ -231,6 +233,7 @@ class MimoV25Runtime:
             f"{current_time} (Asia/Shanghai). Use this as the authoritative "
             "current time when the user asks for the date or time."
         )
+        started_at = time.perf_counter()
         chat_message = self._request(
             {
                 "model": self._model,
@@ -266,10 +269,22 @@ class MimoV25Runtime:
                 "stream": False,
             }
         )
+        chat_finished_at = time.perf_counter()
         reply, task, action, memory_proposals = _decode_json_response(
             _text_content(chat_message)
         )
+        tts_started_at = time.perf_counter()
         response_pcm = self.synthesize(reply)
+        finished_at = time.perf_counter()
+        logger.info(
+            "mimo_voice_turn_completed model=%s chat_duration_ms=%s "
+            "tts_duration_ms=%s total_duration_ms=%s output_audio_ms=%s",
+            self._model,
+            round((chat_finished_at - started_at) * 1_000),
+            round((finished_at - tts_started_at) * 1_000),
+            round((finished_at - started_at) * 1_000),
+            round(response_pcm.duration_ms),
+        )
         return ModelResponse(
             text=reply,
             pcm=response_pcm,
