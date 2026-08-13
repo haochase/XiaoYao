@@ -204,9 +204,14 @@ errors, and malformed responses fail immediately as `model_unavailable`; adjust
 different deployment policy.
 
 Audio is buffered between `listen.start` and `listen.stop`, so one turn causes
-one model request. `COMPANION_AUDIO_QUEUE_CAPACITY` bounds the number of 60 ms
-uplink frames retained for one turn; the default of 256 frames supports about
-15.36 seconds of input. A runtime failure returns a retryable
+one model request. Some auto-mode firmware does not send `listen.stop`; for
+those devices, set `COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD` after inspecting
+aggregate PCM diagnostics and use `COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES`
+to end a turn after sustained quiet audio. The endpoint detector requires an
+audible frame first, and is disabled when its RMS threshold is empty.
+`COMPANION_AUDIO_QUEUE_CAPACITY` bounds the number of 60 ms uplink frames
+retained for one turn; the default of 256 frames supports about 15.36 seconds
+of input. A runtime failure returns a retryable
 `model_unavailable` device error and discards the pending audio. A validated
 model task is created idempotently and enters the `scheduled` state;
 `TaskExecutor.execute_due` can then advance it through delivery states using a

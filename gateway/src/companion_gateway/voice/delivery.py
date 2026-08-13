@@ -75,12 +75,11 @@ class DeviceVoiceDeliveryService:
         *,
         session_id: str,
         opus_frame: bytes,
-    ) -> VoiceTurn | None:
-        self._voice_turn_service.accept_opus_uplink(
+    ) -> Pcm16Mono:
+        return self._voice_turn_service.accept_opus_uplink(
             opus_frame,
             session_id=session_id,
         )
-        return None
 
     def clear_pending_input(self, *, session_id: str | None = None) -> None:
         self._voice_turn_service.clear_pending_input(session_id=session_id)

@@ -67,6 +67,9 @@ class DeviceSession:
     phase: DevicePhase = DevicePhase.IDLE
     audio_frames_received: int = 0
     listening_mode: str | None = None
+    wake_word_detected: bool = False
+    listening_started: bool = False
+    auto_turn_finished: bool = False
 
     @classmethod
     def create(
@@ -100,10 +103,14 @@ class DeviceSession:
                     f"cannot start listening while {self.phase.value}"
                 )
             self.listening_mode = control.mode
+            self.listening_started = True
+            self.auto_turn_finished = False
             self.phase = DevicePhase.LISTENING
             return
 
         if control.state == "stop":
+            if self.phase is DevicePhase.IDLE and self.auto_turn_finished:
+                return
             if self.phase is not DevicePhase.LISTENING:
                 raise InvalidDevicePhase(
                     f"cannot stop listening while {self.phase.value}"
@@ -115,8 +122,26 @@ class DeviceSession:
             raise InvalidDevicePhase(
                 f"cannot report wake word while {self.phase.value}"
             )
+        self.wake_word_detected = True
         if control.mode is not None:
             self.listening_mode = control.mode
+
+    def should_ignore_wake_word_audio(self) -> bool:
+        return (
+            self.phase is DevicePhase.IDLE
+            and not self.wake_word_detected
+            and not self.listening_started
+        )
+
+    def should_ignore_auto_turn_tail_audio(self) -> bool:
+        return self.phase is DevicePhase.IDLE and self.auto_turn_finished
+
+    def finish_auto_listening(self) -> bool:
+        if self.phase is not DevicePhase.LISTENING or self.listening_mode != "auto":
+            return False
+        self.phase = DevicePhase.IDLE
+        self.auto_turn_finished = True
+        return True
 
     def accept_audio_frame(self) -> None:
         if self.phase is not DevicePhase.LISTENING:

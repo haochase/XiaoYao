@@ -132,6 +132,55 @@ def test_settings_loads_mimo_runtime_configuration(monkeypatch) -> None:
     assert settings.mimo_retry_backoff_seconds == 0.25
 
 
+def test_settings_loads_device_auto_stop_idle_seconds(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_AUTO_STOP_IDLE_SECONDS", "1.5")
+
+    settings = Settings.from_environment()
+
+    assert settings.device_auto_stop_idle_seconds == 1.5
+
+
+def test_settings_loads_device_auto_turn_pcm_endpoint(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD", "35")
+    monkeypatch.setenv("COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES", "12")
+
+    settings = Settings.from_environment()
+
+    assert settings.device_auto_turn_rms_threshold == 35.0
+    assert settings.device_auto_turn_silence_frames == 12
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD", "-1"),
+        ("COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD", "not-a-number"),
+        ("COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES", "0"),
+        ("COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES", "not-a-number"),
+    ],
+)
+def test_settings_rejects_invalid_device_auto_turn_pcm_endpoint(
+    monkeypatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        Settings.from_environment()
+
+
+@pytest.mark.parametrize("value", ["0", "-0.1", "not-a-number"])
+def test_settings_rejects_invalid_device_auto_stop_idle_seconds(
+    monkeypatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_AUTO_STOP_IDLE_SECONDS", value)
+
+    with pytest.raises(ValueError, match="COMPANION_DEVICE_AUTO_STOP_IDLE_SECONDS"):
+        Settings.from_environment()
+
+
 def test_settings_requires_mimo_api_key(monkeypatch) -> None:
     monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "mimo")
     monkeypatch.delenv("COMPANION_MIMO_API_KEY", raising=False)

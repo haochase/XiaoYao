@@ -160,6 +160,39 @@ def test_session_stop_returns_to_idle_and_rejects_more_audio() -> None:
         session.accept_audio_frame()
 
 
+def test_auto_listening_session_can_finish_only_once() -> None:
+    session = DeviceSession.create(
+        device_id="dev-test",
+        client_id="client-test",
+        hello=DeviceHello.model_validate(hello_payload()),
+    )
+    session.apply_listen(
+        ListenControl.model_validate(
+            {"type": "listen", "state": "start", "mode": "auto"}
+        )
+    )
+
+    assert session.finish_auto_listening() is True
+    assert session.phase is DevicePhase.IDLE
+    assert session.finish_auto_listening() is False
+
+
+def test_auto_turn_finished_session_ignores_tail_audio() -> None:
+    session = DeviceSession.create(
+        device_id="dev-test",
+        client_id="client-test",
+        hello=DeviceHello.model_validate(hello_payload()),
+    )
+    session.apply_listen(
+        ListenControl.model_validate(
+            {"type": "listen", "state": "start", "mode": "auto"}
+        )
+    )
+    assert session.finish_auto_listening() is True
+
+    assert session.should_ignore_auto_turn_tail_audio() is True
+
+
 def test_abort_returns_listening_session_to_idle() -> None:
     session = DeviceSession.create(
         device_id="dev-test",

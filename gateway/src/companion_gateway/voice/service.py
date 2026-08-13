@@ -236,10 +236,9 @@ class VoiceTurnService:
         payload: bytes,
         *,
         session_id: str | None = None,
-    ) -> None:
+    ) -> Pcm16Mono:
         if session_id is None:
-            self._audio_bridge.decode_uplink(payload)
-            return
+            return self._audio_bridge.decode_uplink(payload)
 
         model_pcm = self._audio_bridge.decode_uplink_frame(payload)
         with self._session_uplink_lock:
@@ -247,6 +246,7 @@ class VoiceTurnService:
             if len(pending) >= self._audio_bridge.queue_capacity:
                 raise AudioQueueFull("decoded audio queue is full")
             pending.append(model_pcm)
+        return model_pcm
 
     def _pop_session_uplink(self, session_id: str) -> Pcm16Mono | None:
         with self._session_uplink_lock:

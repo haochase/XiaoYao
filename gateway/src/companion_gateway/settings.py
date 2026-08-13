@@ -327,6 +327,9 @@ class Settings:
     task_scheduler_interval_seconds: float = 1.0
     device_hello_timeout_seconds: float = 10.0
     device_audio_frame_max_bytes: int = 4096
+    device_auto_stop_idle_seconds: float = 1.2
+    device_auto_turn_rms_threshold: float | None = None
+    device_auto_turn_silence_frames: int = 12
     audio_queue_capacity: int = 256
 
     def __post_init__(self) -> None:
@@ -441,6 +444,21 @@ class Settings:
             )
         if self.audio_queue_capacity < 1:
             raise ValueError("COMPANION_AUDIO_QUEUE_CAPACITY must be positive")
+        if self.device_auto_stop_idle_seconds <= 0:
+            raise ValueError(
+                "COMPANION_DEVICE_AUTO_STOP_IDLE_SECONDS must be positive"
+            )
+        if (
+            self.device_auto_turn_rms_threshold is not None
+            and self.device_auto_turn_rms_threshold < 0
+        ):
+            raise ValueError(
+                "COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD must not be negative"
+            )
+        if self.device_auto_turn_silence_frames < 1:
+            raise ValueError(
+                "COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES must be positive"
+            )
         for value, name in (
             (self.mimo_model, "COMPANION_MIMO_MODEL"),
             (self.mimo_tts_model, "COMPANION_MIMO_TTS_MODEL"),
@@ -621,6 +639,17 @@ class Settings:
             "COMPANION_AUDIO_QUEUE_CAPACITY",
             "256",
         )
+        configured_device_auto_stop_idle_seconds = os.environ.get(
+            "COMPANION_DEVICE_AUTO_STOP_IDLE_SECONDS",
+            "1.2",
+        )
+        configured_device_auto_turn_rms_threshold = os.environ.get(
+            "COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD"
+        )
+        configured_device_auto_turn_silence_frames = os.environ.get(
+            "COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES",
+            "12",
+        )
         public_websocket_url = os.environ.get("COMPANION_PUBLIC_WEBSOCKET_URL")
         ota_tokens_json = os.environ.get("COMPANION_OTA_DEVICE_TOKENS", "{}")
         token_hashes_json = os.environ.get("COMPANION_DEVICE_TOKEN_HASHES", "{}")
@@ -688,6 +717,32 @@ class Settings:
         except ValueError as exc:
             raise ValueError(
                 "COMPANION_AUDIO_QUEUE_CAPACITY must be an integer"
+            ) from exc
+        try:
+            device_auto_stop_idle_seconds = float(
+                configured_device_auto_stop_idle_seconds
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_DEVICE_AUTO_STOP_IDLE_SECONDS must be a number"
+            ) from exc
+        try:
+            device_auto_turn_rms_threshold = (
+                float(configured_device_auto_turn_rms_threshold)
+                if configured_device_auto_turn_rms_threshold is not None
+                else None
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD must be a number"
+            ) from exc
+        try:
+            device_auto_turn_silence_frames = int(
+                configured_device_auto_turn_silence_frames
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES must be an integer"
             ) from exc
         try:
             memory_retention_days = int(configured_memory_retention_days)
@@ -786,5 +841,8 @@ class Settings:
             vision_cleanup_interval_seconds=vision_cleanup_interval_seconds,
             task_scheduler_enabled=task_scheduler_enabled,
             task_scheduler_interval_seconds=task_scheduler_interval_seconds,
+            device_auto_stop_idle_seconds=device_auto_stop_idle_seconds,
+            device_auto_turn_rms_threshold=device_auto_turn_rms_threshold,
+            device_auto_turn_silence_frames=device_auto_turn_silence_frames,
             audio_queue_capacity=audio_queue_capacity,
         )

@@ -71,6 +71,14 @@ class RejectingVoiceLoopCodec(VoiceLoopCodec):
         raise AudioFrameRejected("malformed opus")
 
 
+class SequenceVoiceLoopCodec(VoiceLoopCodec):
+    def __init__(self, frames: list[Pcm16Mono]) -> None:
+        self._frames = iter(frames)
+
+    def decode_uplink(self, payload: bytes) -> Pcm16Mono:
+        return next(self._frames)
+
+
 class UnavailableRuntime:
     def respond(self, pcm: Pcm16Mono):
         raise ModelRuntimeError("MiniCPM-o request failed")
@@ -151,6 +159,50 @@ def test_valid_hello_receives_xiaozhi_server_hello(client: TestClient) -> None:
         "channels": 1,
         "frame_duration": 60,
     }
+
+
+def test_wake_word_detect_keeps_connection_open_for_listening_audio(
+    client: TestClient,
+    app_and_sink,
+) -> None:
+    _, sink = app_and_sink
+    opus_frame = b"wake-following-opus"
+
+    with client.websocket_connect(
+        "/v1/devices/ws",
+        headers=websocket_headers(),
+    ) as websocket:
+        websocket.send_json(hello_payload())
+        server_hello = websocket.receive_json()
+        websocket.send_bytes(b"prewake-opus")
+        websocket.send_json(
+            {
+                "type": "listen",
+                "state": "detect",
+                "session_id": server_hello["session_id"],
+                "text": "你好小智",
+            }
+        )
+        websocket.send_json(
+            {
+                "type": "listen",
+                "state": "start",
+                "mode": "auto",
+                "session_id": server_hello["session_id"],
+            }
+        )
+        websocket.send_bytes(opus_frame)
+        websocket.send_json(
+            {
+                "type": "listen",
+                "state": "stop",
+                "session_id": server_hello["session_id"],
+            }
+        )
+
+    controls = sink.control_snapshot()
+    assert [control.control.state for control in controls] == ["detect", "start", "stop"]
+    assert [frame.payload for frame in sink.audio_snapshot()] == [opus_frame]
 
 
 def test_disconnect_diagnostics_keep_listen_mode_and_protocol_state(
@@ -441,6 +493,183 @@ def test_voice_turn_waits_for_listen_stop_before_model_response(tmp_path) -> Non
 
     assert len(runtime.received_inputs) == 1
     assert runtime.received_inputs[0].sample_count == 1_920
+
+
+def test_auto_voice_turn_processes_after_silence_without_listen_stop(tmp_path) -> None:
+    transport = DeviceTransport()
+    bridge = AudioBridge(
+        codec=VoiceLoopCodec(),
+        model_sample_rate=16_000,
+        queue_capacity=8,
+    )
+    runtime = FakeModelRuntime(
+        response_text="已收到",
+        response_pcm=Pcm16Mono(sample_rate=16_000, payload=b"\x02\x00" * 960),
+    )
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "voice-auto-stop.db",
+            device_token_hashes={
+                DEVICE_ID: sha256(DEVICE_TOKEN.encode("utf-8")).hexdigest()
+            },
+            device_auto_stop_idle_seconds=0.1,
+        ),
+        device_transport=transport,
+        voice_delivery_service=DeviceVoiceDeliveryService(
+            voice_turn_service=VoiceTurnService(
+                audio_bridge=bridge,
+                model_runtime=runtime,
+            ),
+            device_transport=transport,
+        ),
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/v1/devices/ws",
+            headers=websocket_headers(),
+        ) as websocket:
+            websocket.send_json(hello_payload())
+            server_hello = websocket.receive_json()
+            websocket.send_json(
+                {
+                    "type": "listen",
+                    "state": "start",
+                    "mode": "auto",
+                    "session_id": server_hello["session_id"],
+                }
+            )
+            websocket.send_bytes(b"first-opus")
+            websocket.send_bytes(b"second-opus")
+
+            assert websocket.receive_json()["state"] == "start"
+            assert websocket.receive_bytes() == b"voice-loop-opus"
+            assert websocket.receive_json()["state"] == "stop"
+
+    assert len(runtime.received_inputs) == 1
+    assert runtime.received_inputs[0].sample_count == 1_920
+
+
+def test_auto_voice_turn_processes_after_pcm_silence_without_listen_stop(tmp_path) -> None:
+    transport = DeviceTransport()
+    audible = Pcm16Mono(sample_rate=16_000, payload=b"\x64\x00" * 960)
+    silent = Pcm16Mono(sample_rate=16_000, payload=b"\x00\x00" * 960)
+    runtime = FakeModelRuntime(
+        response_text="已收到",
+        response_pcm=Pcm16Mono(sample_rate=16_000, payload=b"\x02\x00" * 960),
+    )
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "voice-pcm-silence.db",
+            device_token_hashes={
+                DEVICE_ID: sha256(DEVICE_TOKEN.encode("utf-8")).hexdigest()
+            },
+            device_auto_turn_rms_threshold=35.0,
+            device_auto_turn_silence_frames=2,
+        ),
+        device_transport=transport,
+        voice_delivery_service=DeviceVoiceDeliveryService(
+            voice_turn_service=VoiceTurnService(
+                audio_bridge=AudioBridge(
+                    codec=SequenceVoiceLoopCodec([audible, silent, silent]),
+                    model_sample_rate=16_000,
+                    queue_capacity=8,
+                ),
+                model_runtime=runtime,
+            ),
+            device_transport=transport,
+        ),
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/v1/devices/ws",
+            headers=websocket_headers(),
+        ) as websocket:
+            websocket.send_json(hello_payload())
+            server_hello = websocket.receive_json()
+            websocket.send_json(
+                {
+                    "type": "listen",
+                    "state": "start",
+                    "mode": "auto",
+                    "session_id": server_hello["session_id"],
+                }
+            )
+            websocket.send_bytes(b"audible-opus")
+            websocket.send_bytes(b"silent-opus-1")
+            websocket.send_bytes(b"silent-opus-2")
+
+            assert websocket.receive_json()["state"] == "start"
+            assert websocket.receive_bytes() == b"voice-loop-opus"
+            assert websocket.receive_json()["state"] == "stop"
+            websocket.send_bytes(b"tail-opus")
+
+    assert len(runtime.received_inputs) == 1
+    assert runtime.received_inputs[0].sample_count == 2_880
+def test_voice_audio_diagnostics_log_only_aggregate_pcm_metrics(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log_messages: list[str] = []
+
+    def capture_info(message: str, *args: object) -> None:
+        log_messages.append(message % args)
+
+    monkeypatch.setattr(api_module.logger, "info", capture_info)
+    transport = DeviceTransport()
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "voice-metrics.db",
+            device_token_hashes={
+                DEVICE_ID: sha256(DEVICE_TOKEN.encode("utf-8")).hexdigest()
+            },
+        ),
+        device_transport=transport,
+        voice_delivery_service=DeviceVoiceDeliveryService(
+            voice_turn_service=VoiceTurnService(
+                audio_bridge=AudioBridge(
+                    codec=VoiceLoopCodec(),
+                    model_sample_rate=16_000,
+                    queue_capacity=8,
+                ),
+                model_runtime=FakeModelRuntime(
+                    response_text="已收到",
+                    response_pcm=Pcm16Mono(
+                        sample_rate=16_000,
+                        payload=b"\x02\x00" * 960,
+                    ),
+                ),
+            ),
+            device_transport=transport,
+        ),
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/v1/devices/ws",
+            headers=websocket_headers(),
+        ) as websocket:
+            websocket.send_json(hello_payload())
+            server_hello = websocket.receive_json()
+            websocket.send_json(
+                {
+                    "type": "listen",
+                    "state": "start",
+                    "mode": "manual",
+                    "session_id": server_hello["session_id"],
+                }
+            )
+            websocket.send_bytes(b"metric-opus")
+
+    diagnostic = next(
+        message for message in log_messages if "device_ws_audio_metrics" in message
+    )
+    assert "frames=1" in diagnostic
+    assert "rms_min=" in diagnostic
+    assert "rms_max=" in diagnostic
+    assert "rms_last=" in diagnostic
+    assert "metric-opus" not in diagnostic
 
 
 def test_model_unavailable_returns_a_retryable_device_error(tmp_path) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+from math import sqrt
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
@@ -25,6 +26,7 @@ class AudioMetrics:
     duration_ms: float
     duration_error_ms: float
     peak_abs: int
+    rms_amplitude: float
     non_silent_ratio: float
 
 
@@ -54,10 +56,12 @@ class Pcm16Mono:
     def metrics(self) -> AudioMetrics:
         samples = struct.unpack(f"<{self.sample_count}h", self.payload)
         non_silent = sum(sample != 0 for sample in samples)
+        mean_square = sum(sample * sample for sample in samples) / self.sample_count
         return AudioMetrics(
             duration_ms=self.duration_ms,
             duration_error_ms=self.duration_error_ms,
             peak_abs=max(abs(sample) for sample in samples),
+            rms_amplitude=sqrt(mean_square),
             non_silent_ratio=non_silent / self.sample_count,
         )
 

@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
 from starlette.websockets import WebSocketDisconnect
 
 from companion_gateway.audio.bridge import AudioFrameRejected, AudioQueueFull
+from companion_gateway.audio.turn import AutoTurnEndpointDetector
 from companion_gateway.agent.service import (
     AgentToolNotAllowed,
     AgentToolRequest,
@@ -531,8 +532,22 @@ def create_app(
         await websocket.accept()
         session: DeviceSession | None = None
         outbound_sender: asyncio.Task[None] | None = None
+        auto_stop_task: asyncio.Task[None] | None = None
         close_code: int | None = None
         close_reason_length = 0
+        wake_word_frames_ignored = 0
+        auto_turn_tail_frames_ignored = 0
+        audio_rms_min: float | None = None
+        audio_rms_max: float | None = None
+        audio_rms_last: float | None = None
+        endpoint_detector = (
+            AutoTurnEndpointDetector(
+                rms_threshold=settings.device_auto_turn_rms_threshold,
+                consecutive_silent_frames=settings.device_auto_turn_silence_frames,
+            )
+            if settings.device_auto_turn_rms_threshold is not None
+            else None
+        )
         trace_id = f"trc_{uuid4().hex}"
         logger.info("device_ws_accepted device=%s", redact_device_id(device_id))
         try:
@@ -607,6 +622,75 @@ def create_app(
 
             outbound_sender = asyncio.create_task(forward_outbound())
 
+            async def process_voice_turn(*, trigger: str) -> None:
+                if voice_delivery_service is None:
+                    return
+                try:
+                    turn = await voice_delivery_service.process_and_send_async(
+                        session_id=session.session_id,
+                        target_device_id=session.device_id,
+                    )
+                    logger.info(
+                        "device_ws_voice_turn_processed device=%s session=%s "
+                        "trigger=%s delivered=%s",
+                        redact_device_id(device_id),
+                        session.session_id,
+                        trigger,
+                        turn is not None,
+                    )
+                except ModelRuntimeError:
+                    voice_delivery_service.clear_pending_input(
+                        session_id=session.session_id,
+                    )
+                    await send_device_error(
+                        websocket,
+                        code="model_unavailable",
+                        trace_id=trace_id,
+                        retryable=True,
+                    )
+                    await websocket.close(code=1011)
+                except (DeviceNotConnected, DeviceOutboundBackpressure):
+                    voice_delivery_service.clear_pending_input(
+                        session_id=session.session_id,
+                    )
+                    logger.info(
+                        "device_ws_voice_turn_delivery_skipped device=%s session=%s "
+                        "trigger=%s",
+                        redact_device_id(device_id),
+                        session.session_id,
+                        trigger,
+                    )
+
+            async def finish_auto_turn_after_silence(expected_frames: int) -> None:
+                await asyncio.sleep(settings.device_auto_stop_idle_seconds)
+                if session.audio_frames_received != expected_frames:
+                    return
+                if not session.finish_auto_listening():
+                    return
+                logger.info(
+                    "device_ws_auto_listen_finished device=%s session=%s frames=%s "
+                    "idle_seconds=%s",
+                    redact_device_id(device_id),
+                    session.session_id,
+                    expected_frames,
+                    settings.device_auto_stop_idle_seconds,
+                )
+                await process_voice_turn(trigger="auto_silence")
+
+            async def finish_auto_turn_after_pcm_silence() -> None:
+                if not session.finish_auto_listening():
+                    return
+                logger.info(
+                    "device_ws_auto_pcm_endpoint device=%s session=%s frames=%s "
+                    "rms_threshold=%s silent_frames=%s",
+                    redact_device_id(device_id),
+                    session.session_id,
+                    session.audio_frames_received,
+                    settings.device_auto_turn_rms_threshold,
+                    settings.device_auto_turn_silence_frames,
+                )
+                await process_voice_turn(trigger="pcm_silence")
+
             while True:
                 message = await websocket.receive()
                 if message["type"] == "websocket.disconnect":
@@ -659,28 +743,19 @@ def create_app(
                             message_type == "listen"
                             and control.state == "stop"
                             and voice_delivery_service is not None
+                            and not session.auto_turn_finished
                         ):
-                            try:
-                                await voice_delivery_service.process_and_send_async(
-                                    session_id=session.session_id,
-                                    target_device_id=session.device_id,
-                                )
-                            except ModelRuntimeError:
-                                voice_delivery_service.clear_pending_input(
-                                    session_id=session.session_id,
-                                )
-                                await send_device_error(
-                                    websocket,
-                                    code="model_unavailable",
-                                    trace_id=trace_id,
-                                    retryable=True,
-                                )
-                                await websocket.close(code=1011)
-                                break
+                            if auto_stop_task is not None:
+                                auto_stop_task.cancel()
+                                auto_stop_task = None
+                            await process_voice_turn(trigger="listen_stop")
                         elif (
                             message_type == "abort"
                             and voice_delivery_service is not None
                         ):
+                            if auto_stop_task is not None:
+                                auto_stop_task.cancel()
+                                auto_stop_task = None
                             voice_delivery_service.clear_pending_input(
                                 session_id=session.session_id,
                             )
@@ -739,6 +814,27 @@ def create_app(
                     await websocket.close(code=1009)
                     break
                 try:
+                    if session.should_ignore_wake_word_audio():
+                        wake_word_frames_ignored += 1
+                        if wake_word_frames_ignored in (1, 10) or (
+                            wake_word_frames_ignored % 50 == 0
+                        ):
+                            logger.info(
+                                "device_ws_wake_audio_ignored device=%s session=%s frames=%s",
+                                redact_device_id(device_id),
+                                session.session_id,
+                                wake_word_frames_ignored,
+                            )
+                        continue
+                    if session.should_ignore_auto_turn_tail_audio():
+                        auto_turn_tail_frames_ignored += 1
+                        if auto_turn_tail_frames_ignored == 1:
+                            logger.info(
+                                "device_ws_auto_tail_audio_ignored device=%s session=%s",
+                                redact_device_id(device_id),
+                                session.session_id,
+                            )
+                        continue
                     session.accept_audio_frame()
                     if session.audio_frames_received in (1, 10) or (
                         session.audio_frames_received % 50 == 0
@@ -751,10 +847,42 @@ def create_app(
                         )
                     sink.on_audio(session, audio_frame)
                     if voice_delivery_service is not None:
-                        voice_delivery_service.accept_and_send(
+                        pcm_frame = voice_delivery_service.accept_and_send(
                             session_id=session.session_id,
                             opus_frame=audio_frame,
                         )
+                        audio_rms_last = pcm_frame.metrics.rms_amplitude
+                        audio_rms_min = (
+                            audio_rms_last
+                            if audio_rms_min is None
+                            else min(audio_rms_min, audio_rms_last)
+                        )
+                        audio_rms_max = (
+                            audio_rms_last
+                            if audio_rms_max is None
+                            else max(audio_rms_max, audio_rms_last)
+                        )
+                        reached_pcm_endpoint = (
+                            session.listening_mode == "auto"
+                            and endpoint_detector is not None
+                            and endpoint_detector.observe(
+                                rms_amplitude=audio_rms_last
+                            )
+                        )
+                        if reached_pcm_endpoint:
+                            if auto_stop_task is not None:
+                                auto_stop_task.cancel()
+                                auto_stop_task = None
+                            await finish_auto_turn_after_pcm_silence()
+                            continue
+                        if session.listening_mode == "auto":
+                            if auto_stop_task is not None:
+                                auto_stop_task.cancel()
+                            auto_stop_task = asyncio.create_task(
+                                finish_auto_turn_after_silence(
+                                    session.audio_frames_received
+                                )
+                            )
                 except InvalidDevicePhase:
                     await send_device_error(
                         websocket,
@@ -827,6 +955,21 @@ def create_app(
             if voice_delivery_service is not None and session is not None:
                 voice_delivery_service.clear_pending_input(
                     session_id=session.session_id,
+                )
+            if auto_stop_task is not None:
+                auto_stop_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await auto_stop_task
+            if audio_rms_last is not None and session is not None:
+                logger.info(
+                    "device_ws_audio_metrics device=%s session=%s frames=%s "
+                    "rms_min=%.1f rms_max=%.1f rms_last=%.1f",
+                    redact_device_id(device_id),
+                    session.session_id,
+                    session.audio_frames_received,
+                    audio_rms_min,
+                    audio_rms_max,
+                    audio_rms_last,
                 )
             if outbound_sender is not None:
                 outbound_sender.cancel()
