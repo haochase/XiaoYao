@@ -24,6 +24,7 @@ from companion_gateway.voice.runtime import ModelResponse, VoiceAction
 
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 _INPUT_SAMPLE_RATE = 16_000
 _OUTPUT_SAMPLE_RATE = 24_000
 _RETRYABLE_STATUS_MIN = 500

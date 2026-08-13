@@ -5,6 +5,7 @@ import json
 import wave
 from datetime import UTC, datetime
 from io import BytesIO
+import logging
 from urllib.error import HTTPError
 
 import pytest
@@ -36,6 +37,10 @@ def input_pcm() -> Pcm16Mono:
 
 def fixed_clock() -> datetime:
     return datetime(2026, 8, 13, 4, 34, tzinfo=UTC)
+
+
+def test_mimo_runtime_enables_info_diagnostics() -> None:
+    assert mimo_v25.logger.level == logging.INFO
 
 
 def chat_payload(content: str) -> bytes:
