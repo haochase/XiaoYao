@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -102,6 +103,10 @@ Reason = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=256),
 ]
+
+
+async def _sleep_between_tts_frames(seconds: float) -> None:
+    await asyncio.sleep(seconds)
 
 
 class EventRequest(BaseModel):
@@ -540,14 +545,7 @@ def create_app(
         audio_rms_min: float | None = None
         audio_rms_max: float | None = None
         audio_rms_last: float | None = None
-        endpoint_detector = (
-            AutoTurnEndpointDetector(
-                rms_threshold=settings.device_auto_turn_rms_threshold,
-                consecutive_silent_frames=settings.device_auto_turn_silence_frames,
-            )
-            if settings.device_auto_turn_rms_threshold is not None
-            else None
-        )
+        endpoint_detector: AutoTurnEndpointDetector | None = None
         trace_id = f"trc_{uuid4().hex}"
         logger.info("device_ws_accepted device=%s", redact_device_id(device_id))
         try:
@@ -591,6 +589,7 @@ def create_app(
             transport.register(session.session_id)
 
             async def forward_outbound() -> None:
+                frame_duration_ms = response_hello["audio_params"]["frame_duration"]
                 while True:
                     message = await transport.next_outbound(session.session_id)
                     if isinstance(message, OutboundTask):
@@ -610,7 +609,20 @@ def create_app(
                             "session_id": message.session_id,
                         }
                     )
-                    for opus_frame in message.opus_frames:
+                    started_at = time.perf_counter()
+                    logger.info(
+                        "device_ws_tts_stream_started device=%s session=%s "
+                        "frames=%s frame_duration_ms=%s",
+                        redact_device_id(device_id),
+                        session.session_id,
+                        len(message.opus_frames),
+                        frame_duration_ms,
+                    )
+                    for frame_index, opus_frame in enumerate(message.opus_frames):
+                        if frame_index:
+                            await _sleep_between_tts_frames(
+                                frame_duration_ms / 1_000
+                            )
                         await websocket.send_bytes(opus_frame)
                     await websocket.send_json(
                         {
@@ -618,6 +630,14 @@ def create_app(
                             "state": "stop",
                             "session_id": message.session_id,
                         }
+                    )
+                    logger.info(
+                        "device_ws_tts_stream_finished device=%s session=%s "
+                        "frames=%s duration_ms=%s",
+                        redact_device_id(device_id),
+                        session.session_id,
+                        len(message.opus_frames),
+                        round((time.perf_counter() - started_at) * 1_000),
                     )
 
             outbound_sender = asyncio.create_task(forward_outbound())
@@ -682,12 +702,13 @@ def create_app(
                     return
                 logger.info(
                     "device_ws_auto_pcm_endpoint device=%s session=%s frames=%s "
-                    "rms_threshold=%s silent_frames=%s",
+                    "rms_threshold=%s silent_frames=%s min_speech_frames=%s",
                     redact_device_id(device_id),
                     session.session_id,
                     session.audio_frames_received,
                     settings.device_auto_turn_rms_threshold,
                     settings.device_auto_turn_silence_frames,
+                    settings.device_auto_turn_min_speech_frames,
                 )
                 await process_voice_turn(trigger="pcm_silence")
 
@@ -722,6 +743,23 @@ def create_app(
                         if message_type == "listen":
                             control = ListenControl.model_validate(payload)
                             session.apply_listen(control)
+                            if control.state == "start":
+                                endpoint_detector = (
+                                    AutoTurnEndpointDetector(
+                                        rms_threshold=(
+                                            settings.device_auto_turn_rms_threshold
+                                        ),
+                                        consecutive_silent_frames=(
+                                            settings.device_auto_turn_silence_frames
+                                        ),
+                                        minimum_speech_frames=(
+                                            settings.device_auto_turn_min_speech_frames
+                                        ),
+                                    )
+                                    if settings.device_auto_turn_rms_threshold
+                                    is not None
+                                    else None
+                                )
                         elif message_type == "abort":
                             control = AbortControl.model_validate(payload)
                             session.apply_abort(control)
@@ -875,7 +913,10 @@ def create_app(
                                 auto_stop_task = None
                             await finish_auto_turn_after_pcm_silence()
                             continue
-                        if session.listening_mode == "auto":
+                        if (
+                            session.listening_mode == "auto"
+                            and endpoint_detector is None
+                        ):
                             if auto_stop_task is not None:
                                 auto_stop_task.cancel()
                             auto_stop_task = asyncio.create_task(

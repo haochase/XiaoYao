@@ -143,11 +143,13 @@ def test_settings_loads_device_auto_stop_idle_seconds(monkeypatch) -> None:
 def test_settings_loads_device_auto_turn_pcm_endpoint(monkeypatch) -> None:
     monkeypatch.setenv("COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD", "35")
     monkeypatch.setenv("COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES", "12")
+    monkeypatch.setenv("COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES", "5")
 
     settings = Settings.from_environment()
 
     assert settings.device_auto_turn_rms_threshold == 35.0
     assert settings.device_auto_turn_silence_frames == 12
+    assert settings.device_auto_turn_min_speech_frames == 5
 
 
 @pytest.mark.parametrize(
@@ -157,6 +159,8 @@ def test_settings_loads_device_auto_turn_pcm_endpoint(monkeypatch) -> None:
         ("COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD", "not-a-number"),
         ("COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES", "0"),
         ("COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES", "not-a-number"),
+        ("COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES", "0"),
+        ("COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES", "not-a-number"),
     ],
 )
 def test_settings_rejects_invalid_device_auto_turn_pcm_endpoint(

@@ -330,6 +330,7 @@ class Settings:
     device_auto_stop_idle_seconds: float = 1.2
     device_auto_turn_rms_threshold: float | None = None
     device_auto_turn_silence_frames: int = 12
+    device_auto_turn_min_speech_frames: int = 5
     audio_queue_capacity: int = 256
 
     def __post_init__(self) -> None:
@@ -458,6 +459,10 @@ class Settings:
         if self.device_auto_turn_silence_frames < 1:
             raise ValueError(
                 "COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES must be positive"
+            )
+        if self.device_auto_turn_min_speech_frames < 1:
+            raise ValueError(
+                "COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES must be positive"
             )
         for value, name in (
             (self.mimo_model, "COMPANION_MIMO_MODEL"),
@@ -650,6 +655,10 @@ class Settings:
             "COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES",
             "12",
         )
+        configured_device_auto_turn_min_speech_frames = os.environ.get(
+            "COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES",
+            "5",
+        )
         public_websocket_url = os.environ.get("COMPANION_PUBLIC_WEBSOCKET_URL")
         ota_tokens_json = os.environ.get("COMPANION_OTA_DEVICE_TOKENS", "{}")
         token_hashes_json = os.environ.get("COMPANION_DEVICE_TOKEN_HASHES", "{}")
@@ -743,6 +752,14 @@ class Settings:
         except ValueError as exc:
             raise ValueError(
                 "COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES must be an integer"
+            ) from exc
+        try:
+            device_auto_turn_min_speech_frames = int(
+                configured_device_auto_turn_min_speech_frames
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES must be an integer"
             ) from exc
         try:
             memory_retention_days = int(configured_memory_retention_days)
@@ -844,5 +861,6 @@ class Settings:
             device_auto_stop_idle_seconds=device_auto_stop_idle_seconds,
             device_auto_turn_rms_threshold=device_auto_turn_rms_threshold,
             device_auto_turn_silence_frames=device_auto_turn_silence_frames,
+            device_auto_turn_min_speech_frames=device_auto_turn_min_speech_frames,
             audio_queue_capacity=audio_queue_capacity,
         )

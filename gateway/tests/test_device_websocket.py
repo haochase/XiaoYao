@@ -1,5 +1,6 @@
 from collections.abc import Iterator
 from hashlib import sha256
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -282,8 +283,15 @@ def test_active_device_receives_tts_control_and_binary_audio(
 def test_active_device_receives_a_multi_frame_tts_stream(
     client: TestClient,
     app_and_sink,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app, _ = app_and_sink
+    delays: list[float] = []
+
+    async def capture_delay(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr(api_module, "_sleep_between_tts_frames", capture_delay)
 
     with client.websocket_connect(
         "/v1/devices/ws",
@@ -300,6 +308,8 @@ def test_active_device_receives_a_multi_frame_tts_stream(
         assert websocket.receive_bytes() == b"first-opus"
         assert websocket.receive_bytes() == b"second-opus"
         assert websocket.receive_json()["state"] == "stop"
+
+    assert delays == [0.06]
 
 
 def test_active_device_receives_a_task_notification(
@@ -566,6 +576,7 @@ def test_auto_voice_turn_processes_after_pcm_silence_without_listen_stop(tmp_pat
             },
             device_auto_turn_rms_threshold=35.0,
             device_auto_turn_silence_frames=2,
+            device_auto_turn_min_speech_frames=1,
         ),
         device_transport=transport,
         voice_delivery_service=DeviceVoiceDeliveryService(
@@ -607,6 +618,79 @@ def test_auto_voice_turn_processes_after_pcm_silence_without_listen_stop(tmp_pat
 
     assert len(runtime.received_inputs) == 1
     assert runtime.received_inputs[0].sample_count == 2_880
+
+
+def test_auto_voice_turn_resets_pcm_endpoint_for_each_listen_start(tmp_path) -> None:
+    transport = DeviceTransport()
+    audible = Pcm16Mono(sample_rate=16_000, payload=b"\x64\x00" * 960)
+    silent = Pcm16Mono(sample_rate=16_000, payload=b"\x00\x00" * 960)
+    runtime = FakeModelRuntime(
+        response_text="received",
+        response_pcm=Pcm16Mono(sample_rate=16_000, payload=b"\x02\x00" * 960),
+    )
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "voice-pcm-endpoint-reset.db",
+            device_token_hashes={
+                DEVICE_ID: sha256(DEVICE_TOKEN.encode("utf-8")).hexdigest()
+            },
+            device_auto_turn_rms_threshold=35.0,
+            device_auto_turn_silence_frames=2,
+            device_auto_turn_min_speech_frames=1,
+            device_auto_stop_idle_seconds=0.01,
+        ),
+        device_transport=transport,
+        voice_delivery_service=DeviceVoiceDeliveryService(
+            voice_turn_service=VoiceTurnService(
+                audio_bridge=AudioBridge(
+                    codec=SequenceVoiceLoopCodec(
+                        [audible, silent, silent, silent, silent]
+                    ),
+                    model_sample_rate=16_000,
+                    queue_capacity=8,
+                ),
+                model_runtime=runtime,
+            ),
+            device_transport=transport,
+        ),
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/v1/devices/ws",
+            headers=websocket_headers(),
+        ) as websocket:
+            websocket.send_json(hello_payload())
+            server_hello = websocket.receive_json()
+            first_start = {
+                "type": "listen",
+                "state": "start",
+                "mode": "auto",
+                "session_id": server_hello["session_id"],
+            }
+            websocket.send_json(first_start)
+            websocket.send_bytes(b"audible-opus")
+            websocket.send_bytes(b"silent-opus-1")
+            websocket.send_bytes(b"silent-opus-2")
+
+            assert websocket.receive_json()["state"] == "start"
+            assert websocket.receive_bytes() == b"voice-loop-opus"
+            assert websocket.receive_json()["state"] == "stop"
+
+            websocket.send_json(first_start)
+            websocket.send_bytes(b"next-silent-opus-1")
+            websocket.send_bytes(b"next-silent-opus-2")
+            time.sleep(0.03)
+            websocket.send_json(
+                {
+                    "type": "abort",
+                    "session_id": server_hello["session_id"],
+                }
+            )
+
+    assert len(runtime.received_inputs) == 1
+
+
 def test_voice_audio_diagnostics_log_only_aggregate_pcm_metrics(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

@@ -38,3 +38,18 @@ def test_endpoint_detector_does_not_finish_before_any_audible_speech() -> None:
     assert detector.observe(rms_amplitude=15.0) is False
     assert detector.observe(rms_amplitude=18.0) is False
     assert detector.has_heard_speech is False
+
+
+def test_endpoint_detector_requires_minimum_speech_frames_before_finishing() -> None:
+    detector = AutoTurnEndpointDetector(
+        rms_threshold=35.0,
+        consecutive_silent_frames=2,
+        minimum_speech_frames=2,
+    )
+
+    assert detector.observe(rms_amplitude=120.0) is False
+    assert detector.observe(rms_amplitude=10.0) is False
+    assert detector.observe(rms_amplitude=10.0) is False
+    assert detector.observe(rms_amplitude=120.0) is False
+    assert detector.observe(rms_amplitude=10.0) is False
+    assert detector.observe(rms_amplitude=10.0) is True

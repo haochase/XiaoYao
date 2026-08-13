@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import wave
+from datetime import UTC, datetime
 from io import BytesIO
 from urllib.error import HTTPError
 
@@ -31,6 +32,10 @@ class FakeResponse:
 
 def input_pcm() -> Pcm16Mono:
     return Pcm16Mono(sample_rate=16_000, payload=b"\x01\x00" * 960)
+
+
+def fixed_clock() -> datetime:
+    return datetime(2026, 8, 13, 4, 34, tzinfo=UTC)
 
 
 def chat_payload(content: str) -> bytes:
@@ -106,6 +111,30 @@ def test_mimo_runtime_sends_audio_to_chat_then_tts(monkeypatch) -> None:
         "format": "pcm16",
         "voice": "mimo_default",
     }
+
+
+def test_mimo_runtime_injects_current_shanghai_time(monkeypatch) -> None:
+    requests: list[dict[str, object]] = []
+
+    def fake_urlopen(request, *, timeout):
+        body = json.loads(request.data)
+        requests.append(body)
+        if body["model"] == "mimo-v2.5":
+            return FakeResponse(chat_payload('{"reply":"ok","task":null}'))
+        return FakeResponse(tts_payload())
+
+    monkeypatch.setattr(mimo_v25, "urlopen", fake_urlopen)
+    runtime = MimoV25Runtime(
+        openai_base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        api_key="example-token",
+        clock=fixed_clock,
+    )
+
+    runtime.respond(input_pcm())
+
+    system_prompt = requests[0]["messages"][0]["content"]
+    assert "2026-08-13T12:34:00+08:00" in system_prompt
+    assert "Asia/Shanghai" in system_prompt
 
 
 def test_mimo_runtime_synthesizes_reminder_text_with_tts(monkeypatch) -> None:
@@ -253,6 +282,7 @@ def test_mimo_runtime_preserves_empty_context_and_appends_bounded_context(
     baseline = MimoV25Runtime(
         openai_base_url="https://token-plan-cn.xiaomimi.test/v1",
         api_key="example-token",
+        clock=fixed_clock,
     )
     baseline.respond(input_pcm())
     baseline_system = requests[0]["messages"][0]["content"]
@@ -261,6 +291,7 @@ def test_mimo_runtime_preserves_empty_context_and_appends_bounded_context(
     empty_context = MimoV25Runtime(
         openai_base_url="https://token-plan-cn.xiaomimi.test/v1",
         api_key="example-token",
+        clock=fixed_clock,
     )
     empty_context.set_memory_context("")
     empty_context.respond(input_pcm())
@@ -270,6 +301,7 @@ def test_mimo_runtime_preserves_empty_context_and_appends_bounded_context(
     with_context = MimoV25Runtime(
         openai_base_url="https://token-plan-cn.xiaomimi.test/v1",
         api_key="example-token",
+        clock=fixed_clock,
     )
     with_context.set_memory_context("\nApproved user preference: preferred form of address: Chase")
     with_context.respond(input_pcm())

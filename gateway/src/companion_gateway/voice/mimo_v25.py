@@ -5,10 +5,13 @@ import binascii
 import json
 import time
 import wave
+from collections.abc import Callable
+from datetime import UTC, datetime
 from io import BytesIO
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
@@ -40,6 +43,11 @@ _MEMORY_PROPOSAL_PROMPT = (
     "reminder_preference, routine_preference, and approved_fact. Do not propose "
     "credentials, health data, location, device data, or raw conversation text."
 )
+_SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def _pcm_to_wav_data_url(pcm: Pcm16Mono) -> str:
@@ -149,6 +157,7 @@ class MimoV25Runtime:
         retry_backoff_seconds: float = 1.0,
         system_prompt: str | None = None,
         memory_proposals_enabled: bool = False,
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         parsed = urlparse(openai_base_url)
         if (
@@ -177,6 +186,8 @@ class MimoV25Runtime:
             raise ValueError("MiMo retry_backoff_seconds must not be negative")
         if not isinstance(memory_proposals_enabled, bool):
             raise ValueError("memory_proposals_enabled must be a boolean")
+        if not callable(clock):
+            raise ValueError("clock must be callable")
         self._base_url = openai_base_url.rstrip("/")
         self._api_key = api_key
         self._model = model
@@ -185,6 +196,7 @@ class MimoV25Runtime:
         self._timeout_seconds = timeout_seconds
         self._max_retries = max_retries
         self._retry_backoff_seconds = retry_backoff_seconds
+        self._clock = clock
         self._system_prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
         if memory_proposals_enabled:
             self._system_prompt += _MEMORY_PROPOSAL_PROMPT
@@ -213,6 +225,12 @@ class MimoV25Runtime:
             raise ModelRuntimeError(
                 f"MiMo input sample_rate must be {_INPUT_SAMPLE_RATE}"
             )
+        current_time = self._clock().astimezone(_SHANGHAI_TIMEZONE).isoformat()
+        time_context = (
+            "\nCurrent gateway time: "
+            f"{current_time} (Asia/Shanghai). Use this as the authoritative "
+            "current time when the user asks for the date or time."
+        )
         chat_message = self._request(
             {
                 "model": self._model,
@@ -221,6 +239,7 @@ class MimoV25Runtime:
                         "role": "system",
                         "content": (
                             self._system_prompt
+                            + time_context
                             + self._action_context
                             + self._memory_context
                         ),
