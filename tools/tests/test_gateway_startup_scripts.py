@@ -142,3 +142,34 @@ $global:registerCalls = 0
         "restart_interval_type": "System.TimeSpan",
         "register_calls": 1,
     }
+
+
+def test_gateway_runner_propagates_uvicorn_exit_code(tmp_path: Path) -> None:
+    fake_python = tmp_path / "fake-python.cmd"
+    fake_python.write_text(
+        "@echo off\r\n"
+        'if "%~1"=="-c" exit /b 0\r\n'
+        'if "%~1"=="-m" if "%~2"=="uvicorn" exit /b 37\r\n'
+        "exit /b 99\r\n",
+        encoding="ascii",
+    )
+
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-File",
+            str(SCRIPTS / "run-xiaoyao-gateway.ps1"),
+            "-GatewayRoot",
+            str(ROOT / "gateway"),
+            "-PythonPath",
+            str(fake_python),
+            "-Port",
+            "8723",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 37

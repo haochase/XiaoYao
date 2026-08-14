@@ -35,6 +35,7 @@ $env:PYTHONPATH = if ($previousPythonPath) {
 } else {
     $sourceDirectory
 }
+$uvicornExitCode = 0
 
 try {
     & $python -c "import uvicorn; import companion_gateway"
@@ -45,9 +46,14 @@ try {
     Push-Location $gatewayDirectory
     try {
         & $python -m uvicorn companion_gateway.api:create_default_app --factory --host 0.0.0.0 --port $Port
+        $uvicornExitCode = $LASTEXITCODE
     } finally {
         Pop-Location
     }
 } finally {
     $env:PYTHONPATH = $previousPythonPath
+}
+
+if ($uvicornExitCode -ne 0) {
+    exit $uvicornExitCode
 }
