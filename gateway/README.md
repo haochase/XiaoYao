@@ -47,6 +47,32 @@ $env:COMPANION_DEVICE_TOKEN_HASHES='{}'
 `GET /health` reports process liveness. `GET /ready` separately reports
 database availability.
 
+## Windows startup
+
+After installing the gateway dependencies, review the scheduled-task plan
+without registering anything:
+
+```powershell
+..\scripts\register-xiaoyao-gateway-task.ps1 -WhatIf
+```
+
+Register it only after that review. The task runs the gateway runner when the
+current user signs in, listens on port `8723`, and requests up to three restarts
+one minute apart after a process failure. The runner changes to this gateway
+directory before Uvicorn starts, so the ignored local environment file and the
+gateway-relative database path resolve consistently. By default it resolves the
+current `python` command; pass an explicit gateway directory, Python executable,
+or port when the scheduled task should use a different environment. The selected
+Python must have the gateway dependencies installed. Registration verifies that
+precondition before creating the task; if it fails, choose an interpreter with
+the gateway dependencies and pass it through `-PythonPath`.
+
+```powershell
+$python = (Get-Command python -CommandType Application).Source
+..\scripts\register-xiaoyao-gateway-task.ps1 -PythonPath $python -Port 8723
+..\scripts\check-xiaoyao-gateway-runtime.ps1 -ExpectedHost 0.0.0.0
+```
+
 ## Bootstrap a Xiaozhi device
 
 For a firmware build that requests its WebSocket settings through OTA, configure
