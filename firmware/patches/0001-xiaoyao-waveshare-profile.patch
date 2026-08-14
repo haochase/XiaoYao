@@ -1,0 +1,51 @@
+diff --git a/main/Kconfig.projbuild b/main/Kconfig.projbuild
+--- a/main/Kconfig.projbuild
++++ b/main/Kconfig.projbuild
+@@ -8,0 +9,7 @@
++config XIAOYAO_WEBSOCKET_ONLY
++    bool "Force WebSocket protocol"
++    default n
++    help
++        Use WebSocket after activation even when OTA does not provide protocol
++        configuration. This prevents a failed OTA round from falling back to MQTT.
++
+diff --git a/main/application.cc b/main/application.cc
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -501,0 +502,3 @@
++#if CONFIG_XIAOYAO_WEBSOCKET_ONLY
++    protocol_ = std::make_unique<WebsocketProtocol>();
++#else
+@@ -509,0 +513,1 @@
++#endif
+diff --git a/main/boards/waveshare/esp32-s3-audio-board/xiaoyao.config.json b/main/boards/waveshare/esp32-s3-audio-board/xiaoyao.config.json
+new file mode 100644
+--- /dev/null
++++ b/main/boards/waveshare/esp32-s3-audio-board/xiaoyao.config.json
+@@ -0,0 +1,26 @@
++{
++  "manufacturer": "waveshare",
++  "type": "esp32-s3-audio-board",
++  "target": "esp32s3",
++  "builds": [
++    {
++      "name": "esp32-s3-audio-board",
++      "sdkconfig_append": [
++        "CONFIG_USE_WECHAT_MESSAGE_STYLE=y",
++        "CONFIG_CAMERA_OV2640=y",
++        "CONFIG_CAMERA_OV2640_AUTO_DETECT_DVP_INTERFACE_SENSOR=y",
++        "CONFIG_CAMERA_OV2640_DVP_YUV422_640X480_6FPS=y",
++        "CONFIG_CAMERA_OV2640_DVP_IF_FORMAT_INDEX_DEFAULT=1",
++        "CONFIG_CAMERA_OV5640=y",
++        "CONFIG_CAMERA_OV5640_AUTO_DETECT_DVP_INTERFACE_SENSOR=y",
++        "CONFIG_CAMERA_OV5640_DVP_YUV422_800X600_10FPS=y",
++        "CONFIG_CAMERA_OV5640_DVP_IF_FORMAT_INDEX_DEFAULT=0",
++        "CONFIG_USE_CUSTOM_WAKE_WORD=y",
++        "CONFIG_CUSTOM_WAKE_WORD=\\"ni hao xiao yao\\"",
++        "CONFIG_CUSTOM_WAKE_WORD_DISPLAY=\\"你好小瑶\\"",
++        "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20",
++        "CONFIG_XIAOYAO_WEBSOCKET_ONLY=y"
++      ]
++    }
++  ]
++}

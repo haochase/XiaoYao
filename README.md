@@ -39,3 +39,24 @@ device tokens in environment variables or a secret manager; do not commit them.
 
 The ESP32 build helpers expect their external dependencies under `.vendor/`.
 They are not bundled or published by this repository.
+
+## Waveshare XiaoYao firmware profile
+
+The Waveshare ESP32-S3 Audio Board build uses a XiaoYao profile that retains the
+board's camera SDK configuration, enables the custom wake word `ni hao xiao
+yao`, shows `你好小瑶`, and uses WebSocket only after activation. The OTA endpoint
+is required at build time and is rendered into a temporary local configuration;
+it is not stored in the tracked profile.
+
+Use an HTTP or HTTPS OTA endpoint without credentials, query parameters, or
+fragments. Run the helper from the repository worktree and pass the endpoint
+explicitly:
+
+```powershell
+.\scripts\build-xiaozhi-waveshare.ps1 -OtaUrl 'https://example.com/ota'
+```
+
+To use a source snapshot outside the default vendor location, provide
+`-XiaozhiSourcePath`. The helper applies the XiaoYao patch idempotently, removes
+the temporary profile in `finally`, and prints SHA-256 hashes for the generated
+images. It does not flash a device.
