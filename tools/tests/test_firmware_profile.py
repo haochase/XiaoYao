@@ -13,6 +13,13 @@ from tools.firmware_profile import (
 )
 
 
+def test_firmware_profile_defers_annotations_for_python_39() -> None:
+    source_path = Path(firmware_profile.__file__)
+    future_import = source_path.read_text(encoding="utf-8").splitlines()[1]
+
+    assert future_import == "from __future__ import annotations"
+
+
 def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) -> None:
     source_root = tmp_path / "xiaozhi"
     main = source_root / "main"
@@ -137,6 +144,9 @@ def test_public_xiaoyao_profile_selects_an_esp32s3_chinese_multinet_model() -> N
     assert "CONFIG_XIAOYAO_VAD_EVENTS=y" in template["builds"][0][
         "sdkconfig_append"
     ]
+    assert "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=50" in template["builds"][0][
+        "sdkconfig_append"
+    ]
 
 
 def test_exact_profile_can_upgrade_a_previous_rendered_profile(tmp_path: Path) -> None:
@@ -248,6 +258,7 @@ def test_firmware_build_script_requires_a_single_interpreter_and_profile_output(
     assert "Unable to render the temporary XiaoYao profile" in build_script
     assert "$buildSdkconfig = Join-Path $xiaozhiRoot 'sdkconfig'" in build_script
     assert 'CONFIG_USE_CUSTOM_WAKE_WORD=y' in build_script
+    assert 'CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=50' in build_script
     assert 'CONFIG_XIAOYAO_WEBSOCKET_ONLY=y' in build_script
     assert 'CONFIG_XIAOYAO_VAD_EVENTS=y' in build_script
     assert 'CONFIG_SR_MN_CN_MULTINET6_QUANT=y' in build_script

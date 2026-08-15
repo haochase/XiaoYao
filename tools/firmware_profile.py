@@ -1,4 +1,5 @@
 """Render a local XiaoYao firmware profile without persisting its OTA endpoint."""
+from __future__ import annotations
 
 import argparse
 import json

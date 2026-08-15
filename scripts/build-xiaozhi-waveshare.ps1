@@ -83,6 +83,7 @@ function Assert-XiaoYaoBuildOutput {
         'CONFIG_USE_CUSTOM_WAKE_WORD=y',
         'CONFIG_SR_MN_CN_MULTINET6_QUANT=y',
         'CONFIG_CUSTOM_WAKE_WORD="ni hao xiao yao"',
+        'CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=50',
         'CONFIG_XIAOYAO_WEBSOCKET_ONLY=y',
         'CONFIG_XIAOYAO_VAD_EVENTS=y',
         ('CONFIG_OTA_URL="' + $ExpectedOtaUrl + '"')
