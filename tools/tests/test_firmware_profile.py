@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
+import re
 
 import pytest
+import tools.firmware_profile as firmware_profile
 
 from tools.firmware_profile import (
     ProfileError,
@@ -9,6 +11,65 @@ from tools.firmware_profile import (
     select_vendor_root,
     validate_ota_url,
 )
+
+
+def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) -> None:
+    source_root = tmp_path / "xiaozhi"
+    main = source_root / "main"
+    main.mkdir(parents=True)
+    scripts = source_root / "scripts"
+    scripts.mkdir()
+    kconfig_path = main / "Kconfig.projbuild"
+    application_path = main / "application.cc"
+    build_path = scripts / "build.py"
+    kconfig_path.write_text(
+        "menu \"Xiaozhi Assistant\"\n\n"
+        "config OTA_URL\n"
+        "    string \"Default OTA URL\"\n"
+        "    default \"https://api.tenclass.net/xiaozhi/ota/\"\n"
+        "    help\n"
+        "        The application will access this URL to check for new firmwares and server address.\n\n"
+        "choice\n",
+        encoding="utf-8",
+    )
+    application_path.write_text(
+        "void Application::InitializeProtocol() {\n"
+        "    if (ota_->HasMqttConfig()) {\n"
+        "        protocol_ = std::make_unique<MqttProtocol>();\n"
+        "    } else if (ota_->HasWebsocketConfig()) {\n"
+        "        protocol_ = std::make_unique<WebsocketProtocol>();\n"
+        "    } else {\n"
+        "        ESP_LOGW(TAG, \"No protocol specified in the OTA config, using MQTT\");\n"
+        "        protocol_ = std::make_unique<MqttProtocol>();\n"
+        "    }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    build_path.write_text(
+        "def _run_idf():\n"
+        "    command = [\"idf.py\"]\n",
+        encoding="utf-8",
+    )
+
+    firmware_profile.apply_vendor_profile(source_root)
+    firmware_profile.apply_vendor_profile(source_root)
+
+    assert "config XIAOYAO_WEBSOCKET_ONLY" in kconfig_path.read_text(encoding="utf-8")
+    application = application_path.read_text(encoding="utf-8")
+    assert "#if CONFIG_XIAOYAO_WEBSOCKET_ONLY" in application
+    assert "#endif" in application
+    assert 'os.environ.get("XIAOYAO_IDF_COMMAND", "idf.py")' in build_path.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_public_xiaoyao_profile_selects_an_esp32s3_chinese_multinet_model() -> None:
+    template_path = Path(__file__).resolve().parents[2] / "firmware" / "xiaoyao.config.json"
+    template = json.loads(template_path.read_text(encoding="utf-8"))
+
+    assert "CONFIG_SR_MN_CN_MULTINET6_QUANT=y" in template["builds"][0][
+        "sdkconfig_append"
+    ]
 
 
 def test_select_vendor_root_prefers_a_vendor_directory_in_the_workspace(
@@ -30,20 +91,6 @@ def test_select_vendor_root_falls_back_from_a_worktree_to_the_repository_vendor(
     (repository_vendor / "xiaozhi-esp32-main").mkdir(parents=True)
 
     assert select_vendor_root(workspace_root) == repository_vendor
-
-
-def test_xiaoyao_patch_has_no_trailing_whitespace() -> None:
-    patch_path = (
-        Path(__file__).resolve().parents[2]
-        / "firmware"
-        / "patches"
-        / "0001-xiaoyao-waveshare-profile.patch"
-    )
-
-    assert all(
-        not line.endswith((" \n", "\t\n"))
-        for line in patch_path.read_text(encoding="utf-8").splitlines(keepends=True)
-    )
 
 
 def test_validate_ota_url_accepts_http_and_https_urls() -> None:
@@ -97,3 +144,25 @@ def test_render_build_config_adds_only_the_validated_ota_setting(tmp_path: Path)
         'CONFIG_OTA_URL="https://example.com/ota"',
     ]
     assert json.loads(template_path.read_text(encoding="utf-8")) == template
+
+
+def test_firmware_build_script_requires_a_single_interpreter_and_profile_output() -> None:
+    build_script = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "build-xiaozhi-waveshare.ps1"
+    ).read_text(encoding="utf-8")
+
+    compact_script = re.sub(r"\s+", "", build_script)
+
+    assert "functionResolve-ProfilePython" in compact_script
+    assert "$hostPython=Resolve-ProfilePython" in compact_script
+    assert "--select-vendor-root" in build_script
+    assert "Unable to render the temporary XiaoYao profile" in build_script
+    assert "$buildSdkconfig = Join-Path $xiaozhiRoot 'sdkconfig'" in build_script
+    assert 'CONFIG_USE_CUSTOM_WAKE_WORD=y' in build_script
+    assert 'CONFIG_XIAOYAO_WEBSOCKET_ONLY=y' in build_script
+    assert 'CONFIG_SR_MN_CN_MULTINET6_QUANT=y' in build_script
+    assert "Copy-Item -Force $idfExecutable $shimPath" not in build_script
+    assert "& $idfExecutable fullclean" in build_script
+    assert 'XIAOYAO_IDF_COMMAND = $idfExecutable' in build_script

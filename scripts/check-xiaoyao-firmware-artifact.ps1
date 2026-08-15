@@ -8,6 +8,21 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Get-Sha256 {
+    param([string]$Path)
+
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        return (($algorithm.ComputeHash($stream) | ForEach-Object {
+            $_.ToString("X2")
+        }) -join "")
+    } finally {
+        $stream.Dispose()
+        $algorithm.Dispose()
+    }
+}
+
 try {
     $expectedSha256WasProvided = $PSBoundParameters.ContainsKey("ExpectedSha256")
     if ($expectedSha256WasProvided -and
@@ -24,7 +39,7 @@ try {
         throw "Firmware image is empty: $($image.FullName)"
     }
 
-    $actualSha256 = (Get-FileHash -LiteralPath $image.FullName -Algorithm SHA256).Hash
+    $actualSha256 = Get-Sha256 -Path $image.FullName
     $normalizedExpectedSha256 = if ($expectedSha256WasProvided) {
         $ExpectedSha256.ToUpperInvariant()
     } else {

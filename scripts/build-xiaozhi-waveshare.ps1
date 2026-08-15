@@ -18,7 +18,24 @@ $profileRenderer = Join-Path $workspaceRoot 'tools\firmware_profile.py'
 if (-not (Test-Path $profileRenderer)) {
     throw "XiaoYao profile renderer is missing: $profileRenderer"
 }
-$hostPython = (Get-Command 'python' -CommandType Application).Source
+
+function Resolve-ProfilePython {
+    $candidates = @(
+        Get-Command 'python' -CommandType Application |
+            ForEach-Object Source |
+            Select-Object -Unique
+    )
+    foreach ($candidate in $candidates) {
+        & $candidate $profileRenderer --select-vendor-root $workspaceRoot 2>$null |
+            Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            return $candidate
+        }
+    }
+    throw 'No local Python interpreter can run the XiaoYao profile renderer'
+}
+
+$hostPython = Resolve-ProfilePython
 $vendorRoot = & $hostPython $profileRenderer --select-vendor-root $workspaceRoot
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($vendorRoot)) {
     throw 'Unable to locate the XiaoYao vendor directory'
@@ -31,11 +48,7 @@ if ([string]::IsNullOrWhiteSpace($XiaozhiSourcePath)) {
 $idfRepository = Join-Path $vendorRoot 'esp-idf\v6.0.2\esp-idf'
 $activationScript = Join-Path $vendorRoot `
     'esp-idf\activate_idf_v6.0.2.ps1\Microsoft.v6.0.2.PowerShell_profile.ps1'
-$shimDirectory = Join-Path $vendorRoot 'idf-shim'
-$shimPath = Join-Path $shimDirectory 'idf.py'
-$firmwarePatch = Join-Path $workspaceRoot 'firmware\patches\0001-xiaoyao-waveshare-profile.patch'
-$profileTemplate = Join-Path $xiaozhiRoot `
-    'main\boards\waveshare\esp32-s3-audio-board\xiaoyao.config.json'
+$profileTemplate = Join-Path $workspaceRoot 'firmware\xiaoyao.config.json'
 $localProfile = Join-Path $xiaozhiRoot `
     'main\boards\waveshare\esp32-s3-audio-board\xiaoyao.local.config.json'
 $driveName = "$IdfDriveLetter`:"
@@ -55,31 +68,35 @@ function Get-SubstTarget {
     return $line.Substring($prefix.Length)
 }
 
-function Apply-XiaoYaoPatch {
+function Assert-XiaoYaoBuildOutput {
     param(
-        [string]$SourceRoot,
-        [string]$PatchPath
+        [string]$SdkconfigPath,
+        [string]$ImagePath,
+        [datetime]$BuildStartedAt,
+        [string]$ExpectedOtaUrl
     )
 
-    $applyArgs = @('apply')
-    if (-not (Test-Path (Join-Path $SourceRoot '.git'))) {
-        $applyArgs += '--no-index'
+    if (-not (Test-Path $SdkconfigPath)) {
+        throw "Build completed without sdkconfig: $SdkconfigPath"
     }
-
-    & git -C $SourceRoot @applyArgs --check $PatchPath
-    if ($LASTEXITCODE -eq 0) {
-        & git -C $SourceRoot @applyArgs $PatchPath
-        if ($LASTEXITCODE -ne 0) {
-            throw "Unable to apply XiaoYao firmware patch: $PatchPath"
+    $requiredSettings = @(
+        'CONFIG_USE_CUSTOM_WAKE_WORD=y',
+        'CONFIG_SR_MN_CN_MULTINET6_QUANT=y',
+        'CONFIG_CUSTOM_WAKE_WORD="ni hao xiao yao"',
+        'CONFIG_XIAOYAO_WEBSOCKET_ONLY=y',
+        ('CONFIG_OTA_URL="' + $ExpectedOtaUrl + '"')
+    )
+    foreach ($setting in $requiredSettings) {
+        if (-not (Select-String -LiteralPath $SdkconfigPath -SimpleMatch $setting -Quiet)) {
+            throw "Build sdkconfig is missing required XiaoYao setting: $setting"
         }
-        return
     }
-
-    & git -C $SourceRoot @applyArgs --reverse --check $PatchPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "XiaoYao firmware patch does not match source snapshot: $PatchPath"
+    if (-not (Test-Path $ImagePath)) {
+        throw "Build completed without merged image: $ImagePath"
     }
-    Write-Host 'XiaoYao firmware patch is already applied.'
+    if ((Get-Item $ImagePath).LastWriteTime -lt $BuildStartedAt) {
+        throw "Merged image predates this build: $ImagePath"
+    }
 }
 
 $existingTarget = Get-SubstTarget -Name $driveName
@@ -103,12 +120,12 @@ try {
     if (-not (Test-Path (Join-Path $xiaozhiRoot 'scripts\build.py'))) {
         throw "xiaozhi source snapshot is missing: $xiaozhiRoot"
     }
-    if (-not (Test-Path $firmwarePatch)) {
-        throw "XiaoYao firmware patch is missing: $firmwarePatch"
+    & $hostPython $profileRenderer --apply-vendor-profile $xiaozhiRoot
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Unable to apply the XiaoYao source profile'
     }
-    Apply-XiaoYaoPatch -SourceRoot $xiaozhiRoot -PatchPath $firmwarePatch
     if (-not (Test-Path $profileTemplate)) {
-        throw "XiaoYao firmware template is missing after patch application: $profileTemplate"
+        throw "XiaoYao firmware template is missing: $profileTemplate"
     }
     if (Test-Path $localProfile) {
         throw "Temporary XiaoYao profile already exists: $localProfile"
@@ -120,9 +137,7 @@ try {
     $env:IDF_PATH = $driveRoot
 
     $idfExecutable = (Get-Command 'idf.py.exe' -CommandType Application).Source
-    New-Item -ItemType Directory -Force $shimDirectory | Out-Null
-    Copy-Item -Force $idfExecutable $shimPath
-    $env:PATH = "$shimDirectory;$env:PATH"
+    $env:XIAOYAO_IDF_COMMAND = $idfExecutable
 
     $buildNinja = Join-Path $xiaozhiRoot 'build\build.ninja'
     $shortIdfMarker = "$IdfDriveLetter`:/components"
@@ -131,7 +146,7 @@ try {
     )
     if ($Clean -or $staleLongPathBuild) {
         Set-Location $xiaozhiRoot
-        & $shimPath fullclean
+        & $idfExecutable fullclean
         if ($LASTEXITCODE -ne 0) {
             throw "idf.py fullclean failed with exit code $LASTEXITCODE"
         }
@@ -148,6 +163,7 @@ try {
     $localProfileCreated = $true
 
     Set-Location $xiaozhiRoot
+    $buildStartedAt = Get-Date
     & $python scripts\build.py `
         'waveshare/esp32-s3-audio-board' `
         -c 'xiaoyao.local.config.json' `
@@ -158,9 +174,15 @@ try {
 
     $mergedImage = Join-Path $xiaozhiRoot 'build\merged-binary.bin'
     $applicationImage = Join-Path $xiaozhiRoot 'build\xiaozhi.bin'
+    $buildSdkconfig = Join-Path $xiaozhiRoot 'sdkconfig'
     if (-not (Test-Path $mergedImage) -or -not (Test-Path $applicationImage)) {
         throw 'Firmware build completed without the expected binary images'
     }
+    Assert-XiaoYaoBuildOutput `
+        -SdkconfigPath $buildSdkconfig `
+        -ImagePath $mergedImage `
+        -BuildStartedAt $buildStartedAt `
+        -ExpectedOtaUrl $OtaUrl
 
     $result = [PSCustomObject]@{
         Board = 'waveshare/esp32-s3-audio-board'

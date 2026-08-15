@@ -2,12 +2,96 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 from urllib.parse import urlsplit
 
 
 class ProfileError(ValueError):
     """Raised when a firmware profile cannot be rendered safely."""
+
+
+_KCONFIG_ANCHOR = (
+    "        The application will access this URL to check for new firmwares and server address.\n\n"
+    "choice\n"
+)
+_KCONFIG_PROFILE = (
+    "        The application will access this URL to check for new firmwares and server address.\n\n"
+    "config XIAOYAO_WEBSOCKET_ONLY\n"
+    "    bool \"Force WebSocket protocol\"\n"
+    "    default n\n"
+    "    help\n"
+    "        Use WebSocket after activation even when OTA does not provide protocol\n"
+    "        configuration. This prevents a failed OTA round from falling back to MQTT.\n\n"
+    "choice\n"
+)
+_PROTOCOL_ANCHOR = (
+    "    if (ota_->HasMqttConfig()) {\n"
+    "        protocol_ = std::make_unique<MqttProtocol>();\n"
+    "    } else if (ota_->HasWebsocketConfig()) {\n"
+    "        protocol_ = std::make_unique<WebsocketProtocol>();\n"
+    "    } else {\n"
+    "        ESP_LOGW(TAG, \"No protocol specified in the OTA config, using MQTT\");\n"
+    "        protocol_ = std::make_unique<MqttProtocol>();\n"
+    "    }\n"
+)
+_PROTOCOL_PROFILE = (
+    "    #if CONFIG_XIAOYAO_WEBSOCKET_ONLY\n"
+    "    protocol_ = std::make_unique<WebsocketProtocol>();\n"
+    "    #else\n"
+    + _PROTOCOL_ANCHOR
+    + "    #endif\n"
+)
+_BUILD_IDF_ANCHOR = '    command = ["idf.py"]\n'
+_BUILD_IDF_PROFILE = (
+    '    command = [os.environ.get("XIAOYAO_IDF_COMMAND", "idf.py")]\n'
+)
+
+
+def _read_text_preserving_newlines(path: Path) -> str:
+    with path.open("r", encoding="utf-8", newline="") as file:
+        return file.read()
+
+
+def _write_text_preserving_newlines(path: Path, content: str) -> None:
+    with path.open("w", encoding="utf-8", newline="") as file:
+        file.write(content)
+
+
+def _apply_exact_profile(path: Path, anchor: str, replacement: str) -> None:
+    try:
+        content = _read_text_preserving_newlines(path)
+    except OSError as exc:
+        raise ProfileError(f"unable to read vendor source: {path}") from exc
+
+    line_ending = "\r\n" if "\r\n" in content else "\n"
+    expected = anchor.replace("\n", line_ending)
+    rendered = replacement.replace("\n", line_ending)
+    if rendered in content:
+        return
+    if expected not in content:
+        raise ProfileError(f"vendor source does not match the expected profile anchor: {path}")
+    _write_text_preserving_newlines(path, content.replace(expected, rendered, 1))
+
+
+def apply_vendor_profile(source_root: Path) -> None:
+    """Apply the XiaoYao protocol profile to a known XiaoZhi source snapshot."""
+    source_root = source_root.resolve()
+    _apply_exact_profile(
+        source_root / "main" / "Kconfig.projbuild",
+        _KCONFIG_ANCHOR,
+        _KCONFIG_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.cc",
+        _PROTOCOL_ANCHOR,
+        _PROTOCOL_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "scripts" / "build.py",
+        _BUILD_IDF_ANCHOR,
+        _BUILD_IDF_PROFILE,
+    )
 
 
 def select_vendor_root(workspace_root: Path) -> Path:
@@ -88,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ota-url")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--select-vendor-root", type=Path)
+    parser.add_argument("--apply-vendor-profile", type=Path)
     args = parser.parse_args(argv)
 
     if args.select_vendor_root is not None:
@@ -95,6 +180,15 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--select-vendor-root cannot be combined with render options")
         try:
             print(select_vendor_root(args.select_vendor_root))
+        except ProfileError as exc:
+            parser.error(str(exc))
+        return 0
+
+    if args.apply_vendor_profile is not None:
+        if any((args.template, args.ota_url, args.output)):
+            parser.error("--apply-vendor-profile cannot be combined with render options")
+        try:
+            apply_vendor_profile(args.apply_vendor_profile)
         except ProfileError as exc:
             parser.error(str(exc))
         return 0
