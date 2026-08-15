@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import RLock
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from companion_gateway.audio.bridge import (
     AudioBridge,
@@ -15,9 +17,33 @@ from companion_gateway.audio.bridge import (
 )
 from companion_gateway.domain.executor import TaskExecutor
 from companion_gateway.domain.models import TaskRecord
+from companion_gateway.domain.tasks import TaskStatus
 from companion_gateway.medication.service import MedicationReminderService
 from companion_gateway.memory.service import MemoryService
-from companion_gateway.voice.runtime import ModelRuntime, VoiceAction
+from companion_gateway.service import TaskService
+from companion_gateway.voice.runtime import ModelRuntime, VoiceAction, VoiceIntent
+
+
+Clock = Callable[[], datetime]
+_SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
+_TASK_STATUS_LABELS = {
+    TaskStatus.CREATED: "已创建",
+    TaskStatus.AWAITING_CONFIRMATION: "等待确认",
+    TaskStatus.SCHEDULED: "已安排",
+    TaskStatus.DUE: "已到时间",
+    TaskStatus.PENDING_DELIVERY: "等待送达",
+    TaskStatus.DELIVERING: "正在送达",
+    TaskStatus.DELIVERED: "已送达",
+    TaskStatus.ACKNOWLEDGED: "已确认",
+    TaskStatus.REJECTED: "已拒绝",
+    TaskStatus.EXPIRED: "已过期",
+    TaskStatus.FAILED: "执行失败",
+    TaskStatus.CANCELLED: "已取消",
+}
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 @dataclass(frozen=True)
@@ -45,14 +71,18 @@ class VoiceTurnService:
         task_executor: TaskExecutor | None = None,
         medication_service: MedicationReminderService | None = None,
         memory_service: MemoryService | None = None,
+        task_service: TaskService | None = None,
         actor_id: str = "voice-user",
+        clock: Clock = _utc_now,
     ) -> None:
         self._audio_bridge = audio_bridge
         self._model_runtime = model_runtime
         self._task_executor = task_executor
         self._medication_service = medication_service
         self._memory_service = memory_service
+        self._task_service = task_service
         self._actor_id = actor_id
+        self._clock = clock
         self._session_uplink: dict[str, deque[Pcm16Mono]] = {}
         self._session_uplink_lock = RLock()
 
@@ -111,6 +141,9 @@ class VoiceTurnService:
     def set_memory_service(self, memory_service: MemoryService) -> None:
         self._memory_service = memory_service
 
+    def set_task_service(self, task_service: TaskService) -> None:
+        self._task_service = task_service
+
     def synthesize_text(self, text: str) -> tuple[bytes, ...]:
         synthesize = getattr(self._model_runtime, "synthesize", None)
         if synthesize is None:
@@ -130,6 +163,16 @@ class VoiceTurnService:
 
         self._prepare_model_context(target_device_id=target_device_id)
         response = self._model_runtime.respond(input_pcm)
+        response_text = response.text
+        response_pcm = response.pcm
+        if response.intent is not None:
+            response_text = self._resolve_intent(
+                response.intent,
+                target_device_id=target_device_id,
+            )
+            response_pcm = self._synthesize(response_text)
+        if response_pcm is None:
+            raise RuntimeError("voice response audio is required")
         memory_proposal_ids: tuple[str, ...] = ()
         if self._memory_service is not None and response.memory_proposals:
             try:
@@ -159,16 +202,49 @@ class VoiceTurnService:
             )
         device_opus_frames = tuple(
             self._audio_bridge.encode_downlink(frame)
-            for frame in self._split_response_pcm(response.pcm)
+            for frame in self._split_response_pcm(response_pcm)
         )
         return VoiceTurn(
             input_metrics=input_pcm.metrics,
-            response_text=response.text,
-            response_metrics=response.pcm.metrics,
+            response_text=response_text,
+            response_metrics=response_pcm.metrics,
             device_opus_frames=device_opus_frames,
             task=task,
             memory_proposal_ids=memory_proposal_ids,
         )
+
+    def _resolve_intent(
+        self,
+        intent: VoiceIntent,
+        *,
+        target_device_id: str | None,
+    ) -> str:
+        now = self._clock().astimezone(_SHANGHAI_TIMEZONE)
+        if intent.type == "current_time":
+            return f"现在是{now.hour}点{now.minute:02d}分。"
+        if intent.type == "current_date":
+            return f"今天是{now.year}年{now.month}月{now.day}日。"
+        if intent.type == "current_datetime":
+            return (
+                f"现在是{now.year}年{now.month}月{now.day}日"
+                f"{now.hour}点{now.minute:02d}分。"
+            )
+        if self._task_service is None or target_device_id is None:
+            return "目前没有找到提醒。"
+        task = self._task_service.get_latest_reminder(
+            actor_id=self._actor_id,
+            target_device_id=target_device_id,
+        )
+        if task is None:
+            return "目前没有找到提醒。"
+        status = _TASK_STATUS_LABELS[task.status]
+        return f"最近的提醒“{task.payload.text}”当前状态是{status}。"
+
+    def _synthesize(self, text: str) -> Pcm16Mono:
+        synthesize = getattr(self._model_runtime, "synthesize", None)
+        if synthesize is None:
+            raise RuntimeError("voice runtime does not support text synthesis")
+        return synthesize(text)
 
     def _apply_medication_action(
         self,

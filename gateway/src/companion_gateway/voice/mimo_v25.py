@@ -20,7 +20,7 @@ from companion_gateway.audio.bridge import Pcm16Mono
 from companion_gateway.domain.memory import MemoryProposalCandidate
 from companion_gateway.domain.models import TaskCreate
 from companion_gateway.voice.minicpm_o import ModelRuntimeError
-from companion_gateway.voice.runtime import ModelResponse, VoiceAction
+from companion_gateway.voice.runtime import ModelResponse, VoiceAction, VoiceIntent
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -32,13 +32,18 @@ _RETRYABLE_STATUS_MAX = 599
 _MAX_MEMORY_PROPOSALS = 3
 _DEFAULT_SYSTEM_PROMPT = (
     "You are the XiaoYao voice companion. Reply in Chinese when the user speaks "
-    "Chinese. Return exactly one JSON object with keys reply, task, and action. The reply "
+    "Chinese. Return exactly one JSON object with keys reply, task, action, and intent. "
+    "The reply "
     "value must be a short natural spoken response. The task value must be null "
     "unless the user explicitly requests a reminder or device action. If a task "
     "is needed, task must match the gateway TaskCreate schema. The action value "
     "must be null unless the user explicitly confirms a medication occurrence or "
     "asks to disable the medication plan; supported action types are "
     "acknowledge_medication_occurrence and disable_medication_plan."
+    " The intent value must be null unless the user asks for the current time, "
+    "current date, current date and time, or latest reminder status. For those "
+    "queries return exactly one of current_time, current_date, current_datetime, "
+    "or reminder_status as {\"type\": \"...\"}."
 )
 _MEMORY_PROPOSAL_PROMPT = (
     " Optionally return memory_proposals as a list only when the user explicitly "
@@ -103,6 +108,7 @@ def _decode_json_response(
     str,
     TaskCreate | None,
     VoiceAction | None,
+    VoiceIntent | None,
     tuple[MemoryProposalCandidate, ...],
 ]:
     candidate = text.strip()
@@ -111,12 +117,23 @@ def _decode_json_response(
     try:
         payload = json.loads(candidate)
     except json.JSONDecodeError:
-        return text, None, None, ()
+        return text, None, None, None, ()
     if not isinstance(payload, dict):
-        return text, None, None, ()
-    reply = payload.get("reply")
-    if not isinstance(reply, str) or not reply.strip():
-        return text, None, None, ()
+        return text, None, None, None, ()
+    raw_intent = payload.get("intent")
+    intent = None
+    if raw_intent is not None:
+        try:
+            intent = VoiceIntent.model_validate(raw_intent)
+        except ValidationError as exc:
+            raise ModelRuntimeError("MiMo response intent is invalid") from exc
+    raw_reply = payload.get("reply")
+    if isinstance(raw_reply, str) and raw_reply.strip():
+        reply = raw_reply.strip()
+    elif intent is not None:
+        reply = ""
+    else:
+        return text, None, None, None, ()
     raw_task = payload.get("task")
     task = None
     if raw_task is not None:
@@ -141,7 +158,7 @@ def _decode_json_response(
                 proposals.append(MemoryProposalCandidate.model_validate(raw_proposal))
             except ValidationError:
                 continue
-    return reply.strip(), task, action, tuple(proposals)
+    return reply, task, action, intent, tuple(proposals)
 
 
 class MimoV25Runtime:
@@ -274,12 +291,17 @@ class MimoV25Runtime:
             }
         )
         chat_finished_at = time.perf_counter()
-        reply, task, action, memory_proposals = _decode_json_response(
+        reply, task, action, intent, memory_proposals = _decode_json_response(
             _text_content(chat_message)
         )
-        tts_started_at = time.perf_counter()
-        response_pcm = self.synthesize(reply)
-        finished_at = time.perf_counter()
+        if intent is None:
+            tts_started_at = time.perf_counter()
+            response_pcm = self.synthesize(reply)
+            finished_at = time.perf_counter()
+        else:
+            tts_started_at = chat_finished_at
+            response_pcm = None
+            finished_at = chat_finished_at
         logger.info(
             "mimo_voice_turn_completed model=%s chat_duration_ms=%s "
             "tts_duration_ms=%s total_duration_ms=%s output_audio_ms=%s",
@@ -287,13 +309,14 @@ class MimoV25Runtime:
             round((chat_finished_at - started_at) * 1_000),
             round((finished_at - tts_started_at) * 1_000),
             round((finished_at - started_at) * 1_000),
-            round(response_pcm.duration_ms),
+            round(response_pcm.duration_ms) if response_pcm is not None else 0,
         )
         return ModelResponse(
             text=reply,
             pcm=response_pcm,
             task=task,
             action=action,
+            intent=intent,
             memory_proposals=memory_proposals,
         )
 

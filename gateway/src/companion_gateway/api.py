@@ -321,6 +321,7 @@ def create_app(
     app.state.agent_tool_service = agent_tool_service
     if voice_delivery_service is not None:
         voice_delivery_service.set_task_executor(task_executor)
+        voice_delivery_service.set_task_service(service)
         voice_delivery_service.set_medication_service(medication_service)
         voice_delivery_service.set_memory_service(memory_service)
     if settings.task_scheduler_enabled:

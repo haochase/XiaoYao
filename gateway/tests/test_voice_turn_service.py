@@ -6,6 +6,8 @@ import wave
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from companion_gateway.audio.bridge import (
     AudioBridge,
     Pcm16Mono,
@@ -20,13 +22,20 @@ from companion_gateway.domain.models import (
     TaskCreate,
     TaskKind,
     TaskPayload,
+    TaskRecord,
     TaskSchedule,
 )
+from companion_gateway.domain.tasks import TaskStatus
 from companion_gateway.service import TaskService
 from companion_gateway.storage.sqlite import SQLiteTaskRepository
 from companion_gateway.memory.service import MemoryService
 from companion_gateway.voice.delivery import DeviceVoiceDeliveryService
-from companion_gateway.voice.runtime import FakeModelRuntime, ModelResponse, VoiceAction
+from companion_gateway.voice.runtime import (
+    FakeModelRuntime,
+    ModelResponse,
+    VoiceAction,
+    VoiceIntent,
+)
 from companion_gateway.voice.service import VoiceTurnService
 
 
@@ -151,6 +160,41 @@ class FailingMemoryService:
         raise RuntimeError("storage unavailable")
 
 
+class IntentRuntime:
+    def __init__(self, intent: VoiceIntent, response_pcm: Pcm16Mono) -> None:
+        self._intent = intent
+        self._response_pcm = response_pcm
+        self.received_inputs: list[Pcm16Mono] = []
+        self.synthesized_texts: list[str] = []
+
+    def respond(self, pcm: Pcm16Mono) -> ModelResponse:
+        self.received_inputs.append(pcm)
+        return ModelResponse(
+            text="模型自由回复不应被使用",
+            pcm=None,
+            intent=self._intent,
+        )
+
+    def synthesize(self, text: str) -> Pcm16Mono:
+        self.synthesized_texts.append(text)
+        return self._response_pcm
+
+
+class LatestReminderTaskService:
+    def __init__(self, task: TaskRecord | None) -> None:
+        self._task = task
+        self.calls: list[tuple[str, str]] = []
+
+    def get_latest_reminder(
+        self,
+        *,
+        actor_id: str,
+        target_device_id: str,
+    ) -> TaskRecord | None:
+        self.calls.append((actor_id, target_device_id))
+        return self._task
+
+
 def test_voice_turn_consumes_input_and_returns_companion_opus_reply() -> None:
     input_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=-400)
     response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
@@ -172,6 +216,115 @@ def test_voice_turn_consumes_input_and_returns_companion_opus_reply() -> None:
     assert codec.downlink_pcm[0].sample_rate == 24_000
     assert codec.downlink_pcm[0].sample_count == 1_440
     assert service.process_next_input() is None
+
+
+@pytest.mark.parametrize(
+    ("intent_type", "expected_text"),
+    [
+        ("current_time", "现在是12点34分。"),
+        ("current_date", "今天是2026年8月13日。"),
+        ("current_datetime", "现在是2026年8月13日12点34分。"),
+    ],
+)
+def test_voice_turn_generates_deterministic_clock_intent_reply(
+    intent_type: str,
+    expected_text: str,
+) -> None:
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    response_pcm = pcm_frame(sample_rate=24_000, sample_count=1_440)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(
+        codec=codec,
+        model_sample_rate=16_000,
+        response_sample_rate=24_000,
+        queue_capacity=1,
+    )
+    runtime = IntentRuntime(VoiceIntent(type=intent_type), response_pcm)
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        clock=lambda: datetime(2026, 8, 13, 4, 34, tzinfo=UTC),
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_next_input(target_device_id="living-room")
+
+    assert turn is not None
+    assert turn.response_text == expected_text
+    assert runtime.synthesized_texts == [expected_text]
+
+
+def test_voice_turn_generates_latest_reminder_status_reply() -> None:
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    response_pcm = pcm_frame(sample_rate=24_000, sample_count=1_440)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(
+        codec=codec,
+        model_sample_rate=16_000,
+        response_sample_rate=24_000,
+        queue_capacity=1,
+    )
+    runtime = IntentRuntime(VoiceIntent(type="reminder_status"), response_pcm)
+    reminder = TaskRecord.model_validate(
+        {
+            "task_id": "tsk-latest",
+            "actor_id": "family-1",
+            "target_device_id": "living-room",
+            "kind": "reminder",
+            "schedule": {
+                "at": "2026-08-13T20:00:00+08:00",
+                "timezone": "Asia/Shanghai",
+            },
+            "payload": {"text": "按时服药"},
+            "confirmation_policy": "required",
+            "idempotency_key": "voice:latest",
+            "status": TaskStatus.ACKNOWLEDGED,
+            "created_at": "2026-08-13T04:00:00+00:00",
+            "trace_id": "trc-latest",
+        }
+    )
+    task_service = LatestReminderTaskService(reminder)
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        task_service=task_service,
+        actor_id="family-1",
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_next_input(target_device_id="living-room")
+
+    assert turn is not None
+    assert turn.response_text == "最近的提醒“按时服药”当前状态是已确认。"
+    assert runtime.synthesized_texts == [turn.response_text]
+    assert task_service.calls == [("family-1", "living-room")]
+
+
+def test_voice_turn_reports_when_no_reminder_exists() -> None:
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    response_pcm = pcm_frame(sample_rate=24_000, sample_count=1_440)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(
+        codec=codec,
+        model_sample_rate=16_000,
+        response_sample_rate=24_000,
+        queue_capacity=1,
+    )
+    runtime = IntentRuntime(VoiceIntent(type="reminder_status"), response_pcm)
+    task_service = LatestReminderTaskService(None)
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        task_service=task_service,
+        actor_id="family-1",
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_next_input(target_device_id="living-room")
+
+    assert turn is not None
+    assert turn.response_text == "目前没有找到提醒。"
+    assert runtime.synthesized_texts == [turn.response_text]
 
 
 def test_voice_turn_processes_all_pending_frames_as_one_turn() -> None:

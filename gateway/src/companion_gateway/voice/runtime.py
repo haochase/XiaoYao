@@ -10,19 +10,6 @@ from companion_gateway.domain.memory import MemoryProposalCandidate
 from companion_gateway.domain.models import Identifier, TaskCreate
 
 
-@dataclass(frozen=True)
-class ModelResponse:
-    text: str
-    pcm: Pcm16Mono
-    task: TaskCreate | None = None
-    action: "VoiceAction | None" = None
-    memory_proposals: tuple[MemoryProposalCandidate, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not self.text.strip():
-            raise ValueError("model response text must not be empty")
-
-
 class VoiceAction(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -43,6 +30,33 @@ class VoiceAction(BaseModel):
         elif self.plan_id is None or self.occurrence_id is not None:
             raise ValueError("disable_medication_plan requires plan_id only")
         return self
+
+
+class VoiceIntent(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    type: Literal[
+        "current_time",
+        "current_date",
+        "current_datetime",
+        "reminder_status",
+    ]
+
+
+@dataclass(frozen=True)
+class ModelResponse:
+    text: str
+    pcm: Pcm16Mono | None
+    task: TaskCreate | None = None
+    action: VoiceAction | None = None
+    intent: VoiceIntent | None = None
+    memory_proposals: tuple[MemoryProposalCandidate, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.text.strip() and self.intent is None:
+            raise ValueError("model response text must not be empty")
+        if self.pcm is None and self.intent is None:
+            raise ValueError("model response pcm is required without an intent")
 
 
 class ModelRuntime(Protocol):

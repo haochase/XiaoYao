@@ -3,7 +3,12 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-from companion_gateway.domain.models import TaskCreate, TaskEvent, TaskRecord
+from companion_gateway.domain.models import (
+    TaskCreate,
+    TaskEvent,
+    TaskKind,
+    TaskRecord,
+)
 from companion_gateway.domain.memory import (
     Memory,
     MemoryCategory,
@@ -954,6 +959,25 @@ class SQLiteTaskRepository:
             row = connection.execute(
                 "SELECT * FROM tasks WHERE task_id = ?",
                 (task_id,),
+            ).fetchone()
+        return self._task_from_row(row) if row is not None else None
+
+    def get_latest_task(
+        self,
+        *,
+        actor_id: str,
+        target_device_id: str,
+        kind: TaskKind,
+    ) -> TaskRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM tasks
+                WHERE actor_id = ? AND target_device_id = ? AND kind = ?
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (actor_id, target_device_id, kind.value),
             ).fetchone()
         return self._task_from_row(row) if row is not None else None
 

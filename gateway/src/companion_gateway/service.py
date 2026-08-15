@@ -7,7 +7,7 @@ from companion_gateway.domain.medication import (
     MedicationPlan,
     MedicationPlanCreate,
 )
-from companion_gateway.domain.models import TaskCreate, TaskEvent, TaskRecord
+from companion_gateway.domain.models import TaskCreate, TaskEvent, TaskKind, TaskRecord
 from companion_gateway.domain.tasks import TaskEventType
 from companion_gateway.storage.sqlite import SQLiteTaskRepository
 
@@ -52,6 +52,18 @@ class TaskService:
 
     def get_task(self, task_id: str) -> TaskRecord | None:
         return self._repository.get_task(task_id)
+
+    def get_latest_reminder(
+        self,
+        *,
+        actor_id: str,
+        target_device_id: str,
+    ) -> TaskRecord | None:
+        return self._repository.get_latest_task(
+            actor_id=actor_id,
+            target_device_id=target_device_id,
+            kind=TaskKind.REMINDER,
+        )
 
     def get_events(self, task_id: str) -> list[TaskEvent]:
         return self._repository.list_events(task_id)

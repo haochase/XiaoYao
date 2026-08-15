@@ -29,12 +29,16 @@ from companion_gateway.voice.mimo_v25 import MimoV25Runtime
 class RecordingReminderVoiceDelivery:
     def __init__(self) -> None:
         self.messages: list[tuple[str, str]] = []
+        self.task_service = None
 
     def synthesize_and_send(self, *, session_id: str, text: str) -> None:
         self.messages.append((session_id, text))
 
     def set_task_executor(self, task_executor) -> None:
         return None
+
+    def set_task_service(self, task_service) -> None:
+        self.task_service = task_service
 
     def set_medication_service(self, medication_service) -> None:
         return None
@@ -322,6 +326,7 @@ def test_reminder_delivery_uses_voice_tts_instead_of_task_json(
     app.state.task_scheduler.tick(now=datetime(2026, 8, 6, 12, tzinfo=UTC))
 
     assert voice_delivery.messages == [(session.session_id, "take medicine")]
+    assert voice_delivery.task_service is app.state.service
     assert app.state.service.get_task(task.task_id).status is TaskStatus.DELIVERED
 
 

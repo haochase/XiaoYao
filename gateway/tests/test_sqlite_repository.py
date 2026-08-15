@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from companion_gateway.domain.models import TaskCreate
+from companion_gateway.domain.models import TaskCreate, TaskKind, TaskPayload
 from companion_gateway.domain.tasks import (
     InvalidTaskTransition,
     TaskEventType,
@@ -134,3 +134,41 @@ def test_missing_task_returns_none_and_no_events(tmp_path) -> None:
 
     assert repository.get_task("missing") is None
     assert repository.list_events("missing") == []
+
+
+def test_latest_task_is_scoped_by_actor_device_and_kind(tmp_path) -> None:
+    repository = SQLiteTaskRepository(tmp_path / "tasks.db")
+    repository.initialize()
+    first, _ = create_once(repository, suffix="first")
+    latest_command = task_command("client:latest").model_copy(
+        update={"payload": TaskPayload(text="latest reminder")}
+    )
+    latest, _ = repository.create_task(
+        latest_command,
+        task_id="tsk-latest",
+        event_id="evt-latest",
+        trace_id="trc-latest",
+        occurred_at=NOW + timedelta(minutes=1),
+    )
+    other_device = task_command("client:other-device").model_copy(
+        update={"target_device_id": "bedroom"}
+    )
+    repository.create_task(
+        other_device,
+        task_id="tsk-other-device",
+        event_id="evt-other-device",
+        trace_id="trc-other-device",
+        occurred_at=NOW + timedelta(minutes=2),
+    )
+
+    assert repository.get_latest_task(
+        actor_id="family-1",
+        target_device_id="living-room",
+        kind=TaskKind.REMINDER,
+    ) == latest
+    assert repository.get_latest_task(
+        actor_id="family-1",
+        target_device_id="missing-device",
+        kind=TaskKind.REMINDER,
+    ) is None
+    assert first.task_id == "tsk-first"

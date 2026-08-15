@@ -119,6 +119,89 @@ def test_mimo_runtime_sends_audio_to_chat_then_tts(monkeypatch) -> None:
     }
 
 
+def test_mimo_runtime_returns_structured_intent_without_early_tts(
+    monkeypatch,
+) -> None:
+    requests: list[dict[str, object]] = []
+
+    def fake_urlopen(request, *, timeout):
+        requests.append(json.loads(request.data))
+        return FakeResponse(
+            chat_payload(
+                '{"reply":"模型可能答错时间。","task":null,'
+                '"action":null,"intent":{"type":"current_time"}}'
+            )
+        )
+
+    monkeypatch.setattr(mimo_v25, "urlopen", fake_urlopen)
+    runtime = MimoV25Runtime(
+        openai_base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        api_key="example-token",
+        clock=fixed_clock,
+    )
+
+    response = runtime.respond(input_pcm())
+
+    assert response.intent is not None
+    assert response.intent.type == "current_time"
+    assert response.pcm is None
+    assert len(requests) == 1
+    system_prompt = requests[0]["messages"][0]["content"]
+    assert "intent" in system_prompt
+    assert "current_time" in system_prompt
+
+
+@pytest.mark.parametrize("reply_fragment", ["", '"reply":"",'])
+def test_mimo_runtime_accepts_intent_without_model_reply(
+    monkeypatch,
+    reply_fragment: str,
+) -> None:
+    requests: list[dict[str, object]] = []
+
+    def fake_urlopen(request, *, timeout):
+        requests.append(json.loads(request.data))
+        return FakeResponse(
+            chat_payload(
+                "{" + reply_fragment
+                + '"task":null,"action":null,'
+                '"intent":{"type":"current_time"}}'
+            )
+        )
+
+    monkeypatch.setattr(mimo_v25, "urlopen", fake_urlopen)
+    runtime = MimoV25Runtime(
+        openai_base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        api_key="example-token",
+    )
+
+    response = runtime.respond(input_pcm())
+
+    assert response.intent is not None
+    assert response.intent.type == "current_time"
+    assert response.pcm is None
+    assert len(requests) == 1
+
+
+def test_mimo_runtime_rejects_invalid_structured_intent(monkeypatch) -> None:
+    monkeypatch.setattr(
+        mimo_v25,
+        "urlopen",
+        lambda request, *, timeout: FakeResponse(
+            chat_payload(
+                '{"reply":"未知意图","task":null,'
+                '"action":null,"intent":{"type":"weather"}}'
+            )
+        ),
+    )
+    runtime = MimoV25Runtime(
+        openai_base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        api_key="example-token",
+    )
+
+    with pytest.raises(ModelRuntimeError, match="intent is invalid"):
+        runtime.respond(input_pcm())
+
+
 def test_mimo_runtime_injects_current_shanghai_time(monkeypatch) -> None:
     requests: list[dict[str, object]] = []
 

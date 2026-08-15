@@ -247,6 +247,16 @@ model task is created idempotently and enters the `scheduled` state;
 `TaskExecutor.execute_due` can then advance it through delivery states using a
 device delivery callback.
 
+Voice runtimes may return a structured `VoiceIntent` for current time, current
+date, current date and time, or latest reminder status. The gateway ignores the
+model-authored reply for those intents, resolves the answer from its
+Asia/Shanghai clock or the actor-and-device-scoped task store, and performs TTS
+only after grounding. A future MiniCPM-o adapter can reuse this contract; a
+runtime that does not emit an intent keeps the normal model response path.
+The current voice entry point is intentionally single-user and resolves task
+queries as the `voice-user` actor. Speaker identification and per-speaker actor
+routing are not implemented.
+
 ## Task scheduler
 
 The scheduler is disabled by default. Enable it only after the target device is
