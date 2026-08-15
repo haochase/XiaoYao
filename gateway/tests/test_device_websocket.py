@@ -1,6 +1,7 @@
+import asyncio
+import time
 from collections.abc import Iterator
 from hashlib import sha256
-import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -310,6 +311,55 @@ def test_active_device_receives_a_multi_frame_tts_stream(
         assert websocket.receive_json()["state"] == "stop"
 
     assert delays == [0.06]
+
+
+def test_abort_interrupts_an_active_tts_stream(
+    client: TestClient,
+    app_and_sink,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = app_and_sink
+
+    async def wait_between_frames(_: float) -> None:
+        await asyncio.sleep(0.02)
+
+    monkeypatch.setattr(api_module, "_sleep_between_tts_frames", wait_between_frames)
+
+    with client.websocket_connect(
+        "/v1/devices/ws",
+        headers=websocket_headers(),
+    ) as websocket:
+        websocket.send_json(hello_payload())
+        server_hello = websocket.receive_json()
+        session_id = server_hello["session_id"]
+        app.state.device_transport.send_tts_stream(
+            session_id,
+            (b"first-opus", b"second-opus", b"third-opus"),
+        )
+
+        assert websocket.receive_json()["state"] == "start"
+        assert websocket.receive_bytes() == b"first-opus"
+        websocket.send_json(
+            {
+                "type": "abort",
+                "session_id": session_id,
+                "reason": "wake_word_detected",
+            }
+        )
+        time.sleep(0.08)
+        app.state.device_transport.send_tts(session_id, b"next-opus")
+
+        assert websocket.receive_json() == {
+            "type": "tts",
+            "state": "start",
+            "session_id": session_id,
+        }
+        assert websocket.receive_bytes() == b"next-opus"
+        assert websocket.receive_json() == {
+            "type": "tts",
+            "state": "stop",
+            "session_id": session_id,
+        }
 
 
 def test_active_device_receives_a_task_notification(
@@ -900,6 +950,7 @@ def test_model_unavailable_returns_a_retryable_device_error(tmp_path) -> None:
 
 def test_injected_voice_turn_rejects_malformed_opus_without_server_error(
     tmp_path,
+    caplog,
 ) -> None:
     transport = DeviceTransport()
     bridge = AudioBridge(
@@ -928,25 +979,33 @@ def test_injected_voice_turn_rejects_malformed_opus_without_server_error(
         ),
     )
 
-    with TestClient(app) as client:
-        with client.websocket_connect(
-            "/v1/devices/ws",
-            headers=websocket_headers(),
-        ) as websocket:
-            websocket.send_json(hello_payload())
-            server_hello = websocket.receive_json()
-            websocket.send_json(
-                {
-                    "type": "listen",
-                    "state": "start",
-                    "session_id": server_hello["session_id"],
-                }
-            )
-            websocket.send_bytes(b"malformed-opus")
-            error = websocket.receive_json()
+    api_module.logger.addHandler(caplog.handler)
+    try:
+        with TestClient(app) as client:
+            caplog.set_level("WARNING", logger=api_module.logger.name)
+            with client.websocket_connect(
+                "/v1/devices/ws",
+                headers=websocket_headers(),
+            ) as websocket:
+                websocket.send_json(hello_payload())
+                server_hello = websocket.receive_json()
+                websocket.send_json(
+                    {
+                        "type": "listen",
+                        "state": "start",
+                        "session_id": server_hello["session_id"],
+                    }
+                )
+                websocket.send_bytes(b"malformed-opus")
+                error = websocket.receive_json()
+    finally:
+        api_module.logger.removeHandler(caplog.handler)
 
     assert error["code"] == "audio_decode_failed"
     assert error["retryable"] is False
+    assert "device_ws_audio_rejected" in caplog.text
+    assert "malformed opus" in caplog.text
+    assert "malformed-opus" not in caplog.text
 
 
 def test_listening_binary_frame_reaches_bounded_sink(

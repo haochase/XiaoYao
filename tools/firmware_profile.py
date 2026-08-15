@@ -42,6 +42,24 @@ _PROTOCOL_PROFILE = (
     + _PROTOCOL_ANCHOR
     + "    #endif\n"
 )
+_SPEAKING_WAKE_WORD_ANCHOR = (
+    "            if (listening_mode_ != kListeningModeRealtime) {\n"
+    "                audio_service_.EnableVoiceProcessing(false);\n"
+    "                // Only AFE wake word can be detected in speaking mode\n"
+    "                audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());\n"
+    "            }\n"
+)
+_SPEAKING_WAKE_WORD_PROFILE = (
+    "            if (listening_mode_ != kListeningModeRealtime) {\n"
+    "                audio_service_.EnableVoiceProcessing(false);\n"
+    "                // Custom wake words cannot safely distinguish speaker feedback.\n"
+    "                #if CONFIG_USE_CUSTOM_WAKE_WORD\n"
+    "                audio_service_.EnableWakeWordDetection(false);\n"
+    "                #else\n"
+    "                audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());\n"
+    "                #endif\n"
+    "            }\n"
+)
 _BUILD_IDF_ANCHOR = '    command = ["idf.py"]\n'
 _BUILD_IDF_PROFILE = (
     '    command = [os.environ.get("XIAOYAO_IDF_COMMAND", "idf.py")]\n'
@@ -86,6 +104,11 @@ def apply_vendor_profile(source_root: Path) -> None:
         source_root / "main" / "application.cc",
         _PROTOCOL_ANCHOR,
         _PROTOCOL_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.cc",
+        _SPEAKING_WAKE_WORD_ANCHOR,
+        _SPEAKING_WAKE_WORD_PROFILE,
     )
     _apply_exact_profile(
         source_root / "scripts" / "build.py",

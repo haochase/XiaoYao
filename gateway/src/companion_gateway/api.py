@@ -551,6 +551,7 @@ def create_app(
         endpoint_detector: AutoTurnEndpointDetector | None = None
         post_tts_silence_gate: ConsecutiveSilenceGate | None = None
         post_tts_frames_ignored = 0
+        tts_interrupted = asyncio.Event()
         trace_id = f"trc_{uuid4().hex}"
         logger.info("device_ws_accepted device=%s", redact_device_id(device_id))
         try:
@@ -596,62 +597,86 @@ def create_app(
             async def forward_outbound() -> None:
                 nonlocal post_tts_frames_ignored, post_tts_silence_gate
                 frame_duration_ms = response_hello["audio_params"]["frame_duration"]
-                while True:
-                    message = await transport.next_outbound(session.session_id)
-                    if isinstance(message, OutboundTask):
+                try:
+                    while True:
+                        message = await transport.next_outbound(session.session_id)
+                        if isinstance(message, OutboundTask):
+                            await websocket.send_json(
+                                {
+                                    "type": "task",
+                                    "state": "notify",
+                                    "session_id": message.session_id,
+                                    "task": jsonable_encoder(message.task),
+                                }
+                            )
+                            continue
+                        tts_interrupted.clear()
                         await websocket.send_json(
                             {
-                                "type": "task",
-                                "state": "notify",
+                                "type": "tts",
+                                "state": "start",
                                 "session_id": message.session_id,
-                                "task": jsonable_encoder(message.task),
                             }
                         )
-                        continue
-                    await websocket.send_json(
-                        {
-                            "type": "tts",
-                            "state": "start",
-                            "session_id": message.session_id,
-                        }
-                    )
-                    started_at = time.perf_counter()
-                    logger.info(
-                        "device_ws_tts_stream_started device=%s session=%s "
-                        "frames=%s frame_duration_ms=%s",
-                        redact_device_id(device_id),
-                        session.session_id,
-                        len(message.opus_frames),
-                        frame_duration_ms,
-                    )
-                    for frame_index, opus_frame in enumerate(message.opus_frames):
-                        if frame_index:
-                            await _sleep_between_tts_frames(
-                                frame_duration_ms / 1_000
-                            )
-                        await websocket.send_bytes(opus_frame)
-                    if settings.device_auto_turn_rms_threshold is not None:
-                        post_tts_frames_ignored = 0
-                        post_tts_silence_gate = ConsecutiveSilenceGate(
-                            rms_threshold=settings.device_auto_turn_rms_threshold,
-                            consecutive_silent_frames=(
-                                settings.device_post_tts_silence_frames
-                            ),
+                        started_at = time.perf_counter()
+                        logger.info(
+                            "device_ws_tts_stream_started device=%s session=%s "
+                            "frames=%s frame_duration_ms=%s",
+                            redact_device_id(device_id),
+                            session.session_id,
+                            len(message.opus_frames),
+                            frame_duration_ms,
                         )
-                    await websocket.send_json(
-                        {
-                            "type": "tts",
-                            "state": "stop",
-                            "session_id": message.session_id,
-                        }
-                    )
+                        frames_sent = 0
+                        for frame_index, opus_frame in enumerate(message.opus_frames):
+                            if tts_interrupted.is_set():
+                                break
+                            if frame_index:
+                                await _sleep_between_tts_frames(
+                                    frame_duration_ms / 1_000
+                                )
+                            if tts_interrupted.is_set():
+                                break
+                            await websocket.send_bytes(opus_frame)
+                            frames_sent += 1
+                        if tts_interrupted.is_set():
+                            logger.info(
+                                "device_ws_tts_stream_interrupted device=%s session=%s "
+                                "frames_sent=%s total_frames=%s",
+                                redact_device_id(device_id),
+                                session.session_id,
+                                frames_sent,
+                                len(message.opus_frames),
+                            )
+                            continue
+                        if settings.device_auto_turn_rms_threshold is not None:
+                            post_tts_frames_ignored = 0
+                            post_tts_silence_gate = ConsecutiveSilenceGate(
+                                rms_threshold=settings.device_auto_turn_rms_threshold,
+                                consecutive_silent_frames=(
+                                    settings.device_post_tts_silence_frames
+                                ),
+                            )
+                        await websocket.send_json(
+                            {
+                                "type": "tts",
+                                "state": "stop",
+                                "session_id": message.session_id,
+                            }
+                        )
+                        logger.info(
+                            "device_ws_tts_stream_finished device=%s session=%s "
+                            "frames=%s duration_ms=%s",
+                            redact_device_id(device_id),
+                            session.session_id,
+                            len(message.opus_frames),
+                            round((time.perf_counter() - started_at) * 1_000),
+                        )
+                except (RuntimeError, WebSocketDisconnect):
                     logger.info(
-                        "device_ws_tts_stream_finished device=%s session=%s "
-                        "frames=%s duration_ms=%s",
+                        "device_ws_outbound_stopped device=%s session=%s",
                         redact_device_id(device_id),
                         session.session_id,
-                        len(message.opus_frames),
-                        round((time.perf_counter() - started_at) * 1_000),
                     )
 
             outbound_sender = asyncio.create_task(forward_outbound())
@@ -779,6 +804,7 @@ def create_app(
                         elif message_type == "abort":
                             control = AbortControl.model_validate(payload)
                             session.apply_abort(control)
+                            tts_interrupted.set()
                         else:
                             raise UnsupportedDeviceControl(
                                 "unsupported control message"
@@ -968,7 +994,15 @@ def create_app(
                     )
                     await websocket.close(code=1008)
                     break
-                except AudioFrameRejected:
+                except AudioFrameRejected as exc:
+                    logger.warning(
+                        "device_ws_audio_rejected device=%s session=%s frame_bytes=%s "
+                        "reason=%s",
+                        redact_device_id(device_id),
+                        session.session_id,
+                        len(audio_frame),
+                        exc,
+                    )
                     await send_device_error(
                         websocket,
                         code="audio_decode_failed",

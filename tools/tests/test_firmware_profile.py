@@ -42,6 +42,18 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
         "        ESP_LOGW(TAG, \"No protocol specified in the OTA config, using MQTT\");\n"
         "        protocol_ = std::make_unique<MqttProtocol>();\n"
         "    }\n"
+        "}\n"
+        "\n"
+        "void Application::HandleStateChangedEvent() {\n"
+        "    switch (GetDeviceState()) {\n"
+        "        case kDeviceStateSpeaking:\n"
+        "            if (listening_mode_ != kListeningModeRealtime) {\n"
+        "                audio_service_.EnableVoiceProcessing(false);\n"
+        "                // Only AFE wake word can be detected in speaking mode\n"
+        "                audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());\n"
+        "            }\n"
+        "            break;\n"
+        "    }\n"
         "}\n",
         encoding="utf-8",
     )
@@ -58,6 +70,8 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     application = application_path.read_text(encoding="utf-8")
     assert "#if CONFIG_XIAOYAO_WEBSOCKET_ONLY" in application
     assert "#endif" in application
+    assert "#if CONFIG_USE_CUSTOM_WAKE_WORD" in application
+    assert "audio_service_.EnableWakeWordDetection(false);" in application
     assert 'os.environ.get("XIAOYAO_IDF_COMMAND", "idf.py")' in build_path.read_text(
         encoding="utf-8"
     )
