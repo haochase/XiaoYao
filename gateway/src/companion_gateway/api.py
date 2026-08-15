@@ -549,6 +549,7 @@ def create_app(
         close_reason_length = 0
         wake_word_frames_ignored = 0
         auto_turn_tail_frames_ignored = 0
+        auto_turn_audio_frames = 0
         audio_rms_min: float | None = None
         audio_rms_max: float | None = None
         audio_rms_last: float | None = None
@@ -736,30 +737,9 @@ def create_app(
                     redact_device_id(device_id),
                     session.session_id,
                     reason,
-                    session.audio_frames_received,
+                    auto_turn_audio_frames,
                 )
-                try:
-                    await asyncio.to_thread(
-                        voice_delivery_service.synthesize_and_send,
-                        session_id=session.session_id,
-                        text="我没有听清，请再说一次。",
-                    )
-                except ModelRuntimeError:
-                    await send_device_error(
-                        websocket,
-                        code="model_unavailable",
-                        trace_id=trace_id,
-                        retryable=True,
-                    )
-                    await websocket.close(code=1011)
-                except (DeviceNotConnected, DeviceOutboundBackpressure):
-                    logger.info(
-                        "device_ws_auto_turn_rejection_delivery_skipped "
-                        "device=%s session=%s reason=%s",
-                        redact_device_id(device_id),
-                        session.session_id,
-                        reason,
-                    )
+                await websocket.close(code=1000, reason="no_speech")
 
             async def finish_auto_turn_after_silence(expected_frames: int) -> None:
                 await asyncio.sleep(settings.device_auto_stop_idle_seconds)
@@ -785,7 +765,7 @@ def create_app(
                     "rms_threshold=%s silent_frames=%s min_speech_frames=%s",
                     redact_device_id(device_id),
                     session.session_id,
-                    session.audio_frames_received,
+                    auto_turn_audio_frames,
                     settings.device_auto_turn_rms_threshold,
                     settings.device_auto_turn_silence_frames,
                     settings.device_auto_turn_min_speech_frames,
@@ -826,6 +806,7 @@ def create_app(
                             if control.state == "detect":
                                 post_tts_silence_gate = None
                             if control.state == "start":
+                                auto_turn_audio_frames = 0
                                 endpoint_detector = (
                                     AutoTurnEndpointDetector(
                                         rms_threshold=(
@@ -875,6 +856,7 @@ def create_app(
                                 and not endpoint_detector.has_heard_speech
                             ):
                                 await reject_auto_turn(reason="unconfirmed_speech")
+                                break
                             else:
                                 await process_voice_turn(trigger="listen_stop")
                         elif (
@@ -1009,6 +991,8 @@ def create_app(
                                 )
                                 post_tts_silence_gate = None
                             continue
+                        if session.listening_mode == "auto":
+                            auto_turn_audio_frames += 1
                         reached_pcm_endpoint = (
                             session.listening_mode == "auto"
                             and endpoint_detector is not None
@@ -1024,7 +1008,7 @@ def create_app(
                             continue
                         if (
                             session.listening_mode == "auto"
-                            and session.audio_frames_received
+                            and auto_turn_audio_frames
                             >= settings.device_auto_turn_max_frames
                         ):
                             if auto_stop_task is not None:
@@ -1037,13 +1021,14 @@ def create_app(
                                 and not endpoint_detector.has_heard_speech
                             ):
                                 await reject_auto_turn(reason="frame_limit_no_speech")
+                                break
                             else:
                                 logger.info(
                                     "device_ws_auto_frame_limit device=%s "
                                     "session=%s frames=%s",
                                     redact_device_id(device_id),
                                     session.session_id,
-                                    session.audio_frames_received,
+                                    auto_turn_audio_frames,
                                 )
                                 await process_voice_turn(trigger="frame_limit")
                             continue

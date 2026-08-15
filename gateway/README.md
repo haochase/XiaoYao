@@ -238,7 +238,8 @@ to end a turn after sustained quiet audio. The endpoint detector requires
 is disabled when its RMS threshold is empty. Auto turns are capped by
 `COMPANION_DEVICE_AUTO_TURN_MAX_FRAMES` (150 60 ms frames, about 9 seconds, by
 default). An unconfirmed turn is discarded without a chat request and receives
-a fixed retry prompt through TTS.
+no TTS response; the gateway closes that connection normally so auto-listen
+firmware cannot feed a retry prompt back into another empty turn.
 `COMPANION_AUDIO_QUEUE_CAPACITY` bounds the number of 60 ms uplink frames
 retained for one turn; the default of 256 frames supports about 15.36 seconds
 of input. A runtime failure returns a retryable

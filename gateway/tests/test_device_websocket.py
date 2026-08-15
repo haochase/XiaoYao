@@ -751,8 +751,90 @@ def test_auto_voice_turn_processes_confirmed_speech_at_frame_limit(tmp_path) -> 
     assert runtime.received_inputs[0].sample_count == 2_880
 
 
+def test_auto_voice_turn_frame_limit_is_per_turn_and_excludes_echo_gate(
+    tmp_path,
+) -> None:
+    transport = DeviceTransport()
+    audible = Pcm16Mono(sample_rate=16_000, payload=b"\x64\x00" * 960)
+    silent = Pcm16Mono(sample_rate=16_000, payload=b"\x00\x00" * 960)
+    runtime = FakeModelRuntime(
+        response_text="已收到",
+        response_pcm=Pcm16Mono(sample_rate=16_000, payload=b"\x02\x00" * 960),
+    )
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "voice-frame-limit-per-turn.db",
+            device_token_hashes={
+                DEVICE_ID: sha256(DEVICE_TOKEN.encode("utf-8")).hexdigest()
+            },
+            device_auto_turn_rms_threshold=35.0,
+            device_auto_turn_silence_frames=1,
+            device_auto_turn_min_speech_frames=2,
+            device_auto_turn_max_frames=3,
+            device_post_tts_silence_frames=2,
+        ),
+        device_transport=transport,
+        voice_delivery_service=DeviceVoiceDeliveryService(
+            voice_turn_service=VoiceTurnService(
+                audio_bridge=AudioBridge(
+                    codec=SequenceVoiceLoopCodec(
+                        [
+                            audible,
+                            audible,
+                            audible,
+                            silent,
+                            silent,
+                            audible,
+                            audible,
+                            silent,
+                        ]
+                    ),
+                    model_sample_rate=16_000,
+                    queue_capacity=8,
+                ),
+                model_runtime=runtime,
+            ),
+            device_transport=transport,
+        ),
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/v1/devices/ws",
+            headers=websocket_headers(),
+        ) as websocket:
+            websocket.send_json(hello_payload())
+            server_hello = websocket.receive_json()
+            listen_start = {
+                "type": "listen",
+                "state": "start",
+                "mode": "auto",
+                "session_id": server_hello["session_id"],
+            }
+            websocket.send_json(listen_start)
+            websocket.send_bytes(b"first-audible-1")
+            websocket.send_bytes(b"first-audible-2")
+            websocket.send_bytes(b"first-audible-3")
+            assert websocket.receive_json()["state"] == "start"
+            assert websocket.receive_bytes() == b"voice-loop-opus"
+            assert websocket.receive_json()["state"] == "stop"
+
+            websocket.send_json(listen_start)
+            websocket.send_bytes(b"echo-gate-silent-1")
+            websocket.send_bytes(b"echo-gate-silent-2")
+            websocket.send_bytes(b"second-audible-1")
+            websocket.send_bytes(b"second-audible-2")
+            websocket.send_bytes(b"second-silent")
+            assert websocket.receive_json()["state"] == "start"
+            assert websocket.receive_bytes() == b"voice-loop-opus"
+            assert websocket.receive_json()["state"] == "stop"
+
+    assert len(runtime.received_inputs) == 2
+    assert [item.sample_count for item in runtime.received_inputs] == [2_880, 2_880]
+
+
 @pytest.mark.parametrize("finish_with_stop", [False, True])
-def test_auto_voice_turn_rejects_unconfirmed_audio_without_chat(
+def test_auto_voice_turn_closes_unconfirmed_audio_without_chat_or_tts(
     tmp_path,
     finish_with_stop: bool,
 ) -> None:
@@ -817,9 +899,10 @@ def test_auto_voice_turn_rejects_unconfirmed_audio_without_chat(
                 websocket.send_bytes(b"silent-1")
                 websocket.send_bytes(b"silent-2")
 
-            assert websocket.receive_json()["state"] == "start"
-            assert websocket.receive_bytes() == b"voice-loop-opus"
-            assert websocket.receive_json()["state"] == "stop"
+            with pytest.raises(WebSocketDisconnect) as disconnected:
+                websocket.receive_json()
+
+            assert disconnected.value.code == 1000
 
     assert runtime.received_inputs == []
 
