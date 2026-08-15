@@ -332,6 +332,7 @@ class Settings:
     device_auto_turn_silence_frames: int = 12
     device_auto_turn_min_speech_frames: int = 5
     device_auto_turn_max_frames: int = 150
+    device_vad_post_tts_rms_threshold: float = 35.0
     device_post_tts_silence_frames: int = 3
     audio_queue_capacity: int = 256
 
@@ -469,6 +470,10 @@ class Settings:
         if self.device_auto_turn_max_frames < 1:
             raise ValueError(
                 "COMPANION_DEVICE_AUTO_TURN_MAX_FRAMES must be positive"
+            )
+        if self.device_vad_post_tts_rms_threshold < 0:
+            raise ValueError(
+                "COMPANION_DEVICE_VAD_POST_TTS_RMS_THRESHOLD must not be negative"
             )
         if self.device_post_tts_silence_frames < 1:
             raise ValueError(
@@ -673,6 +678,10 @@ class Settings:
             "COMPANION_DEVICE_AUTO_TURN_MAX_FRAMES",
             "150",
         )
+        configured_device_vad_post_tts_rms_threshold = os.environ.get(
+            "COMPANION_DEVICE_VAD_POST_TTS_RMS_THRESHOLD",
+            "35",
+        )
         configured_device_post_tts_silence_frames = os.environ.get(
             "COMPANION_DEVICE_POST_TTS_SILENCE_FRAMES",
             "3",
@@ -788,6 +797,14 @@ class Settings:
                 "COMPANION_DEVICE_AUTO_TURN_MAX_FRAMES must be an integer"
             ) from exc
         try:
+            device_vad_post_tts_rms_threshold = float(
+                configured_device_vad_post_tts_rms_threshold
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_DEVICE_VAD_POST_TTS_RMS_THRESHOLD must be a number"
+            ) from exc
+        try:
             device_post_tts_silence_frames = int(
                 configured_device_post_tts_silence_frames
             )
@@ -897,6 +914,9 @@ class Settings:
             device_auto_turn_silence_frames=device_auto_turn_silence_frames,
             device_auto_turn_min_speech_frames=device_auto_turn_min_speech_frames,
             device_auto_turn_max_frames=device_auto_turn_max_frames,
+            device_vad_post_tts_rms_threshold=(
+                device_vad_post_tts_rms_threshold
+            ),
             device_post_tts_silence_frames=device_post_tts_silence_frames,
             audio_queue_capacity=audio_queue_capacity,
         )

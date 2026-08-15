@@ -8,7 +8,12 @@ from threading import RLock
 from typing import Literal
 from uuid import uuid4
 
-from companion_gateway.device.models import AbortControl, DeviceHello, ListenControl
+from companion_gateway.device.models import (
+    AbortControl,
+    DeviceHello,
+    ListenControl,
+    VadControl,
+)
 
 
 Clock = Callable[[], datetime]
@@ -142,6 +147,22 @@ class DeviceSession:
         self.phase = DevicePhase.IDLE
         self.auto_turn_finished = True
         return True
+
+    def apply_vad(self, control: VadControl) -> None:
+        if not self.hello.features.vad_events:
+            raise InvalidDevicePhase("VAD events were not advertised")
+        if control.session_id not in (None, self.session_id):
+            raise InvalidDevicePhase("VAD message has the wrong session_id")
+        if (
+            control.state == "stop"
+            and self.phase is DevicePhase.IDLE
+            and self.auto_turn_finished
+        ):
+            return
+        if self.phase is not DevicePhase.LISTENING:
+            raise InvalidDevicePhase(
+                f"cannot report VAD while {self.phase.value}"
+            )
 
     def accept_audio_frame(self) -> None:
         if self.phase is not DevicePhase.LISTENING:

@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -19,6 +20,7 @@ from companion_gateway.audio.bridge import AudioFrameRejected, AudioQueueFull
 from companion_gateway.audio.turn import (
     AutoTurnEndpointDetector,
     ConsecutiveSilenceGate,
+    VadTurnEndpointDetector,
 )
 from companion_gateway.agent.service import (
     AgentToolNotAllowed,
@@ -35,6 +37,7 @@ from companion_gateway.device.models import (
     AbortControl,
     DeviceHello,
     ListenControl,
+    VadControl,
     server_hello,
 )
 from companion_gateway.device.session import (
@@ -554,6 +557,10 @@ def create_app(
         audio_rms_max: float | None = None
         audio_rms_last: float | None = None
         endpoint_detector: AutoTurnEndpointDetector | None = None
+        vad_endpoint_detector: VadTurnEndpointDetector | None = None
+        vad_preroll_frames: deque[bytes] = deque(maxlen=5)
+        vad_turn_discarded = False
+        vad_blocked_segment = False
         post_tts_silence_gate: ConsecutiveSilenceGate | None = None
         post_tts_frames_ignored = 0
         tts_interrupted = asyncio.Event()
@@ -571,13 +578,15 @@ def create_app(
                 hello=hello,
             )
             logger.info(
-                "device_ws_hello device=%s session=%s audio=%s/%s/%s/%sms",
+                "device_ws_hello device=%s session=%s audio=%s/%s/%s/%sms "
+                "vad_events=%s",
                 redact_device_id(device_id),
                 session.session_id,
                 hello.audio_params.format,
                 hello.audio_params.sample_rate,
                 hello.audio_params.channels,
                 hello.audio_params.frame_duration,
+                hello.features.vad_events,
             )
             previous = device_sessions.connect(session)
             if previous is not None:
@@ -654,10 +663,15 @@ def create_app(
                                 len(message.opus_frames),
                             )
                             continue
-                        if settings.device_auto_turn_rms_threshold is not None:
+                        post_tts_rms_threshold = (
+                            settings.device_vad_post_tts_rms_threshold
+                            if hello.features.vad_events
+                            else settings.device_auto_turn_rms_threshold
+                        )
+                        if post_tts_rms_threshold is not None:
                             post_tts_frames_ignored = 0
                             post_tts_silence_gate = ConsecutiveSilenceGate(
-                                rms_threshold=settings.device_auto_turn_rms_threshold,
+                                rms_threshold=post_tts_rms_threshold,
                                 consecutive_silent_frames=(
                                     settings.device_post_tts_silence_frames
                                 ),
@@ -807,6 +821,18 @@ def create_app(
                                 post_tts_silence_gate = None
                             if control.state == "start":
                                 auto_turn_audio_frames = 0
+                                vad_preroll_frames.clear()
+                                vad_turn_discarded = False
+                                vad_blocked_segment = False
+                                vad_endpoint_detector = (
+                                    VadTurnEndpointDetector(
+                                        minimum_speech_frames=(
+                                            settings.device_auto_turn_min_speech_frames
+                                        )
+                                    )
+                                    if hello.features.vad_events
+                                    else None
+                                )
                                 endpoint_detector = (
                                     AutoTurnEndpointDetector(
                                         rms_threshold=(
@@ -819,10 +845,13 @@ def create_app(
                                             settings.device_auto_turn_min_speech_frames
                                         ),
                                     )
-                                    if settings.device_auto_turn_rms_threshold
-                                    is not None
+                                    if not hello.features.vad_events
+                                    and settings.device_auto_turn_rms_threshold is not None
                                     else None
                                 )
+                        elif message_type == "vad":
+                            control = VadControl.model_validate(payload)
+                            session.apply_vad(control)
                         elif message_type == "abort":
                             control = AbortControl.model_validate(payload)
                             session.apply_abort(control)
@@ -841,23 +870,151 @@ def create_app(
                             getattr(control, "mode", None),
                         )
                         sink.on_control(session, control)
-                        if (
+                        if message_type == "vad":
+                            if vad_endpoint_detector is None:
+                                raise InvalidDevicePhase(
+                                    "VAD endpoint is unavailable before listen.start"
+                                )
+                            if control.state == "start":
+                                if post_tts_silence_gate is not None:
+                                    vad_blocked_segment = True
+                                    vad_preroll_frames.clear()
+                                    auto_turn_audio_frames = 0
+                                    if voice_delivery_service is not None:
+                                        voice_delivery_service.clear_pending_input(
+                                            session_id=session.session_id,
+                                        )
+                                    logger.info(
+                                        "device_ws_vad_blocked_by_post_tts_gate "
+                                        "device=%s session=%s",
+                                        redact_device_id(device_id),
+                                        session.session_id,
+                                    )
+                                elif not (
+                                    vad_blocked_segment or vad_turn_discarded
+                                ) and not vad_endpoint_detector.speech_active:
+                                    vad_endpoint_detector.start()
+                                    if voice_delivery_service is not None:
+                                        voice_delivery_service.clear_pending_input(
+                                            session_id=session.session_id,
+                                        )
+                                        while vad_preroll_frames:
+                                            if (
+                                                auto_turn_audio_frames
+                                                >= settings.device_auto_turn_max_frames
+                                            ):
+                                                vad_turn_discarded = True
+                                                break
+                                            voice_delivery_service.accept_and_send(
+                                                session_id=session.session_id,
+                                                opus_frame=vad_preroll_frames.popleft(),
+                                            )
+                                            auto_turn_audio_frames += 1
+                                        if vad_turn_discarded:
+                                            voice_delivery_service.clear_pending_input(
+                                                session_id=session.session_id,
+                                            )
+                                            vad_preroll_frames.clear()
+                                            logger.info(
+                                                "device_ws_vad_frame_limit_discarded "
+                                                "device=%s session=%s frames=%s "
+                                                "source=preroll",
+                                                redact_device_id(device_id),
+                                                session.session_id,
+                                                auto_turn_audio_frames,
+                                            )
+                                    else:
+                                        vad_preroll_frames.clear()
+                            else:
+                                speech_frames = vad_endpoint_detector.speech_frames
+                                if vad_blocked_segment or vad_turn_discarded:
+                                    discard_reason = (
+                                        "post_tts_gate"
+                                        if vad_blocked_segment
+                                        else "frame_limit"
+                                    )
+                                    vad_blocked_segment = False
+                                    vad_turn_discarded = False
+                                    vad_endpoint_detector.stop()
+                                    if voice_delivery_service is not None:
+                                        voice_delivery_service.clear_pending_input(
+                                            session_id=session.session_id,
+                                        )
+                                    vad_preroll_frames.clear()
+                                    auto_turn_audio_frames = 0
+                                    logger.info(
+                                        "device_ws_vad_segment_discarded device=%s "
+                                        "session=%s reason=%s",
+                                        redact_device_id(device_id),
+                                        session.session_id,
+                                        discard_reason,
+                                    )
+                                elif vad_endpoint_detector.stop():
+                                    if voice_delivery_service is None:
+                                        vad_preroll_frames.clear()
+                                        auto_turn_audio_frames = 0
+                                        continue
+                                    if not session.finish_auto_listening():
+                                        raise InvalidDevicePhase(
+                                            "VAD endpoint requires auto listening"
+                                        )
+                                    logger.info(
+                                        "device_ws_vad_endpoint device=%s session=%s "
+                                        "speech_frames=%s audio_frames=%s",
+                                        redact_device_id(device_id),
+                                        session.session_id,
+                                        speech_frames,
+                                        auto_turn_audio_frames,
+                                    )
+                                    await process_voice_turn(trigger="device_vad")
+                                else:
+                                    if voice_delivery_service is not None:
+                                        voice_delivery_service.clear_pending_input(
+                                            session_id=session.session_id,
+                                        )
+                                    vad_preroll_frames.clear()
+                                    auto_turn_audio_frames = 0
+                                    logger.info(
+                                        "device_ws_vad_rejected device=%s session=%s "
+                                        "speech_frames=%s",
+                                        redact_device_id(device_id),
+                                        session.session_id,
+                                        speech_frames,
+                                    )
+                        elif (
                             message_type == "listen"
                             and control.state == "stop"
-                            and voice_delivery_service is not None
                             and not session.auto_turn_finished
                         ):
                             if auto_stop_task is not None:
                                 auto_stop_task.cancel()
                                 auto_stop_task = None
-                            if (
-                                session.listening_mode == "auto"
+                            if hello.features.vad_events:
+                                if vad_endpoint_detector is not None:
+                                    vad_endpoint_detector.stop()
+                                if voice_delivery_service is not None:
+                                    voice_delivery_service.clear_pending_input(
+                                        session_id=session.session_id,
+                                    )
+                                vad_preroll_frames.clear()
+                                auto_turn_audio_frames = 0
+                                vad_turn_discarded = False
+                                vad_blocked_segment = False
+                                logger.info(
+                                    "device_ws_vad_listen_stop_discarded device=%s "
+                                    "session=%s",
+                                    redact_device_id(device_id),
+                                    session.session_id,
+                                )
+                            elif (
+                                voice_delivery_service is not None
+                                and session.listening_mode == "auto"
                                 and endpoint_detector is not None
                                 and not endpoint_detector.has_heard_speech
                             ):
                                 await reject_auto_turn(reason="unconfirmed_speech")
                                 break
-                            else:
+                            elif voice_delivery_service is not None:
                                 await process_voice_turn(trigger="listen_stop")
                         elif (
                             message_type == "abort"
@@ -890,6 +1047,31 @@ def create_app(
                             retryable=False,
                         )
                         await websocket.close(code=1008)
+                        break
+                    except AudioFrameRejected as exc:
+                        logger.warning(
+                            "device_ws_audio_rejected device=%s session=%s "
+                            "source=vad_preroll reason=%s",
+                            redact_device_id(device_id),
+                            session.session_id,
+                            exc,
+                        )
+                        await send_device_error(
+                            websocket,
+                            code="audio_decode_failed",
+                            trace_id=trace_id,
+                            retryable=False,
+                        )
+                        await websocket.close(code=1003)
+                        break
+                    except AudioQueueFull:
+                        await send_device_error(
+                            websocket,
+                            code="audio_pipeline_backpressure",
+                            trace_id=trace_id,
+                            retryable=True,
+                        )
+                        await websocket.close(code=1013)
                         break
                     except DeviceBackpressure:
                         await send_device_error(
@@ -956,6 +1138,90 @@ def create_app(
                             session.audio_frames_received,
                         )
                     sink.on_audio(session, audio_frame)
+                    if (
+                        hello.features.vad_events
+                        and vad_endpoint_detector is not None
+                    ):
+                        if (
+                            voice_delivery_service is not None
+                            and post_tts_silence_gate is not None
+                        ):
+                            pcm_frame = voice_delivery_service.accept_and_send(
+                                session_id=session.session_id,
+                                opus_frame=audio_frame,
+                            )
+                            audio_rms_last = pcm_frame.metrics.rms_amplitude
+                            audio_rms_min = (
+                                audio_rms_last
+                                if audio_rms_min is None
+                                else min(audio_rms_min, audio_rms_last)
+                            )
+                            audio_rms_max = (
+                                audio_rms_last
+                                if audio_rms_max is None
+                                else max(audio_rms_max, audio_rms_last)
+                            )
+                            voice_delivery_service.clear_pending_input(
+                                session_id=session.session_id,
+                            )
+                            post_tts_frames_ignored += 1
+                            if post_tts_silence_gate.observe(
+                                rms_amplitude=audio_rms_last
+                            ):
+                                logger.info(
+                                    "device_ws_post_tts_gate_opened device=%s "
+                                    "session=%s ignored_frames=%s "
+                                    "silence_frames=%s",
+                                    redact_device_id(device_id),
+                                    session.session_id,
+                                    post_tts_frames_ignored,
+                                    settings.device_post_tts_silence_frames,
+                                )
+                                post_tts_silence_gate = None
+                            continue
+                        if vad_blocked_segment or vad_turn_discarded:
+                            continue
+                        if not vad_endpoint_detector.speech_active:
+                            if voice_delivery_service is not None:
+                                vad_preroll_frames.append(bytes(audio_frame))
+                            continue
+                        if (
+                            auto_turn_audio_frames
+                            >= settings.device_auto_turn_max_frames
+                        ):
+                            if voice_delivery_service is not None:
+                                voice_delivery_service.clear_pending_input(
+                                    session_id=session.session_id,
+                                )
+                            vad_preroll_frames.clear()
+                            vad_turn_discarded = True
+                            logger.info(
+                                "device_ws_vad_frame_limit_discarded device=%s "
+                                "session=%s frames=%s source=active",
+                                redact_device_id(device_id),
+                                session.session_id,
+                                auto_turn_audio_frames,
+                            )
+                            continue
+                        vad_endpoint_detector.observe_audio()
+                        auto_turn_audio_frames += 1
+                        if voice_delivery_service is not None:
+                            pcm_frame = voice_delivery_service.accept_and_send(
+                                session_id=session.session_id,
+                                opus_frame=audio_frame,
+                            )
+                            audio_rms_last = pcm_frame.metrics.rms_amplitude
+                            audio_rms_min = (
+                                audio_rms_last
+                                if audio_rms_min is None
+                                else min(audio_rms_min, audio_rms_last)
+                            )
+                            audio_rms_max = (
+                                audio_rms_last
+                                if audio_rms_max is None
+                                else max(audio_rms_max, audio_rms_last)
+                            )
+                        continue
                     if voice_delivery_service is not None:
                         pcm_frame = voice_delivery_service.accept_and_send(
                             session_id=session.session_id,
@@ -1008,6 +1274,7 @@ def create_app(
                             continue
                         if (
                             session.listening_mode == "auto"
+                            and vad_endpoint_detector is None
                             and auto_turn_audio_frames
                             >= settings.device_auto_turn_max_frames
                         ):

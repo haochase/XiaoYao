@@ -54,3 +54,36 @@ class AutoTurnEndpointDetector:
             self.has_heard_speech
             and self.silent_frames >= self.consecutive_silent_frames
         )
+
+
+@dataclass
+class VadTurnEndpointDetector:
+    minimum_speech_frames: int = 1
+    speech_frames: int = 0
+    speech_active: bool = False
+
+    def __post_init__(self) -> None:
+        if self.minimum_speech_frames < 1:
+            raise ValueError("minimum_speech_frames must be positive")
+
+    @property
+    def has_confirmed_speech(self) -> bool:
+        return self.speech_frames >= self.minimum_speech_frames
+
+    def start(self) -> None:
+        if self.speech_active:
+            return
+        self.speech_active = True
+        self.speech_frames = 0
+
+    def observe_audio(self) -> None:
+        if self.speech_active:
+            self.speech_frames += 1
+
+    def stop(self) -> bool:
+        if not self.speech_active:
+            return False
+        confirmed = self.has_confirmed_speech
+        self.speech_active = False
+        self.speech_frames = 0
+        return confirmed

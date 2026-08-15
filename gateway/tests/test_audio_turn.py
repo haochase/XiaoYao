@@ -1,3 +1,4 @@
+import companion_gateway.audio.turn as audio_turn
 from companion_gateway.audio.turn import (
     AutoTurnEndpointDetector,
     ConsecutiveSilenceGate,
@@ -76,3 +77,21 @@ def test_endpoint_detector_requires_consecutive_speech_frames_before_finishing()
     assert detector.has_heard_speech is True
     assert detector.observe(rms_amplitude=10.0) is False
     assert detector.observe(rms_amplitude=10.0) is True
+
+
+def test_vad_endpoint_requires_a_complete_minimum_length_speech_segment() -> None:
+    detector = audio_turn.VadTurnEndpointDetector(minimum_speech_frames=2)
+
+    assert detector.stop() is False
+    detector.start()
+    detector.observe_audio()
+    detector.start()
+    assert detector.stop() is False
+
+    detector.start()
+    detector.observe_audio()
+    detector.observe_audio()
+
+    assert detector.has_confirmed_speech is True
+    assert detector.stop() is True
+    assert detector.stop() is False

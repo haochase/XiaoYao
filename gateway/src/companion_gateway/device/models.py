@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AudioParameters(BaseModel):
@@ -12,12 +12,19 @@ class AudioParameters(BaseModel):
     frame_duration: Literal[60]
 
 
+class DeviceFeatures(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    vad_events: bool = False
+
+
 class DeviceHello(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     type: Literal["hello"]
     version: Literal[1]
     transport: Literal["websocket"]
+    features: DeviceFeatures = Field(default_factory=DeviceFeatures)
     audio_params: AudioParameters
 
 
@@ -39,7 +46,15 @@ class AbortControl(BaseModel):
     reason: str | None = None
 
 
-DeviceControl = ListenControl | AbortControl
+class VadControl(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["vad"]
+    state: Literal["start", "stop"]
+    session_id: str | None = None
+
+
+DeviceControl = ListenControl | AbortControl | VadControl
 
 
 def server_hello(session_id: str) -> dict[str, object]:

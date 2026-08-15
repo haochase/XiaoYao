@@ -115,7 +115,8 @@ Client-Id: <firmware-client-id>
 
 The first text frame is a `hello` message. Audio is accepted only after a
 `listen` start control and is returned as `tts.start`, binary Opus frames, and
-`tts.stop`.
+`tts.stop`. XiaoYao firmware advertises `features.vad_events=true` and sends
+`vad.start` and `vad.stop` controls around speech detected by the ESP32-S3 AFE.
 
 Inspect the current local session without exposing a token or audio payload:
 
@@ -229,15 +230,24 @@ errors, and malformed responses fail immediately as `model_unavailable`; adjust
 `COMPANION_MIMO_MAX_RETRIES` and `COMPANION_MIMO_RETRY_BACKOFF_SECONDS` for a
 different deployment policy.
 
-Audio is buffered between `listen.start` and `listen.stop`, so one turn causes
-one model request. Some auto-mode firmware does not send `listen.stop`; for
-those devices, set `COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD` after inspecting
-aggregate PCM diagnostics and use `COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES`
-to end a turn after sustained quiet audio. The endpoint detector requires
+For firmware that advertises VAD events, audio outside a complete VAD speech
+segment is not added to model input. A valid `vad.stop` ends one turn, and the
+same WebSocket remains available for the next `listen.start` and VAD segment.
+Short or isolated VAD events are discarded without calling the model or
+playing TTS. This is the preferred endpoint source for continuous XiaoYao
+conversation.
+
+Legacy auto-mode firmware can use `COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD`
+after inspecting aggregate PCM diagnostics and
+`COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES` to end a turn after sustained quiet
+audio. The legacy endpoint detector requires
 `COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES` consecutive audible frames and
 is disabled when its RMS threshold is empty. Auto turns are capped by
 `COMPANION_DEVICE_AUTO_TURN_MAX_FRAMES` (150 60 ms frames, about 9 seconds, by
-default). An unconfirmed turn is discarded without a chat request and receives
+default). VAD firmware uses the independent
+`COMPANION_DEVICE_VAD_POST_TTS_RMS_THRESHOLD` (35 by default) to reject speaker
+tail audio before accepting the next speech segment.
+An unconfirmed turn is discarded without a chat request and receives
 no TTS response; the gateway closes that connection normally so auto-listen
 firmware cannot feed a retry prompt back into another empty turn.
 `COMPANION_AUDIO_QUEUE_CAPACITY` bounds the number of 60 ms uplink frames
