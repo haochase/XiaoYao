@@ -233,8 +233,12 @@ Audio is buffered between `listen.start` and `listen.stop`, so one turn causes
 one model request. Some auto-mode firmware does not send `listen.stop`; for
 those devices, set `COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD` after inspecting
 aggregate PCM diagnostics and use `COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES`
-to end a turn after sustained quiet audio. The endpoint detector requires an
-audible frame first, and is disabled when its RMS threshold is empty.
+to end a turn after sustained quiet audio. The endpoint detector requires
+`COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES` consecutive audible frames and
+is disabled when its RMS threshold is empty. Auto turns are capped by
+`COMPANION_DEVICE_AUTO_TURN_MAX_FRAMES` (150 60 ms frames, about 9 seconds, by
+default). An unconfirmed turn is discarded without a chat request and receives
+a fixed retry prompt through TTS.
 `COMPANION_AUDIO_QUEUE_CAPACITY` bounds the number of 60 ms uplink frames
 retained for one turn; the default of 256 frames supports about 15.36 seconds
 of input. A runtime failure returns a retryable

@@ -723,6 +723,43 @@ def create_app(
                         trigger,
                     )
 
+            async def reject_auto_turn(*, reason: str) -> None:
+                if voice_delivery_service is None:
+                    return
+                voice_delivery_service.clear_pending_input(
+                    session_id=session.session_id,
+                )
+                logger.info(
+                    "device_ws_auto_turn_rejected device=%s session=%s "
+                    "reason=%s frames=%s",
+                    redact_device_id(device_id),
+                    session.session_id,
+                    reason,
+                    session.audio_frames_received,
+                )
+                try:
+                    await asyncio.to_thread(
+                        voice_delivery_service.synthesize_and_send,
+                        session_id=session.session_id,
+                        text="我没有听清，请再说一次。",
+                    )
+                except ModelRuntimeError:
+                    await send_device_error(
+                        websocket,
+                        code="model_unavailable",
+                        trace_id=trace_id,
+                        retryable=True,
+                    )
+                    await websocket.close(code=1011)
+                except (DeviceNotConnected, DeviceOutboundBackpressure):
+                    logger.info(
+                        "device_ws_auto_turn_rejection_delivery_skipped "
+                        "device=%s session=%s reason=%s",
+                        redact_device_id(device_id),
+                        session.session_id,
+                        reason,
+                    )
+
             async def finish_auto_turn_after_silence(expected_frames: int) -> None:
                 await asyncio.sleep(settings.device_auto_stop_idle_seconds)
                 if session.audio_frames_received != expected_frames:
@@ -831,7 +868,14 @@ def create_app(
                             if auto_stop_task is not None:
                                 auto_stop_task.cancel()
                                 auto_stop_task = None
-                            await process_voice_turn(trigger="listen_stop")
+                            if (
+                                session.listening_mode == "auto"
+                                and endpoint_detector is not None
+                                and not endpoint_detector.has_heard_speech
+                            ):
+                                await reject_auto_turn(reason="unconfirmed_speech")
+                            else:
+                                await process_voice_turn(trigger="listen_stop")
                         elif (
                             message_type == "abort"
                             and voice_delivery_service is not None
@@ -976,6 +1020,31 @@ def create_app(
                                 auto_stop_task.cancel()
                                 auto_stop_task = None
                             await finish_auto_turn_after_pcm_silence()
+                            continue
+                        if (
+                            session.listening_mode == "auto"
+                            and session.audio_frames_received
+                            >= settings.device_auto_turn_max_frames
+                        ):
+                            if auto_stop_task is not None:
+                                auto_stop_task.cancel()
+                                auto_stop_task = None
+                            if not session.finish_auto_listening():
+                                continue
+                            if (
+                                endpoint_detector is not None
+                                and not endpoint_detector.has_heard_speech
+                            ):
+                                await reject_auto_turn(reason="frame_limit_no_speech")
+                            else:
+                                logger.info(
+                                    "device_ws_auto_frame_limit device=%s "
+                                    "session=%s frames=%s",
+                                    redact_device_id(device_id),
+                                    session.session_id,
+                                    session.audio_frames_received,
+                                )
+                                await process_voice_turn(trigger="frame_limit")
                             continue
                         if (
                             session.listening_mode == "auto"

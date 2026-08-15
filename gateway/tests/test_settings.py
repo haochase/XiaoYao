@@ -144,6 +144,7 @@ def test_settings_loads_device_auto_turn_pcm_endpoint(monkeypatch) -> None:
     monkeypatch.setenv("COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD", "35")
     monkeypatch.setenv("COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES", "12")
     monkeypatch.setenv("COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES", "5")
+    monkeypatch.setenv("COMPANION_DEVICE_AUTO_TURN_MAX_FRAMES", "150")
     monkeypatch.setenv("COMPANION_DEVICE_POST_TTS_SILENCE_FRAMES", "5")
 
     settings = Settings.from_environment()
@@ -151,6 +152,7 @@ def test_settings_loads_device_auto_turn_pcm_endpoint(monkeypatch) -> None:
     assert settings.device_auto_turn_rms_threshold == 35.0
     assert settings.device_auto_turn_silence_frames == 12
     assert settings.device_auto_turn_min_speech_frames == 5
+    assert settings.device_auto_turn_max_frames == 150
     assert settings.device_post_tts_silence_frames == 5
 
 
@@ -163,6 +165,8 @@ def test_settings_loads_device_auto_turn_pcm_endpoint(monkeypatch) -> None:
         ("COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES", "not-a-number"),
         ("COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES", "0"),
         ("COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES", "not-a-number"),
+        ("COMPANION_DEVICE_AUTO_TURN_MAX_FRAMES", "0"),
+        ("COMPANION_DEVICE_AUTO_TURN_MAX_FRAMES", "not-a-number"),
         ("COMPANION_DEVICE_POST_TTS_SILENCE_FRAMES", "0"),
         ("COMPANION_DEVICE_POST_TTS_SILENCE_FRAMES", "not-a-number"),
     ],

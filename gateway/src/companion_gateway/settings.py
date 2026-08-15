@@ -331,6 +331,7 @@ class Settings:
     device_auto_turn_rms_threshold: float | None = None
     device_auto_turn_silence_frames: int = 12
     device_auto_turn_min_speech_frames: int = 5
+    device_auto_turn_max_frames: int = 150
     device_post_tts_silence_frames: int = 3
     audio_queue_capacity: int = 256
 
@@ -464,6 +465,10 @@ class Settings:
         if self.device_auto_turn_min_speech_frames < 1:
             raise ValueError(
                 "COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES must be positive"
+            )
+        if self.device_auto_turn_max_frames < 1:
+            raise ValueError(
+                "COMPANION_DEVICE_AUTO_TURN_MAX_FRAMES must be positive"
             )
         if self.device_post_tts_silence_frames < 1:
             raise ValueError(
@@ -664,6 +669,10 @@ class Settings:
             "COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES",
             "5",
         )
+        configured_device_auto_turn_max_frames = os.environ.get(
+            "COMPANION_DEVICE_AUTO_TURN_MAX_FRAMES",
+            "150",
+        )
         configured_device_post_tts_silence_frames = os.environ.get(
             "COMPANION_DEVICE_POST_TTS_SILENCE_FRAMES",
             "3",
@@ -769,6 +778,14 @@ class Settings:
         except ValueError as exc:
             raise ValueError(
                 "COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES must be an integer"
+            ) from exc
+        try:
+            device_auto_turn_max_frames = int(
+                configured_device_auto_turn_max_frames
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_DEVICE_AUTO_TURN_MAX_FRAMES must be an integer"
             ) from exc
         try:
             device_post_tts_silence_frames = int(
@@ -879,6 +896,7 @@ class Settings:
             device_auto_turn_rms_threshold=device_auto_turn_rms_threshold,
             device_auto_turn_silence_frames=device_auto_turn_silence_frames,
             device_auto_turn_min_speech_frames=device_auto_turn_min_speech_frames,
+            device_auto_turn_max_frames=device_auto_turn_max_frames,
             device_post_tts_silence_frames=device_post_tts_silence_frames,
             audio_queue_capacity=audio_queue_capacity,
         )

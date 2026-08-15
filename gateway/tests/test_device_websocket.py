@@ -692,6 +692,138 @@ def test_auto_voice_turn_processes_after_pcm_silence_without_listen_stop(tmp_pat
     assert runtime.received_inputs[0].sample_count == 2_880
 
 
+def test_auto_voice_turn_processes_confirmed_speech_at_frame_limit(tmp_path) -> None:
+    transport = DeviceTransport()
+    audible = Pcm16Mono(sample_rate=16_000, payload=b"\x64\x00" * 960)
+    runtime = FakeModelRuntime(
+        response_text="已收到",
+        response_pcm=Pcm16Mono(sample_rate=16_000, payload=b"\x02\x00" * 960),
+    )
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "voice-frame-limit.db",
+            device_token_hashes={
+                DEVICE_ID: sha256(DEVICE_TOKEN.encode("utf-8")).hexdigest()
+            },
+            device_auto_turn_rms_threshold=35.0,
+            device_auto_turn_silence_frames=12,
+            device_auto_turn_min_speech_frames=2,
+            device_auto_turn_max_frames=3,
+        ),
+        device_transport=transport,
+        voice_delivery_service=DeviceVoiceDeliveryService(
+            voice_turn_service=VoiceTurnService(
+                audio_bridge=AudioBridge(
+                    codec=SequenceVoiceLoopCodec([audible, audible, audible]),
+                    model_sample_rate=16_000,
+                    queue_capacity=8,
+                ),
+                model_runtime=runtime,
+            ),
+            device_transport=transport,
+        ),
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/v1/devices/ws",
+            headers=websocket_headers(),
+        ) as websocket:
+            websocket.send_json(hello_payload())
+            server_hello = websocket.receive_json()
+            websocket.send_json(
+                {
+                    "type": "listen",
+                    "state": "start",
+                    "mode": "auto",
+                    "session_id": server_hello["session_id"],
+                }
+            )
+            websocket.send_bytes(b"audible-1")
+            websocket.send_bytes(b"audible-2")
+            websocket.send_bytes(b"audible-3")
+
+            assert websocket.receive_json()["state"] == "start"
+            assert websocket.receive_bytes() == b"voice-loop-opus"
+            assert websocket.receive_json()["state"] == "stop"
+
+    assert len(runtime.received_inputs) == 1
+    assert runtime.received_inputs[0].sample_count == 2_880
+
+
+@pytest.mark.parametrize("finish_with_stop", [False, True])
+def test_auto_voice_turn_rejects_unconfirmed_audio_without_chat(
+    tmp_path,
+    finish_with_stop: bool,
+) -> None:
+    transport = DeviceTransport()
+    audible = Pcm16Mono(sample_rate=16_000, payload=b"\x64\x00" * 960)
+    silent = Pcm16Mono(sample_rate=16_000, payload=b"\x00\x00" * 960)
+    runtime = FakeModelRuntime(
+        response_text="不应调用聊天模型",
+        response_pcm=Pcm16Mono(sample_rate=16_000, payload=b"\x02\x00" * 960),
+    )
+    app = create_app(
+        Settings(
+            database_path=tmp_path / f"voice-reject-{finish_with_stop}.db",
+            device_token_hashes={
+                DEVICE_ID: sha256(DEVICE_TOKEN.encode("utf-8")).hexdigest()
+            },
+            device_auto_turn_rms_threshold=35.0,
+            device_auto_turn_silence_frames=12,
+            device_auto_turn_min_speech_frames=2,
+            device_auto_turn_max_frames=3,
+        ),
+        device_transport=transport,
+        voice_delivery_service=DeviceVoiceDeliveryService(
+            voice_turn_service=VoiceTurnService(
+                audio_bridge=AudioBridge(
+                    codec=SequenceVoiceLoopCodec([audible, silent, silent]),
+                    model_sample_rate=16_000,
+                    queue_capacity=8,
+                ),
+                model_runtime=runtime,
+            ),
+            device_transport=transport,
+        ),
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/v1/devices/ws",
+            headers=websocket_headers(),
+        ) as websocket:
+            websocket.send_json(hello_payload())
+            server_hello = websocket.receive_json()
+            websocket.send_json(
+                {
+                    "type": "listen",
+                    "state": "start",
+                    "mode": "auto",
+                    "session_id": server_hello["session_id"],
+                }
+            )
+            websocket.send_bytes(b"noise")
+            if finish_with_stop:
+                websocket.send_json(
+                    {
+                        "type": "listen",
+                        "state": "stop",
+                        "mode": "auto",
+                        "session_id": server_hello["session_id"],
+                    }
+                )
+            else:
+                websocket.send_bytes(b"silent-1")
+                websocket.send_bytes(b"silent-2")
+
+            assert websocket.receive_json()["state"] == "start"
+            assert websocket.receive_bytes() == b"voice-loop-opus"
+            assert websocket.receive_json()["state"] == "stop"
+
+    assert runtime.received_inputs == []
+
+
 def test_auto_voice_turn_resets_pcm_endpoint_for_each_listen_start(tmp_path) -> None:
     transport = DeviceTransport()
     audible = Pcm16Mono(sample_rate=16_000, payload=b"\x64\x00" * 960)
