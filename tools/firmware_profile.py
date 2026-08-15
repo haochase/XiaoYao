@@ -15,6 +15,16 @@ _KCONFIG_ANCHOR = (
     "        The application will access this URL to check for new firmwares and server address.\n\n"
     "choice\n"
 )
+_KCONFIG_WEBSOCKET_ONLY_PROFILE = (
+    "        The application will access this URL to check for new firmwares and server address.\n\n"
+    "config XIAOYAO_WEBSOCKET_ONLY\n"
+    "    bool \"Force WebSocket protocol\"\n"
+    "    default n\n"
+    "    help\n"
+    "        Use WebSocket after activation even when OTA does not provide protocol\n"
+    "        configuration. This prevents a failed OTA round from falling back to MQTT.\n\n"
+    "choice\n"
+)
 _KCONFIG_PROFILE = (
     "        The application will access this URL to check for new firmwares and server address.\n\n"
     "config XIAOYAO_WEBSOCKET_ONLY\n"
@@ -23,6 +33,12 @@ _KCONFIG_PROFILE = (
     "    help\n"
     "        Use WebSocket after activation even when OTA does not provide protocol\n"
     "        configuration. This prevents a failed OTA round from falling back to MQTT.\n\n"
+    "config XIAOYAO_VAD_EVENTS\n"
+    "    bool \"Send AFE VAD events to the XiaoYao gateway\"\n"
+    "    default n\n"
+    "    depends on USE_AUDIO_PROCESSOR\n"
+    "    help\n"
+    "        Advertise VAD event support and send speech start and stop controls.\n\n"
     "choice\n"
 )
 _PROTOCOL_ANCHOR = (
@@ -60,6 +76,72 @@ _SPEAKING_WAKE_WORD_PROFILE = (
     "                #endif\n"
     "            }\n"
 )
+_VAD_CALLBACK_ANCHOR = (
+    "    callbacks.on_vad_change = [this](bool speaking) {\n"
+    "        xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);\n"
+    "    };\n"
+)
+_VAD_CALLBACK_PROFILE = (
+    "    callbacks.on_vad_change = [this](bool speaking) {\n"
+    "#if CONFIG_XIAOYAO_VAD_EVENTS\n"
+    "        Schedule([this, speaking]() {\n"
+    "            auto state = GetDeviceState();\n"
+    "            bool accepts_vad = state == kDeviceStateListening ||\n"
+    "                (state == kDeviceStateSpeaking &&\n"
+    "                 listening_mode_ == kListeningModeRealtime);\n"
+    "            if (accepts_vad && protocol_ && protocol_->IsAudioChannelOpened()) {\n"
+    "                protocol_->SendVadState(speaking);\n"
+    "            }\n"
+    "        });\n"
+    "#endif\n"
+    "        xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);\n"
+    "    };\n"
+)
+_PROTOCOL_HEADER_ANCHOR = (
+    "    virtual void SendStartListening(ListeningMode mode);\n"
+    "    virtual void SendStopListening();\n"
+    "    virtual void SendAbortSpeaking(AbortReason reason);\n"
+)
+_PROTOCOL_HEADER_PROFILE = (
+    "    virtual void SendStartListening(ListeningMode mode);\n"
+    "    virtual void SendStopListening();\n"
+    "    virtual void SendVadState(bool speaking);\n"
+    "    virtual void SendAbortSpeaking(AbortReason reason);\n"
+)
+_PROTOCOL_SOURCE_ANCHOR = (
+    "void Protocol::SendStopListening() {\n"
+    "    std::string message =\n"
+    "        \"{\\\"session_id\\\":\\\"\" + session_id_ + \"\\\",\\\"type\\\":\\\"listen\\\",\\\"state\\\":\\\"stop\\\"}\";\n"
+    "    SendText(message);\n"
+    "}\n\n"
+    "void Protocol::SendMcpMessage(const std::string& payload) {\n"
+)
+_PROTOCOL_SOURCE_PROFILE = (
+    "void Protocol::SendStopListening() {\n"
+    "    std::string message =\n"
+    "        \"{\\\"session_id\\\":\\\"\" + session_id_ + \"\\\",\\\"type\\\":\\\"listen\\\",\\\"state\\\":\\\"stop\\\"}\";\n"
+    "    SendText(message);\n"
+    "}\n\n"
+    "void Protocol::SendVadState(bool speaking) {\n"
+    "    std::string message = \"{\\\"session_id\\\":\\\"\" + session_id_ +\n"
+    "                          \"\\\",\\\"type\\\":\\\"vad\\\",\\\"state\\\":\\\"\";\n"
+    "    message += speaking ? \"start\" : \"stop\";\n"
+    "    message += \"\\\"}\";\n"
+    "    SendText(message);\n"
+    "}\n\n"
+    "void Protocol::SendMcpMessage(const std::string& payload) {\n"
+)
+_WEBSOCKET_FEATURE_ANCHOR = (
+    "    cJSON_AddBoolToObject(features, \"mcp\", true);\n"
+    "    cJSON_AddItemToObject(root, \"features\", features);\n"
+)
+_WEBSOCKET_FEATURE_PROFILE = (
+    "    cJSON_AddBoolToObject(features, \"mcp\", true);\n"
+    "#if CONFIG_XIAOYAO_VAD_EVENTS\n"
+    "    cJSON_AddBoolToObject(features, \"vad_events\", true);\n"
+    "#endif\n"
+    "    cJSON_AddItemToObject(root, \"features\", features);\n"
+)
 _BUILD_IDF_ANCHOR = '    command = ["idf.py"]\n'
 _BUILD_IDF_PROFILE = (
     '    command = [os.environ.get("XIAOYAO_IDF_COMMAND", "idf.py")]\n'
@@ -76,7 +158,13 @@ def _write_text_preserving_newlines(path: Path, content: str) -> None:
         file.write(content)
 
 
-def _apply_exact_profile(path: Path, anchor: str, replacement: str) -> None:
+def _apply_exact_profile(
+    path: Path,
+    anchor: str,
+    replacement: str,
+    *,
+    previous_profiles: tuple[str, ...] = (),
+) -> None:
     try:
         content = _read_text_preserving_newlines(path)
     except OSError as exc:
@@ -87,6 +175,14 @@ def _apply_exact_profile(path: Path, anchor: str, replacement: str) -> None:
     rendered = replacement.replace("\n", line_ending)
     if rendered in content:
         return
+    for previous_profile in previous_profiles:
+        previous = previous_profile.replace("\n", line_ending)
+        if previous in content:
+            _write_text_preserving_newlines(
+                path,
+                content.replace(previous, rendered, 1),
+            )
+            return
     if expected not in content:
         raise ProfileError(f"vendor source does not match the expected profile anchor: {path}")
     _write_text_preserving_newlines(path, content.replace(expected, rendered, 1))
@@ -99,6 +195,7 @@ def apply_vendor_profile(source_root: Path) -> None:
         source_root / "main" / "Kconfig.projbuild",
         _KCONFIG_ANCHOR,
         _KCONFIG_PROFILE,
+        previous_profiles=(_KCONFIG_WEBSOCKET_ONLY_PROFILE,),
     )
     _apply_exact_profile(
         source_root / "main" / "application.cc",
@@ -109,6 +206,26 @@ def apply_vendor_profile(source_root: Path) -> None:
         source_root / "main" / "application.cc",
         _SPEAKING_WAKE_WORD_ANCHOR,
         _SPEAKING_WAKE_WORD_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.cc",
+        _VAD_CALLBACK_ANCHOR,
+        _VAD_CALLBACK_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "protocols" / "protocol.h",
+        _PROTOCOL_HEADER_ANCHOR,
+        _PROTOCOL_HEADER_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "protocols" / "protocol.cc",
+        _PROTOCOL_SOURCE_ANCHOR,
+        _PROTOCOL_SOURCE_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "protocols" / "websocket_protocol.cc",
+        _WEBSOCKET_FEATURE_ANCHOR,
+        _WEBSOCKET_FEATURE_PROFILE,
     )
     _apply_exact_profile(
         source_root / "scripts" / "build.py",

@@ -19,8 +19,13 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     main.mkdir(parents=True)
     scripts = source_root / "scripts"
     scripts.mkdir()
+    protocols = main / "protocols"
+    protocols.mkdir()
     kconfig_path = main / "Kconfig.projbuild"
     application_path = main / "application.cc"
+    protocol_header_path = protocols / "protocol.h"
+    protocol_source_path = protocols / "protocol.cc"
+    websocket_source_path = protocols / "websocket_protocol.cc"
     build_path = scripts / "build.py"
     kconfig_path.write_text(
         "menu \"Xiaozhi Assistant\"\n\n"
@@ -33,6 +38,14 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
         encoding="utf-8",
     )
     application_path.write_text(
+        "void Application::Initialize() {\n"
+        "    AudioServiceCallbacks callbacks;\n"
+        "    callbacks.on_vad_change = [this](bool speaking) {\n"
+        "        xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);\n"
+        "    };\n"
+        "    audio_service_.SetCallbacks(callbacks);\n"
+        "}\n"
+        "\n"
         "void Application::InitializeProtocol() {\n"
         "    if (ota_->HasMqttConfig()) {\n"
         "        protocol_ = std::make_unique<MqttProtocol>();\n"
@@ -57,6 +70,33 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
         "}\n",
         encoding="utf-8",
     )
+    protocol_header_path.write_text(
+        "class Protocol {\n"
+        "public:\n"
+        "    virtual void SendStartListening(ListeningMode mode);\n"
+        "    virtual void SendStopListening();\n"
+        "    virtual void SendAbortSpeaking(AbortReason reason);\n"
+        "};\n",
+        encoding="utf-8",
+    )
+    protocol_source_path.write_text(
+        "void Protocol::SendStopListening() {\n"
+        "    std::string message =\n"
+        "        \"{\\\"session_id\\\":\\\"\" + session_id_ + \"\\\",\\\"type\\\":\\\"listen\\\",\\\"state\\\":\\\"stop\\\"}\";\n"
+        "    SendText(message);\n"
+        "}\n"
+        "\n"
+        "void Protocol::SendMcpMessage(const std::string& payload) {\n",
+        encoding="utf-8",
+    )
+    websocket_source_path.write_text(
+        "std::string WebsocketProtocol::GetHelloMessage() {\n"
+        "    cJSON* features = cJSON_CreateObject();\n"
+        "    cJSON_AddBoolToObject(features, \"mcp\", true);\n"
+        "    cJSON_AddItemToObject(root, \"features\", features);\n"
+        "}\n",
+        encoding="utf-8",
+    )
     build_path.write_text(
         "def _run_idf():\n"
         "    command = [\"idf.py\"]\n",
@@ -66,12 +106,22 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     firmware_profile.apply_vendor_profile(source_root)
     firmware_profile.apply_vendor_profile(source_root)
 
-    assert "config XIAOYAO_WEBSOCKET_ONLY" in kconfig_path.read_text(encoding="utf-8")
+    kconfig = kconfig_path.read_text(encoding="utf-8")
+    assert "config XIAOYAO_WEBSOCKET_ONLY" in kconfig
+    assert "config XIAOYAO_VAD_EVENTS" in kconfig
     application = application_path.read_text(encoding="utf-8")
     assert "#if CONFIG_XIAOYAO_WEBSOCKET_ONLY" in application
     assert "#endif" in application
     assert "#if CONFIG_USE_CUSTOM_WAKE_WORD" in application
     assert "audio_service_.EnableWakeWordDetection(false);" in application
+    assert "protocol_->SendVadState(speaking);" in application
+    protocol_header = protocol_header_path.read_text(encoding="utf-8")
+    assert "virtual void SendVadState(bool speaking);" in protocol_header
+    protocol_source = protocol_source_path.read_text(encoding="utf-8")
+    assert r'\"type\":\"vad\"' in protocol_source
+    assert 'speaking ? "start" : "stop"' in protocol_source
+    websocket_source = websocket_source_path.read_text(encoding="utf-8")
+    assert 'cJSON_AddBoolToObject(features, "vad_events", true);' in websocket_source
     assert 'os.environ.get("XIAOYAO_IDF_COMMAND", "idf.py")' in build_path.read_text(
         encoding="utf-8"
     )
@@ -84,6 +134,29 @@ def test_public_xiaoyao_profile_selects_an_esp32s3_chinese_multinet_model() -> N
     assert "CONFIG_SR_MN_CN_MULTINET6_QUANT=y" in template["builds"][0][
         "sdkconfig_append"
     ]
+    assert "CONFIG_XIAOYAO_VAD_EVENTS=y" in template["builds"][0][
+        "sdkconfig_append"
+    ]
+
+
+def test_exact_profile_can_upgrade_a_previous_rendered_profile(tmp_path: Path) -> None:
+    profile_path = tmp_path / "Kconfig.projbuild"
+    previous_profile = "config XIAOYAO_WEBSOCKET_ONLY\n\nchoice\n"
+    current_profile = (
+        "config XIAOYAO_WEBSOCKET_ONLY\n\n"
+        "config XIAOYAO_VAD_EVENTS\n\n"
+        "choice\n"
+    )
+    profile_path.write_text(previous_profile, encoding="utf-8")
+
+    firmware_profile._apply_exact_profile(
+        profile_path,
+        "choice\n",
+        current_profile,
+        previous_profiles=(previous_profile,),
+    )
+
+    assert profile_path.read_text(encoding="utf-8") == current_profile
 
 
 def test_select_vendor_root_prefers_a_vendor_directory_in_the_workspace(
@@ -176,6 +249,7 @@ def test_firmware_build_script_requires_a_single_interpreter_and_profile_output(
     assert "$buildSdkconfig = Join-Path $xiaozhiRoot 'sdkconfig'" in build_script
     assert 'CONFIG_USE_CUSTOM_WAKE_WORD=y' in build_script
     assert 'CONFIG_XIAOYAO_WEBSOCKET_ONLY=y' in build_script
+    assert 'CONFIG_XIAOYAO_VAD_EVENTS=y' in build_script
     assert 'CONFIG_SR_MN_CN_MULTINET6_QUANT=y' in build_script
     assert "Copy-Item -Force $idfExecutable $shimPath" not in build_script
     assert "& $idfExecutable fullclean" in build_script

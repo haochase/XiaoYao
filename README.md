@@ -44,9 +44,10 @@ They are not bundled or published by this repository.
 
 The Waveshare ESP32-S3 Audio Board build uses a XiaoYao profile that retains the
 board's camera SDK configuration, enables the custom wake word `ni hao xiao
-yao`, shows `你好小瑶`, and uses WebSocket only after activation. The OTA endpoint
-is required at build time and is rendered into a temporary local configuration;
-it is not stored in the tracked profile.
+yao`, shows `你好小瑶`, uses WebSocket only after activation, and advertises AFE
+voice-activity events for continuous conversation endpoint detection. The OTA
+endpoint is required at build time and is rendered into a temporary local
+configuration; it is not stored in the tracked profile.
 
 Use an HTTP or HTTPS OTA endpoint without credentials, query parameters, or
 fragments. Run the helper from the repository worktree and pass the endpoint

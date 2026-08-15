@@ -20,7 +20,8 @@
         "CONFIG_CUSTOM_WAKE_WORD=\"ni hao xiao yao\"",
         "CONFIG_CUSTOM_WAKE_WORD_DISPLAY=\"你好小瑶\"",
         "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20",
-        "CONFIG_XIAOYAO_WEBSOCKET_ONLY=y"
+        "CONFIG_XIAOYAO_WEBSOCKET_ONLY=y",
+        "CONFIG_XIAOYAO_VAD_EVENTS=y"
       ]
     }
   ]
