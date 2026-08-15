@@ -338,6 +338,50 @@ def test_active_device_receives_a_multi_frame_tts_stream(
     assert delays == [0.06]
 
 
+def test_tts_disconnect_log_includes_failure_details(
+    client: TestClient,
+    app_and_sink,
+    caplog,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = app_and_sink
+    original_send_bytes = api_module.WebSocket.send_bytes
+    send_count = 0
+
+    async def fail_second_audio_frame(websocket, data: bytes) -> None:
+        nonlocal send_count
+        send_count += 1
+        if send_count == 2:
+            raise RuntimeError("simulated write failure")
+        await original_send_bytes(websocket, data)
+
+    monkeypatch.setattr(api_module.WebSocket, "send_bytes", fail_second_audio_frame)
+    api_module.logger.addHandler(caplog.handler)
+    try:
+        caplog.set_level("INFO", logger=api_module.logger.name)
+        with client.websocket_connect(
+            "/v1/devices/ws",
+            headers=websocket_headers(),
+        ) as websocket:
+            websocket.send_json(hello_payload())
+            server_hello = websocket.receive_json()
+            app.state.device_transport.send_tts_stream(
+                server_hello["session_id"],
+                (b"first-opus", b"second-opus", b"third-opus"),
+            )
+            assert websocket.receive_json()["state"] == "start"
+            assert websocket.receive_bytes() == b"first-opus"
+            time.sleep(0.2)
+    finally:
+        api_module.logger.removeHandler(caplog.handler)
+
+    assert "device_ws_outbound_stopped" in caplog.text
+    assert "error_type=" in caplog.text
+    assert "error=" in caplog.text
+    assert "frames_sent=1" in caplog.text
+    assert "total_frames=3" in caplog.text
+
+
 def test_abort_interrupts_an_active_tts_stream(
     client: TestClient,
     app_and_sink,

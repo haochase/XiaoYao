@@ -611,10 +611,16 @@ def create_app(
             async def forward_outbound() -> None:
                 nonlocal post_tts_frames_ignored, post_tts_silence_gate
                 frame_duration_ms = response_hello["audio_params"]["frame_duration"]
+                outbound_kind = "unknown"
+                frames_sent = 0
+                total_frames = 0
                 try:
                     while True:
                         message = await transport.next_outbound(session.session_id)
                         if isinstance(message, OutboundTask):
+                            outbound_kind = "task"
+                            frames_sent = 0
+                            total_frames = 0
                             await websocket.send_json(
                                 {
                                     "type": "task",
@@ -624,6 +630,9 @@ def create_app(
                                 }
                             )
                             continue
+                        outbound_kind = "tts"
+                        frames_sent = 0
+                        total_frames = len(message.opus_frames)
                         tts_interrupted.clear()
                         await websocket.send_json(
                             {
@@ -641,7 +650,6 @@ def create_app(
                             len(message.opus_frames),
                             frame_duration_ms,
                         )
-                        frames_sent = 0
                         for frame_index, opus_frame in enumerate(message.opus_frames):
                             if tts_interrupted.is_set():
                                 break
@@ -691,11 +699,17 @@ def create_app(
                             len(message.opus_frames),
                             round((time.perf_counter() - started_at) * 1_000),
                         )
-                except (RuntimeError, WebSocketDisconnect):
+                except (RuntimeError, WebSocketDisconnect) as exc:
                     logger.info(
-                        "device_ws_outbound_stopped device=%s session=%s",
+                        "device_ws_outbound_stopped device=%s session=%s kind=%s "
+                        "error_type=%s error=%r frames_sent=%s total_frames=%s",
                         redact_device_id(device_id),
                         session.session_id,
+                        outbound_kind,
+                        type(exc).__name__,
+                        str(exc),
+                        frames_sent,
+                        total_frames,
                     )
 
             outbound_sender = asyncio.create_task(forward_outbound())
