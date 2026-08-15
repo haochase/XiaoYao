@@ -11,6 +11,8 @@ import companion_gateway.api as api_module
 from companion_gateway.api import create_app
 from companion_gateway.audio.bridge import AudioBridge, AudioFrameRejected, Pcm16Mono
 from companion_gateway.device.events import BoundedDeviceEventSink
+from companion_gateway.device.models import DeviceHello
+from companion_gateway.device.session import DeviceSession
 from companion_gateway.device.transport import DeviceTransport
 from companion_gateway.domain.models import (
     ConfirmationPolicy,
@@ -105,6 +107,26 @@ def client(app_and_sink) -> Iterator[TestClient]:
     app, _ = app_and_sink
     with TestClient(app) as test_client:
         yield test_client
+
+
+def test_default_event_sink_does_not_backpressure_long_voice_sessions(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_path=tmp_path / "default-event-sink.db",
+        device_token_hashes={
+            DEVICE_ID: sha256(DEVICE_TOKEN.encode("utf-8")).hexdigest()
+        },
+    )
+    app = create_app(settings)
+    session = DeviceSession.create(
+        device_id=DEVICE_ID,
+        client_id=CLIENT_ID,
+        hello=DeviceHello.model_validate(hello_payload()),
+    )
+
+    for _ in range(256):
+        app.state.device_event_sink.on_audio(session, b"opus-frame")
 
 
 def test_invalid_device_token_is_rejected(client: TestClient) -> None:

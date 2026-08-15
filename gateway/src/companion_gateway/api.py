@@ -29,6 +29,7 @@ from companion_gateway.agent.service import (
 from companion_gateway.device.events import (
     BoundedDeviceEventSink,
     DeviceBackpressure,
+    DiscardingDeviceEventSink,
 )
 from companion_gateway.device.models import (
     AbortControl,
@@ -160,7 +161,9 @@ def _request_trace_id(request: Request) -> str:
 def create_app(
     settings: Settings,
     *,
-    device_event_sink: BoundedDeviceEventSink | None = None,
+    device_event_sink: (
+        BoundedDeviceEventSink | DiscardingDeviceEventSink | None
+    ) = None,
     device_transport: DeviceTransport | None = None,
     voice_delivery_service: DeviceVoiceDeliveryService | None = None,
     medication_notifier: MedicationNotifier | None = None,
@@ -175,7 +178,7 @@ def create_app(
     device_sessions = DeviceSessionRegistry()
     device_authenticator = DeviceAuthenticator(settings.device_token_hashes)
     transport = device_transport or DeviceTransport()
-    sink = device_event_sink or BoundedDeviceEventSink()
+    sink = device_event_sink or DiscardingDeviceEventSink()
 
     def deliver_task(task: TaskRecord) -> TaskDeliveryAttempt:
         session = device_sessions.get(task.target_device_id)

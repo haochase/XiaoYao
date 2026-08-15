@@ -10,6 +10,18 @@ class DeviceBackpressure(RuntimeError):
     pass
 
 
+class DiscardingDeviceEventSink:
+    def on_audio(self, session: DeviceSession, payload: bytes) -> None:
+        return
+
+    def on_control(
+        self,
+        session: DeviceSession,
+        control: DeviceControl,
+    ) -> None:
+        return
+
+
 @dataclass(frozen=True)
 class ReceivedAudioFrame:
     session_id: str
