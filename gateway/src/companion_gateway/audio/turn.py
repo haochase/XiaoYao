@@ -40,13 +40,17 @@ class AutoTurnEndpointDetector:
 
     def observe(self, *, rms_amplitude: float) -> bool:
         if rms_amplitude > self.rms_threshold:
-            self.has_heard_speech = True
             self.speech_frames += 1
+            if self.speech_frames >= self.minimum_speech_frames:
+                self.has_heard_speech = True
+            self.silent_frames = 0
+            return False
+        if not self.has_heard_speech:
+            self.speech_frames = 0
             self.silent_frames = 0
             return False
         self.silent_frames += 1
         return (
             self.has_heard_speech
-            and self.speech_frames >= self.minimum_speech_frames
             and self.silent_frames >= self.consecutive_silent_frames
         )
