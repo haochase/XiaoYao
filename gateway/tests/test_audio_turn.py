@@ -95,3 +95,23 @@ def test_vad_endpoint_requires_a_complete_minimum_length_speech_segment() -> Non
     assert detector.has_confirmed_speech is True
     assert detector.stop() is True
     assert detector.stop() is False
+
+
+def test_vad_endpoint_tracks_rms_metrics_for_the_current_segment() -> None:
+    detector = audio_turn.VadTurnEndpointDetector(minimum_speech_frames=2)
+
+    detector.start()
+    detector.observe_audio(rms_amplitude=12.0)
+    detector.observe_audio(rms_amplitude=48.0)
+
+    assert detector.audio_frames == 2
+    assert detector.rms_min == 12.0
+    assert detector.rms_max == 48.0
+    assert detector.average_rms == 30.0
+    assert detector.stop() is True
+
+    detector.start()
+    assert detector.audio_frames == 0
+    assert detector.rms_min is None
+    assert detector.rms_max is None
+    assert detector.average_rms is None

@@ -61,6 +61,10 @@ class VadTurnEndpointDetector:
     minimum_speech_frames: int = 1
     speech_frames: int = 0
     speech_active: bool = False
+    audio_frames: int = 0
+    rms_min: float | None = None
+    rms_max: float | None = None
+    rms_sum: float = 0.0
 
     def __post_init__(self) -> None:
         if self.minimum_speech_frames < 1:
@@ -75,10 +79,36 @@ class VadTurnEndpointDetector:
             return
         self.speech_active = True
         self.speech_frames = 0
+        self.audio_frames = 0
+        self.rms_min = None
+        self.rms_max = None
+        self.rms_sum = 0.0
 
-    def observe_audio(self) -> None:
+    @property
+    def average_rms(self) -> float | None:
+        if not self.audio_frames:
+            return None
+        return self.rms_sum / self.audio_frames
+
+    def observe_audio(self, *, rms_amplitude: float | None = None) -> None:
         if self.speech_active:
             self.speech_frames += 1
+            if rms_amplitude is None:
+                return
+            if rms_amplitude < 0:
+                raise ValueError("rms_amplitude must not be negative")
+            self.audio_frames += 1
+            self.rms_min = (
+                rms_amplitude
+                if self.rms_min is None
+                else min(self.rms_min, rms_amplitude)
+            )
+            self.rms_max = (
+                rms_amplitude
+                if self.rms_max is None
+                else max(self.rms_max, rms_amplitude)
+            )
+            self.rms_sum += rms_amplitude
 
     def stop(self) -> bool:
         if not self.speech_active:

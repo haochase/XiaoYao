@@ -865,6 +865,15 @@ def create_app(
                                 )
                         elif message_type == "vad":
                             control = VadControl.model_validate(payload)
+                            if session.should_ignore_auto_turn_tail_audio():
+                                logger.info(
+                                    "device_ws_auto_tail_vad_ignored device=%s "
+                                    "session=%s state=%s",
+                                    redact_device_id(device_id),
+                                    session.session_id,
+                                    control.state,
+                                )
+                                continue
                             session.apply_vad(control)
                         elif message_type == "abort":
                             control = AbortControl.model_validate(payload)
@@ -974,11 +983,15 @@ def create_app(
                                         )
                                     logger.info(
                                         "device_ws_vad_endpoint device=%s session=%s "
-                                        "speech_frames=%s audio_frames=%s",
+                                        "speech_frames=%s audio_frames=%s "
+                                        "rms_min=%s rms_max=%s rms_avg=%s",
                                         redact_device_id(device_id),
                                         session.session_id,
                                         speech_frames,
                                         auto_turn_audio_frames,
+                                        vad_endpoint_detector.rms_min,
+                                        vad_endpoint_detector.rms_max,
+                                        vad_endpoint_detector.average_rms,
                                     )
                                     await process_voice_turn(trigger="device_vad")
                                 else:
@@ -1217,7 +1230,6 @@ def create_app(
                                 auto_turn_audio_frames,
                             )
                             continue
-                        vad_endpoint_detector.observe_audio()
                         auto_turn_audio_frames += 1
                         if voice_delivery_service is not None:
                             pcm_frame = voice_delivery_service.accept_and_send(
@@ -1235,6 +1247,11 @@ def create_app(
                                 if audio_rms_max is None
                                 else max(audio_rms_max, audio_rms_last)
                             )
+                            vad_endpoint_detector.observe_audio(
+                                rms_amplitude=audio_rms_last,
+                            )
+                        else:
+                            vad_endpoint_detector.observe_audio()
                         continue
                     if voice_delivery_service is not None:
                         pcm_frame = voice_delivery_service.accept_and_send(
