@@ -22,3 +22,6 @@ docs/superpowers/
 *.map
 *.zip
 *.log
+docs/acceptance/
+docs/design/
+docs/verification/
