@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -459,6 +460,13 @@ class Settings:
         ):
             raise ValueError(
                 "COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD must not be negative"
+            )
+        if (
+            self.device_vad_turn_rms_threshold is not None
+            and not math.isfinite(self.device_vad_turn_rms_threshold)
+        ):
+            raise ValueError(
+                "COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD must be finite"
             )
         if (
             self.device_vad_turn_rms_threshold is not None
