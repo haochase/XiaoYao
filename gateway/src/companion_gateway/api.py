@@ -977,6 +977,25 @@ def create_app(
                                         vad_preroll_frames.clear()
                                         auto_turn_audio_frames = 0
                                         continue
+                                    if not vad_endpoint_detector.meets_rms_threshold(
+                                        settings.device_vad_turn_rms_threshold
+                                    ):
+                                        voice_delivery_service.clear_pending_input(
+                                            session_id=session.session_id,
+                                        )
+                                        vad_preroll_frames.clear()
+                                        auto_turn_audio_frames = 0
+                                        logger.info(
+                                            "device_ws_vad_rms_rejected device=%s "
+                                            "session=%s speech_frames=%s "
+                                            "rms_avg=%s threshold=%s",
+                                            redact_device_id(device_id),
+                                            session.session_id,
+                                            speech_frames,
+                                            vad_endpoint_detector.average_rms,
+                                            settings.device_vad_turn_rms_threshold,
+                                        )
+                                        continue
                                     if not session.finish_auto_listening():
                                         raise InvalidDevicePhase(
                                             "VAD endpoint requires auto listening"

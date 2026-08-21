@@ -237,6 +237,9 @@ Short or isolated VAD events are discarded without calling the model or
 playing TTS. This is the preferred endpoint source for continuous XiaoYao
 conversation.
 
+Set `COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD` only for VAD-capable firmware
+after calibrating it from aggregate `device_ws_vad_rms_rejected` logs.
+
 Legacy auto-mode firmware can use `COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD`
 after inspecting aggregate PCM diagnostics and
 `COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES` to end a turn after sustained quiet

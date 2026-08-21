@@ -818,6 +818,84 @@ def test_vad_capable_device_does_not_infer_speech_from_audio_energy(tmp_path) ->
     assert runtime.received_inputs[0].sample_count == 960
 
 
+def test_vad_rms_rejection_keeps_connection_listening_for_next_segment(
+    tmp_path,
+) -> None:
+    transport = DeviceTransport()
+    low_rms = Pcm16Mono(sample_rate=16_000, payload=b"\x64\x00" * 960)
+    high_rms = Pcm16Mono(sample_rate=16_000, payload=b"\x90\x01" * 960)
+    runtime = FakeModelRuntime(
+        response_text="已收到",
+        response_pcm=Pcm16Mono(sample_rate=16_000, payload=b"\x02\x00" * 960),
+    )
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "voice-vad-rms-rejection.db",
+            device_token_hashes={
+                DEVICE_ID: sha256(DEVICE_TOKEN.encode("utf-8")).hexdigest()
+            },
+            device_auto_turn_min_speech_frames=1,
+            device_vad_turn_rms_threshold=180.0,
+        ),
+        device_transport=transport,
+        voice_delivery_service=DeviceVoiceDeliveryService(
+            voice_turn_service=VoiceTurnService(
+                audio_bridge=AudioBridge(
+                    codec=SequenceVoiceLoopCodec([low_rms, high_rms]),
+                    model_sample_rate=16_000,
+                    queue_capacity=8,
+                ),
+                model_runtime=runtime,
+            ),
+            device_transport=transport,
+        ),
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/v1/devices/ws",
+            headers=websocket_headers(),
+        ) as websocket:
+            websocket.send_json(hello_payload(vad_events=True))
+            server_hello = websocket.receive_json()
+            session_id = server_hello["session_id"]
+            websocket.send_json(
+                {
+                    "type": "listen",
+                    "state": "start",
+                    "mode": "auto",
+                    "session_id": session_id,
+                }
+            )
+            vad_start = {
+                "type": "vad",
+                "state": "start",
+                "session_id": session_id,
+            }
+            vad_stop = {
+                "type": "vad",
+                "state": "stop",
+                "session_id": session_id,
+            }
+
+            websocket.send_json(vad_start)
+            websocket.send_bytes(b"low-rms-speech")
+            websocket.send_json(vad_stop)
+
+            assert runtime.received_inputs == []
+
+            websocket.send_json(vad_start)
+            websocket.send_bytes(b"high-rms-speech")
+            websocket.send_json(vad_stop)
+
+            assert websocket.receive_json()["state"] == "start"
+            assert websocket.receive_bytes() == b"voice-loop-opus"
+            assert websocket.receive_json()["state"] == "stop"
+
+    assert len(runtime.received_inputs) == 1
+    assert runtime.received_inputs[0].payload == high_rms.payload
+
+
 def test_vad_capable_device_processes_two_turns_on_one_connection(tmp_path) -> None:
     transport = DeviceTransport()
     runtime = FakeModelRuntime(
