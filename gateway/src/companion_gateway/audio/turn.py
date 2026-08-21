@@ -90,6 +90,16 @@ class VadTurnEndpointDetector:
             return None
         return self.rms_sum / self.audio_frames
 
+    def meets_rms_threshold(self, minimum_average_rms: float | None) -> bool:
+        if minimum_average_rms is None:
+            return True
+        if minimum_average_rms < 0:
+            raise ValueError("minimum_average_rms must not be negative")
+        return (
+            self.average_rms is not None
+            and self.average_rms >= minimum_average_rms
+        )
+
     def observe_audio(self, *, rms_amplitude: float | None = None) -> None:
         if self.speech_active:
             self.speech_frames += 1

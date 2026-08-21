@@ -115,3 +115,38 @@ def test_vad_endpoint_tracks_rms_metrics_for_the_current_segment() -> None:
     assert detector.rms_min is None
     assert detector.rms_max is None
     assert detector.average_rms is None
+
+
+def test_vad_endpoint_allows_turn_when_rms_threshold_is_not_configured() -> None:
+    detector = audio_turn.VadTurnEndpointDetector()
+
+    detector.start()
+    detector.observe_audio(rms_amplitude=160.0)
+
+    assert detector.meets_rms_threshold(None) is True
+
+
+def test_vad_endpoint_passes_when_average_rms_meets_threshold() -> None:
+    detector = audio_turn.VadTurnEndpointDetector()
+
+    detector.start()
+    detector.observe_audio(rms_amplitude=160.0)
+
+    assert detector.meets_rms_threshold(160.0) is True
+
+
+def test_vad_endpoint_fails_when_average_rms_is_below_threshold() -> None:
+    detector = audio_turn.VadTurnEndpointDetector()
+
+    detector.start()
+    detector.observe_audio(rms_amplitude=160.0)
+
+    assert detector.meets_rms_threshold(161.0) is False
+
+
+def test_vad_endpoint_fails_configured_rms_threshold_without_samples() -> None:
+    detector = audio_turn.VadTurnEndpointDetector()
+
+    detector.start()
+
+    assert detector.meets_rms_threshold(160.0) is False
