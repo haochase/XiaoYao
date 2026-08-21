@@ -329,6 +329,7 @@ class Settings:
     device_audio_frame_max_bytes: int = 4096
     device_auto_stop_idle_seconds: float = 1.2
     device_auto_turn_rms_threshold: float | None = None
+    device_vad_turn_rms_threshold: float | None = None
     device_auto_turn_silence_frames: int = 12
     device_auto_turn_min_speech_frames: int = 5
     device_auto_turn_max_frames: int = 150
@@ -458,6 +459,13 @@ class Settings:
         ):
             raise ValueError(
                 "COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD must not be negative"
+            )
+        if (
+            self.device_vad_turn_rms_threshold is not None
+            and self.device_vad_turn_rms_threshold < 0
+        ):
+            raise ValueError(
+                "COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD must not be negative"
             )
         if self.device_auto_turn_silence_frames < 1:
             raise ValueError(
@@ -670,6 +678,9 @@ class Settings:
             "COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES",
             "12",
         )
+        configured_device_vad_turn_rms_threshold = os.environ.get(
+            "COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD"
+        )
         configured_device_auto_turn_min_speech_frames = os.environ.get(
             "COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES",
             "5",
@@ -771,6 +782,17 @@ class Settings:
         except ValueError as exc:
             raise ValueError(
                 "COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD must be a number"
+            ) from exc
+        try:
+            device_vad_turn_rms_threshold = (
+                float(configured_device_vad_turn_rms_threshold.strip())
+                if configured_device_vad_turn_rms_threshold is not None
+                and configured_device_vad_turn_rms_threshold.strip()
+                else None
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD must be a number"
             ) from exc
         try:
             device_auto_turn_silence_frames = int(
@@ -910,6 +932,7 @@ class Settings:
             task_scheduler_enabled=task_scheduler_enabled,
             task_scheduler_interval_seconds=task_scheduler_interval_seconds,
             device_auto_stop_idle_seconds=device_auto_stop_idle_seconds,
+            device_vad_turn_rms_threshold=device_vad_turn_rms_threshold,
             device_auto_turn_rms_threshold=device_auto_turn_rms_threshold,
             device_auto_turn_silence_frames=device_auto_turn_silence_frames,
             device_auto_turn_min_speech_frames=device_auto_turn_min_speech_frames,

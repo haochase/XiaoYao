@@ -486,6 +486,47 @@ def test_direct_settings_configuration_rejects_conflicting_digest(tmp_path) -> N
         )
 
 
+def test_settings_loads_device_vad_turn_rms_threshold(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD", " 180 ")
+
+    settings = Settings.from_environment()
+
+    assert settings.device_vad_turn_rms_threshold == 180.0
+
+
+def test_settings_blanks_device_vad_turn_rms_threshold(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD", "   ")
+
+    settings = Settings.from_environment()
+
+    assert settings.device_vad_turn_rms_threshold is None
+
+
+@pytest.mark.parametrize("value", ["-1", "not-a-number"])
+def test_settings_rejects_invalid_device_vad_turn_rms_threshold(
+    monkeypatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD", value)
+
+    with pytest.raises(
+        ValueError,
+        match="COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD",
+    ):
+        Settings.from_environment()
+
+
+def test_direct_settings_rejects_negative_device_vad_turn_rms_threshold() -> None:
+    with pytest.raises(
+        ValueError,
+        match="COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD must not be negative",
+    ):
+        Settings(
+            database_path=Path("data/test.db"),
+            device_vad_turn_rms_threshold=-1,
+        )
+
+
 @pytest.mark.parametrize(
     "configured",
     [
