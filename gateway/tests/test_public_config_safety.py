@@ -29,6 +29,21 @@ def test_local_env_files_are_ignored() -> None:
     assert "!.env.example" in gitignore
 
 
+def test_feishu_chat_example_is_disabled_and_contains_no_credentials() -> None:
+    example = (WORKTREE_ROOT / "gateway" / ".env.example").read_text(
+        encoding="utf-8"
+    )
+    pyproject = (WORKTREE_ROOT / "gateway" / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "COMPANION_FEISHU_CHAT_ENABLED=false" in example
+    assert "COMPANION_FEISHU_CHAT_HISTORY_TURNS=6" in example
+    assert "lark-channel-sdk>=1.2,<2" in pyproject
+    assert "cli_test_app" not in example
+    assert "secret_test_value" not in example
+
+
 def test_ascend_runbook_is_public_safe_and_covers_d1_tools() -> None:
     runbook = (WORKTREE_ROOT / "deploy" / "ascend" / "README.md").read_text(
         encoding="utf-8"

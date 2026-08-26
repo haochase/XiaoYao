@@ -22,6 +22,8 @@ from companion_gateway.audio.turn import (
     ConsecutiveSilenceGate,
     VadTurnEndpointDetector,
 )
+from companion_gateway.channels.feishu_chat import create_feishu_chat_listener
+from companion_gateway.chat.mimo import MimoTextChatRuntime
 from companion_gateway.agent.service import (
     AgentToolNotAllowed,
     AgentToolRequest,
@@ -170,6 +172,7 @@ def create_app(
     device_transport: DeviceTransport | None = None,
     voice_delivery_service: DeviceVoiceDeliveryService | None = None,
     medication_notifier: MedicationNotifier | None = None,
+    feishu_chat_listener=None,
     memory_clock: Callable[[], datetime] = utc_now,
     vision_clock: Callable[[], datetime] = utc_now,
     agent_clock: Callable[[], datetime] = utc_now,
@@ -317,6 +320,7 @@ def create_app(
     app.state.medication_service = medication_service
     app.state.medication_scheduler = medication_scheduler
     app.state.medication_notifier = medication_notifier
+    app.state.feishu_chat_listener = feishu_chat_listener
     app.state.memory_service = memory_service
     app.state.memory_scheduler = memory_scheduler
     app.state.vision_service = vision_service
@@ -338,6 +342,9 @@ def create_app(
     if settings.vision_enabled:
         app.add_event_handler("startup", vision_scheduler.start)
         app.add_event_handler("shutdown", vision_scheduler.stop)
+    if feishu_chat_listener is not None:
+        app.add_event_handler("startup", feishu_chat_listener.start)
+        app.add_event_handler("shutdown", feishu_chat_listener.stop)
 
     @app.middleware("http")
     async def attach_trace_id(request: Request, call_next):
@@ -362,6 +369,22 @@ def create_app(
             status_code=200 if database_ready else 503,
             content=content,
         )
+
+    @app.get("/v1/channels/feishu/status")
+    def feishu_chat_status() -> dict[str, bool | int]:
+        return {
+            "configured": feishu_chat_listener is not None,
+            "available": bool(
+                feishu_chat_listener is not None
+                and getattr(feishu_chat_listener, "is_available", False)
+            ),
+            "received_messages": int(
+                getattr(feishu_chat_listener, "received_messages", 0)
+            ),
+            "replied_messages": int(
+                getattr(feishu_chat_listener, "replied_messages", 0)
+            ),
+        }
 
     @app.get("/v1/devices/{device_id}/status")
     def device_status(device_id: Identifier) -> dict[str, object]:
@@ -1765,6 +1788,7 @@ def create_default_app() -> FastAPI:
     settings = Settings.from_environment()
     transport = DeviceTransport()
     voice_delivery_service = None
+    feishu_chat_listener = None
     if settings.voice_runtime == "fixture":
         if settings.fake_voice_fixture_path is None:
             raise ValueError("fixture voice runtime requires a fixture path")
@@ -1825,8 +1849,35 @@ def create_default_app() -> FastAPI:
             response_sample_rate=24_000,
             queue_capacity=settings.audio_queue_capacity,
         )
+    if settings.feishu_chat_enabled:
+        if (
+            settings.feishu_app_id is None
+            or settings.feishu_app_secret is None
+            or settings.feishu_receiver_open_id is None
+            or settings.mimo_api_key is None
+        ):
+            raise ValueError("Feishu chat settings are incomplete")
+        feishu_chat_listener = create_feishu_chat_listener(
+            app_id=settings.feishu_app_id,
+            app_secret=settings.feishu_app_secret,
+            owner_open_id=settings.feishu_receiver_open_id,
+            runtime=MimoTextChatRuntime(
+                openai_base_url=settings.mimo_openai_base_url,
+                api_key=settings.mimo_api_key,
+                model=settings.mimo_model,
+                timeout_seconds=settings.mimo_timeout_seconds,
+                max_retries=settings.mimo_max_retries,
+                retry_backoff_seconds=settings.mimo_retry_backoff_seconds,
+            ),
+            history_turns=settings.feishu_chat_history_turns,
+            startup_timeout_seconds=(
+                settings.feishu_chat_startup_timeout_seconds
+            ),
+            base_url=settings.feishu_base_url,
+        )
     return create_app(
         settings,
         device_transport=transport,
         voice_delivery_service=voice_delivery_service,
+        feishu_chat_listener=feishu_chat_listener,
     )

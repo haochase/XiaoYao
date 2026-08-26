@@ -325,11 +325,23 @@ COMPANION_FEISHU_MAX_RETRIES=2
 COMPANION_FEISHU_RETRY_BACKOFF_SECONDS=1
 ```
 
-The adapter caches `tenant_access_token` in memory and retries only transport
-errors, HTTP 429, and HTTP 5xx responses. It does not subscribe to Feishu
-events, expose a public callback, accept inbound Feishu commands, or call
-Home Assistant. The database stays on the gateway host and is never stored on
-the ESP32.
+The outbound adapter caches `tenant_access_token` in memory and retries only
+transport errors, HTTP 429, and HTTP 5xx responses. An optional single-user
+private text-chat channel can receive Feishu message events over the official
+long connection and route plain text to the configured MiMo model:
+
+```text
+COMPANION_FEISHU_CHAT_ENABLED=true
+COMPANION_FEISHU_CHAT_HISTORY_TURNS=6
+COMPANION_FEISHU_CHAT_STARTUP_TIMEOUT_SECONDS=10
+```
+
+The chat channel accepts only the configured receiver `open_id`, rejects group
+and non-text messages, drops duplicate message IDs, and keeps only bounded
+in-memory conversation context. `帮助` and `清除上下文` are local commands.
+It does not expose a public callback, accept arbitrary tools, or call Home
+Assistant. The database stays on the gateway host and is never stored on the
+ESP32.
 
 ## Long-term memory (local API, opt-in)
 

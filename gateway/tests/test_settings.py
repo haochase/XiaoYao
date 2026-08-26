@@ -246,6 +246,27 @@ def test_settings_loads_feishu_configuration(monkeypatch) -> None:
     assert settings.feishu_retry_backoff_seconds == 0.25
 
 
+def test_settings_loads_feishu_chat_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test_app")
+    monkeypatch.setenv("COMPANION_FEISHU_APP_SECRET", "secret_test_value")
+    monkeypatch.setenv("COMPANION_FEISHU_RECEIVER_OPEN_ID", "ou_test_receiver")
+    monkeypatch.setenv("COMPANION_MIMO_API_KEY", "example-token")
+    monkeypatch.setenv("COMPANION_FEISHU_CHAT_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_FEISHU_CHAT_HISTORY_TURNS", "4")
+
+    settings = Settings.from_environment()
+
+    assert settings.feishu_chat_enabled is True
+    assert settings.feishu_chat_history_turns == 4
+
+
+def test_settings_requires_feishu_and_mimo_for_enabled_chat(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_FEISHU_CHAT_ENABLED", "true")
+
+    with pytest.raises(ValueError, match="COMPANION_FEISHU_CHAT_ENABLED"):
+        Settings.from_environment()
+
+
 def test_settings_loads_memory_configuration(monkeypatch) -> None:
     monkeypatch.setenv("COMPANION_MEMORY_ENABLED", "true")
     monkeypatch.setenv("COMPANION_MEMORY_RETENTION_DAYS", "45")

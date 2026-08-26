@@ -313,6 +313,9 @@ class Settings:
     feishu_timeout_seconds: float = 10.0
     feishu_max_retries: int = 2
     feishu_retry_backoff_seconds: float = 1.0
+    feishu_chat_enabled: bool = False
+    feishu_chat_history_turns: int = 6
+    feishu_chat_startup_timeout_seconds: float = 10.0
     memory_enabled: bool = False
     memory_retention_days: int = 60
     memory_quota_bytes: int = 50_000_000
@@ -419,6 +422,23 @@ class Settings:
         if self.feishu_retry_backoff_seconds < 0:
             raise ValueError(
                 "COMPANION_FEISHU_RETRY_BACKOFF_SECONDS must not be negative"
+            )
+        if not isinstance(self.feishu_chat_enabled, bool):
+            raise ValueError("COMPANION_FEISHU_CHAT_ENABLED must be true or false")
+        if self.feishu_chat_history_turns < 1 or self.feishu_chat_history_turns > 20:
+            raise ValueError(
+                "COMPANION_FEISHU_CHAT_HISTORY_TURNS must be between 1 and 20"
+            )
+        if self.feishu_chat_startup_timeout_seconds <= 0:
+            raise ValueError(
+                "COMPANION_FEISHU_CHAT_STARTUP_TIMEOUT_SECONDS must be positive"
+            )
+        if self.feishu_chat_enabled and (
+            not all(feishu_values) or normalized_mimo_api_key is None
+        ):
+            raise ValueError(
+                "COMPANION_FEISHU_CHAT_ENABLED requires Feishu credentials, "
+                "receiver open_id, and COMPANION_MIMO_API_KEY"
             )
         if not isinstance(self.memory_enabled, bool):
             raise ValueError("COMPANION_MEMORY_ENABLED must be true or false")
@@ -604,6 +624,19 @@ class Settings:
             "COMPANION_FEISHU_RETRY_BACKOFF_SECONDS",
             "1",
         )
+        feishu_chat_enabled = _parse_bool(
+            os.environ.get("COMPANION_FEISHU_CHAT_ENABLED"),
+            name="COMPANION_FEISHU_CHAT_ENABLED",
+            default=False,
+        )
+        configured_feishu_chat_history_turns = os.environ.get(
+            "COMPANION_FEISHU_CHAT_HISTORY_TURNS",
+            "6",
+        )
+        configured_feishu_chat_startup_timeout = os.environ.get(
+            "COMPANION_FEISHU_CHAT_STARTUP_TIMEOUT_SECONDS",
+            "10",
+        )
         configured_timeout = os.environ.get(
             "COMPANION_MINICPM_O_TIMEOUT_SECONDS",
             "20",
@@ -768,6 +801,20 @@ class Settings:
                 "COMPANION_FEISHU_RETRY_BACKOFF_SECONDS must be a number"
             ) from exc
         try:
+            feishu_chat_history_turns = int(configured_feishu_chat_history_turns)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_FEISHU_CHAT_HISTORY_TURNS must be an integer"
+            ) from exc
+        try:
+            feishu_chat_startup_timeout_seconds = float(
+                configured_feishu_chat_startup_timeout
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_FEISHU_CHAT_STARTUP_TIMEOUT_SECONDS must be a number"
+            ) from exc
+        try:
             audio_queue_capacity = int(configured_audio_queue_capacity)
         except ValueError as exc:
             raise ValueError(
@@ -926,6 +973,11 @@ class Settings:
             feishu_timeout_seconds=feishu_timeout_seconds,
             feishu_max_retries=feishu_max_retries,
             feishu_retry_backoff_seconds=feishu_retry_backoff_seconds,
+            feishu_chat_enabled=feishu_chat_enabled,
+            feishu_chat_history_turns=feishu_chat_history_turns,
+            feishu_chat_startup_timeout_seconds=(
+                feishu_chat_startup_timeout_seconds
+            ),
             memory_enabled=memory_enabled,
             memory_retention_days=memory_retention_days,
             memory_quota_bytes=memory_quota_bytes,

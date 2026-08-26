@@ -112,6 +112,104 @@ def test_enabled_memory_scheduler_starts_and_stops_with_app(tmp_path) -> None:
     assert app.state.memory_scheduler.is_running is False
 
 
+def test_feishu_chat_listener_starts_and_stops_with_app(tmp_path) -> None:
+    class FakeListener:
+        def __init__(self) -> None:
+            self.started = False
+            self.stopped = False
+
+        async def start(self) -> None:
+            self.started = True
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    listener = FakeListener()
+    app = create_app(
+        Settings(database_path=tmp_path / "feishu-chat.db"),
+        feishu_chat_listener=listener,
+    )
+
+    with TestClient(app):
+        assert listener.started is True
+
+    assert listener.stopped is True
+
+
+def test_feishu_chat_status_reports_configuration_and_availability(tmp_path) -> None:
+    class FakeListener:
+        is_available = True
+        received_messages = 3
+        replied_messages = 2
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    configured_app = create_app(
+        Settings(database_path=tmp_path / "feishu-status.db"),
+        feishu_chat_listener=FakeListener(),
+    )
+    disabled_app = create_app(
+        Settings(database_path=tmp_path / "feishu-disabled.db"),
+    )
+
+    with TestClient(configured_app) as client:
+        assert client.get("/v1/channels/feishu/status").json() == {
+            "configured": True,
+            "available": True,
+            "received_messages": 3,
+            "replied_messages": 2,
+        }
+    with TestClient(disabled_app) as client:
+        assert client.get("/v1/channels/feishu/status").json() == {
+            "configured": False,
+            "available": False,
+            "received_messages": 0,
+            "replied_messages": 0,
+        }
+
+
+def test_default_app_builds_feishu_chat_listener_when_enabled(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class FakeListener:
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    listener = FakeListener()
+    captured: dict[str, object] = {}
+
+    def fake_create_feishu_chat_listener(**kwargs):
+        captured.update(kwargs)
+        return listener
+
+    monkeypatch.setattr(
+        api_module,
+        "create_feishu_chat_listener",
+        fake_create_feishu_chat_listener,
+    )
+    monkeypatch.setenv("COMPANION_DB_PATH", str(tmp_path / "default-chat.db"))
+    monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test_app")
+    monkeypatch.setenv("COMPANION_FEISHU_APP_SECRET", "secret_test_value")
+    monkeypatch.setenv("COMPANION_FEISHU_RECEIVER_OPEN_ID", "ou_owner")
+    monkeypatch.setenv("COMPANION_MIMO_API_KEY", "example-token")
+    monkeypatch.setenv("COMPANION_FEISHU_CHAT_ENABLED", "true")
+
+    app = create_default_app()
+
+    assert app.state.feishu_chat_listener is listener
+    assert captured["app_id"] == "cli_test_app"
+    assert captured["owner_open_id"] == "ou_owner"
+    assert captured["history_turns"] == 6
+
+
 def test_device_status_api_reports_unknown_device_as_offline(
     client: TestClient,
 ) -> None:

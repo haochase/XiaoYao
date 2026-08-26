@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
   "av>=16,<17",
   "fastapi>=0.115,<1",
+  "lark-channel-sdk>=1.2,<2",
   "numpy>=2,<3",
   "pydantic>=2.10,<3",
   "uvicorn>=0.30,<1",
