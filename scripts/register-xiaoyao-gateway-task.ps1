@@ -27,13 +27,14 @@ if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
     throw "Python executable was not found at $PythonPath. Specify -PythonPath explicitly."
 }
 $python = (Resolve-Path -LiteralPath $PythonPath).Path
-$runnerPath = (Resolve-Path (Join-Path $PSScriptRoot "run-xiaoyao-gateway.ps1")).Path
+$pythonRunnerPath = Join-Path $PSScriptRoot "run_xiaoyao_gateway.py"
+$pythonRunnerPath = (Resolve-Path -LiteralPath $pythonRunnerPath).Path
 $taskPlan = [pscustomobject]@{
     TaskName = $TaskName
     Trigger = "AtLogOn"
     RestartCount = 3
     RestartInterval = "PT1M"
-    Runner = $runnerPath
+    Runner = $pythonRunnerPath
     GatewayRoot = $gatewayDirectory
     PythonPath = $python
     Port = $Port
@@ -58,8 +59,9 @@ try {
     }
 
     $taskAction = New-ScheduledTaskAction `
-        -Execute "powershell.exe" `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`" -GatewayRoot `"$gatewayDirectory`" -PythonPath `"$python`" -Port $Port"
+        -Execute $python `
+        -Argument "`"$pythonRunnerPath`" --gateway-root `"$gatewayDirectory`" --port $Port" `
+        -WorkingDirectory $gatewayDirectory
     $taskTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $taskSettings = New-ScheduledTaskSettingsSet `
         -RestartCount 3 `

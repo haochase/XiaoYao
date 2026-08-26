@@ -30,6 +30,8 @@ def test_gateway_runner_uses_gateway_directory_and_lan_listener() -> None:
     assert "Push-Location $gatewayDirectory" in runner
     assert "--host 0.0.0.0 --port $Port" in runner
     assert "companion_gateway.api:create_default_app --factory" in runner
+    assert '$vendorSitePackages = Join-Path $projectRoot ".vendor\\python-site"' in runner
+    assert "Test-Path -LiteralPath $vendorSitePackages -PathType Container" in runner
 
 
 def test_task_registration_supports_dry_run_logon_start_and_restart_policy() -> None:
@@ -43,9 +45,13 @@ def test_task_registration_supports_dry_run_logon_start_and_restart_policy() -> 
     assert "if ([string]::IsNullOrWhiteSpace($GatewayRoot))" in registration
     assert "if ($WhatIf)" in registration
     assert "Get-Command python" in registration
+    assert '$pythonRunnerPath = Join-Path $PSScriptRoot "run_xiaoyao_gateway.py"' in registration
+    assert "-Execute $python" in registration
+    assert "-WorkingDirectory $gatewayDirectory" in registration
     assert "-GatewayRoot" in registration
     assert "-PythonPath" in registration
-    assert "-Port $Port" in registration
+    assert "--port $Port" in registration
+    assert "--gateway-root" in registration
     assert '$sourceDirectory = Join-Path $gatewayDirectory "src"' in registration
     assert "import uvicorn; import companion_gateway" in registration
     assert "does not have gateway dependencies" in registration
@@ -83,8 +89,15 @@ $gatewayRoot = {powershell_literal(ROOT / "gateway")}
 $python = {powershell_literal(Path(sys.executable))}
 
 function New-ScheduledTaskAction {{
-    param([string]$Execute, [string]$Argument)
-    [pscustomobject]@{{ Execute = $Execute; Argument = $Argument }}
+    param([string]$Execute, [string]$Argument, [string]$WorkingDirectory)
+    $global:taskExecute = $Execute
+    $global:taskArgument = $Argument
+    $global:taskWorkingDirectory = $WorkingDirectory
+    [pscustomobject]@{{
+        Execute = $Execute
+        Argument = $Argument
+        WorkingDirectory = $WorkingDirectory
+    }}
 }}
 
 function New-ScheduledTaskTrigger {{
@@ -125,6 +138,9 @@ $global:registerCalls = 0
 [pscustomobject]@{{
     restart_interval_type = $global:restartIntervalType
     register_calls = $global:registerCalls
+    task_execute = $global:taskExecute
+    task_argument = $global:taskArgument
+    task_working_directory = $global:taskWorkingDirectory
 }} | ConvertTo-Json -Compress
 ''',
         encoding="utf-8",
@@ -141,7 +157,33 @@ $global:registerCalls = 0
     assert result == {
         "restart_interval_type": "System.TimeSpan",
         "register_calls": 1,
+        "task_execute": str(Path(sys.executable).resolve()),
+        "task_argument": (
+            f'"{SCRIPTS / "run_xiaoyao_gateway.py"}" '
+            f'--gateway-root "{ROOT / "gateway"}" --port 8723'
+        ),
+        "task_working_directory": str((ROOT / "gateway").resolve()),
     }
+
+
+def test_python_gateway_runner_check_uses_project_paths_without_starting_server() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "run_xiaoyao_gateway.py"),
+            "--gateway-root",
+            str(ROOT / "gateway"),
+            "--check",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = json.loads(completed.stdout)
+    assert result["status"] == "ready"
+    assert result["gateway_root"] == str((ROOT / "gateway").resolve())
+    assert result["source_available"] is True
 
 
 def test_gateway_runner_propagates_uvicorn_exit_code(tmp_path: Path) -> None:

@@ -29,12 +29,17 @@ if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
 $python = (Resolve-Path -LiteralPath $PythonPath).Path
 
 $sourceDirectory = Join-Path $gatewayDirectory "src"
+$projectRoot = Split-Path $PSScriptRoot -Parent
+$vendorSitePackages = Join-Path $projectRoot ".vendor\python-site"
 $previousPythonPath = $env:PYTHONPATH
-$env:PYTHONPATH = if ($previousPythonPath) {
-    "$sourceDirectory;$previousPythonPath"
-} else {
-    $sourceDirectory
+$pythonPathEntries = @($sourceDirectory)
+if (Test-Path -LiteralPath $vendorSitePackages -PathType Container) {
+    $pythonPathEntries += $vendorSitePackages
 }
+if ($previousPythonPath) {
+    $pythonPathEntries += $previousPythonPath
+}
+$env:PYTHONPATH = $pythonPathEntries -join ";"
 $uvicornExitCode = 0
 
 try {
