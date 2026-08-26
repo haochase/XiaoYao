@@ -11,6 +11,7 @@ to one model provider or hardware deployment.
 
 - [`gateway/`](gateway/README.md): FastAPI gateway, audio bridge, task API, and tests.
 - [`tools/`](tools/esp32_probe.py): read-only ESP32 board inspection utility.
+- [`deploy/ascend/`](deploy/ascend/README.md): public-safe Ascend deployment readiness runbook.
 - [`scripts/`](scripts/): audio-fixture generation and optional ESP-IDF build helpers.
 - [`assets/audio/`](assets/audio/): generated, non-user test audio fixture.
 

@@ -26,3 +26,14 @@ def test_local_env_files_are_ignored() -> None:
 
     assert ".env" in gitignore
     assert "!.env.example" in gitignore
+
+
+def test_ascend_runbook_is_public_safe_and_covers_d1_tools() -> None:
+    runbook = (WORKTREE_ROOT / "deploy" / "ascend" / "README.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "ascend_runtime_probe.py" in runbook
+    assert "minicpm_o_endpoint_check.py" in runbook
+    for forbidden in ("192.168.", "COM7", "COMPANION_MINICPM_O_AUTH_TOKEN="):
+        assert forbidden not in runbook
