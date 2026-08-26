@@ -9,33 +9,55 @@ device details in private operator notes.
 
 Run the checks in this order:
 
-1. Validate the host workspace and NPU runtime with
-   `ascend_runtime_probe.py`.
+1. Validate the local workspace with `ascend_runtime_probe.py` without
+   requiring an NPU.
 2. Validate the HTTP contract against the local MiniCPM-o Mock.
 3. Validate the optional Realtime contract against the same local Mock.
-4. On HiDevLab, repeat the sanitized probe and the endpoint smoke check with
-   private operator values.
+4. On HiDevLab, repeat the sanitized probe with a required NPU, then run the
+   endpoint smoke check with private operator values.
 5. Stop the NPU-backed workload as soon as the required evidence is captured.
 
 A local Mock proves the gateway contract only. It is not evidence that a
 provider instance, a platform-specific backend, or a physical device is ready.
 
-## 1. Runtime probe
+## 1. Local D1 workspace probe
 
-Run from the repository root. The workspace path is a disposable, private
-workspace; do not redirect output into a tracked file.
+Run from the repository root. This local no-NPU gate confirms that the
+disposable workspace is writable and the probe can complete. It does not prove
+that an NPU, a provider instance, or HiDevLab is ready.
 
 ```powershell
 $env:PYTHONPATH='gateway\src'
+$probeWorkspace = Join-Path $PWD '.vendor\ascend-probe'
+New-Item -ItemType Directory -Force $probeWorkspace | Out-Null
 C:\Users\chase\miniconda3\python.exe tools\ascend_runtime_probe.py `
-  --workspace .vendor\ascend-probe `
+  --workspace $probeWorkspace `
+  --json
+```
+
+Expected local result: Exit code `0` means `status=ready` when the
+workspace is writable. A missing or unavailable `npu-smi info` command is
+recorded as a sanitized fact but does not block this local gate.
+
+## 2. HiDevLab required-NPU probe
+
+Run this private operator command from the checked-out HiDevLab Linux workspace.
+It requires an NPU and is the only probe command that can supply the D2 handoff
+evidence.
+
+```bash
+export PYTHONPATH='gateway/src'
+probe_workspace="$PWD/.vendor/ascend-probe"
+mkdir -p "$probe_workspace"
+python3 tools/ascend_runtime_probe.py \
+  --workspace "$probe_workspace" \
   --require-npu --json
 ```
 
 The probe returns sanitized JSON. It records command availability, exit code,
 and a SHA-256 digest of command output rather than retaining raw NPU output.
 
-The `--require-npu` contract is explicit:
+The required-NPU contract is explicit:
 
 - Exit code `0` means `status=ready`: the workspace is writable and
   `npu-smi info` is available with exit code `0`.
@@ -49,8 +71,7 @@ the checks needed for the current gate, stop the workload, release the
 allocated NPU resources, and shut down the instance according to the
 HiDevLab project procedure. A blocked probe is a reason to fix the environment,
 not a reason to leave a paid resource running.
-
-## 2. Local MiniCPM-o Mock
+## 3. Local MiniCPM-o Mock
 
 Start the Mock in one terminal and leave it in the foreground:
 
@@ -64,6 +85,7 @@ C:\Users\chase\miniconda3\python.exe -m uvicorn `
 In a second terminal, run the HTTP check first:
 
 ```powershell
+$env:PYTHONPATH='gateway\src'
 C:\Users\chase\miniconda3\python.exe tools\minicpm_o_endpoint_check.py `
   --mode http --endpoint http://127.0.0.1:9000/v1/infer `
   --fixture assets\audio\companion-greeting-zh-cn.wav --turns 3 --json
@@ -72,6 +94,7 @@ C:\Users\chase\miniconda3\python.exe tools\minicpm_o_endpoint_check.py `
 Then run the optional Realtime check:
 
 ```powershell
+$env:PYTHONPATH='gateway\src'
 C:\Users\chase\miniconda3\python.exe tools\minicpm_o_endpoint_check.py `
   --mode realtime `
   --endpoint ws://127.0.0.1:9000/v1/realtime?mode=audio `
@@ -83,7 +106,7 @@ sanitized per-turn metrics. The checker does not print audio payloads,
 response text, credentials, or raw request data. Stop the Mock with
 `Ctrl+C` after the checks.
 
-## 3. HTTP-first fallback
+## 4. HTTP-first fallback
 
 HTTP is the required first path for D1 endpoint validation. Realtime is an
 additional capability check, not a prerequisite for the HTTP path.
@@ -96,17 +119,25 @@ audio contract:
 3. Do not describe an HTTP result as Realtime or full-duplex evidence.
 4. Continue to D2 only when the separate D2 handoff gate below is satisfied.
 
-## 4. HiDevLab operator sequence
+## 5. HiDevLab endpoint smoke sequence
 
-Run the same tools from a private HiDevLab workspace. Use the runtime probe
-first, with `--require-npu --json`, then run the HTTP endpoint check before
-attempting Realtime. Keep the service endpoint and authentication lookup in
-the private operator command sheet; do not copy those values into this
-repository or into public logs.
+After the required-NPU probe returns `status=ready`, run the HTTP endpoint
+check before attempting Realtime in the same HiDevLab Linux shell. Keep the
+service endpoint and authentication lookup in the private operator command
+sheet; do not copy those values into this repository or into public logs.
+
+```bash
+export PYTHONPATH='gateway/src'
+python3 tools/minicpm_o_endpoint_check.py \
+  --mode http --endpoint "$MINICPM_O_ENDPOINT" \
+  --auth-env COMPANION_MINICPM_O_AUTH_TOKEN \
+  --fixture assets/audio/companion-greeting-zh-cn.wav --turns 3 --json
+```
 
 The endpoint checker accepts an environment-variable name through
-`--auth-env`. The value is read at runtime and is never printed. Omit
-authentication for the local Mock commands above.
+`--auth-env`. The value is read at runtime and is never printed. Set the
+endpoint and authentication values only in the private shell environment.
+Omit authentication for the local Mock commands above.
 
 ## D2 handoff gate
 
