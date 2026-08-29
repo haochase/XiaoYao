@@ -201,6 +201,12 @@ class SQLiteTaskRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_agent_executions_agent_started
                 ON agent_executions(agent_id, started_at, execution_id);
+
+                CREATE TABLE IF NOT EXISTS deleted_agents (
+                    agent_id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    deleted_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -292,6 +298,15 @@ class SQLiteTaskRepository:
                         (draft_id,),
                     )
                 draft = self._agent_draft_from_row(draft_row)
+                deleted = connection.execute(
+                    """
+                    SELECT 1 FROM deleted_agents
+                    WHERE agent_id = ? AND owner_id = ?
+                    """,
+                    (draft.spec.agent_id, owner_id),
+                ).fetchone()
+                if deleted is not None:
+                    raise ValueError("confirmed agent was deleted")
                 existing = connection.execute(
                     "SELECT * FROM agents WHERE agent_id = ?",
                     (draft.spec.agent_id,),
@@ -371,20 +386,53 @@ class SQLiteTaskRepository:
 
     def delete_agent(self, agent_id: str, *, owner_id: str) -> bool:
         with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT 1 FROM agents WHERE agent_id = ? AND owner_id = ?",
+                (agent_id, owner_id),
+            ).fetchone()
+            if existing is None:
+                return False
+            connection.execute(
+                """
+                INSERT INTO deleted_agents (agent_id, owner_id, deleted_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(agent_id) DO UPDATE SET
+                    owner_id = excluded.owner_id,
+                    deleted_at = excluded.deleted_at
+                """,
+                (agent_id, owner_id, datetime.now(UTC).isoformat()),
+            )
             cursor = connection.execute(
                 "DELETE FROM agents WHERE agent_id = ? AND owner_id = ?",
                 (agent_id, owner_id),
             )
         return cursor.rowcount == 1
 
-    def record_execution(self, execution: AgentExecution) -> AgentExecution:
+    def record_execution(
+        self,
+        execution: AgentExecution,
+        *,
+        owner_id: str,
+    ) -> AgentExecution:
         with self._connect() as connection:
             agent = connection.execute(
-                "SELECT agent_id FROM agents WHERE agent_id = ?",
-                (execution.agent_id,),
+                "SELECT agent_id FROM agents WHERE agent_id = ? AND owner_id = ?",
+                (execution.agent_id, owner_id),
             ).fetchone()
             if agent is None:
-                raise KeyError(execution.agent_id)
+                raise PermissionError("agent execution owner mismatch")
+            existing = connection.execute(
+                """
+                SELECT agent_id, trigger_id FROM agent_executions
+                WHERE execution_id = ?
+                """,
+                (execution.execution_id,),
+            ).fetchone()
+            if existing is not None and (
+                existing["agent_id"] != execution.agent_id
+                or existing["trigger_id"] != execution.trigger_id
+            ):
+                raise ValueError("execution identity cannot be changed")
             connection.execute(
                 """
                 INSERT INTO agent_executions (
@@ -392,8 +440,6 @@ class SQLiteTaskRepository:
                     completed_at, output_text, error
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(execution_id) DO UPDATE SET
-                    agent_id = excluded.agent_id,
-                    trigger_id = excluded.trigger_id,
                     status = excluded.status,
                     started_at = excluded.started_at,
                     completed_at = excluded.completed_at,

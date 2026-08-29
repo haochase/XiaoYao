@@ -72,6 +72,10 @@ def test_agent_spec_accepts_the_declared_registry_contract() -> None:
             "local_time": "07:30",
         },
         {
+            "kind": "manual",
+            "timezone": "Asia/Shanghai",
+        },
+        {
             "kind": "once",
             "timezone": "Asia/Shanghai",
             "at": datetime(2026, 8, 29, 12, 0),

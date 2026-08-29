@@ -137,7 +137,12 @@ def test_agent_update_delete_and_execution_history_enforce_owner_scope(tmp_path)
         repository.update_agent(updated, owner_id="family-2")
 
     execution = build_execution(updated.agent_id)
-    assert repository.record_execution(execution) == execution
+    assert repository.record_execution(execution, owner_id="family-1") == execution
+    with pytest.raises(PermissionError, match="owner"):
+        repository.record_execution(
+            execution.model_copy(update={"execution_id": "execution-cross-owner"}),
+            owner_id="family-2",
+        )
 
     restarted = SQLiteTaskRepository(database_path)
     restarted.initialize()
@@ -148,3 +153,33 @@ def test_agent_update_delete_and_execution_history_enforce_owner_scope(tmp_path)
     assert restarted.delete_agent(updated.agent_id, owner_id="family-2") is False
     assert restarted.delete_agent(updated.agent_id, owner_id="family-1") is True
     assert restarted.get_agent(updated.agent_id, owner_id="family-1") is None
+
+
+def test_execution_identity_cannot_be_redirected_on_idempotent_update(tmp_path) -> None:
+    repository = SQLiteTaskRepository(tmp_path / "agents.db")
+    repository.initialize()
+    draft = build_draft()
+    repository.create_draft(draft)
+    repository.confirm_draft(draft.draft_id, owner_id=draft.owner_id)
+    execution = build_execution(draft.spec.agent_id)
+    repository.record_execution(execution, owner_id=draft.owner_id)
+
+    with pytest.raises(ValueError, match="execution identity"):
+        repository.record_execution(
+            execution.model_copy(update={"trigger_id": "different-trigger"}),
+            owner_id=draft.owner_id,
+        )
+
+
+def test_deleted_confirmed_agent_cannot_be_resurrected_by_replay(tmp_path) -> None:
+    repository = SQLiteTaskRepository(tmp_path / "agents.db")
+    repository.initialize()
+    draft = build_draft()
+    repository.create_draft(draft)
+    repository.confirm_draft(draft.draft_id, owner_id=draft.owner_id)
+    assert repository.delete_agent(draft.spec.agent_id, owner_id=draft.owner_id)
+
+    with pytest.raises(ValueError, match="deleted"):
+        repository.confirm_draft(draft.draft_id, owner_id=draft.owner_id)
+
+    assert repository.get_agent(draft.spec.agent_id, owner_id=draft.owner_id) is None

@@ -97,8 +97,14 @@ class AgentTrigger(BaseModel):
     @model_validator(mode="after")
     def validate_schedule(self) -> "AgentTrigger":
         if self.kind is TriggerKind.MANUAL:
-            if self.at is not None or self.local_time is not None:
-                raise ValueError("manual trigger must not include at or local_time")
+            if (
+                self.at is not None
+                or self.local_time is not None
+                or self.timezone is not None
+            ):
+                raise ValueError(
+                    "manual trigger must not include at, local_time, or timezone"
+                )
             return self
         if self.kind is TriggerKind.ONCE:
             if self.at is None or self.timezone is None:
@@ -196,7 +202,12 @@ class AgentRepository(Protocol):
 
     def delete_agent(self, agent_id: str, *, owner_id: str) -> bool: ...
 
-    def record_execution(self, execution: AgentExecution) -> AgentExecution: ...
+    def record_execution(
+        self,
+        execution: AgentExecution,
+        *,
+        owner_id: str,
+    ) -> AgentExecution: ...
 
     def list_executions(
         self,
