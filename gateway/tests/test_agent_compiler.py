@@ -132,6 +132,61 @@ def test_compiler_rejects_mimo_non_json_output() -> None:
         )
 
 
+def test_compiler_accepts_one_complete_json_code_fence() -> None:
+    candidate = candidate_for(
+        AgentKind.COMPANION,
+        trigger={"kind": "manual"},
+        allowed_tools=[],
+    )
+    runtime = FakeMimoRuntime(
+        "```json\n" + json.dumps(candidate, ensure_ascii=False) + "\n```"
+    )
+    identifiers = iter(("agent-fenced", "draft-fenced"))
+    compiler = MimoAgentSpecCompiler(
+        runtime=runtime,
+        clock=lambda: NOW,
+        id_factory=lambda: next(identifiers),
+    )
+
+    draft = compiler.compile(
+        "创建陪伴智能体",
+        owner_id="owner-1",
+        source_message_id="message-fenced",
+    )
+
+    assert draft.spec.kind is AgentKind.COMPANION
+    assert draft.spec.agent_id == "agent-fenced"
+
+
+def test_compiler_prompt_contains_exact_candidate_field_contract() -> None:
+    runtime = FakeMimoRuntime(
+        json.dumps(
+            candidate_for(
+                AgentKind.COMPANION,
+                trigger={"kind": "manual"},
+                allowed_tools=[],
+            )
+        )
+    )
+    compiler = MimoAgentSpecCompiler(
+        runtime=runtime,
+        clock=lambda: NOW,
+        id_factory=iter(("agent-contract", "draft-contract")).__next__,
+    )
+
+    compiler.compile(
+        "创建陪伴智能体",
+        owner_id="owner-1",
+        source_message_id="message-contract",
+    )
+
+    prompt = runtime.calls[0][0]
+    assert '"kind": "companion"' in prompt
+    assert '"trigger": {"kind": "manual"}' in prompt
+    assert '"allowed_tools"' in prompt
+    assert "agent_kind" not in prompt
+
+
 def test_compiler_rejects_unknown_gateway_tools_before_creating_a_draft() -> None:
     runtime = FakeMimoRuntime(
         json.dumps(
