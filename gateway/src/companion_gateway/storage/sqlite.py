@@ -9,6 +9,7 @@ from companion_gateway.domain.models import (
     TaskKind,
     TaskRecord,
 )
+from companion_gateway.domain.agents import AgentDraft, AgentExecution, AgentSpec
 from companion_gateway.domain.memory import (
     Memory,
     MemoryCategory,
@@ -160,6 +161,46 @@ class SQLiteTaskRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_vision_observations_subject_expiry
                 ON vision_observations(subject_id, expires_at);
+
+                CREATE TABLE IF NOT EXISTS agents (
+                    agent_id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    spec_json TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_agents_owner
+                ON agents(owner_id, agent_id);
+
+                CREATE TABLE IF NOT EXISTS agent_drafts (
+                    draft_id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    source_message_id TEXT NOT NULL,
+                    spec_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    confirmed_agent_id TEXT,
+                    UNIQUE(owner_id, source_message_id),
+                    FOREIGN KEY (confirmed_agent_id) REFERENCES agents(agent_id)
+                    ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_agent_drafts_owner
+                ON agent_drafts(owner_id, draft_id);
+
+                CREATE TABLE IF NOT EXISTS agent_executions (
+                    execution_id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL,
+                    trigger_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    output_text TEXT,
+                    error TEXT,
+                    FOREIGN KEY (agent_id) REFERENCES agents(agent_id)
+                    ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_agent_executions_agent_started
+                ON agent_executions(agent_id, started_at, execution_id);
                 """
             )
 
@@ -169,6 +210,271 @@ class SQLiteTaskRepository:
                 return connection.execute("SELECT 1").fetchone()[0] == 1
         except sqlite3.Error:
             return False
+
+    def create_draft(self, draft: AgentDraft) -> AgentDraft:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = connection.execute(
+                    """
+                    SELECT * FROM agent_drafts
+                    WHERE owner_id = ? AND source_message_id = ?
+                    """,
+                    (draft.owner_id, draft.source_message_id),
+                ).fetchone()
+                if existing is not None:
+                    connection.commit()
+                    return self._agent_draft_from_row(existing)
+                connection.execute(
+                    """
+                    INSERT INTO agent_drafts (
+                        draft_id, owner_id, source_message_id, spec_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        draft.draft_id,
+                        draft.owner_id,
+                        draft.source_message_id,
+                        self._agent_spec_to_json(draft.spec),
+                        _require_aware(draft.created_at).isoformat(),
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return draft
+
+    def get_draft(self, draft_id: str, *, owner_id: str) -> AgentDraft | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM agent_drafts
+                WHERE draft_id = ? AND owner_id = ?
+                """,
+                (draft_id, owner_id),
+            ).fetchone()
+        return self._agent_draft_from_row(row) if row is not None else None
+
+    def confirm_draft(
+        self,
+        draft_id: str,
+        *,
+        owner_id: str,
+    ) -> tuple[AgentSpec, bool]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                draft_row = connection.execute(
+                    """
+                    SELECT * FROM agent_drafts
+                    WHERE draft_id = ? AND owner_id = ?
+                    """,
+                    (draft_id, owner_id),
+                ).fetchone()
+                if draft_row is None:
+                    raise KeyError(draft_id)
+                confirmed_agent_id = draft_row["confirmed_agent_id"]
+                if confirmed_agent_id is not None:
+                    existing = connection.execute(
+                        "SELECT * FROM agents WHERE agent_id = ?",
+                        (confirmed_agent_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        connection.commit()
+                        return self._agent_spec_from_row(existing), False
+                    connection.execute(
+                        """
+                        UPDATE agent_drafts
+                        SET confirmed_agent_id = NULL
+                        WHERE draft_id = ?
+                        """,
+                        (draft_id,),
+                    )
+                draft = self._agent_draft_from_row(draft_row)
+                existing = connection.execute(
+                    "SELECT * FROM agents WHERE agent_id = ?",
+                    (draft.spec.agent_id,),
+                ).fetchone()
+                if existing is not None:
+                    existing_spec = self._agent_spec_from_row(existing)
+                    if existing_spec != draft.spec:
+                        raise ValueError(
+                            "agent_id is already registered with a different specification"
+                        )
+                    created = False
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO agents (agent_id, owner_id, spec_json)
+                        VALUES (?, ?, ?)
+                        """,
+                        (
+                            draft.spec.agent_id,
+                            draft.spec.owner_id,
+                            self._agent_spec_to_json(draft.spec),
+                        ),
+                    )
+                    created = True
+                connection.execute(
+                    """
+                    UPDATE agent_drafts
+                    SET confirmed_agent_id = ?
+                    WHERE draft_id = ? AND owner_id = ?
+                    """,
+                    (draft.spec.agent_id, draft_id, owner_id),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return draft.spec, created
+
+    def list_agents(self, *, owner_id: str) -> list[AgentSpec]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM agents
+                WHERE owner_id = ?
+                ORDER BY agent_id
+                """,
+                (owner_id,),
+            ).fetchall()
+        return [self._agent_spec_from_row(row) for row in rows]
+
+    def get_agent(self, agent_id: str, *, owner_id: str) -> AgentSpec | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM agents
+                WHERE agent_id = ? AND owner_id = ?
+                """,
+                (agent_id, owner_id),
+            ).fetchone()
+        return self._agent_spec_from_row(row) if row is not None else None
+
+    def update_agent(self, agent: AgentSpec, *, owner_id: str) -> AgentSpec:
+        if agent.owner_id != owner_id:
+            raise ValueError("agent owner_id must match owner_id")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE agents
+                SET spec_json = ?
+                WHERE agent_id = ? AND owner_id = ?
+                """,
+                (self._agent_spec_to_json(agent), agent.agent_id, owner_id),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(agent.agent_id)
+        return agent
+
+    def delete_agent(self, agent_id: str, *, owner_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM agents WHERE agent_id = ? AND owner_id = ?",
+                (agent_id, owner_id),
+            )
+        return cursor.rowcount == 1
+
+    def record_execution(self, execution: AgentExecution) -> AgentExecution:
+        with self._connect() as connection:
+            agent = connection.execute(
+                "SELECT agent_id FROM agents WHERE agent_id = ?",
+                (execution.agent_id,),
+            ).fetchone()
+            if agent is None:
+                raise KeyError(execution.agent_id)
+            connection.execute(
+                """
+                INSERT INTO agent_executions (
+                    execution_id, agent_id, trigger_id, status, started_at,
+                    completed_at, output_text, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(execution_id) DO UPDATE SET
+                    agent_id = excluded.agent_id,
+                    trigger_id = excluded.trigger_id,
+                    status = excluded.status,
+                    started_at = excluded.started_at,
+                    completed_at = excluded.completed_at,
+                    output_text = excluded.output_text,
+                    error = excluded.error
+                """,
+                (
+                    execution.execution_id,
+                    execution.agent_id,
+                    execution.trigger_id,
+                    execution.status.value,
+                    _require_aware(execution.started_at).isoformat(),
+                    (
+                        _require_aware(execution.completed_at).isoformat()
+                        if execution.completed_at is not None
+                        else None
+                    ),
+                    execution.output_text,
+                    execution.error,
+                ),
+            )
+        return execution
+
+    def list_executions(
+        self,
+        agent_id: str,
+        *,
+        owner_id: str,
+    ) -> list[AgentExecution]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT executions.*
+                FROM agent_executions AS executions
+                INNER JOIN agents AS agents ON agents.agent_id = executions.agent_id
+                WHERE executions.agent_id = ? AND agents.owner_id = ?
+                ORDER BY executions.started_at, executions.execution_id
+                """,
+                (agent_id, owner_id),
+            ).fetchall()
+        return [self._agent_execution_from_row(row) for row in rows]
+
+    @staticmethod
+    def _agent_spec_to_json(agent: AgentSpec) -> str:
+        return json.dumps(
+            agent.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _agent_spec_from_row(row: sqlite3.Row) -> AgentSpec:
+        return AgentSpec.model_validate(json.loads(row["spec_json"]))
+
+    @staticmethod
+    def _agent_draft_from_row(row: sqlite3.Row) -> AgentDraft:
+        return AgentDraft.model_validate(
+            {
+                "draft_id": row["draft_id"],
+                "owner_id": row["owner_id"],
+                "source_message_id": row["source_message_id"],
+                "spec": json.loads(row["spec_json"]),
+                "created_at": row["created_at"],
+            }
+        )
+
+    @staticmethod
+    def _agent_execution_from_row(row: sqlite3.Row) -> AgentExecution:
+        return AgentExecution.model_validate(
+            {
+                "execution_id": row["execution_id"],
+                "agent_id": row["agent_id"],
+                "trigger_id": row["trigger_id"],
+                "status": row["status"],
+                "started_at": row["started_at"],
+                "completed_at": row["completed_at"],
+                "output_text": row["output_text"],
+                "error": row["error"],
+            }
+        )
 
     def upsert_memory(self, memory: Memory) -> Memory:
         with self._connect() as connection:
