@@ -60,6 +60,32 @@ def test_english_invalid_structure_does_not_invent_scores() -> None:
     assert result.corrections == ()
 
 
+def test_english_missing_required_json_fields_uses_safe_fallback() -> None:
+    raw = '{"coach_reply_en":"Try again","scores":{"grammar":9}}'
+
+    result = parse_english_turn(raw)
+
+    assert result.coach_reply_en == "Try again"
+    assert result.coach_reply_en != raw
+    assert result.scores is None
+    assert result.corrections == ()
+
+
+def test_english_advance_at_turn_limit_never_creates_a_sixth_turn() -> None:
+    session = EnglishPracticeSession(
+        level="intermediate",
+        scenario="interview",
+        turn_count=5,
+        max_turns=5,
+        completed=False,
+    )
+
+    result = session.advance(parse_english_turn(english_result()))
+
+    assert result.turn_count == 5
+    assert result.completed is True
+
+
 def test_text_practice_prompt_forbids_pronunciation_score() -> None:
     prompt = build_english_system_prompt(
         level="beginner",

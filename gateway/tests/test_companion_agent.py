@@ -41,6 +41,16 @@ def test_companion_invalid_structure_falls_back_without_side_effects() -> None:
     assert result.end_session is False
 
 
+def test_companion_invalid_json_schema_never_exposes_raw_json() -> None:
+    raw = '{"reply":"你好","emotion":"angry","end_session":false}'
+
+    result = parse_companion_turn(raw)
+
+    assert result.reply == "我暂时没有理解清楚，请再说一次。"
+    assert result.reply != raw
+    assert result.memory_proposal is None
+
+
 def test_companion_session_clear_removes_only_short_context() -> None:
     session = CompanionSession().append("user", "以后叫我小明").append(
         "assistant",

@@ -43,11 +43,28 @@ def parse_companion_turn(text: str) -> CompanionTurnResult:
         candidate = candidate.split("\n", 1)[-1][:-3].strip()
     try:
         payload = json.loads(candidate)
-        if not isinstance(payload, dict):
-            raise ValueError("companion response must be an object")
-        return CompanionTurnResult.model_validate(payload)
-    except (json.JSONDecodeError, ValidationError, ValueError):
+    except json.JSONDecodeError:
         return CompanionTurnResult(reply=normalized, emotion="neutral")
+    if not isinstance(payload, dict):
+        return CompanionTurnResult(
+            reply="我暂时没有理解清楚，请再说一次。",
+            emotion="neutral",
+        )
+    try:
+        return CompanionTurnResult.model_validate(payload)
+    except ValidationError:
+        safe_reply = payload.get("reply")
+        if not isinstance(safe_reply, str) or not safe_reply.strip():
+            safe_reply = "我暂时没有理解清楚，请再说一次。"
+        elif payload.get("emotion") not in {
+            "neutral",
+            "happy",
+            "sad",
+            "anxious",
+            "tired",
+        }:
+            safe_reply = "我暂时没有理解清楚，请再说一次。"
+        return CompanionTurnResult(reply=safe_reply.strip(), emotion="neutral")
 
 
 def build_companion_system_prompt(*, max_turns: int) -> str:

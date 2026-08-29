@@ -25,13 +25,13 @@ class EnglishScores(BaseModel):
 class EnglishTurnResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    heard_text: str = ""
+    heard_text: str
     coach_reply_en: str
-    feedback_zh: str = ""
-    corrections: tuple[EnglishCorrection, ...] = ()
-    scores: EnglishScores | None = None
-    suggested_expression: str = ""
-    session_complete: bool = False
+    feedback_zh: str
+    corrections: tuple[EnglishCorrection, ...]
+    scores: EnglishScores | None
+    suggested_expression: str
+    session_complete: bool
 
 
 class EnglishPracticeSession(BaseModel):
@@ -51,8 +51,8 @@ class EnglishPracticeSession(BaseModel):
         return self
 
     def advance(self, result: EnglishTurnResult) -> "EnglishPracticeSession":
-        if self.completed:
-            return self
+        if self.completed or self.turn_count >= self.max_turns:
+            return self.model_copy(update={"completed": True})
         next_count = self.turn_count + 1
         return self.model_copy(
             update={
@@ -72,11 +72,29 @@ def parse_english_turn(text: str) -> EnglishTurnResult:
         candidate = candidate.split("\n", 1)[-1][:-3].strip()
     try:
         payload = json.loads(candidate)
-        if not isinstance(payload, dict):
-            raise ValueError("English response must be an object")
+    except json.JSONDecodeError:
+        return _english_fallback(normalized)
+    if not isinstance(payload, dict):
+        return _english_fallback("Let's try that again.")
+    try:
         return EnglishTurnResult.model_validate(payload)
-    except (json.JSONDecodeError, ValidationError, ValueError):
-        return EnglishTurnResult(coach_reply_en=normalized)
+    except ValidationError:
+        safe_reply = payload.get("coach_reply_en")
+        if not isinstance(safe_reply, str) or not safe_reply.strip():
+            safe_reply = "Let's try that again."
+        return _english_fallback(safe_reply.strip())
+
+
+def _english_fallback(reply: str) -> EnglishTurnResult:
+    return EnglishTurnResult(
+        heard_text="",
+        coach_reply_en=reply,
+        feedback_zh="",
+        corrections=(),
+        scores=None,
+        suggested_expression="",
+        session_complete=False,
+    )
 
 
 def build_english_system_prompt(
