@@ -20,6 +20,7 @@ from companion_gateway.domain.memory import (
     MemoryCategory,
     PendingMemoryProposal,
 )
+from companion_gateway.domain.recent_context import RecentChannelMessage
 from companion_gateway.domain.medication import (
     FeishuFallbackStatus,
     MedicationOccurrence,
@@ -151,6 +152,20 @@ class SQLiteTaskRepository:
                 CREATE INDEX IF NOT EXISTS idx_memory_proposals_subject_expiry
                 ON memory_proposals(subject_id, expires_at);
 
+                CREATE TABLE IF NOT EXISTS recent_channel_messages (
+                    message_id TEXT PRIMARY KEY,
+                    subject_id TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    external_message_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    UNIQUE(channel, external_message_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_recent_messages_subject_created
+                ON recent_channel_messages(subject_id, created_at, message_id);
+
                 CREATE TABLE IF NOT EXISTS vision_observations (
                     observation_id TEXT PRIMARY KEY,
                     subject_id TEXT NOT NULL,
@@ -221,6 +236,106 @@ class SQLiteTaskRepository:
                 return connection.execute("SELECT 1").fetchone()[0] == 1
         except sqlite3.Error:
             return False
+
+    def upsert_recent_message(
+        self,
+        message: RecentChannelMessage,
+    ) -> RecentChannelMessage:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_row = connection.execute(
+                """
+                SELECT * FROM recent_channel_messages
+                WHERE channel = ? AND external_message_id = ?
+                """,
+                (message.channel, message.external_message_id),
+            ).fetchone()
+            if existing_row is not None:
+                if existing_row["subject_id"] != message.subject_id:
+                    raise PermissionError("recent message ownership mismatch")
+                return self._recent_message_from_row(existing_row)
+            connection.execute(
+                """
+                INSERT INTO recent_channel_messages (
+                    message_id, subject_id, channel, external_message_id,
+                    content, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message.message_id,
+                    message.subject_id,
+                    message.channel,
+                    message.external_message_id,
+                    message.content,
+                    _require_aware(message.created_at).isoformat(),
+                    _require_aware(message.expires_at).isoformat(),
+                ),
+            )
+        return message
+
+    def list_recent_messages(
+        self,
+        *,
+        subject_id: str,
+        now: datetime,
+        limit: int,
+        max_bytes: int,
+    ) -> list[RecentChannelMessage]:
+        if limit < 1 or max_bytes < 0:
+            raise ValueError("recent context bounds are invalid")
+        current = _require_aware(now).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM recent_channel_messages
+                WHERE subject_id = ? AND expires_at > ?
+                ORDER BY created_at, message_id
+                """,
+                (subject_id, current),
+            ).fetchall()
+        selected: list[RecentChannelMessage] = []
+        used_bytes = 0
+        for row in rows:
+            item = self._recent_message_from_row(row)
+            item_bytes = len(item.content.encode("utf-8"))
+            if len(selected) >= limit:
+                break
+            if used_bytes + item_bytes > max_bytes:
+                continue
+            selected.append(item)
+            used_bytes += item_bytes
+        return selected
+
+    def delete_recent_messages(self, *, subject_id: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM recent_channel_messages WHERE subject_id = ?",
+                (subject_id,),
+            )
+        return cursor.rowcount
+
+    def purge_expired_recent_messages(self, *, now: datetime) -> int:
+        current = _require_aware(now).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM recent_channel_messages WHERE expires_at <= ?",
+                (current,),
+            )
+        return cursor.rowcount
+
+    @staticmethod
+    def _recent_message_from_row(row: sqlite3.Row) -> RecentChannelMessage:
+        return RecentChannelMessage.model_validate(
+            {
+                "message_id": row["message_id"],
+                "subject_id": row["subject_id"],
+                "channel": row["channel"],
+                "external_message_id": row["external_message_id"],
+                "content": row["content"],
+                "created_at": row["created_at"],
+                "expires_at": row["expires_at"],
+            }
+        )
 
     def create_draft(self, draft: AgentDraft) -> AgentDraft:
         with self._connect() as connection:
