@@ -329,6 +329,10 @@ class Settings:
     vision_cleanup_interval_seconds: float = 86_400.0
     task_scheduler_enabled: bool = False
     task_scheduler_interval_seconds: float = 1.0
+    dynamic_agents_enabled: bool = False
+    dynamic_agent_owner_id: str | None = None
+    dynamic_agent_target_device_id: str | None = None
+    dynamic_agent_scheduler_interval_seconds: float = 1.0
     device_hello_timeout_seconds: float = 10.0
     device_audio_frame_max_bytes: int = 4096
     device_auto_stop_idle_seconds: float = 1.2
@@ -375,6 +379,16 @@ class Settings:
         normalized_feishu_receiver_open_id = _normalize_optional_feishu_value(
             self.feishu_receiver_open_id,
             name="COMPANION_FEISHU_RECEIVER_OPEN_ID",
+        )
+        normalized_dynamic_agent_owner_id = _normalize_optional_feishu_value(
+            self.dynamic_agent_owner_id,
+            name="COMPANION_DYNAMIC_AGENT_OWNER_ID",
+        )
+        normalized_dynamic_agent_target_device_id = (
+            _normalize_optional_feishu_value(
+                self.dynamic_agent_target_device_id,
+                name="COMPANION_DYNAMIC_AGENT_TARGET_DEVICE_ID",
+            )
         )
         feishu_values = (
             normalized_feishu_app_id,
@@ -526,6 +540,31 @@ class Settings:
             raise ValueError(
                 "COMPANION_TASK_SCHEDULER_INTERVAL_SECONDS must be positive"
             )
+        if not isinstance(self.dynamic_agents_enabled, bool):
+            raise ValueError(
+                "COMPANION_DYNAMIC_AGENTS_ENABLED must be true or false"
+            )
+        if self.dynamic_agent_scheduler_interval_seconds <= 0:
+            raise ValueError(
+                "COMPANION_DYNAMIC_AGENT_SCHEDULER_INTERVAL_SECONDS "
+                "must be positive"
+            )
+        if self.dynamic_agents_enabled:
+            if normalized_dynamic_agent_owner_id is None:
+                raise ValueError(
+                    "COMPANION_DYNAMIC_AGENT_OWNER_ID is required when "
+                    "dynamic Agents are enabled"
+                )
+            if normalized_dynamic_agent_target_device_id is None:
+                raise ValueError(
+                    "COMPANION_DYNAMIC_AGENT_TARGET_DEVICE_ID is required when "
+                    "dynamic Agents are enabled"
+                )
+            if normalized_mimo_api_key is None:
+                raise ValueError(
+                    "COMPANION_MIMO_API_KEY is required when dynamic Agents "
+                    "are enabled"
+                )
         object.__setattr__(self, "ota_device_tokens", ota_tokens)
         object.__setattr__(self, "public_websocket_url", normalized_url)
         object.__setattr__(self, "device_token_hashes", normalized_hashes)
@@ -549,6 +588,16 @@ class Settings:
             self,
             "feishu_receiver_open_id",
             normalized_feishu_receiver_open_id,
+        )
+        object.__setattr__(
+            self,
+            "dynamic_agent_owner_id",
+            normalized_dynamic_agent_owner_id,
+        )
+        object.__setattr__(
+            self,
+            "dynamic_agent_target_device_id",
+            normalized_dynamic_agent_target_device_id,
         )
         object.__setattr__(self, "feishu_base_url", normalized_feishu_base_url)
 
@@ -658,6 +707,21 @@ class Settings:
             "COMPANION_TASK_SCHEDULER_INTERVAL_SECONDS",
             "1",
         )
+        dynamic_agents_enabled = _parse_bool(
+            os.environ.get("COMPANION_DYNAMIC_AGENTS_ENABLED"),
+            name="COMPANION_DYNAMIC_AGENTS_ENABLED",
+            default=False,
+        )
+        configured_dynamic_agent_owner_id = os.environ.get(
+            "COMPANION_DYNAMIC_AGENT_OWNER_ID"
+        )
+        configured_dynamic_agent_target_device_id = os.environ.get(
+            "COMPANION_DYNAMIC_AGENT_TARGET_DEVICE_ID"
+        )
+        configured_dynamic_agent_scheduler_interval = os.environ.get(
+            "COMPANION_DYNAMIC_AGENT_SCHEDULER_INTERVAL_SECONDS",
+            "1",
+        )
         memory_enabled = _parse_bool(
             os.environ.get("COMPANION_MEMORY_ENABLED"),
             name="COMPANION_MEMORY_ENABLED",
@@ -743,6 +807,17 @@ class Settings:
         token_hashes_json = os.environ.get("COMPANION_DEVICE_TOKEN_HASHES", "{}")
         ota_tokens = json.loads(ota_tokens_json)
         token_hashes = json.loads(token_hashes_json)
+        if dynamic_agents_enabled:
+            configured_dynamic_agent_owner_id = (
+                configured_dynamic_agent_owner_id
+                or configured_feishu_receiver_open_id
+            )
+            if (
+                not configured_dynamic_agent_target_device_id
+                and isinstance(ota_tokens, dict)
+                and len(ota_tokens) == 1
+            ):
+                configured_dynamic_agent_target_device_id = next(iter(ota_tokens))
         voice_runtime = (
             configured_runtime.strip().lower()
             if configured_runtime
@@ -771,6 +846,15 @@ class Settings:
         except ValueError as exc:
             raise ValueError(
                 "COMPANION_TASK_SCHEDULER_INTERVAL_SECONDS must be a number"
+            ) from exc
+        try:
+            dynamic_agent_scheduler_interval_seconds = float(
+                configured_dynamic_agent_scheduler_interval
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_DYNAMIC_AGENT_SCHEDULER_INTERVAL_SECONDS "
+                "must be a number"
             ) from exc
         try:
             mimo_timeout_seconds = float(configured_mimo_timeout)
@@ -991,6 +1075,14 @@ class Settings:
             vision_cleanup_interval_seconds=vision_cleanup_interval_seconds,
             task_scheduler_enabled=task_scheduler_enabled,
             task_scheduler_interval_seconds=task_scheduler_interval_seconds,
+            dynamic_agents_enabled=dynamic_agents_enabled,
+            dynamic_agent_owner_id=configured_dynamic_agent_owner_id,
+            dynamic_agent_target_device_id=(
+                configured_dynamic_agent_target_device_id
+            ),
+            dynamic_agent_scheduler_interval_seconds=(
+                dynamic_agent_scheduler_interval_seconds
+            ),
             device_auto_stop_idle_seconds=device_auto_stop_idle_seconds,
             device_vad_turn_rms_threshold=device_vad_turn_rms_threshold,
             device_auto_turn_rms_threshold=device_auto_turn_rms_threshold,

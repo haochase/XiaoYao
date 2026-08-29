@@ -10,12 +10,32 @@ from pathlib import Path
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
 from starlette.websockets import WebSocketDisconnect
 
+from companion_gateway.agent.compiler import (
+    AGENT_COMPILER_SYSTEM_PROMPT,
+    AgentSpecCompileError,
+    MimoAgentSpecCompiler,
+)
+from companion_gateway.agent.registry import AgentRegistry
+from companion_gateway.agent.router import AgentCommandRouter
+from companion_gateway.agent.runtime import AgentRuntime
+from companion_gateway.agent.scheduler import DynamicAgentScheduler
+from companion_gateway.agent.service import (
+    AgentToolNotAllowed,
+    AgentToolRequest,
+    AgentToolService,
+    AgentToolTimeout,
+)
+from companion_gateway.agent.templates.summary import (
+    DailySummaryBuilder,
+    DailySummaryFacts,
+)
+from companion_gateway.agent.tools.weather import WeatherTool
 from companion_gateway.audio.bridge import AudioFrameRejected, AudioQueueFull
 from companion_gateway.audio.turn import (
     AutoTurnEndpointDetector,
@@ -24,12 +44,7 @@ from companion_gateway.audio.turn import (
 )
 from companion_gateway.channels.feishu_chat import create_feishu_chat_listener
 from companion_gateway.chat.mimo import MimoTextChatRuntime
-from companion_gateway.agent.service import (
-    AgentToolNotAllowed,
-    AgentToolRequest,
-    AgentToolService,
-    AgentToolTimeout,
-)
+from companion_gateway.chat.service import TextChatRuntime
 from companion_gateway.device.events import (
     BoundedDeviceEventSink,
     DeviceBackpressure,
@@ -55,9 +70,10 @@ from companion_gateway.device.transport import (
     DeviceTransport,
     OutboundTask,
 )
-from companion_gateway.domain.memory import MemoryCandidate, MemoryCategory, utc_now
 from companion_gateway.domain.executor import TaskDeliveryAttempt, TaskExecutor
+from companion_gateway.domain.agents import AgentDraft, AgentSpec
 from companion_gateway.domain.medication import MedicationPlanCreate
+from companion_gateway.domain.memory import MemoryCandidate, MemoryCategory, utc_now
 from companion_gateway.domain.models import (
     ContentText,
     Identifier,
@@ -65,6 +81,7 @@ from companion_gateway.domain.models import (
     TaskRecord,
 )
 from companion_gateway.domain.scheduler import TaskScheduler
+from companion_gateway.domain.tasks import InvalidTaskTransition, TaskEventType
 from companion_gateway.medication.scheduler import MedicationScheduler
 from companion_gateway.medication.service import (
     MedicationNotifier,
@@ -80,6 +97,10 @@ from companion_gateway.memory.service import (
     MemoryService,
 )
 from companion_gateway.memory.scheduler import MemoryScheduler
+from companion_gateway.notifications.feishu import FeishuNotifier
+from companion_gateway.service import TaskService
+from companion_gateway.settings import Settings, load_environment_file
+from companion_gateway.storage.sqlite import SQLiteTaskRepository
 from companion_gateway.vision.scheduler import VisionScheduler
 from companion_gateway.vision.service import (
     VisionConsentRequired,
@@ -90,11 +111,6 @@ from companion_gateway.vision.service import (
     VisionTooLarge,
     VisionUnsupportedType,
 )
-from companion_gateway.notifications.feishu import FeishuNotifier
-from companion_gateway.domain.tasks import InvalidTaskTransition, TaskEventType
-from companion_gateway.service import TaskService
-from companion_gateway.settings import Settings, load_environment_file
-from companion_gateway.storage.sqlite import SQLiteTaskRepository
 from companion_gateway.voice.delivery import DeviceVoiceDeliveryService
 from companion_gateway.voice.fixture import (
     create_fixture_voice_delivery,
@@ -147,6 +163,13 @@ class MemoryProposalConfirmRequest(BaseModel):
     subject_id: Identifier
 
 
+class AgentDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_text: ContentText
+    source_message_id: Identifier
+
+
 class UnsupportedDeviceControl(ValueError):
     pass
 
@@ -157,10 +180,50 @@ if not logger.handlers:
     logger.addHandler(logging.StreamHandler())
 logger.propagate = False
 LOCAL_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+_LOCAL_ADMIN_HOSTS = frozenset({"127.0.0.1", "::1", "testclient"})
+_PUBLIC_AGENT_CONFIG_FIELDS = frozenset(
+    {"message", "city", "level", "scenario", "input_mode"}
+)
 
 
 def _request_trace_id(request: Request) -> str:
     return request.state.trace_id
+
+
+def _require_local_dynamic_admin(request: Request) -> None:
+    client_host = request.client.host if request.client is not None else None
+    if client_host not in _LOCAL_ADMIN_HOSTS:
+        raise HTTPException(
+            status_code=403,
+            detail="dynamic Agent management is local-only",
+        )
+
+
+def _public_agent(agent: AgentSpec) -> dict[str, object]:
+    safe_config = {
+        key: value
+        for key, value in agent.config.items()
+        if key in _PUBLIC_AGENT_CONFIG_FIELDS
+    }
+    return {
+        "agent_id": agent.agent_id,
+        "name": agent.name,
+        "kind": agent.kind.value,
+        "enabled": agent.enabled,
+        "trigger": jsonable_encoder(agent.trigger),
+        "channels": [channel.value for channel in agent.channels],
+        "memory_policy": agent.memory_policy.value,
+        "max_turns": agent.max_turns,
+        "config": jsonable_encoder(safe_config),
+    }
+
+
+def _public_agent_draft(draft: AgentDraft) -> dict[str, object]:
+    return {
+        "draft_id": draft.draft_id,
+        "created_at": jsonable_encoder(draft.created_at),
+        "agent": _public_agent(draft.spec),
+    }
 
 
 def create_app(
@@ -173,6 +236,9 @@ def create_app(
     voice_delivery_service: DeviceVoiceDeliveryService | None = None,
     medication_notifier: MedicationNotifier | None = None,
     feishu_chat_listener=None,
+    feishu_chat_listener_factory: Callable[[AgentCommandRouter | None], object]
+    | None = None,
+    agent_text_runtime: TextChatRuntime | None = None,
     memory_clock: Callable[[], datetime] = utc_now,
     vision_clock: Callable[[], datetime] = utc_now,
     agent_clock: Callable[[], datetime] = utc_now,
@@ -308,6 +374,97 @@ def create_app(
         service=medication_service,
         interval_seconds=settings.task_scheduler_interval_seconds,
     )
+    agent_registry = None
+    agent_runtime = None
+    agent_command_router = None
+    dynamic_agent_scheduler = None
+    if settings.dynamic_agents_enabled:
+        owner_id = settings.dynamic_agent_owner_id
+        target_device_id = settings.dynamic_agent_target_device_id
+        if owner_id is None or target_device_id is None:
+            raise ValueError("dynamic Agent settings are incomplete")
+        if agent_text_runtime is None:
+            if settings.mimo_api_key is None:
+                raise ValueError("dynamic Agents require a MiMo API key")
+            agent_text_runtime = MimoTextChatRuntime(
+                openai_base_url=settings.mimo_openai_base_url,
+                api_key=settings.mimo_api_key,
+                model=settings.mimo_model,
+                timeout_seconds=settings.mimo_timeout_seconds,
+                max_retries=settings.mimo_max_retries,
+                retry_backoff_seconds=settings.mimo_retry_backoff_seconds,
+                system_prompt=AGENT_COMPILER_SYSTEM_PROMPT,
+            )
+        agent_registry = AgentRegistry(
+            repository=repository,
+            compiler=MimoAgentSpecCompiler(runtime=agent_text_runtime),
+        )
+
+        def send_dynamic_feishu(text: str) -> bool:
+            if medication_notifier is None:
+                return False
+            result = medication_notifier.send_text(
+                text=text,
+                trace_id=f"dynamic-agent-{uuid4().hex}",
+            )
+            return result.success
+
+        def speak_dynamic_esp32(text: str) -> bool:
+            if voice_delivery_service is None:
+                return False
+            session = device_sessions.get(target_device_id)
+            if session is None:
+                return False
+            try:
+                voice_delivery_service.synthesize_and_send(
+                    session_id=session.session_id,
+                    text=text,
+                )
+            except (ModelRuntimeError, RuntimeError, ValueError):
+                return False
+            return True
+
+        def daily_summary_facts(
+            summary_owner_id: str,
+            now: datetime,
+        ) -> DailySummaryFacts:
+            entries: list[str] = []
+            for agent in repository.list_agents(owner_id=summary_owner_id):
+                for execution in repository.list_executions(
+                    agent.agent_id,
+                    owner_id=summary_owner_id,
+                ):
+                    if execution.started_at.date() == now.date():
+                        entries.append(
+                            f"{agent.name}: {execution.status.value}"
+                        )
+            return DailySummaryFacts(agent_executions=tuple(entries[-20:]))
+
+        agent_runtime = AgentRuntime(
+            repository=repository,
+            weather_tool=WeatherTool(),
+            send_feishu=send_dynamic_feishu,
+            speak_esp32=speak_dynamic_esp32,
+            summary_builder=DailySummaryBuilder(
+                facts_provider=daily_summary_facts,
+            ),
+        )
+        agent_command_router = AgentCommandRouter(
+            registry=agent_registry,
+            runtime=agent_runtime,
+            clock=agent_clock,
+        )
+        dynamic_agent_scheduler = DynamicAgentScheduler(
+            repository=repository,
+            runtime=agent_runtime,
+            owner_id=owner_id,
+            interval_seconds=(
+                settings.dynamic_agent_scheduler_interval_seconds
+            ),
+            clock=agent_clock,
+        )
+    if feishu_chat_listener is None and feishu_chat_listener_factory is not None:
+        feishu_chat_listener = feishu_chat_listener_factory(agent_command_router)
     app = FastAPI(title="XiaoYao Voice Gateway", version="0.1.0")
     app.state.repository = repository
     app.state.service = service
@@ -326,11 +483,36 @@ def create_app(
     app.state.vision_service = vision_service
     app.state.vision_scheduler = vision_scheduler
     app.state.agent_tool_service = agent_tool_service
+    app.state.agent_registry = agent_registry
+    app.state.agent_runtime = agent_runtime
+    app.state.agent_command_router = agent_command_router
+    app.state.dynamic_agent_scheduler = dynamic_agent_scheduler
     if voice_delivery_service is not None:
         voice_delivery_service.set_task_executor(task_executor)
         voice_delivery_service.set_task_service(service)
         voice_delivery_service.set_medication_service(medication_service)
         voice_delivery_service.set_memory_service(memory_service)
+        if (
+            agent_command_router is not None
+            and settings.dynamic_agent_owner_id is not None
+            and settings.dynamic_agent_target_device_id is not None
+        ):
+            dynamic_owner_id = settings.dynamic_agent_owner_id
+            dynamic_target_device_id = settings.dynamic_agent_target_device_id
+
+            def active_voice_agent_context(
+                _actor_id: str,
+                target_device_id: str | None,
+            ) -> str:
+                if target_device_id != dynamic_target_device_id:
+                    return ""
+                return agent_command_router.active_context_for_owner(
+                    owner_id=dynamic_owner_id,
+                )
+
+            voice_delivery_service.set_agent_context_provider(
+                active_voice_agent_context
+            )
     if settings.task_scheduler_enabled:
         app.add_event_handler("startup", task_scheduler.start)
         app.add_event_handler("shutdown", task_scheduler.stop)
@@ -342,6 +524,9 @@ def create_app(
     if settings.vision_enabled:
         app.add_event_handler("startup", vision_scheduler.start)
         app.add_event_handler("shutdown", vision_scheduler.stop)
+    if dynamic_agent_scheduler is not None:
+        app.add_event_handler("startup", dynamic_agent_scheduler.start)
+        app.add_event_handler("shutdown", dynamic_agent_scheduler.stop)
     if feishu_chat_listener is not None:
         app.add_event_handler("startup", feishu_chat_listener.start)
         app.add_event_handler("shutdown", feishu_chat_listener.stop)
@@ -370,6 +555,49 @@ def create_app(
             content=content,
         )
 
+    @app.get(
+        "/v1/demo/status",
+        dependencies=[Depends(_require_local_dynamic_admin)],
+    )
+    def demo_status() -> dict[str, bool | int]:
+        target_device_id = settings.dynamic_agent_target_device_id
+        mimo_canary_ok = False
+        if agent_text_runtime is not None:
+            try:
+                mimo_canary_ok = bool(
+                    agent_text_runtime.respond(
+                        'Return exactly this JSON object: {"status":"ok"}',
+                        history=(),
+                    ).strip()
+                )
+            except Exception:
+                mimo_canary_ok = False
+        tts_canary_ok = bool(
+            voice_delivery_service is not None
+            and voice_delivery_service.can_synthesize("小瑶在线检查")
+        )
+        return {
+            "mimo_configured": settings.mimo_api_key is not None,
+            "mimo_canary_ok": mimo_canary_ok,
+            "tts_configured": voice_delivery_service is not None,
+            "tts_canary_ok": tts_canary_ok,
+            "feishu_available": bool(
+                feishu_chat_listener is not None
+                and getattr(feishu_chat_listener, "is_available", False)
+            ),
+            "device_online": bool(
+                target_device_id is not None
+                and device_sessions.get(target_device_id) is not None
+            ),
+            "dynamic_agents_enabled": agent_registry is not None,
+            "dynamic_agent_count": (
+                len(agent_registry.list(owner_id=settings.dynamic_agent_owner_id))
+                if agent_registry is not None
+                and settings.dynamic_agent_owner_id is not None
+                else 0
+            ),
+        }
+
     @app.get("/v1/channels/feishu/status")
     def feishu_chat_status() -> dict[str, bool | int]:
         return {
@@ -385,6 +613,157 @@ def create_app(
                 getattr(feishu_chat_listener, "replied_messages", 0)
             ),
         }
+
+    if agent_registry is not None and agent_runtime is not None:
+        dynamic_owner_id = settings.dynamic_agent_owner_id
+        if dynamic_owner_id is None:
+            raise ValueError("dynamic Agent owner is not configured")
+
+        @app.post(
+            "/v1/agents/drafts",
+            status_code=201,
+            dependencies=[Depends(_require_local_dynamic_admin)],
+        )
+        def propose_dynamic_agent(
+            body: AgentDraftRequest,
+        ) -> dict[str, object]:
+            try:
+                draft = agent_registry.propose(
+                    body.request_text,
+                    owner_id=dynamic_owner_id,
+                    source_message_id=body.source_message_id,
+                )
+            except (AgentSpecCompileError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return {"draft": _public_agent_draft(draft)}
+
+        @app.post(
+            "/v1/agents/drafts/{draft_id}/confirm",
+            status_code=201,
+            dependencies=[Depends(_require_local_dynamic_admin)],
+        )
+        def confirm_dynamic_agent(draft_id: Identifier) -> dict[str, object]:
+            try:
+                agent = agent_registry.confirm(
+                    draft_id,
+                    owner_id=dynamic_owner_id,
+                )
+            except KeyError as exc:
+                raise HTTPException(
+                    status_code=404,
+                    detail="agent draft not found",
+                ) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {"agent": _public_agent(agent)}
+
+        @app.get(
+            "/v1/agents",
+            dependencies=[Depends(_require_local_dynamic_admin)],
+        )
+        def list_dynamic_agents() -> dict[str, object]:
+            return {
+                "agents": [
+                    _public_agent(agent)
+                    for agent in agent_registry.list(owner_id=dynamic_owner_id)
+                ]
+            }
+
+        @app.get(
+            "/v1/agents/{agent_id}",
+            dependencies=[Depends(_require_local_dynamic_admin)],
+        )
+        def get_dynamic_agent(agent_id: Identifier) -> dict[str, object]:
+            agent = agent_registry.get(agent_id, owner_id=dynamic_owner_id)
+            if agent is None:
+                raise HTTPException(status_code=404, detail="agent not found")
+            return {"agent": _public_agent(agent)}
+
+        @app.post(
+            "/v1/agents/{agent_id}/run",
+            dependencies=[Depends(_require_local_dynamic_admin)],
+        )
+        def run_dynamic_agent(
+            agent_id: Identifier,
+            request: Request,
+        ) -> dict[str, object]:
+            try:
+                execution = agent_runtime.run(
+                    agent_id,
+                    owner_id=dynamic_owner_id,
+                    trigger_id=f"api-{_request_trace_id(request)}",
+                    now=agent_clock(),
+                )
+            except KeyError as exc:
+                raise HTTPException(
+                    status_code=404,
+                    detail="agent not found",
+                ) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {"execution": jsonable_encoder(execution)}
+
+        @app.post(
+            "/v1/agents/{agent_id}/pause",
+            dependencies=[Depends(_require_local_dynamic_admin)],
+        )
+        def pause_dynamic_agent(agent_id: Identifier) -> dict[str, object]:
+            try:
+                agent = agent_registry.pause(
+                    agent_id,
+                    owner_id=dynamic_owner_id,
+                )
+            except KeyError as exc:
+                raise HTTPException(
+                    status_code=404,
+                    detail="agent not found",
+                ) from exc
+            return {"agent": _public_agent(agent)}
+
+        @app.post(
+            "/v1/agents/{agent_id}/resume",
+            dependencies=[Depends(_require_local_dynamic_admin)],
+        )
+        def resume_dynamic_agent(agent_id: Identifier) -> dict[str, object]:
+            try:
+                agent = agent_registry.resume(
+                    agent_id,
+                    owner_id=dynamic_owner_id,
+                )
+            except KeyError as exc:
+                raise HTTPException(
+                    status_code=404,
+                    detail="agent not found",
+                ) from exc
+            return {"agent": _public_agent(agent)}
+
+        @app.delete(
+            "/v1/agents/{agent_id}",
+            dependencies=[Depends(_require_local_dynamic_admin)],
+        )
+        def delete_dynamic_agent(agent_id: Identifier) -> dict[str, bool]:
+            deleted = agent_registry.delete(
+                agent_id,
+                owner_id=dynamic_owner_id,
+            )
+            if not deleted:
+                raise HTTPException(status_code=404, detail="agent not found")
+            return {"deleted": True}
+
+        @app.get(
+            "/v1/agents/{agent_id}/executions",
+            dependencies=[Depends(_require_local_dynamic_admin)],
+        )
+        def list_dynamic_agent_executions(
+            agent_id: Identifier,
+        ) -> dict[str, object]:
+            if agent_registry.get(agent_id, owner_id=dynamic_owner_id) is None:
+                raise HTTPException(status_code=404, detail="agent not found")
+            executions = repository.list_executions(
+                agent_id,
+                owner_id=dynamic_owner_id,
+            )
+            return {"executions": jsonable_encoder(executions)}
 
     @app.get("/v1/devices/{device_id}/status")
     def device_status(device_id: Identifier) -> dict[str, object]:
@@ -1788,7 +2167,9 @@ def create_default_app() -> FastAPI:
     settings = Settings.from_environment()
     transport = DeviceTransport()
     voice_delivery_service = None
-    feishu_chat_listener = None
+    agent_text_runtime = None
+    feishu_text_runtime = None
+    feishu_chat_listener_factory = None
     if settings.voice_runtime == "fixture":
         if settings.fake_voice_fixture_path is None:
             raise ValueError("fixture voice runtime requires a fixture path")
@@ -1849,6 +2230,18 @@ def create_default_app() -> FastAPI:
             response_sample_rate=24_000,
             queue_capacity=settings.audio_queue_capacity,
         )
+    if settings.dynamic_agents_enabled:
+        if settings.mimo_api_key is None:
+            raise ValueError("text Agent runtime requires COMPANION_MIMO_API_KEY")
+        agent_text_runtime = MimoTextChatRuntime(
+            openai_base_url=settings.mimo_openai_base_url,
+            api_key=settings.mimo_api_key,
+            model=settings.mimo_model,
+            timeout_seconds=settings.mimo_timeout_seconds,
+            max_retries=settings.mimo_max_retries,
+            retry_backoff_seconds=settings.mimo_retry_backoff_seconds,
+            system_prompt=AGENT_COMPILER_SYSTEM_PROMPT,
+        )
     if settings.feishu_chat_enabled:
         if (
             settings.feishu_app_id is None
@@ -1857,27 +2250,33 @@ def create_default_app() -> FastAPI:
             or settings.mimo_api_key is None
         ):
             raise ValueError("Feishu chat settings are incomplete")
-        feishu_chat_listener = create_feishu_chat_listener(
-            app_id=settings.feishu_app_id,
-            app_secret=settings.feishu_app_secret,
-            owner_open_id=settings.feishu_receiver_open_id,
-            runtime=MimoTextChatRuntime(
-                openai_base_url=settings.mimo_openai_base_url,
-                api_key=settings.mimo_api_key,
-                model=settings.mimo_model,
-                timeout_seconds=settings.mimo_timeout_seconds,
-                max_retries=settings.mimo_max_retries,
-                retry_backoff_seconds=settings.mimo_retry_backoff_seconds,
-            ),
-            history_turns=settings.feishu_chat_history_turns,
-            startup_timeout_seconds=(
-                settings.feishu_chat_startup_timeout_seconds
-            ),
-            base_url=settings.feishu_base_url,
+        feishu_text_runtime = MimoTextChatRuntime(
+            openai_base_url=settings.mimo_openai_base_url,
+            api_key=settings.mimo_api_key,
+            model=settings.mimo_model,
+            timeout_seconds=settings.mimo_timeout_seconds,
+            max_retries=settings.mimo_max_retries,
+            retry_backoff_seconds=settings.mimo_retry_backoff_seconds,
         )
+
+        def feishu_chat_listener_factory(agent_router):
+            return create_feishu_chat_listener(
+                app_id=settings.feishu_app_id,
+                app_secret=settings.feishu_app_secret,
+                owner_open_id=settings.feishu_receiver_open_id,
+                runtime=feishu_text_runtime,
+                history_turns=settings.feishu_chat_history_turns,
+                startup_timeout_seconds=(
+                    settings.feishu_chat_startup_timeout_seconds
+                ),
+                base_url=settings.feishu_base_url,
+                agent_router=agent_router,
+            )
+
     return create_app(
         settings,
         device_transport=transport,
         voice_delivery_service=voice_delivery_service,
-        feishu_chat_listener=feishu_chat_listener,
+        feishu_chat_listener_factory=feishu_chat_listener_factory,
+        agent_text_runtime=agent_text_runtime,
     )

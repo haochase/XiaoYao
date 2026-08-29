@@ -176,18 +176,18 @@ def test_router_creates_confirms_and_cancels_chat_scoped_drafts() -> None:
     cancelled = handle(router, "\u53d6\u6d88\u521b\u5efa", source="message-cancel")
 
     assert proposed.handled is True
-    assert "draft" in proposed.reply
+    assert "草稿" in proposed.reply
     assert registry.propose_calls == [
         ("\u559d\u6c34\u63d0\u9192", "owner-1", "message-create"),
         ("\u65b0\u63d0\u9192", "owner-1", "message-create-2"),
     ]
     assert confirmed.handled is True
-    assert "created agent" in confirmed.reply
+    assert "已创建智能体" in confirmed.reply
     assert registry.confirm_calls == [("draft-1", "owner-1")]
     assert missing.handled is True
-    assert "no pending" in missing.reply
+    assert "没有待确认" in missing.reply
     assert cancelled.handled is True
-    assert "cancelled" in cancelled.reply
+    assert "已取消创建" in cancelled.reply
 
 
 def test_router_lists_manages_unique_names_and_rejects_ambiguous_or_other_owner_agents() -> None:
@@ -223,7 +223,7 @@ def test_router_lists_manages_unique_names_and_rejects_ambiguous_or_other_owner_
     assert listed.handled is True
     assert "water" in listed.reply
     assert ambiguous.handled is True
-    assert "ambiguous" in ambiguous.reply
+    assert "同名智能体" in ambiguous.reply
     assert run.reply == "manual result"
     assert runtime.calls == [("agent-reminder", "owner-1", runtime.calls[0][2], NOW)]
     assert pause.handled is True
@@ -235,7 +235,7 @@ def test_router_lists_manages_unique_names_and_rejects_ambiguous_or_other_owner_
         ("delete", "agent-reminder", "owner-1"),
     ]
     assert missing.handled is True
-    assert "not found" in missing.reply
+    assert "没有找到" in missing.reply
 
 
 def test_router_activates_companion_and_english_sessions_per_owner_and_chat() -> None:
@@ -277,3 +277,21 @@ def test_router_activates_companion_and_english_sessions_per_owner_and_chat() ->
         owner_id="owner-1",
         chat_id="chat-1",
     )
+
+
+def test_router_exposes_only_one_active_context_for_voice_owner() -> None:
+    companion = build_agent(
+        agent_id="agent-companion",
+        name="companion",
+        kind=AgentKind.COMPANION,
+        prompt="companion initial prompt",
+    )
+    router, _registry, _runtime = router_with_agents(companion)
+
+    handle(router, "\u8fdb\u5165\u966a\u4f34\u6a21\u5f0f")
+
+    assert router.active_context_for_owner(owner_id="owner-1") == router.active_context(
+        owner_id="owner-1",
+        chat_id="chat-1",
+    )
+    assert router.active_context_for_owner(owner_id="owner-2") == ""

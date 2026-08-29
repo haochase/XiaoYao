@@ -147,6 +147,12 @@ class VoiceTurnService:
     def set_task_service(self, task_service: TaskService) -> None:
         self._task_service = task_service
 
+    def set_agent_context_provider(
+        self,
+        provider: AgentContextProvider | None,
+    ) -> None:
+        self._agent_context_provider = provider
+
     def synthesize_text(self, text: str) -> tuple[bytes, ...]:
         synthesize = getattr(self._model_runtime, "synthesize", None)
         if synthesize is None:

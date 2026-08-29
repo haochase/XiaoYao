@@ -601,3 +601,82 @@ def test_settings_reject_invalid_device_token_hashes(
 
     with pytest.raises(ValueError, match="COMPANION_DEVICE_TOKEN_HASHES"):
         Settings.from_environment()
+
+
+def test_dynamic_agents_are_disabled_by_default() -> None:
+    settings = Settings(database_path=Path("data/test.db"))
+
+    assert settings.dynamic_agents_enabled is False
+    assert settings.dynamic_agent_owner_id is None
+    assert settings.dynamic_agent_target_device_id is None
+    assert settings.dynamic_agent_scheduler_interval_seconds == 1.0
+
+
+def test_settings_loads_dynamic_agent_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MIMO_API_KEY", "example-token")
+    monkeypatch.setenv("COMPANION_DYNAMIC_AGENTS_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_DYNAMIC_AGENT_OWNER_ID", "ou_owner")
+    monkeypatch.setenv(
+        "COMPANION_DYNAMIC_AGENT_TARGET_DEVICE_ID",
+        "living-room",
+    )
+    monkeypatch.setenv(
+        "COMPANION_DYNAMIC_AGENT_SCHEDULER_INTERVAL_SECONDS",
+        "0.25",
+    )
+
+    settings = Settings.from_environment()
+
+    assert settings.dynamic_agents_enabled is True
+    assert settings.dynamic_agent_owner_id == "ou_owner"
+    assert settings.dynamic_agent_target_device_id == "living-room"
+    assert settings.dynamic_agent_scheduler_interval_seconds == 0.25
+
+
+def test_settings_infers_dynamic_owner_and_unique_ota_device(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MIMO_API_KEY", "example-token")
+    monkeypatch.setenv("COMPANION_DYNAMIC_AGENTS_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test")
+    monkeypatch.setenv("COMPANION_FEISHU_APP_SECRET", "secret_test")
+    monkeypatch.setenv("COMPANION_FEISHU_RECEIVER_OPEN_ID", "ou_owner")
+    monkeypatch.setenv(
+        "COMPANION_OTA_DEVICE_TOKENS",
+        '{"living-room":"device-token"}',
+    )
+    monkeypatch.setenv(
+        "COMPANION_PUBLIC_WEBSOCKET_URL",
+        "ws://192.0.2.20:8723/v1/devices/ws",
+    )
+
+    settings = Settings.from_environment()
+
+    assert settings.dynamic_agent_owner_id == "ou_owner"
+    assert settings.dynamic_agent_target_device_id == "living-room"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("dynamic_agent_owner_id", None, "OWNER_ID"),
+        ("dynamic_agent_target_device_id", None, "TARGET_DEVICE_ID"),
+        ("mimo_api_key", None, "MIMO_API_KEY"),
+        ("dynamic_agent_scheduler_interval_seconds", 0, "INTERVAL_SECONDS"),
+    ],
+)
+def test_enabled_dynamic_agents_require_complete_configuration(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    values: dict[str, object] = {
+        "database_path": Path("data/test.db"),
+        "dynamic_agents_enabled": True,
+        "dynamic_agent_owner_id": "ou_owner",
+        "dynamic_agent_target_device_id": "living-room",
+        "dynamic_agent_scheduler_interval_seconds": 1.0,
+        "mimo_api_key": "example-token",
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        Settings(**values)

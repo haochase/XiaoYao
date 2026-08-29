@@ -646,6 +646,31 @@ def test_device_voice_delivery_sends_processed_turn_to_active_session() -> None:
     assert transport.messages == [("ses-active", (b"opus-reply",))]
 
 
+def test_device_voice_delivery_propagates_agent_context_provider() -> None:
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=-400)
+    response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(codec=codec, model_sample_rate=16_000, queue_capacity=1)
+    runtime = AgentContextRuntime(response_pcm)
+    voice_turns = VoiceTurnService(audio_bridge=bridge, model_runtime=runtime)
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=voice_turns,
+        device_transport=RecordingTransport(),
+    )
+    delivery.set_agent_context_provider(
+        lambda actor_id, target_device_id: f"{actor_id}:{target_device_id}"
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = delivery.process_and_send(
+        session_id="ses-agent",
+        target_device_id="living-room",
+    )
+
+    assert turn is not None
+    assert runtime.agent_contexts == ["voice-user:living-room"]
+
+
 def test_device_voice_delivery_synthesizes_and_sends_reminder_text() -> None:
     response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
     codec = EchoOpusCodec(pcm_frame(sample_rate=16_000, sample_count=960))
@@ -669,6 +694,29 @@ def test_device_voice_delivery_synthesizes_and_sends_reminder_text() -> None:
     delivery.synthesize_and_send(session_id="ses-reminder", text="take medicine")
 
     assert transport.messages == [("ses-reminder", (b"opus-reply",))]
+
+
+def test_device_voice_delivery_runs_tts_canary_without_sending() -> None:
+    response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
+    codec = EchoOpusCodec(pcm_frame(sample_rate=16_000, sample_count=960))
+    transport = RecordingTransport()
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=VoiceTurnService(
+            audio_bridge=AudioBridge(
+                codec=codec,
+                model_sample_rate=16_000,
+                queue_capacity=1,
+            ),
+            model_runtime=FakeModelRuntime(
+                response_text="reply",
+                response_pcm=response_pcm,
+            ),
+        ),
+        device_transport=transport,
+    )
+
+    assert delivery.can_synthesize("小瑶在线检查") is True
+    assert transport.messages == []
 
 
 def test_device_voice_delivery_propagates_memory_service(tmp_path) -> None:

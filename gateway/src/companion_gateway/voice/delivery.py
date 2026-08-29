@@ -8,7 +8,11 @@ from companion_gateway.domain.executor import TaskExecutor
 from companion_gateway.medication.service import MedicationReminderService
 from companion_gateway.memory.service import MemoryService
 from companion_gateway.service import TaskService
-from companion_gateway.voice.service import VoiceTurn, VoiceTurnService
+from companion_gateway.voice.service import (
+    AgentContextProvider,
+    VoiceTurn,
+    VoiceTurnService,
+)
 
 
 class TtsTransport(Protocol):
@@ -59,6 +63,13 @@ class DeviceVoiceDeliveryService:
             opus_frames=self._voice_turn_service.synthesize_text(text),
         )
 
+    def can_synthesize(self, text: str) -> bool:
+        """Run a bounded synthesis canary without sending audio to a device."""
+        try:
+            return bool(self._voice_turn_service.synthesize_text(text))
+        except Exception:
+            return False
+
     async def process_and_send_async(
         self,
         *,
@@ -99,6 +110,12 @@ class DeviceVoiceDeliveryService:
 
     def set_task_service(self, task_service: TaskService) -> None:
         self._voice_turn_service.set_task_service(task_service)
+
+    def set_agent_context_provider(
+        self,
+        provider: AgentContextProvider | None,
+    ) -> None:
+        self._voice_turn_service.set_agent_context_provider(provider)
 
     def _send_tts_frames(
         self,
