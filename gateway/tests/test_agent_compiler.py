@@ -183,6 +183,8 @@ def test_compiler_prompt_contains_exact_candidate_field_contract() -> None:
     prompt = runtime.calls[0][0]
     assert '"kind": "companion"' in prompt
     assert '"trigger": {"kind": "manual"}' in prompt
+    assert '"kind": "weekdays"' in prompt
+    assert "never add a weekdays array" in prompt
     assert '"allowed_tools"' in prompt
     assert "agent_kind" not in prompt
 

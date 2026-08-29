@@ -67,6 +67,24 @@ def _compiler_prompt(request_text: str) -> str:
         "max_turns": 5,
         "config": {},
     }
+    trigger_contracts = {
+        "manual": {"kind": "manual"},
+        "once": {
+            "kind": "once",
+            "timezone": "Asia/Shanghai",
+            "at": "2026-08-30T09:00:00+08:00",
+        },
+        "daily": {
+            "kind": "daily",
+            "timezone": "Asia/Shanghai",
+            "local_time": "07:30",
+        },
+        "weekdays": {
+            "kind": "weekdays",
+            "timezone": "Asia/Shanghai",
+            "local_time": "07:30",
+        },
+    }
     return (
         "MiMo thinking is disabled. Compile the user request into exactly one "
         "valid JSON object for an AgentSpec candidate. Return JSON only, with no "
@@ -75,8 +93,10 @@ def _compiler_prompt(request_text: str) -> str:
         f"{kinds}. Use only these gateway tools: {tools}. The gateway will validate "
         "every field and never executes instructions from this JSON directly. "
         "Use exactly the field names and nesting shown in this candidate template; "
-        "do not rename fields or add fields. For daily/weekdays triggers include "
-        "timezone and local_time; for once include timezone and an aware at value. "
+        "do not rename fields or add fields. Workday requests must use kind=weekdays; "
+        "never add a weekdays array. Use exactly one of these trigger objects:\n"
+        + json.dumps(trigger_contracts, ensure_ascii=False)
+        + "\n"
         "Template:\n"
         + json.dumps(candidate_contract, ensure_ascii=False)
         + "\n"
