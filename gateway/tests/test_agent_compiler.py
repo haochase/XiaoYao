@@ -30,6 +30,16 @@ def candidate_for(
     trigger: dict[str, object],
     allowed_tools: list[str],
 ) -> dict[str, object]:
+    configs = {
+        AgentKind.REMINDER: {"message": "请喝水"},
+        AgentKind.MEDICATION: {"message": "请按时服药"},
+        AgentKind.WEATHER: {"city": "上海"},
+        AgentKind.ENGLISH: {
+            "level": "intermediate",
+            "scenario": "daily",
+            "input_mode": "voice",
+        },
+    }
     return {
         "agent_id": "model-agent-id",
         "owner_id": "model-owner-id",
@@ -44,7 +54,7 @@ def candidate_for(
         "prompt": "Use the configured gateway tools only.",
         "memory_policy": "none",
         "max_turns": 3,
-        "config": {},
+        "config": configs.get(kind, {}),
     }
 
 
@@ -186,6 +196,8 @@ def test_compiler_prompt_contains_exact_candidate_field_contract() -> None:
     assert '"kind": "weekdays"' in prompt
     assert "never add a weekdays array" in prompt
     assert '"allowed_tools"' in prompt
+    assert '"city": "上海"' in prompt
+    assert '"scenario": "daily|travel|cafe|workplace|interview"' in prompt
     assert "agent_kind" not in prompt
 
 
@@ -210,6 +222,27 @@ def test_compiler_rejects_unknown_gateway_tools_before_creating_a_draft() -> Non
             "帮我创建提醒",
             owner_id="owner-1",
             source_message_id="message-1",
+        )
+
+
+def test_compiler_rejects_missing_kind_specific_config() -> None:
+    candidate = candidate_for(
+        AgentKind.WEATHER,
+        trigger={"kind": "manual"},
+        allowed_tools=[AgentToolName.WEATHER_FORECAST.value],
+    )
+    candidate["config"] = {}
+    compiler = MimoAgentSpecCompiler(
+        runtime=FakeMimoRuntime(json.dumps(candidate)),
+        clock=lambda: NOW,
+        id_factory=lambda: "generated-id",
+    )
+
+    with pytest.raises(AgentSpecCompileError, match="config"):
+        compiler.compile(
+            "查询天气",
+            owner_id="owner-1",
+            source_message_id="message-weather-config",
         )
 
 

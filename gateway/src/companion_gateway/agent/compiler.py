@@ -85,6 +85,19 @@ def _compiler_prompt(request_text: str) -> str:
             "local_time": "07:30",
         },
     }
+    config_contracts = {
+        "reminder": {"message": "提醒内容"},
+        "medication": {"message": "服药提醒内容"},
+        "companion": {},
+        "english_practice": {
+            "level": "beginner|intermediate|advanced",
+            "scenario": "daily|travel|cafe|workplace|interview",
+            "input_mode": "voice|text",
+        },
+        "weather_clothing": {"city": "上海"},
+        "daily_summary": {},
+        "image_observation": {},
+    }
     return (
         "MiMo thinking is disabled. Compile the user request into exactly one "
         "valid JSON object for an AgentSpec candidate. Return JSON only, with no "
@@ -96,6 +109,9 @@ def _compiler_prompt(request_text: str) -> str:
         "do not rename fields or add fields. Workday requests must use kind=weekdays; "
         "never add a weekdays array. Use exactly one of these trigger objects:\n"
         + json.dumps(trigger_contracts, ensure_ascii=False)
+        + "\n"
+        "Use the config object required by the selected kind:\n"
+        + json.dumps(config_contracts, ensure_ascii=False)
         + "\n"
         "Template:\n"
         + json.dumps(candidate_contract, ensure_ascii=False)
@@ -132,6 +148,7 @@ class MimoAgentSpecCompiler:
         )
         candidate = self._parse_candidate(response)
         allowed_tools = self._validated_tools(candidate)
+        self._validated_kind_config(candidate)
         candidate.pop("draft_id", None)
         candidate.pop("source_message_id", None)
         candidate["agent_id"] = self._id_factory()
@@ -179,6 +196,42 @@ class MimoAgentSpecCompiler:
             return tuple(AgentToolName(tool) for tool in raw_tools)
         except ValueError as exc:
             raise AgentSpecCompileError("MiMo allowed tool is not gateway-approved") from exc
+
+    @staticmethod
+    def _validated_kind_config(candidate: dict[str, Any]) -> None:
+        try:
+            kind = AgentKind(candidate.get("kind"))
+        except (TypeError, ValueError) as exc:
+            raise AgentSpecCompileError("MiMo Agent kind is invalid") from exc
+        config = candidate.get("config")
+        if not isinstance(config, dict):
+            raise AgentSpecCompileError("MiMo Agent config must be an object")
+
+        def require_text(field: str) -> str:
+            value = config.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise AgentSpecCompileError(
+                    f"MiMo {kind.value} config.{field} is required"
+                )
+            return value.strip()
+
+        if kind in {AgentKind.REMINDER, AgentKind.MEDICATION}:
+            require_text("message")
+        elif kind is AgentKind.WEATHER:
+            require_text("city")
+        elif kind is AgentKind.ENGLISH:
+            if require_text("level") not in {"beginner", "intermediate", "advanced"}:
+                raise AgentSpecCompileError("MiMo English config.level is invalid")
+            if require_text("scenario") not in {
+                "daily",
+                "travel",
+                "cafe",
+                "workplace",
+                "interview",
+            }:
+                raise AgentSpecCompileError("MiMo English config.scenario is invalid")
+            if require_text("input_mode") not in {"voice", "text"}:
+                raise AgentSpecCompileError("MiMo English config.input_mode is invalid")
 
     @staticmethod
     def _trusted_prompt(candidate: dict[str, Any]) -> str:
