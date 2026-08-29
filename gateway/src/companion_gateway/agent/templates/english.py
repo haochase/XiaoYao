@@ -32,6 +32,13 @@ class EnglishTurnResult(BaseModel):
     scores: EnglishScores | None
     suggested_expression: str
     session_complete: bool
+    structured: bool = Field(default=True, exclude=True)
+
+    @model_validator(mode="after")
+    def require_scores_for_structured_result(self) -> "EnglishTurnResult":
+        if self.structured and self.scores is None:
+            raise ValueError("structured English result requires scores")
+        return self
 
 
 class EnglishPracticeSession(BaseModel):
@@ -77,7 +84,8 @@ def parse_english_turn(text: str) -> EnglishTurnResult:
     if not isinstance(payload, dict):
         return _english_fallback("Let's try that again.")
     try:
-        return EnglishTurnResult.model_validate(payload)
+        validated_payload = {**payload, "structured": True}
+        return EnglishTurnResult.model_validate(validated_payload)
     except ValidationError:
         safe_reply = payload.get("coach_reply_en")
         if not isinstance(safe_reply, str) or not safe_reply.strip():
@@ -94,6 +102,7 @@ def _english_fallback(reply: str) -> EnglishTurnResult:
         scores=None,
         suggested_expression="",
         session_complete=False,
+        structured=False,
     )
 
 

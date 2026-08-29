@@ -71,6 +71,29 @@ def test_english_missing_required_json_fields_uses_safe_fallback() -> None:
     assert result.corrections == ()
 
 
+def test_english_explicit_null_scores_is_not_a_successful_structured_result() -> None:
+    payload = json.loads(english_result())
+    payload["scores"] = None
+
+    result = parse_english_turn(json.dumps(payload, ensure_ascii=False))
+
+    assert result.coach_reply_en == payload["coach_reply_en"]
+    assert result.scores is None
+    assert result.corrections == ()
+
+
+def test_model_cannot_disable_structured_validation() -> None:
+    payload = json.loads(english_result())
+    payload.update({"scores": None, "structured": False, "session_complete": True})
+
+    result = parse_english_turn(json.dumps(payload, ensure_ascii=False))
+
+    assert result.structured is False
+    assert result.scores is None
+    assert result.corrections == ()
+    assert result.session_complete is False
+
+
 def test_english_advance_at_turn_limit_never_creates_a_sixth_turn() -> None:
     session = EnglishPracticeSession(
         level="intermediate",
