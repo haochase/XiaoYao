@@ -1177,28 +1177,56 @@ class SQLiteTaskRepository:
     def mark_occurrence_acknowledged(
         self, occurrence_id: str, *, occurred_at: datetime
     ) -> MedicationOccurrence:
+        occurrence, _claimed = self.claim_occurrence_acknowledgement(
+            occurrence_id,
+            occurred_at=occurred_at,
+        )
+        return occurrence
+
+    def claim_occurrence_acknowledgement(
+        self,
+        occurrence_id: str,
+        *,
+        occurred_at: datetime,
+    ) -> tuple[MedicationOccurrence, bool]:
         if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
         with self._connect() as connection:
-            connection.execute(
-                """
-                UPDATE medication_occurrences
-                SET status = ?, acknowledged_at = ?
-                WHERE occurrence_id = ?
-                """,
-                (
-                    MedicationOccurrenceStatus.ACKNOWLEDGED.value,
-                    occurred_at.astimezone(UTC).isoformat(),
-                    occurrence_id,
-                ),
-            )
-            row = connection.execute(
-                "SELECT * FROM medication_occurrences WHERE occurrence_id = ?",
-                (occurrence_id,),
-            ).fetchone()
-        if row is None:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT * FROM medication_occurrences WHERE occurrence_id = ?",
+                    (occurrence_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(occurrence_id)
+                occurrence = self._medication_occurrence_from_row(row)
+                if occurrence.status is MedicationOccurrenceStatus.ACKNOWLEDGED:
+                    connection.commit()
+                    return occurrence, False
+                connection.execute(
+                    """
+                    UPDATE medication_occurrences
+                    SET status = ?, acknowledged_at = ?
+                    WHERE occurrence_id = ?
+                    """,
+                    (
+                        MedicationOccurrenceStatus.ACKNOWLEDGED.value,
+                        occurred_at.astimezone(UTC).isoformat(),
+                        occurrence_id,
+                    ),
+                )
+                updated = connection.execute(
+                    "SELECT * FROM medication_occurrences WHERE occurrence_id = ?",
+                    (occurrence_id,),
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        if updated is None:
             raise KeyError(occurrence_id)
-        return self._medication_occurrence_from_row(row)
+        return self._medication_occurrence_from_row(updated), True
 
     def claim_feishu_fallback(self, occurrence_id: str) -> bool:
         with self._connect() as connection:

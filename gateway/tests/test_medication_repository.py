@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, time, timedelta
 
 import pytest
@@ -138,3 +139,32 @@ def test_atomic_fallback_claim_and_completion(tmp_path) -> None:
     assert second_claim is False
     assert sent.feishu_status is FeishuFallbackStatus.SENT
     assert sent.feishu_message_id == "om_test_message"
+
+
+def test_acknowledgement_claim_is_atomic_and_only_one_caller_wins(tmp_path) -> None:
+    repository = SQLiteTaskRepository(tmp_path / "medication-ack-claim.db")
+    repository.initialize()
+    plan, _ = repository.create_medication_plan(
+        build_plan(),
+        plan_id="med-plan-ack-claim",
+        occurred_at=datetime(2026, 8, 11, tzinfo=UTC),
+    )
+    occurrence, _ = repository.create_occurrence_if_absent(build_occurrence(plan.plan_id))
+
+    def claim():
+        return repository.claim_occurrence_acknowledgement(
+            occurrence.occurrence_id,
+            occurred_at=datetime(2026, 8, 11, 1, tzinfo=UTC),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: claim(), range(2)))
+
+    assert sorted(won for _occurrence, won in results) == [False, True]
+    assert all(
+        item.status is MedicationOccurrenceStatus.ACKNOWLEDGED
+        for item, _won in results
+    )
+    assert repository.get_medication_occurrence(occurrence.occurrence_id).status is (
+        MedicationOccurrenceStatus.ACKNOWLEDGED
+    )

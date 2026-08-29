@@ -181,6 +181,13 @@ class MedicationRepository(Protocol):
         self, occurrence_id: str, *, occurred_at: datetime
     ) -> MedicationOccurrence: ...
 
+    def claim_occurrence_acknowledgement(
+        self,
+        occurrence_id: str,
+        *,
+        occurred_at: datetime,
+    ) -> tuple[MedicationOccurrence, bool]: ...
+
     def claim_feishu_fallback(self, occurrence_id: str) -> bool: ...
 
     def complete_feishu_fallback(

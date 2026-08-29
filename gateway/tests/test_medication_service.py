@@ -1,7 +1,10 @@
-from datetime import UTC, datetime, time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, date, datetime, time, timedelta
+from threading import Barrier
 
 from companion_gateway.domain.medication import (
     FeishuSendResult,
+    MedicationOccurrence,
     MedicationPlanCreate,
     MedicationOccurrenceStatus,
 )
@@ -215,4 +218,87 @@ def test_acknowledgement_is_idempotent_and_prevents_fallback(tmp_path) -> None:
 
     assert first.status is MedicationOccurrenceStatus.ACKNOWLEDGED
     assert second.status is MedicationOccurrenceStatus.ACKNOWLEDGED
-    assert len(notifier.calls) == 0
+    assert len(notifier.calls) == 1
+    assert "已确认服药" in notifier.calls[0][0]
+    assert notifier.calls[0][1] == "trace-ack"
+
+
+def test_acknowledgement_keeps_state_when_confirmation_receipt_fails(tmp_path) -> None:
+    notifier = FakeNotifier(success=False)
+    repository, _task_service, executor, service, plan = create_service(
+        tmp_path,
+        notifier=notifier,
+    )
+    due = datetime(2026, 8, 11, 0, tzinfo=UTC)
+    service.tick(now=due, trace_id="trace-schedule")
+    TaskScheduler(
+        executor=executor,
+        deliver=lambda _task: True,
+        interval_seconds=1,
+    ).tick(now=due)
+    service.tick(now=due, trace_id="trace-adopt-delivery")
+    occurrence = repository.list_medication_occurrences()[0]
+
+    acknowledged = service.acknowledge_occurrence(
+        occurrence.occurrence_id,
+        actor_id=plan.actor_id,
+        target_device_id=plan.target_device_id,
+        occurred_at=datetime(2026, 8, 11, 0, 5, tzinfo=UTC),
+        trace_id="trace-ack-failed-receipt",
+    )
+
+    assert acknowledged.status is MedicationOccurrenceStatus.ACKNOWLEDGED
+    assert repository.get_medication_occurrence(occurrence.occurrence_id).status is (
+        MedicationOccurrenceStatus.ACKNOWLEDGED
+    )
+    assert len(notifier.calls) == 1
+    assert "已确认服药" in notifier.calls[0][0]
+
+
+def test_concurrent_acknowledgements_send_only_one_confirmation_receipt(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    notifier = FakeNotifier()
+    repository, _task_service, _executor, service, plan = create_service(
+        tmp_path,
+        notifier=notifier,
+    )
+    occurrence = MedicationOccurrence(
+        occurrence_id="med-occurrence-concurrent-ack",
+        plan_id=plan.plan_id,
+        actor_id=plan.actor_id,
+        target_device_id=plan.target_device_id,
+        local_date=date(2026, 8, 11),
+        local_time=time(8),
+        scheduled_at=datetime(2026, 8, 11, 0, tzinfo=UTC),
+        ack_deadline_at=datetime(2026, 8, 11, 0, 10, tzinfo=UTC),
+        status=MedicationOccurrenceStatus.DELIVERED,
+        created_at=datetime(2026, 8, 11, 0, tzinfo=UTC),
+        trace_id="trace-concurrent-ack",
+    )
+    repository.create_occurrence_if_absent(occurrence)
+    original_mark = repository.mark_occurrence_acknowledged
+    barrier = Barrier(2)
+
+    def synchronized_mark(occurrence_id: str, *, occurred_at: datetime):
+        barrier.wait(timeout=5)
+        return original_mark(occurrence_id, occurred_at=occurred_at)
+
+    monkeypatch.setattr(repository, "mark_occurrence_acknowledged", synchronized_mark)
+
+    def acknowledge(trace_id: str):
+        return service.acknowledge_occurrence(
+            occurrence.occurrence_id,
+            actor_id=plan.actor_id,
+            target_device_id=plan.target_device_id,
+            occurred_at=datetime(2026, 8, 11, 0, 5, tzinfo=UTC),
+            trace_id=trace_id,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(acknowledge, ("trace-ack-1", "trace-ack-2")))
+
+    assert all(result.status is MedicationOccurrenceStatus.ACKNOWLEDGED for result in results)
+    assert len(notifier.calls) == 1
+    assert "已确认服药" in notifier.calls[0][0]

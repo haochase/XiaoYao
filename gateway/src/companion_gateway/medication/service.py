@@ -156,21 +156,37 @@ class MedicationReminderService:
             raise PermissionError("medication occurrence ownership mismatch")
         if occurrence.status is MedicationOccurrenceStatus.ACKNOWLEDGED:
             return occurrence
+        task = None
         if occurrence.task_id is not None:
             task = self._task_service.get_task(occurrence.task_id)
-            if task is not None and task.status is TaskStatus.DELIVERED:
-                self._task_service.record_event(
-                    task.task_id,
-                    TaskEventType.ACKNOWLEDGED,
-                    reason="medication_voice_acknowledged",
-                    trace_id=trace_id,
-                )
-            elif task is not None and task.status is not TaskStatus.ACKNOWLEDGED:
+            if task is not None and task.status not in {
+                TaskStatus.DELIVERED,
+                TaskStatus.ACKNOWLEDGED,
+            }:
                 raise ValueError("medication reminder has not been delivered")
-        return self._repository.mark_occurrence_acknowledged(
-            occurrence_id,
-            occurred_at=occurred_at,
+        acknowledged, won_acknowledgement = (
+            self._repository.claim_occurrence_acknowledgement(
+                occurrence_id,
+                occurred_at=occurred_at,
+            )
         )
+        if not won_acknowledgement:
+            return acknowledged
+        if task is not None and task.status is TaskStatus.DELIVERED:
+            self._task_service.record_event(
+                task.task_id,
+                TaskEventType.ACKNOWLEDGED,
+                reason="medication_voice_acknowledged",
+                trace_id=trace_id,
+            )
+        try:
+            self._notifier.send_text(
+                text=self._acknowledgement_receipt_text(acknowledged),
+                trace_id=trace_id,
+            )
+        except Exception:
+            pass
+        return acknowledged
 
     def disable_plan(
         self,
@@ -363,6 +379,13 @@ class MedicationReminderService:
         return (
             f"语音提醒已发送，但暂未收到服药确认：{occurrence.local_date.isoformat()} "
             f"{occurrence.local_time:%H:%M}。请确认是否已服药。"
+        )
+
+    @staticmethod
+    def _acknowledgement_receipt_text(occurrence: MedicationOccurrence) -> str:
+        return (
+            f"已确认服药：{occurrence.local_date.isoformat()} "
+            f"{occurrence.local_time:%H:%M}。"
         )
 
     @staticmethod

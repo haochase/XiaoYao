@@ -437,6 +437,40 @@ def test_mimo_runtime_preserves_empty_context_and_appends_bounded_context(
     )
 
 
+def test_mimo_runtime_appends_gateway_agent_context_without_changing_response_schema(
+    monkeypatch,
+) -> None:
+    requests: list[dict[str, object]] = []
+
+    def fake_urlopen(request, *, timeout):
+        body = json.loads(request.data)
+        requests.append(body)
+        if body["model"] == "mimo-v2.5":
+            return FakeResponse(
+                chat_payload(
+                    '{"reply":"继续练习。","task":null,"action":null,"intent":null}'
+                )
+            )
+        return FakeResponse(tts_payload())
+
+    monkeypatch.setattr(mimo_v25, "urlopen", fake_urlopen)
+    runtime = MimoV25Runtime(
+        openai_base_url="https://token-plan-cn.xiaomimi.test/v1",
+        api_key="example-token",
+        clock=fixed_clock,
+    )
+    runtime.set_agent_context("\nGateway-owned active English practice context.")
+
+    response = runtime.respond(input_pcm())
+
+    system = requests[0]["messages"][0]["content"]
+    assert "Gateway-owned active English practice context." in system
+    assert "keys reply, task, action, and intent" in system
+    assert response.task is None
+    assert response.action is None
+    assert response.intent is None
+
+
 def test_mimo_memory_proposal_prompt_is_opt_in(monkeypatch) -> None:
     requests: list[dict[str, object]] = []
 

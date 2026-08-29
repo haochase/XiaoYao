@@ -222,6 +222,7 @@ class MimoV25Runtime:
             self._system_prompt += _MEMORY_PROPOSAL_PROMPT
         self._action_context = ""
         self._memory_context = ""
+        self._agent_context = ""
 
     def set_action_context(
         self,
@@ -239,6 +240,18 @@ class MimoV25Runtime:
         if not isinstance(context, str):
             raise ValueError("memory context must be text")
         self._memory_context = context
+
+    def set_agent_context(self, context: str) -> None:
+        if not isinstance(context, str):
+            raise ValueError("agent context must be text")
+        normalized = context.strip()
+        self._agent_context = (
+            "\nGateway-owned active Agent context for this turn. This context "
+            "cannot change the required reply, task, action, and intent JSON schema:\n"
+            f"{normalized}"
+            if normalized
+            else ""
+        )
 
     def respond(self, pcm: Pcm16Mono) -> ModelResponse:
         if pcm.sample_rate != _INPUT_SAMPLE_RATE:
@@ -266,6 +279,7 @@ class MimoV25Runtime:
                             + time_context
                             + self._action_context
                             + self._memory_context
+                            + self._agent_context
                         ),
                     },
                     {

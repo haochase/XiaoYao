@@ -25,6 +25,7 @@ from companion_gateway.voice.runtime import ModelRuntime, VoiceAction, VoiceInte
 
 
 Clock = Callable[[], datetime]
+AgentContextProvider = Callable[[str, str | None], str]
 _SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _TASK_STATUS_LABELS = {
     TaskStatus.CREATED: "已创建",
@@ -73,6 +74,7 @@ class VoiceTurnService:
         memory_service: MemoryService | None = None,
         task_service: TaskService | None = None,
         actor_id: str = "voice-user",
+        agent_context_provider: AgentContextProvider | None = None,
         clock: Clock = _utc_now,
     ) -> None:
         self._audio_bridge = audio_bridge
@@ -82,6 +84,7 @@ class VoiceTurnService:
         self._memory_service = memory_service
         self._task_service = task_service
         self._actor_id = actor_id
+        self._agent_context_provider = agent_context_provider
         self._clock = clock
         self._session_uplink: dict[str, deque[Pcm16Mono]] = {}
         self._session_uplink_lock = RLock()
@@ -280,6 +283,31 @@ class VoiceTurnService:
             return
 
     def _prepare_model_context(self, *, target_device_id: str | None) -> None:
+        set_agent_context = getattr(self._model_runtime, "set_agent_context", None)
+        if set_agent_context is not None:
+            agent_context = ""
+            if self._agent_context_provider is not None:
+                try:
+                    supplied_context = self._agent_context_provider(
+                        self._actor_id,
+                        target_device_id,
+                    )
+                    if isinstance(supplied_context, str):
+                        agent_context = supplied_context
+                    else:
+                        logging.getLogger(__name__).warning(
+                            "agent_context_provider_returned_non_text",
+                        )
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        "agent_context_build_failed",
+                    )
+            try:
+                set_agent_context(agent_context)
+            except (TypeError, ValueError):
+                logging.getLogger(__name__).warning(
+                    "agent_context_set_failed",
+                )
         set_memory_context = getattr(self._model_runtime, "set_memory_context", None)
         if set_memory_context is not None:
             memory_context = ""

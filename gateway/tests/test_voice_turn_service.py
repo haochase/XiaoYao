@@ -152,6 +152,15 @@ class MemoryProposalRuntime(FakeModelRuntime):
         )
 
 
+class AgentContextRuntime(FakeModelRuntime):
+    def __init__(self, response_pcm: Pcm16Mono) -> None:
+        super().__init__(response_text="好的", response_pcm=response_pcm)
+        self.agent_contexts: list[str] = []
+
+    def set_agent_context(self, context: str) -> None:
+        self.agent_contexts.append(context)
+
+
 class FailingMemoryService:
     def build_context(self, *, subject_id: str) -> str:
         return ""
@@ -478,6 +487,31 @@ def test_voice_turn_stores_model_proposals_after_reply_and_sets_context(tmp_path
         subject_id="family-1",
         now=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
     ) == []
+
+
+def test_voice_turn_passes_actor_and_target_device_to_agent_context_provider_and_clears_empty_context() -> None:
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(codec=codec, model_sample_rate=16_000, queue_capacity=1)
+    runtime = AgentContextRuntime(
+        pcm_frame(sample_rate=16_000, sample_count=960, start=100),
+    )
+    provider_calls: list[tuple[str, str | None]] = []
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        actor_id="family-1",
+        agent_context_provider=lambda actor_id, target_device_id: (
+            provider_calls.append((actor_id, target_device_id)) or ""
+        ),
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_next_input(target_device_id="living-room")
+
+    assert turn is not None
+    assert provider_calls == [("family-1", "living-room")]
+    assert runtime.agent_contexts == [""]
 
 
 def test_voice_turn_keeps_audio_when_memory_proposal_storage_fails() -> None:
