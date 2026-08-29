@@ -183,3 +183,27 @@ def test_deleted_confirmed_agent_cannot_be_resurrected_by_replay(tmp_path) -> No
         repository.confirm_draft(draft.draft_id, owner_id=draft.owner_id)
 
     assert repository.get_agent(draft.spec.agent_id, owner_id=draft.owner_id) is None
+
+
+def test_deleted_agent_id_cannot_be_reused_by_another_owner(tmp_path) -> None:
+    repository = SQLiteTaskRepository(tmp_path / "agents.db")
+    repository.initialize()
+    original = build_draft()
+    repository.create_draft(original)
+    repository.confirm_draft(original.draft_id, owner_id=original.owner_id)
+    assert repository.delete_agent(original.spec.agent_id, owner_id=original.owner_id)
+
+    other_spec = original.spec.model_copy(update={"owner_id": "family-2"})
+    other_draft = build_draft(
+        draft_id="draft-other-owner",
+        owner_id="family-2",
+        source_message_id="om_other_owner",
+        spec=other_spec,
+    )
+    repository.create_draft(other_draft)
+
+    with pytest.raises(ValueError, match="deleted"):
+        repository.confirm_draft(other_draft.draft_id, owner_id="family-2")
+
+    with pytest.raises(ValueError, match="deleted"):
+        repository.confirm_draft(original.draft_id, owner_id=original.owner_id)

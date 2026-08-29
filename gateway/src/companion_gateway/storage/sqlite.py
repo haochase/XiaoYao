@@ -301,9 +301,9 @@ class SQLiteTaskRepository:
                 deleted = connection.execute(
                     """
                     SELECT 1 FROM deleted_agents
-                    WHERE agent_id = ? AND owner_id = ?
+                    WHERE agent_id = ?
                     """,
-                    (draft.spec.agent_id, owner_id),
+                    (draft.spec.agent_id,),
                 ).fetchone()
                 if deleted is not None:
                     raise ValueError("confirmed agent was deleted")
@@ -394,11 +394,9 @@ class SQLiteTaskRepository:
                 return False
             connection.execute(
                 """
-                INSERT INTO deleted_agents (agent_id, owner_id, deleted_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(agent_id) DO UPDATE SET
-                    owner_id = excluded.owner_id,
-                    deleted_at = excluded.deleted_at
+                INSERT OR IGNORE INTO deleted_agents (
+                    agent_id, owner_id, deleted_at
+                ) VALUES (?, ?, ?)
                 """,
                 (agent_id, owner_id, datetime.now(UTC).isoformat()),
             )
