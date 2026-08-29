@@ -10,6 +10,7 @@ from companion_gateway.memory.service import MemoryService
 from companion_gateway.service import TaskService
 from companion_gateway.voice.service import (
     AgentContextProvider,
+    RecentContextProvider,
     VoiceTurn,
     VoiceTurnService,
 )
@@ -116,6 +117,12 @@ class DeviceVoiceDeliveryService:
         provider: AgentContextProvider | None,
     ) -> None:
         self._voice_turn_service.set_agent_context_provider(provider)
+
+    def set_recent_context_provider(
+        self,
+        provider: RecentContextProvider | None,
+    ) -> None:
+        self._voice_turn_service.set_recent_context_provider(provider)
 
     def _send_tts_frames(
         self,

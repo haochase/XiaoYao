@@ -26,6 +26,7 @@ from companion_gateway.voice.runtime import ModelRuntime, VoiceAction, VoiceInte
 
 Clock = Callable[[], datetime]
 AgentContextProvider = Callable[[str, str | None], str]
+RecentContextProvider = Callable[[str, str | None], str]
 _SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _TASK_STATUS_LABELS = {
     TaskStatus.CREATED: "已创建",
@@ -75,6 +76,7 @@ class VoiceTurnService:
         task_service: TaskService | None = None,
         actor_id: str = "voice-user",
         agent_context_provider: AgentContextProvider | None = None,
+        recent_context_provider: RecentContextProvider | None = None,
         clock: Clock = _utc_now,
     ) -> None:
         self._audio_bridge = audio_bridge
@@ -85,6 +87,7 @@ class VoiceTurnService:
         self._task_service = task_service
         self._actor_id = actor_id
         self._agent_context_provider = agent_context_provider
+        self._recent_context_provider = recent_context_provider
         self._clock = clock
         self._session_uplink: dict[str, deque[Pcm16Mono]] = {}
         self._session_uplink_lock = RLock()
@@ -152,6 +155,12 @@ class VoiceTurnService:
         provider: AgentContextProvider | None,
     ) -> None:
         self._agent_context_provider = provider
+
+    def set_recent_context_provider(
+        self,
+        provider: RecentContextProvider | None,
+    ) -> None:
+        self._recent_context_provider = provider
 
     def synthesize_text(self, text: str) -> tuple[bytes, ...]:
         synthesize = getattr(self._model_runtime, "synthesize", None)
@@ -327,6 +336,31 @@ class VoiceTurnService:
                         "memory_context_build_failed",
                     )
             set_memory_context(memory_context)
+        set_recent_context = getattr(self._model_runtime, "set_recent_context", None)
+        if set_recent_context is not None:
+            recent_context = ""
+            if self._recent_context_provider is not None:
+                try:
+                    supplied_context = self._recent_context_provider(
+                        self._actor_id,
+                        target_device_id,
+                    )
+                    if isinstance(supplied_context, str):
+                        recent_context = supplied_context
+                    else:
+                        logging.getLogger(__name__).warning(
+                            "recent_context_provider_returned_non_text",
+                        )
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        "recent_context_build_failed",
+                    )
+            try:
+                set_recent_context(recent_context)
+            except (TypeError, ValueError):
+                logging.getLogger(__name__).warning(
+                    "recent_context_set_failed",
+                )
         if self._medication_service is None or target_device_id is None:
             return
         set_context = getattr(self._model_runtime, "set_action_context", None)
