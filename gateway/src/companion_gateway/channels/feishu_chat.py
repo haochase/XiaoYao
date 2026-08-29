@@ -8,6 +8,7 @@ from typing import Protocol
 
 from companion_gateway.agent.router import AgentCommandRouter
 from companion_gateway.chat.service import FeishuChatService, TextChatRuntime
+from companion_gateway.context.service import ConversationContextService
 from companion_gateway.voice.minicpm_o import ModelRuntimeError
 
 
@@ -127,6 +128,7 @@ def create_feishu_chat_listener(
     startup_timeout_seconds: float = 10.0,
     base_url: str = "https://open.feishu.cn",
     agent_router: AgentCommandRouter | None = None,
+    recent_context: ConversationContextService | None = None,
 ) -> FeishuChatListener:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
@@ -166,6 +168,7 @@ def create_feishu_chat_listener(
             runtime=runtime,
             max_history_turns=history_turns,
             agent_router=agent_router,
+            recent_context=recent_context,
         ),
         startup_timeout_seconds=startup_timeout_seconds,
     )

@@ -7,6 +7,10 @@ from threading import Lock
 from typing import Literal, Protocol
 
 from companion_gateway.agent.router import AgentCommandRouter
+from companion_gateway.context.service import (
+    ContextStoreError,
+    ConversationContextService,
+)
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,7 @@ class FeishuChatService:
         max_history_turns: int = 6,
         dedup_capacity: int = 2_048,
         agent_router: AgentCommandRouter | None = None,
+        recent_context: ConversationContextService | None = None,
     ) -> None:
         if not owner_open_id or owner_open_id != owner_open_id.strip():
             raise ValueError("owner_open_id must be a non-empty token")
@@ -56,6 +61,7 @@ class FeishuChatService:
         self._max_history_turns = max_history_turns
         self._dedup_capacity = dedup_capacity
         self._agent_router = agent_router
+        self._recent_context = recent_context
         self._seen_message_ids: OrderedDict[str, None] = OrderedDict()
         self._history: dict[str, deque[TextChatTurn]] = {}
         self._lock = Lock()
@@ -81,6 +87,15 @@ class FeishuChatService:
             if text == "清除上下文":
                 self._history.pop(message.chat_id, None)
                 return "已清除本次飞书对话上下文。"
+            if text == "清除共享上下文":
+                self._history.pop(message.chat_id, None)
+                if self._recent_context is None:
+                    return "共享近期上下文功能未启用。"
+                try:
+                    self._recent_context.clear()
+                except ContextStoreError:
+                    return "共享近期上下文清除失败，请稍后重试。"
+                return "已清除共享近期上下文。"
             if text == "帮助":
                 return "你可以直接和小瑶聊天，发送“清除上下文”可开始新对话。"
             history = tuple(self._history.get(message.chat_id, ()))
@@ -103,6 +118,17 @@ class FeishuChatService:
                 )
                 if isinstance(supplied_context, str):
                     agent_context = supplied_context.strip()
+
+        if self._recent_context is not None:
+            try:
+                self._recent_context.record_user_message(
+                    channel="feishu",
+                    external_message_id=message.message_id,
+                    content=text,
+                )
+            except ContextStoreError:
+                # Recent context is an enhancement; it must not block chat.
+                pass
 
         if agent_context and _supports_agent_context(self._runtime):
             reply = self._runtime.respond(
