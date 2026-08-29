@@ -96,3 +96,24 @@ def test_mimo_text_chat_retries_429_and_5xx(monkeypatch) -> None:
     assert runtime.respond("测试") == "重试成功"
     assert attempts == 3
     assert delays == [0.25, 0.5]
+
+
+def test_mimo_text_chat_adds_gateway_agent_context_only_to_the_system_message(monkeypatch) -> None:
+    requests: list[dict[str, object]] = []
+
+    def fake_urlopen(request, *, timeout):
+        requests.append(json.loads(request.data))
+        return FakeResponse(chat_response("active reply"))
+
+    monkeypatch.setattr(mimo_chat, "urlopen", fake_urlopen)
+    runtime = MimoTextChatRuntime(
+        openai_base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        api_key="example-token",
+    )
+
+    assert runtime.respond(
+        "continue",
+        agent_context="Gateway active mode: companion. Continue safely.",
+    ) == "active reply"
+    assert "Gateway active mode: companion. Continue safely." in requests[0]["messages"][0]["content"]
+    assert requests[0]["messages"][1:] == [{"role": "user", "content": "continue"}]

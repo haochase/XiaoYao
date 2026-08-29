@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from collections import OrderedDict, deque
 from dataclasses import dataclass
+from inspect import Parameter, signature
 from threading import Lock
 from typing import Literal, Protocol
+
+from companion_gateway.agent.router import AgentCommandRouter
 
 
 @dataclass(frozen=True)
@@ -18,6 +21,7 @@ class TextChatRuntime(Protocol):
         text: str,
         *,
         history: tuple[TextChatTurn, ...] = (),
+        agent_context: str | None = None,
     ) -> str: ...
 
 
@@ -39,6 +43,7 @@ class FeishuChatService:
         runtime: TextChatRuntime,
         max_history_turns: int = 6,
         dedup_capacity: int = 2_048,
+        agent_router: AgentCommandRouter | None = None,
     ) -> None:
         if not owner_open_id or owner_open_id != owner_open_id.strip():
             raise ValueError("owner_open_id must be a non-empty token")
@@ -50,6 +55,7 @@ class FeishuChatService:
         self._runtime = runtime
         self._max_history_turns = max_history_turns
         self._dedup_capacity = dedup_capacity
+        self._agent_router = agent_router
         self._seen_message_ids: OrderedDict[str, None] = OrderedDict()
         self._history: dict[str, deque[TextChatTurn]] = {}
         self._lock = Lock()
@@ -79,7 +85,33 @@ class FeishuChatService:
                 return "你可以直接和小瑶聊天，发送“清除上下文”可开始新对话。"
             history = tuple(self._history.get(message.chat_id, ()))
 
-        reply = self._runtime.respond(text, history=history).strip()
+        agent_context = ""
+        if self._agent_router is not None:
+            routed = self._agent_router.handle(
+                text=text,
+                owner_id=self._owner_open_id,
+                chat_id=message.chat_id,
+                source_message_id=message.message_id,
+            )
+            if routed.handled:
+                return routed.reply
+            active_context = getattr(self._agent_router, "active_context", None)
+            if callable(active_context):
+                supplied_context = active_context(
+                    owner_id=self._owner_open_id,
+                    chat_id=message.chat_id,
+                )
+                if isinstance(supplied_context, str):
+                    agent_context = supplied_context.strip()
+
+        if agent_context and _supports_agent_context(self._runtime):
+            reply = self._runtime.respond(
+                text,
+                history=history,
+                agent_context=agent_context,
+            ).strip()
+        else:
+            reply = self._runtime.respond(text, history=history).strip()
         if not reply:
             raise ValueError("text chat runtime returned an empty reply")
 
@@ -91,3 +123,15 @@ class FeishuChatService:
             conversation.append(TextChatTurn(role="user", content=text))
             conversation.append(TextChatTurn(role="assistant", content=reply))
         return reply
+
+
+def _supports_agent_context(runtime: TextChatRuntime) -> bool:
+    try:
+        parameters = signature(runtime.respond).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "agent_context"
+        or parameter.kind is Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )

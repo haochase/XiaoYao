@@ -9,6 +9,7 @@ from companion_gateway.channels.feishu_chat import (
     FeishuInboundText,
     create_feishu_chat_listener,
 )
+from companion_gateway.agent.router import AgentRouteResult
 from companion_gateway.chat.service import FeishuChatService, TextChatTurn
 from companion_gateway.voice.minicpm_o import ModelRuntimeError
 
@@ -26,6 +27,50 @@ class RecordingRuntime:
     ) -> str:
         self.calls.append((text, history))
         return next(self.replies)
+
+
+@dataclass
+class RecordingAgentRouter:
+    result: AgentRouteResult
+    calls: list[tuple[str, str, str, str]]
+
+    def handle(
+        self,
+        *,
+        text: str,
+        owner_id: str,
+        chat_id: str,
+        source_message_id: str,
+    ) -> AgentRouteResult:
+        self.calls.append((text, owner_id, chat_id, source_message_id))
+        return self.result
+
+
+@dataclass
+class ActiveContextRouter:
+    context: str
+
+    def handle(
+        self,
+        *,
+        text: str,
+        owner_id: str,
+        chat_id: str,
+        source_message_id: str,
+    ) -> AgentRouteResult:
+        return AgentRouteResult(handled=False, reply=None)
+
+    def active_context(self, *, owner_id: str, chat_id: str) -> str:
+        return self.context
+
+
+class AgentAwareRuntime:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[TextChatTurn, ...], str | None]] = []
+
+    def respond(self, text: str, *, history=(), agent_context: str | None = None) -> str:
+        self.calls.append((text, history, agent_context))
+        return "active mode reply"
 
 
 def inbound(
@@ -76,6 +121,57 @@ def test_chat_service_keeps_bounded_context_and_can_clear_it() -> None:
     assert service.handle(inbound(message_id="om_3", text="清除上下文")) == "已清除本次飞书对话上下文。"
     assert service.handle(inbound(message_id="om_4", text="重新开始")) == "清空后的回复"
     assert runtime.calls[2][1] == ()
+
+
+def test_chat_service_calls_optional_agent_router_after_local_commands_and_before_mimo() -> None:
+    runtime = RecordingRuntime(["ordinary reply"])
+    router = RecordingAgentRouter(
+        result=AgentRouteResult(handled=True, reply="agent reply"),
+        calls=[],
+    )
+    service = FeishuChatService(
+        owner_open_id="ou_owner",
+        runtime=runtime,
+        agent_router=router,
+    )
+
+    assert service.handle(inbound(message_id="om_agent", text="agent command")) == "agent reply"
+    assert service.handle(inbound(message_id="om_agent", text="agent command")) is None
+    assert service.handle(inbound(message_id="om_help", text="\u5e2e\u52a9")) == "\u4f60\u53ef\u4ee5\u76f4\u63a5\u548c\u5c0f\u7476\u804a\u5929\uff0c\u53d1\u9001\u201c\u6e05\u9664\u4e0a\u4e0b\u6587\u201d\u53ef\u5f00\u59cb\u65b0\u5bf9\u8bdd\u3002"
+    router.result = AgentRouteResult(handled=False, reply=None)
+    assert service.handle(inbound(message_id="om_ordinary", text="ordinary text")) == "ordinary reply"
+
+    assert router.calls == [
+        ("agent command", "ou_owner", "oc_chat", "om_agent"),
+        ("ordinary text", "ou_owner", "oc_chat", "om_ordinary"),
+    ]
+    assert [call[0] for call in runtime.calls] == ["ordinary text"]
+
+
+def test_chat_service_uses_active_context_for_capable_runtime_without_revealing_prompt() -> None:
+    runtime = AgentAwareRuntime()
+    router = ActiveContextRouter(
+        context="Gateway active mode: companion. Continue safely.",
+    )
+    service = FeishuChatService(
+        owner_open_id="ou_owner",
+        runtime=runtime,
+        agent_router=router,
+    )
+
+    assert service.handle(inbound(message_id="om_active", text="continue")) == "active mode reply"
+    assert runtime.calls == [
+        ("continue", (), "Gateway active mode: companion. Continue safely."),
+    ]
+
+    legacy = RecordingRuntime(["legacy active reply"])
+    legacy_service = FeishuChatService(
+        owner_open_id="ou_owner",
+        runtime=legacy,
+        agent_router=router,
+    )
+    assert legacy_service.handle(inbound(message_id="om_legacy", text="continue")) == "legacy active reply"
+    assert [call[0] for call in legacy.calls] == ["continue"]
 
 
 @dataclass

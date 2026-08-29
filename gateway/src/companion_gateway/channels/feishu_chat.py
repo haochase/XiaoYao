@@ -6,6 +6,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Protocol
 
+from companion_gateway.agent.router import AgentCommandRouter
 from companion_gateway.chat.service import FeishuChatService, TextChatRuntime
 from companion_gateway.voice.minicpm_o import ModelRuntimeError
 
@@ -125,6 +126,7 @@ def create_feishu_chat_listener(
     history_turns: int = 6,
     startup_timeout_seconds: float = 10.0,
     base_url: str = "https://open.feishu.cn",
+    agent_router: AgentCommandRouter | None = None,
 ) -> FeishuChatListener:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
@@ -163,6 +165,7 @@ def create_feishu_chat_listener(
             owner_open_id=owner_open_id,
             runtime=runtime,
             max_history_turns=history_turns,
+            agent_router=agent_router,
         ),
         startup_timeout_seconds=startup_timeout_seconds,
     )
