@@ -58,6 +58,7 @@ class RecordingRepository:
     def __init__(self, *agents: AgentSpec) -> None:
         self._agents = {agent.agent_id: agent for agent in agents}
         self.records: list[tuple[AgentExecution, str]] = []
+        self.claims: dict[str, AgentExecution] = {}
 
     def get_agent(self, agent_id: str, *, owner_id: str) -> AgentSpec | None:
         agent = self._agents.get(agent_id)
@@ -74,7 +75,23 @@ class RecordingRepository:
         if self.get_agent(execution.agent_id, owner_id=owner_id) is None:
             raise PermissionError("agent execution owner mismatch")
         self.records.append((execution, owner_id))
+        self.claims[execution.execution_id] = execution
         return execution
+
+    def claim_execution(
+        self,
+        execution: AgentExecution,
+        *,
+        owner_id: str,
+    ) -> tuple[AgentExecution, bool]:
+        if self.get_agent(execution.agent_id, owner_id=owner_id) is None:
+            raise PermissionError("agent execution owner mismatch")
+        existing = self.claims.get(execution.execution_id)
+        if existing is not None:
+            return existing, False
+        self.claims[execution.execution_id] = execution
+        self.records.append((execution, owner_id))
+        return execution, True
 
 
 class StaticWeatherTool:
@@ -308,6 +325,39 @@ def test_runtime_rejects_another_owner_before_creating_execution_state() -> None
         )
 
     assert repository.records == []
+
+
+def test_duplicate_run_returns_existing_execution_without_second_delivery() -> None:
+    agent = build_agent(
+        agent_id="agent-idempotent",
+        kind=AgentKind.REMINDER,
+        config={"message": "喝水"},
+    )
+    repository = RecordingRepository(agent)
+    sent: list[str] = []
+    runtime = AgentRuntime(
+        repository=repository,
+        weather_tool=StaticWeatherTool(weather_advice()),
+        send_feishu=lambda text: sent.append(text) is None,
+        speak_esp32=lambda text: True,
+        summary_builder=lambda owner_id, now: "unused",
+    )
+
+    first = runtime.run(
+        agent.agent_id,
+        owner_id=agent.owner_id,
+        trigger_id="same-trigger",
+        now=NOW,
+    )
+    second = runtime.run(
+        agent.agent_id,
+        owner_id=agent.owner_id,
+        trigger_id="same-trigger",
+        now=NOW,
+    )
+
+    assert second == first
+    assert sent == ["喝水"]
 
 
 def test_runtime_never_invokes_a_tool_outside_the_agent_allowlist() -> None:

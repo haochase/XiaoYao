@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from threading import RLock
+
 from companion_gateway.agent.compiler import AgentSpecCompiler
 from companion_gateway.domain.agents import AgentDraft, AgentRepository, AgentSpec
 
@@ -13,6 +15,7 @@ class AgentRegistry:
     ) -> None:
         self._repository = repository
         self._compiler = compiler
+        self._proposal_lock = RLock()
 
     def propose(
         self,
@@ -21,12 +24,19 @@ class AgentRegistry:
         owner_id: str,
         source_message_id: str,
     ) -> AgentDraft:
-        draft = self._compiler.compile(
-            request_text,
-            owner_id=owner_id,
-            source_message_id=source_message_id,
-        )
-        return self._repository.create_draft(draft)
+        with self._proposal_lock:
+            existing = self._repository.get_draft_by_source(
+                owner_id=owner_id,
+                source_message_id=source_message_id,
+            )
+            if existing is not None:
+                return existing
+            draft = self._compiler.compile(
+                request_text,
+                owner_id=owner_id,
+                source_message_id=source_message_id,
+            )
+            return self._repository.create_draft(draft)
 
     def confirm(self, draft_id: str, *, owner_id: str) -> AgentSpec:
         agent, _created = self._repository.confirm_draft(

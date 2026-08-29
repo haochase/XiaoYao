@@ -9,7 +9,12 @@ from companion_gateway.domain.models import (
     TaskKind,
     TaskRecord,
 )
-from companion_gateway.domain.agents import AgentDraft, AgentExecution, AgentSpec
+from companion_gateway.domain.agents import (
+    AgentDraft,
+    AgentExecution,
+    AgentExecutionStatus,
+    AgentSpec,
+)
 from companion_gateway.domain.memory import (
     Memory,
     MemoryCategory,
@@ -262,6 +267,22 @@ class SQLiteTaskRepository:
             ).fetchone()
         return self._agent_draft_from_row(row) if row is not None else None
 
+    def get_draft_by_source(
+        self,
+        *,
+        owner_id: str,
+        source_message_id: str,
+    ) -> AgentDraft | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM agent_drafts
+                WHERE owner_id = ? AND source_message_id = ?
+                """,
+                (owner_id, source_message_id),
+            ).fetchone()
+        return self._agent_draft_from_row(row) if row is not None else None
+
     def confirm_draft(
         self,
         draft_id: str,
@@ -460,6 +481,57 @@ class SQLiteTaskRepository:
                 ),
             )
         return execution
+
+    def claim_execution(
+        self,
+        execution: AgentExecution,
+        *,
+        owner_id: str,
+    ) -> tuple[AgentExecution, bool]:
+        if execution.status is not AgentExecutionStatus.STARTED:
+            raise ValueError("execution claim must start in STARTED status")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                agent = connection.execute(
+                    "SELECT 1 FROM agents WHERE agent_id = ? AND owner_id = ?",
+                    (execution.agent_id, owner_id),
+                ).fetchone()
+                if agent is None:
+                    raise PermissionError("agent execution owner mismatch")
+                existing = connection.execute(
+                    "SELECT * FROM agent_executions WHERE execution_id = ?",
+                    (execution.execution_id,),
+                ).fetchone()
+                if existing is not None:
+                    claimed = self._agent_execution_from_row(existing)
+                    if (
+                        claimed.agent_id != execution.agent_id
+                        or claimed.trigger_id != execution.trigger_id
+                    ):
+                        raise ValueError("execution identity cannot be changed")
+                    connection.commit()
+                    return claimed, False
+                connection.execute(
+                    """
+                    INSERT INTO agent_executions (
+                        execution_id, agent_id, trigger_id, status, started_at,
+                        completed_at, output_text, error
+                    ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)
+                    """,
+                    (
+                        execution.execution_id,
+                        execution.agent_id,
+                        execution.trigger_id,
+                        execution.status.value,
+                        _require_aware(execution.started_at).isoformat(),
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return execution, True
 
     def list_executions(
         self,

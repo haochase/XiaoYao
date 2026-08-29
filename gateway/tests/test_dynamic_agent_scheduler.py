@@ -70,6 +70,16 @@ class SchedulingRepository:
     def record(self, execution: AgentExecution) -> None:
         self._executions.append(execution)
 
+    def record_execution(
+        self,
+        execution: AgentExecution,
+        *,
+        owner_id: str,
+    ) -> AgentExecution:
+        assert owner_id == "family-1"
+        self.record(execution)
+        return execution
+
 
 class RecordingRuntime:
     def __init__(self, repository: SchedulingRepository) -> None:
@@ -214,3 +224,48 @@ def test_scheduler_start_and_stop_are_idempotent() -> None:
         await scheduler.stop()
 
     asyncio.run(exercise())
+
+
+def test_scheduler_records_failure_and_continues_after_one_agent_raises() -> None:
+    repository = SchedulingRepository(
+        build_agent(
+            agent_id="agent-a-fails",
+            trigger=AgentTrigger(
+                kind=TriggerKind.DAILY,
+                timezone="Asia/Shanghai",
+                local_time=time(7, 30),
+            ),
+        ),
+        build_agent(
+            agent_id="agent-b-runs",
+            trigger=AgentTrigger(
+                kind=TriggerKind.DAILY,
+                timezone="Asia/Shanghai",
+                local_time=time(7, 30),
+            ),
+        ),
+    )
+
+    class PartiallyFailingRuntime(RecordingRuntime):
+        def run(self, agent_id: str, **kwargs) -> AgentExecution:
+            if agent_id == "agent-a-fails":
+                raise RuntimeError("secret upstream detail")
+            return super().run(agent_id, **kwargs)
+
+    runtime = PartiallyFailingRuntime(repository)
+    scheduler = DynamicAgentScheduler(
+        repository=repository,
+        runtime=runtime,
+        owner_id="family-1",
+        interval_seconds=60,
+    )
+
+    executions = scheduler.tick(now=MONDAY_NOW)
+
+    assert [execution.agent_id for execution in executions] == [
+        "agent-a-fails",
+        "agent-b-runs",
+    ]
+    assert executions[0].status is AgentExecutionStatus.FAILED
+    assert "secret upstream detail" not in executions[0].error
+    assert executions[1].status is AgentExecutionStatus.SUCCEEDED

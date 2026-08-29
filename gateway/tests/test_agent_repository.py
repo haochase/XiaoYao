@@ -90,6 +90,14 @@ def test_draft_is_owner_scoped_idempotent_by_source_message_and_survives_reopen(
 
     assert created == draft
     assert duplicate == draft
+    assert restarted.get_draft_by_source(
+        owner_id="family-1",
+        source_message_id=draft.source_message_id,
+    ) == draft
+    assert restarted.get_draft_by_source(
+        owner_id="family-2",
+        source_message_id=draft.source_message_id,
+    ) is None
     assert restarted.get_draft(draft.draft_id, owner_id="family-1") == draft
     assert restarted.get_draft(draft.draft_id, owner_id="family-2") is None
 
@@ -168,6 +176,35 @@ def test_execution_identity_cannot_be_redirected_on_idempotent_update(tmp_path) 
         repository.record_execution(
             execution.model_copy(update={"trigger_id": "different-trigger"}),
             owner_id=draft.owner_id,
+        )
+
+
+def test_execution_claim_is_atomic_owner_scoped_and_idempotent(tmp_path) -> None:
+    repository = SQLiteTaskRepository(tmp_path / "agents.db")
+    repository.initialize()
+    draft = build_draft()
+    repository.create_draft(draft)
+    repository.confirm_draft(draft.draft_id, owner_id=draft.owner_id)
+    started = AgentExecution(
+        execution_id="execution-claim",
+        agent_id=draft.spec.agent_id,
+        trigger_id="trigger-claim",
+        status=AgentExecutionStatus.STARTED,
+        started_at=NOW,
+    )
+
+    claimed, created = repository.claim_execution(started, owner_id=draft.owner_id)
+    replayed, replay_created = repository.claim_execution(
+        started,
+        owner_id=draft.owner_id,
+    )
+
+    assert (claimed, created) == (started, True)
+    assert (replayed, replay_created) == (started, False)
+    with pytest.raises(PermissionError, match="owner"):
+        repository.claim_execution(
+            started.model_copy(update={"execution_id": "cross-owner-claim"}),
+            owner_id="family-2",
         )
 
 

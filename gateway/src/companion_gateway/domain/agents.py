@@ -187,6 +187,13 @@ class AgentRepository(Protocol):
 
     def get_draft(self, draft_id: str, *, owner_id: str) -> AgentDraft | None: ...
 
+    def get_draft_by_source(
+        self,
+        *,
+        owner_id: str,
+        source_message_id: str,
+    ) -> AgentDraft | None: ...
+
     def confirm_draft(
         self,
         draft_id: str,
@@ -208,6 +215,13 @@ class AgentRepository(Protocol):
         *,
         owner_id: str,
     ) -> AgentExecution: ...
+
+    def claim_execution(
+        self,
+        execution: AgentExecution,
+        *,
+        owner_id: str,
+    ) -> tuple[AgentExecution, bool]: ...
 
     def list_executions(
         self,

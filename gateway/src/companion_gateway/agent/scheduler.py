@@ -6,8 +6,14 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from zoneinfo import ZoneInfo
 
-from companion_gateway.agent.runtime import AgentRuntime
-from companion_gateway.domain.agents import AgentRepository, AgentSpec, TriggerKind
+from companion_gateway.agent.runtime import AgentRuntime, execution_id_for
+from companion_gateway.domain.agents import (
+    AgentExecution,
+    AgentExecutionStatus,
+    AgentRepository,
+    AgentSpec,
+    TriggerKind,
+)
 
 
 Clock = Callable[[], datetime]
@@ -64,14 +70,34 @@ class DynamicAgentScheduler:
             )
             if any(execution.trigger_id == trigger_id for execution in existing):
                 continue
-            executions.append(
-                self._runtime.run(
+            try:
+                execution = self._runtime.run(
                     agent.agent_id,
                     owner_id=self._owner_id,
                     trigger_id=trigger_id,
                     now=current,
                 )
-            )
+            except Exception as exc:
+                execution = AgentExecution(
+                    execution_id=execution_id_for(
+                        agent_id=agent.agent_id,
+                        trigger_id=trigger_id,
+                    ),
+                    agent_id=agent.agent_id,
+                    trigger_id=trigger_id,
+                    status=AgentExecutionStatus.FAILED,
+                    started_at=current,
+                    completed_at=current,
+                    error=f"agent scheduler failed: {type(exc).__name__}",
+                )
+                try:
+                    self._repository.record_execution(
+                        execution,
+                        owner_id=self._owner_id,
+                    )
+                except Exception:
+                    pass
+            executions.append(execution)
         return tuple(executions)
 
     async def start(self) -> None:

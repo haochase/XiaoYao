@@ -58,13 +58,21 @@ class AgentRuntime:
             raise ValueError("agent is disabled")
 
         started = AgentExecution(
-            execution_id=_execution_id(agent_id=agent.agent_id, trigger_id=trigger_id),
+            execution_id=execution_id_for(
+                agent_id=agent.agent_id,
+                trigger_id=trigger_id,
+            ),
             agent_id=agent.agent_id,
             trigger_id=trigger_id,
             status=AgentExecutionStatus.STARTED,
             started_at=now,
         )
-        self._repository.record_execution(started, owner_id=owner_id)
+        claimed, created = self._repository.claim_execution(
+            started,
+            owner_id=owner_id,
+        )
+        if not created:
+            return claimed
         try:
             output_text = self._build_output(agent, now=now)
             succeeded = started.model_copy(
@@ -148,7 +156,7 @@ def _delivery_succeeded(delivery: Delivery, text: str) -> bool:
         return False
 
 
-def _execution_id(*, agent_id: str, trigger_id: str) -> str:
+def execution_id_for(*, agent_id: str, trigger_id: str) -> str:
     identity = f"{agent_id}\x00{trigger_id}".encode("utf-8")
     return f"execution-{sha256(identity).hexdigest()[:32]}"
 

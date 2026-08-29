@@ -90,6 +90,15 @@ class FakeRepository:
         draft = self.drafts.get(draft_id)
         return draft if draft is not None and draft.owner_id == owner_id else None
 
+    def get_draft_by_source(
+        self,
+        *,
+        owner_id: str,
+        source_message_id: str,
+    ) -> AgentDraft | None:
+        draft_id = self.drafts_by_source.get((owner_id, source_message_id))
+        return self.drafts.get(draft_id) if draft_id is not None else None
+
     def confirm_draft(
         self,
         draft_id: str,
@@ -145,10 +154,7 @@ def test_propose_delegates_duplicate_messages_to_the_owner_scoped_repository() -
 
     assert proposed == first
     assert replayed == first
-    assert compiler.calls == [
-        ("提醒我喝水", "owner-1", "message-1"),
-        ("提醒我喝水", "owner-1", "message-1"),
-    ]
+    assert compiler.calls == [("提醒我喝水", "owner-1", "message-1")]
 
 
 def test_confirm_pause_resume_list_get_and_delete_are_owner_scoped() -> None:
