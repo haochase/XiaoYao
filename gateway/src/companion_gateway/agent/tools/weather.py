@@ -15,6 +15,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 _CACHE_TTL = timedelta(hours=1)
 _FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 _GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+_VALID_WMO_CODES = {
+    0, 1, 2, 3, 45, 48, 51, 53, 55, 56, 57, 61, 63, 65, 66, 67,
+    71, 73, 75, 77, 80, 81, 82, 85, 86, 95, 96, 99,
+}
 
 
 class WeatherToolError(RuntimeError):
@@ -138,6 +142,10 @@ class WeatherTool:
         )
         weather_code = _required_integer(current, "weather_code", context="current")
         wind_speed_kmh = _required_number(current, "wind_speed_10m", context="current")
+        if weather_code not in _VALID_WMO_CODES:
+            raise WeatherToolError("weather current weather code is invalid")
+        if wind_speed_kmh < 0:
+            raise WeatherToolError("weather current wind speed is invalid")
         precipitation_probability = _daily_precipitation_probability(
             payload,
             observed_at=observed_at,

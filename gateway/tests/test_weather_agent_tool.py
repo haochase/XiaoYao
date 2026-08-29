@@ -252,3 +252,28 @@ def test_unknown_city_returns_an_explicit_error_without_inventing_weather(monkey
 
     with pytest.raises(WeatherToolError, match="weather city not found"):
         WeatherTool().advise("不存在的城市", now=MONDAY)
+
+
+@pytest.mark.parametrize(
+    ("wind_speed_kmh", "weather_code", "message"),
+    [
+        (-0.1, 3, "wind speed"),
+        (5.0, 100, "weather code"),
+    ],
+)
+def test_physical_weather_values_are_rejected(
+    monkeypatch,
+    wind_speed_kmh: float,
+    weather_code: int,
+    message: str,
+) -> None:
+    install_open_meteo(
+        monkeypatch,
+        forecast=forecast_payload(
+            wind_speed_kmh=wind_speed_kmh,
+            weather_code=weather_code,
+        ),
+    )
+
+    with pytest.raises(WeatherToolError, match=message):
+        WeatherTool().advise("北京", now=MONDAY)
