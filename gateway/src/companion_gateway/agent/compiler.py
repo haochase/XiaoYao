@@ -12,6 +12,7 @@ from companion_gateway.agent.templates.companion import build_companion_system_p
 from companion_gateway.agent.templates.english import build_english_system_prompt
 from companion_gateway.chat.service import TextChatRuntime
 from companion_gateway.domain.agents import (
+    AgentChannel,
     AgentDraft,
     AgentKind,
     AgentSpec,
@@ -113,6 +114,8 @@ def _compiler_prompt(request_text: str) -> str:
         "Use the config object required by the selected kind:\n"
         + json.dumps(config_contracts, ensure_ascii=False)
         + "\n"
+        "Every feishu channel requires send_feishu in allowed_tools. Every esp32 "
+        "channel requires speak_esp32 in allowed_tools.\n"
         "Template:\n"
         + json.dumps(candidate_contract, ensure_ascii=False)
         + "\n"
@@ -148,6 +151,7 @@ class MimoAgentSpecCompiler:
         )
         candidate = self._parse_candidate(response)
         allowed_tools = self._validated_tools(candidate)
+        self._validated_channel_tools(candidate, allowed_tools=allowed_tools)
         self._validated_kind_config(candidate)
         candidate.pop("draft_id", None)
         candidate.pop("source_message_id", None)
@@ -196,6 +200,32 @@ class MimoAgentSpecCompiler:
             return tuple(AgentToolName(tool) for tool in raw_tools)
         except ValueError as exc:
             raise AgentSpecCompileError("MiMo allowed tool is not gateway-approved") from exc
+
+    @staticmethod
+    def _validated_channel_tools(
+        candidate: dict[str, Any],
+        *,
+        allowed_tools: tuple[AgentToolName, ...],
+    ) -> None:
+        raw_channels = candidate.get("channels")
+        if not isinstance(raw_channels, list) or not all(
+            isinstance(channel, str) for channel in raw_channels
+        ):
+            raise AgentSpecCompileError("MiMo channels must be a JSON string list")
+        try:
+            channels = tuple(AgentChannel(channel) for channel in raw_channels)
+        except ValueError as exc:
+            raise AgentSpecCompileError("MiMo Agent channel is invalid") from exc
+        requirements = {
+            AgentChannel.FEISHU: AgentToolName.SEND_FEISHU,
+            AgentChannel.ESP32: AgentToolName.SPEAK_ESP32,
+        }
+        for channel in channels:
+            required_tool = requirements[channel]
+            if required_tool not in allowed_tools:
+                raise AgentSpecCompileError(
+                    f"MiMo channel {channel.value} requires {required_tool.value}"
+                )
 
     @staticmethod
     def _validated_kind_config(candidate: dict[str, Any]) -> None:
