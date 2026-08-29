@@ -390,7 +390,9 @@ def test_abort_interrupts_an_active_tts_stream(
     app, _ = app_and_sink
 
     async def wait_between_frames(_: float) -> None:
-        await asyncio.sleep(0.02)
+        # Keep the second frame pending long enough for the abort control to be
+        # processed. Frames already queued to the client cannot be recalled.
+        await asyncio.sleep(0.2)
 
     monkeypatch.setattr(api_module, "_sleep_between_tts_frames", wait_between_frames)
 
