@@ -10,6 +10,8 @@ from companion_gateway.device.camera import (
     CameraCaptureMetadata,
     CameraUploadError,
     CameraUploadState,
+    build_vision_capability_message,
+    derive_vision_explain_url,
 )
 from companion_gateway.device.transport import DeviceTransport, OutboundControl
 from companion_gateway.device.models import DeviceHello
@@ -117,3 +119,32 @@ def test_device_transport_delivers_camera_capture_control() -> None:
         assert outbound.payload["state"] == "capture"
 
     asyncio.run(scenario())
+
+
+def test_vision_capability_message_matches_xiaozhi_mcp_initialize_shape() -> None:
+    message = build_vision_capability_message(
+        "http://192.0.2.20:8723/v1/vision/explain"
+    )
+
+    assert message == {
+        "type": "mcp",
+        "session_id": "ses-camera",
+        "payload": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "capabilities": {
+                    "vision": {
+                        "url": "http://192.0.2.20:8723/v1/vision/explain",
+                    }
+                }
+            },
+        },
+    }
+
+
+def test_derive_vision_explain_url_uses_http_for_public_websocket_url() -> None:
+    assert derive_vision_explain_url(
+        "ws://192.0.2.20:8723/v1/devices/ws"
+    ) == "http://192.0.2.20:8723/v1/vision/explain"

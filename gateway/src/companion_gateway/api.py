@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import time
+from email import policy
+from email.parser import BytesParser
 from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
@@ -56,6 +58,8 @@ from companion_gateway.device.camera import (
     CameraFrameRegistry,
     CameraUploadError,
     CameraUploadState,
+    build_vision_capability_message,
+    derive_vision_explain_url,
 )
 from companion_gateway.device.idle import ConversationIdleController
 from companion_gateway.device.models import (
@@ -205,6 +209,36 @@ _PUBLIC_AGENT_CONFIG_FIELDS = frozenset(
 
 def _request_trace_id(request: Request) -> str:
     return request.state.trace_id
+
+
+def _parse_camera_explain_multipart(
+    content_type: str,
+    body: bytes,
+) -> tuple[str, bytes]:
+    if not content_type.lower().startswith("multipart/form-data"):
+        raise ValueError("camera explain requires multipart form data")
+    message = BytesParser(policy=policy.default).parsebytes(
+        b"Content-Type: "
+        + content_type.encode("ascii", errors="strict")
+        + b"\r\nMIME-Version: 1.0\r\n\r\n"
+        + body
+    )
+    question: str | None = None
+    image: bytes | None = None
+    for part in message.iter_parts():
+        disposition = part.get("Content-Disposition", "")
+        name = part.get_param("name", header="content-disposition")
+        if name == "question" and "filename" not in disposition:
+            value = part.get_content()
+            if isinstance(value, str):
+                question = value.strip()
+        elif name == "file":
+            image = part.get_payload(decode=True)
+    if not question:
+        raise ValueError("camera explain question is required")
+    if not image:
+        raise ValueError("camera explain JPEG file is required")
+    return question, image
 
 
 def _require_local_dynamic_admin(request: Request) -> None:
@@ -928,6 +962,85 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"text": text}
 
+    @app.post("/v1/vision/explain")
+    async def explain_camera_multipart(request: Request) -> JSONResponse:
+        device_id = request.headers.get("Device-Id", "").strip()
+        client_id = request.headers.get("Client-Id", "").strip()
+        session = device_sessions.get_by_identity(
+            device_id=device_id,
+            client_id=client_id,
+        )
+        if session is None:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "success": False,
+                    "message": "camera client unauthorized",
+                },
+            )
+        if not settings.camera_enabled:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "success": False,
+                    "message": "camera feature disabled",
+                },
+            )
+        if vision_coordinator is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "success": False,
+                    "message": "vision runtime unavailable",
+                },
+            )
+        content_length = request.headers.get("Content-Length")
+        if content_length is not None:
+            try:
+                if int(content_length) > settings.camera_max_bytes + 16_384:
+                    return JSONResponse(
+                        status_code=413,
+                        content={
+                            "success": False,
+                            "message": "camera image too large",
+                        },
+                    )
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"success": False, "message": "invalid content length"},
+                )
+        try:
+            question, image = _parse_camera_explain_multipart(
+                request.headers.get("Content-Type", ""),
+                await request.body(),
+            )
+            if len(image) > settings.camera_max_bytes:
+                raise VisionTooLarge("camera image too large")
+            turn_id = f"camera-http-{uuid4().hex}"
+            camera_frames.put(
+                session_id=session.session_id,
+                turn_id=turn_id,
+                payload=image,
+            )
+            result = vision_coordinator.describe(
+                session_id=session.session_id,
+                turn_id=turn_id,
+                prompt=question,
+            )
+        except (ValueError, VisionRuntimeError, VisionFeatureDisabled) as exc:
+            return JSONResponse(
+                status_code=503 if isinstance(exc, VisionRuntimeError) else 400,
+                content={
+                    "success": False,
+                    "message": "camera explain failed",
+                },
+            )
+        return JSONResponse(
+            status_code=200,
+            content={"success": True, "result": result},
+        )
+
     @app.post("/v1/vision/observations")
     async def upload_vision_observation(request: Request) -> JSONResponse:
         subject_id = request.headers.get("X-Subject-Id", "").strip()
@@ -1319,6 +1432,17 @@ def create_app(
                     )
 
             outbound_sender = asyncio.create_task(forward_outbound())
+            if settings.camera_enabled and vision_coordinator is not None:
+                if settings.public_websocket_url:
+                    transport.send_control(
+                        session.session_id,
+                        build_vision_capability_message(
+                            derive_vision_explain_url(
+                                settings.public_websocket_url
+                            ),
+                            session_id=session.session_id,
+                        ),
+                    )
 
             async def process_voice_turn(*, trigger: str) -> None:
                 nonlocal pending_session_close_reason

@@ -232,6 +232,18 @@ class DeviceSessionRegistry:
         with self._lock:
             return self._sessions.get(device_id)
 
+    def get_by_identity(
+        self,
+        *,
+        device_id: str,
+        client_id: str,
+    ) -> DeviceSession | None:
+        with self._lock:
+            session = self._sessions.get(device_id)
+            if session is None or session.client_id != client_id:
+                return None
+            return session
+
     def status(self, device_id: str) -> DeviceStatusSnapshot:
         with self._lock:
             session = self._sessions.get(device_id)

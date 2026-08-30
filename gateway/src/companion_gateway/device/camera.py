@@ -4,6 +4,7 @@ import hashlib
 import re
 from threading import RLock
 from typing import Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -121,3 +122,40 @@ class CameraFrameRegistry:
             for key in tuple(self._frames):
                 if key[0] == session_id:
                     del self._frames[key]
+
+
+def build_vision_capability_message(
+    explain_url: str,
+    *,
+    session_id: str = "ses-camera",
+) -> dict[str, object]:
+    if not explain_url.strip():
+        raise ValueError("vision explain URL must not be empty")
+    if not session_id.strip():
+        raise ValueError("vision session_id must not be empty")
+    return {
+        "type": "mcp",
+        "session_id": session_id,
+        "payload": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "capabilities": {
+                    "vision": {
+                        "url": explain_url,
+                    }
+                }
+            },
+        },
+    }
+
+
+def derive_vision_explain_url(public_websocket_url: str) -> str:
+    parsed = urlsplit(public_websocket_url.strip())
+    if parsed.scheme not in {"ws", "wss"} or not parsed.netloc:
+        raise ValueError("public websocket URL must use ws or wss")
+    if parsed.query or parsed.fragment or parsed.username or parsed.password:
+        raise ValueError("public websocket URL must not contain credentials or query")
+    scheme = "https" if parsed.scheme == "wss" else "http"
+    return urlunsplit((scheme, parsed.netloc, "/v1/vision/explain", "", ""))
