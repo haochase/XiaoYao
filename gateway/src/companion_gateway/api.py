@@ -313,6 +313,30 @@ def create_app(
     transport = device_transport or DeviceTransport()
     sink = device_event_sink or DiscardingDeviceEventSink()
 
+    def send_feishu_fallback(task: TaskRecord) -> TaskDeliveryAttempt:
+        if medication_notifier is None:
+            return TaskDeliveryAttempt.failed("feishu_fallback_unavailable")
+        try:
+            result = medication_notifier.send_text(
+                text=task.payload.text,
+                trace_id=f"task-fallback-{task.task_id}",
+            )
+        except Exception:
+            logger.exception(
+                "task_delivery_fallback_failed device=%s task=%s",
+                redact_device_id(task.target_device_id),
+                task.task_id,
+            )
+            return TaskDeliveryAttempt.failed("feishu_fallback_failed")
+        if not result.success:
+            return TaskDeliveryAttempt.failed("feishu_fallback_failed")
+        logger.info(
+            "task_delivery_fallback_succeeded device=%s task=%s",
+            redact_device_id(task.target_device_id),
+            task.task_id,
+        )
+        return TaskDeliveryAttempt.succeeded()
+
     def deliver_task(task: TaskRecord) -> TaskDeliveryAttempt:
         session = device_sessions.get(task.target_device_id)
         if session is None:
@@ -321,7 +345,7 @@ def create_app(
                 redact_device_id(task.target_device_id),
                 task.task_id,
             )
-            return TaskDeliveryAttempt.failed("device_offline")
+            return send_feishu_fallback(task)
         try:
             if medication_service.is_medication_task(task.task_id):
                 if voice_delivery_service is None:
@@ -349,7 +373,7 @@ def create_app(
                 redact_device_id(task.target_device_id),
                 task.task_id,
             )
-            return TaskDeliveryAttempt.failed("device_offline")
+            return send_feishu_fallback(task)
         except DeviceOutboundBackpressure:
             logger.info(
                 "task_delivery_failed device=%s task=%s "

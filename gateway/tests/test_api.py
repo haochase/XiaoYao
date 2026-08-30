@@ -959,6 +959,33 @@ class FakeMedicationNotifier:
         return FeishuSendResult(success=True, message_id="om_api_test")
 
 
+def test_reminder_task_uses_feishu_fallback_when_device_is_offline(tmp_path) -> None:
+    notifier = FakeMedicationNotifier()
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "reminder-fallback.db",
+            feishu_app_id="cli_test_app",
+            feishu_app_secret="secret_test_value",
+            feishu_receiver_open_id="ou_test_receiver",
+        ),
+        medication_notifier=notifier,
+    )
+
+    task, _ = app.state.task_executor.create_and_schedule(
+        TaskCreate.model_validate(
+            {
+                **task_payload(),
+                "confirmation_policy": "optional",
+            }
+        ),
+        trace_id="trace-reminder-fallback",
+    )
+    app.state.task_scheduler.tick(now=datetime(2026, 8, 6, 12, tzinfo=UTC))
+
+    assert notifier.calls == ["take medicine"]
+    assert app.state.service.get_task(task.task_id).status is TaskStatus.DELIVERED
+
+
 def test_medication_api_requires_feishu_configuration(client: TestClient) -> None:
     response = client.post(
         "/v1/medication/plans",
