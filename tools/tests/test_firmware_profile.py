@@ -147,6 +147,8 @@ def test_public_xiaoyao_profile_selects_an_esp32s3_chinese_multinet_model() -> N
     assert "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=50" in template["builds"][0][
         "sdkconfig_append"
     ]
+    assert "CONFIG_CAMERA_OV2640=y" in template["builds"][0]["sdkconfig_append"]
+    assert "CONFIG_SPIRAM=y" in template["builds"][0]["sdkconfig_append"]
 
 
 def test_exact_profile_can_upgrade_a_previous_rendered_profile(tmp_path: Path) -> None:

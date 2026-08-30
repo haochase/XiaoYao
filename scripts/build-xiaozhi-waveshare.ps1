@@ -86,6 +86,8 @@ function Assert-XiaoYaoBuildOutput {
         'CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=50',
         'CONFIG_XIAOYAO_WEBSOCKET_ONLY=y',
         'CONFIG_XIAOYAO_VAD_EVENTS=y',
+        'CONFIG_CAMERA_OV2640=y',
+        'CONFIG_SPIRAM=y',
         ('CONFIG_OTA_URL="' + $ExpectedOtaUrl + '"')
     )
     foreach ($setting in $requiredSettings) {
