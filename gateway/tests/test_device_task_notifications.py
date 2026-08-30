@@ -96,7 +96,7 @@ def test_cancelling_outbound_wait_cleans_up_both_internal_waiters(
             pass
 
         await asyncio.sleep(0)
-        assert len(created_waiters) == 2
+        assert len(created_waiters) == 3
         assert all(waiter.done() for waiter in created_waiters)
         assert all(waiter.cancelled() for waiter in created_waiters)
 

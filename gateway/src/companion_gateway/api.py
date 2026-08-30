@@ -51,6 +51,12 @@ from companion_gateway.device.events import (
     DeviceBackpressure,
     DiscardingDeviceEventSink,
 )
+from companion_gateway.device.camera import (
+    CameraCaptureMetadata,
+    CameraFrameRegistry,
+    CameraUploadError,
+    CameraUploadState,
+)
 from companion_gateway.device.idle import ConversationIdleController
 from companion_gateway.device.models import (
     AbortControl,
@@ -70,6 +76,7 @@ from companion_gateway.device.transport import (
     DeviceNotConnected,
     DeviceOutboundBackpressure,
     DeviceTransport,
+    OutboundControl,
     OutboundTask,
 )
 from companion_gateway.domain.executor import TaskDeliveryAttempt, TaskExecutor
@@ -258,6 +265,7 @@ def create_app(
     service = TaskService(repository)
     task_executor = TaskExecutor(service)
     device_sessions = DeviceSessionRegistry()
+    camera_frames = CameraFrameRegistry()
     device_authenticator = DeviceAuthenticator(settings.device_token_hashes)
     transport = device_transport or DeviceTransport()
     sink = device_event_sink or DiscardingDeviceEventSink()
@@ -485,6 +493,7 @@ def create_app(
     app.state.service = service
     app.state.task_executor = task_executor
     app.state.device_sessions = device_sessions
+    app.state.camera_frames = camera_frames
     app.state.device_event_sink = sink
     app.state.device_transport = transport
     app.state.voice_delivery_service = voice_delivery_service
@@ -824,6 +833,42 @@ def create_app(
     def device_status(device_id: Identifier) -> dict[str, object]:
         return {"device": jsonable_encoder(device_sessions.status(device_id))}
 
+    @app.post(
+        "/v1/devices/{device_id}/camera/capture",
+        dependencies=[Depends(_require_local_dynamic_admin)],
+    )
+    def request_camera_capture(
+        device_id: Identifier,
+        request: Request,
+    ) -> dict[str, object]:
+        if not settings.camera_enabled:
+            raise HTTPException(status_code=503, detail="camera feature is disabled")
+        session = device_sessions.get(device_id)
+        if session is None:
+            raise HTTPException(status_code=409, detail="device is offline")
+        if not session.hello.features.camera_jpeg:
+            raise HTTPException(status_code=409, detail="device camera is unavailable")
+        turn_id = request.headers.get("X-Turn-Id", "").strip() or _request_trace_id(request)
+        max_bytes = min(
+            settings.camera_max_bytes,
+            session.hello.features.camera_max_bytes or settings.camera_max_bytes,
+        )
+        try:
+            transport.send_control(
+                session.session_id,
+                {
+                    "type": "camera",
+                    "state": "capture",
+                    "session_id": session.session_id,
+                    "turn_id": turn_id,
+                    "format": "jpeg",
+                    "max_bytes": max_bytes,
+                },
+            )
+        except (DeviceNotConnected, DeviceOutboundBackpressure) as exc:
+            raise HTTPException(status_code=409, detail="camera request unavailable") from exc
+        return {"requested": True, "turn_id": turn_id, "max_bytes": max_bytes}
+
     @app.post("/v1/vision/observations")
     async def upload_vision_observation(request: Request) -> JSONResponse:
         subject_id = request.headers.get("X-Subject-Id", "").strip()
@@ -1003,6 +1048,7 @@ def create_app(
 
         await websocket.accept()
         session: DeviceSession | None = None
+        camera_upload: CameraUploadState | None = None
         outbound_sender: asyncio.Task[None] | None = None
         auto_stop_task: asyncio.Task[None] | None = None
         idle_controller: ConversationIdleController | None = None
@@ -1032,6 +1078,14 @@ def create_app(
                 timeout=settings.device_hello_timeout_seconds,
             )
             hello = DeviceHello.model_validate(raw_hello)
+            if settings.camera_enabled and hello.features.camera_jpeg:
+                camera_upload = CameraUploadState(
+                    max_bytes=min(
+                        settings.camera_max_bytes,
+                        hello.features.camera_max_bytes
+                        or settings.camera_max_bytes,
+                    )
+                )
             session = DeviceSession.create(
                 device_id=device_id,
                 client_id=client_id,
@@ -1092,6 +1146,9 @@ def create_app(
                 try:
                     while True:
                         message = await transport.next_outbound(session.session_id)
+                        if isinstance(message, OutboundControl):
+                            await websocket.send_json(message.payload)
+                            continue
                         if isinstance(message, OutboundTask):
                             outbound_kind = "task"
                             frames_sent = 0
@@ -1321,6 +1378,22 @@ def create_app(
                             if isinstance(payload, dict)
                             else None
                         )
+                        if message_type == "camera":
+                            if camera_upload is None:
+                                await send_device_error(
+                                    websocket,
+                                    code="camera_unavailable",
+                                    trace_id=trace_id,
+                                    retryable=False,
+                                )
+                                continue
+                            metadata = CameraCaptureMetadata.model_validate(payload)
+                            if metadata.session_id != session.session_id:
+                                raise InvalidDevicePhase(
+                                    "camera message has the wrong session_id"
+                                )
+                            camera_upload.start(metadata)
+                            continue
                         if message_type == "listen":
                             control = ListenControl.model_validate(payload)
                             session.apply_listen(control)
@@ -1646,6 +1719,24 @@ def create_app(
 
                 audio_frame = message.get("bytes")
                 if audio_frame is None:
+                    continue
+                if camera_upload is not None and camera_upload.active:
+                    metadata = camera_upload.metadata
+                    try:
+                        camera_upload.accept_chunk(audio_frame)
+                        if camera_upload.complete and metadata is not None:
+                            camera_frames.put(
+                                session_id=session.session_id,
+                                turn_id=metadata.turn_id,
+                                payload=camera_upload.finish(),
+                            )
+                    except CameraUploadError:
+                        await send_device_error(
+                            websocket,
+                            code="camera_invalid",
+                            trace_id=trace_id,
+                            retryable=False,
+                        )
                     continue
                 if not audio_frame:
                     await send_device_error(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from threading import RLock
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -41,6 +42,14 @@ class CameraUploadState:
     @property
     def active(self) -> bool:
         return self._metadata is not None
+
+    @property
+    def complete(self) -> bool:
+        return self._metadata is not None and len(self._buffer) == self._metadata.declared_bytes
+
+    @property
+    def metadata(self) -> CameraCaptureMetadata | None:
+        return self._metadata
 
     def start(self, metadata: CameraCaptureMetadata) -> None:
         if self.active:
@@ -84,3 +93,31 @@ class CameraUploadState:
     def _reset(self) -> None:
         self._metadata = None
         self._buffer.clear()
+
+
+class CameraFrameRegistry:
+    """Bounded in-memory handoff from a device upload to vision processing."""
+
+    def __init__(self) -> None:
+        self._frames: dict[tuple[str, str], bytes] = {}
+        self._lock = RLock()
+
+    def put(self, *, session_id: str, turn_id: str, payload: bytes) -> None:
+        with self._lock:
+            self._frames[(session_id, turn_id)] = bytes(payload)
+
+    def get(self, *, session_id: str, turn_id: str) -> bytes | None:
+        with self._lock:
+            payload = self._frames.get((session_id, turn_id))
+            return bytes(payload) if payload is not None else None
+
+    def pop(self, *, session_id: str, turn_id: str) -> bytes | None:
+        with self._lock:
+            payload = self._frames.pop((session_id, turn_id), None)
+            return bytes(payload) if payload is not None else None
+
+    def clear_session(self, *, session_id: str) -> None:
+        with self._lock:
+            for key in tuple(self._frames):
+                if key[0] == session_id:
+                    del self._frames[key]

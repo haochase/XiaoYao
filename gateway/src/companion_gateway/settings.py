@@ -327,6 +327,8 @@ class Settings:
     vision_retention_days: int = 7
     vision_quota_bytes: int = 200_000_000
     vision_cleanup_interval_seconds: float = 86_400.0
+    camera_enabled: bool = False
+    camera_max_bytes: int = 2_097_152
     task_scheduler_enabled: bool = False
     task_scheduler_interval_seconds: float = 1.0
     dynamic_agents_enabled: bool = False
@@ -487,6 +489,12 @@ class Settings:
         if self.vision_cleanup_interval_seconds <= 0:
             raise ValueError(
                 "COMPANION_VISION_CLEANUP_INTERVAL_SECONDS must be positive"
+            )
+        if not isinstance(self.camera_enabled, bool):
+            raise ValueError("COMPANION_CAMERA_ENABLED must be true or false")
+        if not 1 <= self.camera_max_bytes <= 2_097_152:
+            raise ValueError(
+                "COMPANION_CAMERA_MAX_BYTES must be between 1 and 2097152"
             )
         if self.audio_queue_capacity < 1:
             raise ValueError("COMPANION_AUDIO_QUEUE_CAPACITY must be positive")
@@ -755,6 +763,15 @@ class Settings:
             "COMPANION_DYNAMIC_AGENT_SCHEDULER_INTERVAL_SECONDS",
             "1",
         )
+        camera_enabled = _parse_bool(
+            os.environ.get("COMPANION_CAMERA_ENABLED"),
+            name="COMPANION_CAMERA_ENABLED",
+            default=False,
+        )
+        configured_camera_max_bytes = os.environ.get(
+            "COMPANION_CAMERA_MAX_BYTES",
+            "2097152",
+        )
         configured_conversation_idle_timeout = os.environ.get(
             "COMPANION_DEVICE_CONVERSATION_IDLE_TIMEOUT_SECONDS",
             "15",
@@ -934,6 +951,10 @@ class Settings:
             raise ValueError(
                 "COMPANION_RECENT_CONTEXT limits must be integers"
             ) from exc
+        try:
+            camera_max_bytes = int(configured_camera_max_bytes)
+        except ValueError as exc:
+            raise ValueError("COMPANION_CAMERA_MAX_BYTES must be an integer") from exc
         try:
             mimo_timeout_seconds = float(configured_mimo_timeout)
         except ValueError as exc:
@@ -1169,6 +1190,8 @@ class Settings:
             recent_context_max_messages=recent_context_max_messages,
             recent_context_max_bytes=recent_context_max_bytes,
             subject_id=configured_subject_id,
+            camera_enabled=camera_enabled,
+            camera_max_bytes=camera_max_bytes,
             device_auto_stop_idle_seconds=device_auto_stop_idle_seconds,
             device_vad_turn_rms_threshold=device_vad_turn_rms_threshold,
             device_auto_turn_rms_threshold=device_auto_turn_rms_threshold,

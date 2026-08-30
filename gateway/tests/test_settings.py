@@ -673,6 +673,29 @@ def test_settings_loads_conversation_idle_timeout(monkeypatch) -> None:
     assert settings.device_conversation_idle_timeout_seconds == 25.0
 
 
+def test_camera_is_disabled_with_two_megabyte_safe_default() -> None:
+    settings = Settings(database_path=Path("data/test.db"))
+
+    assert settings.camera_enabled is False
+    assert settings.camera_max_bytes == 2_097_152
+
+
+def test_settings_loads_camera_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_CAMERA_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_CAMERA_MAX_BYTES", "1000000")
+
+    settings = Settings.from_environment()
+
+    assert settings.camera_enabled is True
+    assert settings.camera_max_bytes == 1_000_000
+
+
+@pytest.mark.parametrize("value", [0, 2_097_153])
+def test_settings_rejects_invalid_camera_max_bytes(value: int) -> None:
+    with pytest.raises(ValueError, match="CAMERA_MAX_BYTES"):
+        Settings(database_path=Path("data/test.db"), camera_max_bytes=value)
+
+
 @pytest.mark.parametrize("value", ["0", "301"])
 def test_settings_rejects_invalid_conversation_idle_timeout(value: str) -> None:
     with pytest.raises(ValueError, match="CONVERSATION_IDLE_TIMEOUT"):

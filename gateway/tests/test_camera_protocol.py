@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 
 import pytest
 from pydantic import ValidationError
@@ -10,6 +11,7 @@ from companion_gateway.device.camera import (
     CameraUploadError,
     CameraUploadState,
 )
+from companion_gateway.device.transport import DeviceTransport, OutboundControl
 from companion_gateway.device.models import DeviceHello
 
 
@@ -91,3 +93,27 @@ def test_camera_upload_rejects_size_overflow_and_cleans_state() -> None:
         upload.accept_chunk(payload + b"overflow")
     with pytest.raises(CameraUploadError, match="not active"):
         upload.finish()
+
+
+def test_device_transport_delivers_camera_capture_control() -> None:
+    async def scenario() -> None:
+        transport = DeviceTransport()
+        transport.register("ses-camera")
+        transport.send_control(
+            "ses-camera",
+            {
+                "type": "camera",
+                "state": "capture",
+                "session_id": "ses-camera",
+                "turn_id": "turn-1",
+                "format": "jpeg",
+                "max_bytes": 2_097_152,
+            },
+        )
+
+        outbound = await transport.next_outbound("ses-camera")
+
+        assert isinstance(outbound, OutboundControl)
+        assert outbound.payload["state"] == "capture"
+
+    asyncio.run(scenario())
