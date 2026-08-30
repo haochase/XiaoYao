@@ -586,6 +586,19 @@ def create_app(
     )
     def demo_status() -> dict[str, bool | int]:
         target_device_id = settings.dynamic_agent_target_device_id
+        recent_context_count = 0
+        if recent_context_service.enabled:
+            try:
+                recent_context_count = len(
+                    repository.list_recent_messages(
+                        subject_id=recent_context_service.subject_id,
+                        now=utc_now(),
+                        limit=settings.recent_context_max_messages,
+                        max_bytes=settings.recent_context_max_bytes,
+                    )
+                )
+            except Exception:
+                recent_context_count = 0
         mimo_canary_ok = False
         if agent_text_runtime is not None:
             try:
@@ -621,7 +634,23 @@ def create_app(
                 and settings.dynamic_agent_owner_id is not None
                 else 0
             ),
+            "recent_context_enabled": recent_context_service.enabled,
+            "recent_context_count": recent_context_count,
         }
+
+    @app.post(
+        "/v1/context/clear",
+        dependencies=[Depends(_require_local_dynamic_admin)],
+    )
+    def clear_recent_context() -> dict[str, int]:
+        try:
+            deleted = recent_context_service.clear()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="recent context clear failed",
+            ) from exc
+        return {"deleted": deleted}
 
     @app.get("/v1/channels/feishu/status")
     def feishu_chat_status() -> dict[str, bool | int]:
