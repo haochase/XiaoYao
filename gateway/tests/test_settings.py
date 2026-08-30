@@ -673,6 +673,20 @@ def test_settings_loads_conversation_idle_timeout(monkeypatch) -> None:
     assert settings.device_conversation_idle_timeout_seconds == 25.0
 
 
+def test_continuous_conversation_is_disabled_with_safe_default() -> None:
+    settings = Settings(database_path=Path("data/test.db"))
+
+    assert settings.device_continuous_conversation_enabled is False
+
+
+def test_settings_loads_continuous_conversation_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_CONTINUOUS_CONVERSATION_ENABLED", "true")
+
+    settings = Settings.from_environment()
+
+    assert settings.device_continuous_conversation_enabled is True
+
+
 def test_camera_is_disabled_with_two_megabyte_safe_default() -> None:
     settings = Settings(database_path=Path("data/test.db"))
 

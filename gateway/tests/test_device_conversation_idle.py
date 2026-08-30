@@ -118,6 +118,7 @@ def test_websocket_closes_after_tts_stop_and_idle_window(tmp_path) -> None:
                 device_id: sha256(token.encode("utf-8")).hexdigest()
             },
             device_conversation_idle_timeout_seconds=0.01,
+            device_continuous_conversation_enabled=True,
         )
     )
 

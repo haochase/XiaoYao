@@ -1415,9 +1415,18 @@ def create_app(
                             close_reason_length = len(reason)
                             await websocket.close(code=1000, reason=reason)
                             return
-                        if idle_controller is not None:
+                        if (
+                            settings.device_continuous_conversation_enabled
+                            and idle_controller is not None
+                        ):
                             generation = session.arm_conversation_idle()
                             idle_controller.arm(generation)
+                        else:
+                            close_code = 1000
+                            close_reason = "conversation_turn_complete"
+                            close_reason_length = len(close_reason)
+                            await websocket.close(code=1000, reason=close_reason)
+                            return
                 except (RuntimeError, WebSocketDisconnect) as exc:
                     logger.info(
                         "device_ws_outbound_stopped device=%s session=%s kind=%s "

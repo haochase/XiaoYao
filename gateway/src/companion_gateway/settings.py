@@ -336,6 +336,7 @@ class Settings:
     dynamic_agent_target_device_id: str | None = None
     dynamic_agent_scheduler_interval_seconds: float = 1.0
     device_conversation_idle_timeout_seconds: float = 15.0
+    device_continuous_conversation_enabled: bool = False
     recent_context_enabled: bool = False
     recent_context_retention_days: int = 7
     recent_context_max_messages: int = 20
@@ -776,6 +777,11 @@ class Settings:
             "COMPANION_DEVICE_CONVERSATION_IDLE_TIMEOUT_SECONDS",
             "15",
         )
+        device_continuous_conversation_enabled = _parse_bool(
+            os.environ.get("COMPANION_DEVICE_CONTINUOUS_CONVERSATION_ENABLED"),
+            name="COMPANION_DEVICE_CONTINUOUS_CONVERSATION_ENABLED",
+            default=False,
+        )
         recent_context_enabled = _parse_bool(
             os.environ.get("COMPANION_RECENT_CONTEXT_ENABLED"),
             name="COMPANION_RECENT_CONTEXT_ENABLED",
@@ -1184,6 +1190,9 @@ class Settings:
             ),
             device_conversation_idle_timeout_seconds=(
                 device_conversation_idle_timeout_seconds
+            ),
+            device_continuous_conversation_enabled=(
+                device_continuous_conversation_enabled
             ),
             recent_context_enabled=recent_context_enabled,
             recent_context_retention_days=recent_context_retention_days,

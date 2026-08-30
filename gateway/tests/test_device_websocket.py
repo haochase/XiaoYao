@@ -338,6 +338,34 @@ def test_active_device_receives_a_multi_frame_tts_stream(
     assert delays == [0.06]
 
 
+def test_completed_tts_closes_session_to_rearm_wake_word(
+    client: TestClient,
+    app_and_sink,
+) -> None:
+    app, _ = app_and_sink
+
+    with client.websocket_connect(
+        "/v1/devices/ws",
+        headers=websocket_headers(),
+    ) as websocket:
+        websocket.send_json(hello_payload())
+        server_hello = websocket.receive_json()
+        app.state.device_transport.send_tts(
+            server_hello["session_id"],
+            b"completed-opus",
+        )
+
+        assert websocket.receive_json()["state"] == "start"
+        assert websocket.receive_bytes() == b"completed-opus"
+        assert websocket.receive_json()["state"] == "stop"
+        with pytest.raises(WebSocketDisconnect) as disconnected:
+            websocket.receive_json()
+
+    assert disconnected.value.code == 1000
+    assert disconnected.value.reason == "conversation_turn_complete"
+    assert app.state.device_sessions.get(DEVICE_ID) is None
+
+
 def test_tts_disconnect_log_includes_failure_details(
     client: TestClient,
     app_and_sink,
@@ -972,6 +1000,7 @@ def test_vad_capable_device_processes_two_turns_on_one_connection(tmp_path) -> N
             device_auto_turn_rms_threshold=35.0,
             device_auto_turn_min_speech_frames=1,
             device_post_tts_silence_frames=2,
+            device_continuous_conversation_enabled=True,
         ),
         device_transport=transport,
         voice_delivery_service=DeviceVoiceDeliveryService(
@@ -1042,6 +1071,7 @@ def test_vad_tail_controls_during_inference_do_not_close_connection(tmp_path) ->
             },
             device_auto_turn_min_speech_frames=1,
             device_post_tts_silence_frames=1,
+            device_continuous_conversation_enabled=True,
         ),
         device_transport=transport,
         voice_delivery_service=DeviceVoiceDeliveryService(
@@ -1697,6 +1727,7 @@ def test_auto_voice_turn_frame_limit_is_per_turn_and_excludes_echo_gate(
             device_auto_turn_min_speech_frames=2,
             device_auto_turn_max_frames=3,
             device_post_tts_silence_frames=2,
+            device_continuous_conversation_enabled=True,
         ),
         device_transport=transport,
         voice_delivery_service=DeviceVoiceDeliveryService(
@@ -1923,6 +1954,7 @@ def test_auto_voice_turn_ignores_post_tts_echo_until_stable_silence(tmp_path) ->
             device_auto_turn_silence_frames=2,
             device_auto_turn_min_speech_frames=1,
             device_post_tts_silence_frames=2,
+            device_continuous_conversation_enabled=True,
         ),
         device_transport=transport,
         voice_delivery_service=DeviceVoiceDeliveryService(
@@ -2010,6 +2042,7 @@ def test_vad_voice_turn_ignores_complete_post_tts_echo_segment(tmp_path) -> None
             },
             device_auto_turn_min_speech_frames=1,
             device_post_tts_silence_frames=2,
+            device_continuous_conversation_enabled=True,
         ),
         device_transport=transport,
         voice_delivery_service=DeviceVoiceDeliveryService(
