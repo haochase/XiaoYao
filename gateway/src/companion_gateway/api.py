@@ -524,6 +524,8 @@ def create_app(
             registry=agent_registry,
             runtime=agent_runtime,
             clock=agent_clock,
+            reminder_tool=agent_tool_service,
+            target_device_id=target_device_id,
         )
         dynamic_agent_scheduler = DynamicAgentScheduler(
             repository=repository,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -7,6 +8,7 @@ from threading import RLock
 from typing import TYPE_CHECKING, Callable
 
 from companion_gateway.domain.agents import AgentKind, AgentSpec
+from companion_gateway.agent.reminder import parse_timed_reminder
 
 if TYPE_CHECKING:
     from companion_gateway.agent.registry import AgentRegistry
@@ -14,6 +16,7 @@ if TYPE_CHECKING:
 
 
 Clock = Callable[[], datetime]
+logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass(frozen=True)
@@ -31,10 +34,14 @@ class AgentCommandRouter:
         registry: AgentRegistry,
         runtime: AgentRuntime,
         clock: Clock,
+        reminder_tool: object | None = None,
+        target_device_id: str | None = None,
     ) -> None:
         self._registry = registry
         self._runtime = runtime
         self._clock = clock
+        self._reminder_tool = reminder_tool
+        self._target_device_id = target_device_id
         self._pending: dict[tuple[str, str], str] = {}
         self._active: dict[tuple[str, str], AgentSpec] = {}
         self._lock = RLock()
@@ -60,6 +67,7 @@ class AgentCommandRouter:
                     source_message_id=source_message_id,
                 )
         except Exception:
+            logger.exception("agent_command_failed")
             return AgentRouteResult(handled=True, reply="智能体命令执行失败，请稍后重试。")
 
     def active_context(self, *, owner_id: str, chat_id: str) -> str:
@@ -105,6 +113,32 @@ class AgentCommandRouter:
                 f"已生成“{draft.spec.name}”草稿。回复“确认创建”保存，"
                 "或回复“取消创建”放弃。",
             )
+        reminder = parse_timed_reminder(text, now=self._clock())
+        if reminder is not None and self._reminder_tool is not None:
+            message, scheduled = reminder
+            if self._target_device_id is None:
+                return AgentRouteResult(True, "提醒设备尚未配置。")
+            result = self._reminder_tool.create_reminder(
+                actor_id=owner_id,
+                target_device_id=self._target_device_id,
+                arguments={
+                    "text": message,
+                    "idempotency_key": f"feishu-reminder-{source_message_id}",
+                    "schedule": {
+                        "at": scheduled.isoformat(),
+                        "timezone": "Asia/Shanghai",
+                    },
+                },
+                trace_id=f"feishu-reminder-{source_message_id}",
+            )
+            created = result.result.get("created") is True
+            return AgentRouteResult(
+                True,
+                f"{'已创建' if created else '提醒已存在'}提醒，将于"
+                f"{scheduled:%m月%d日 %H:%M}提醒你{message}。",
+            )
+        if _looks_like_timed_reminder(text) and self._reminder_tool is not None:
+            return AgentRouteResult(True, "提醒时间无法识别，请使用例如“今天 20 点提醒我喝水”。")
         if _looks_like_timed_reminder(text):
             draft = self._registry.propose(
                 text,

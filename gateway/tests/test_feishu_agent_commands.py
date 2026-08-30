@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from companion_gateway.agent.router import AgentCommandRouter
+from companion_gateway.agent.service import AgentToolResult
 from companion_gateway.domain.agents import (
     AgentChannel,
     AgentDraft,
@@ -139,6 +140,32 @@ class FakeRuntime:
         )
 
 
+@dataclass
+class FakeReminderTool:
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    def create_reminder(
+        self,
+        *,
+        actor_id: str,
+        target_device_id: str,
+        arguments: dict[str, object],
+        trace_id: str,
+    ) -> AgentToolResult:
+        self.calls.append(
+            {
+                "actor_id": actor_id,
+                "target_device_id": target_device_id,
+                "arguments": arguments,
+                "trace_id": trace_id,
+            }
+        )
+        return AgentToolResult(
+            tool="create_reminder",
+            result={"created": True, "status": "scheduled"},
+        )
+
+
 def router_with_agents(*agents: AgentSpec) -> tuple[AgentCommandRouter, FakeRegistry, FakeRuntime]:
     proposed = build_draft(
         build_agent(
@@ -200,6 +227,25 @@ def test_router_routes_natural_language_timed_reminders_to_confirmation_flow() -
     assert registry.propose_calls == [
         ("今天零点十二分提醒我去洗澡", "owner-1", "message-timed-reminder"),
     ]
+
+
+def test_router_creates_timed_reminder_without_dynamic_agent_compilation() -> None:
+    router, registry, runtime = router_with_agents()
+    reminder_tool = FakeReminderTool()
+    router = AgentCommandRouter(
+        registry=registry,
+        runtime=runtime,
+        clock=lambda: datetime(2026, 8, 30, 16, 5, tzinfo=UTC),
+        reminder_tool=reminder_tool,
+        target_device_id="living-room",
+    )
+
+    result = handle(router, "今天零点十二分提醒我去洗澡", source="message-direct")
+
+    assert result.handled is True
+    assert "已创建" in result.reply
+    assert registry.propose_calls == []
+    assert reminder_tool.calls[0]["target_device_id"] == "living-room"
 
 
 def test_router_lists_manages_unique_names_and_rejects_ambiguous_or_other_owner_agents() -> None:

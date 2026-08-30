@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from urllib.error import HTTPError
 
 from companion_gateway.chat import mimo as mimo_chat
@@ -117,3 +118,21 @@ def test_mimo_text_chat_adds_gateway_agent_context_only_to_the_system_message(mo
     ) == "active reply"
     assert "Gateway active mode: companion. Continue safely." in requests[0]["messages"][0]["content"]
     assert requests[0]["messages"][1:] == [{"role": "user", "content": "continue"}]
+
+
+def test_mimo_text_chat_injects_authoritative_gateway_time(monkeypatch) -> None:
+    requests: list[dict[str, object]] = []
+
+    def fake_urlopen(request, *, timeout):
+        requests.append(json.loads(request.data))
+        return FakeResponse(chat_response("收到"))
+
+    monkeypatch.setattr(mimo_chat, "urlopen", fake_urlopen)
+    runtime = MimoTextChatRuntime(
+        openai_base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        api_key="example-token",
+        clock=lambda: datetime(2026, 8, 31, 16, 5, tzinfo=UTC),
+    )
+
+    assert runtime.respond("今天几点提醒我喝水") == "收到"
+    assert "2026-09-01T00:05:00+08:00" in requests[0]["messages"][0]["content"]

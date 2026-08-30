@@ -127,6 +127,27 @@ class AgentToolService:
             auto_executed=policy.auto_execute,
         )
 
+    def create_reminder(
+        self,
+        *,
+        actor_id: str,
+        target_device_id: str,
+        arguments: Mapping[str, object],
+        trace_id: str,
+    ) -> AgentToolResult:
+        result = self._create_reminder(
+            actor_id=actor_id,
+            target_device_id=target_device_id,
+            arguments=arguments,
+            trace_id=trace_id,
+            confirmation_policy=ConfirmationPolicy.NONE,
+        )
+        return AgentToolResult(
+            tool="create_reminder",
+            result=result,
+            auto_executed=False,
+        )
+
     def _query_task_status(
         self,
         *,
@@ -160,6 +181,7 @@ class AgentToolService:
         target_device_id: str,
         arguments: Mapping[str, object],
         trace_id: str,
+        confirmation_policy: ConfirmationPolicy = ConfirmationPolicy.REQUIRED,
     ) -> dict[str, object]:
         text = arguments.get("text")
         idempotency_key = arguments.get("idempotency_key")
@@ -185,7 +207,7 @@ class AgentToolService:
             kind=TaskKind.REMINDER,
             schedule=schedule,
             payload=TaskPayload(text=text),
-            confirmation_policy=ConfirmationPolicy.REQUIRED,
+            confirmation_policy=confirmation_policy,
             idempotency_key=idempotency_key,
         )
         task, created = self._task_executor.create_and_schedule(

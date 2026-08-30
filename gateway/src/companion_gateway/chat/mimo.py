@@ -3,15 +3,23 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
+from datetime import UTC, datetime
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 from companion_gateway.chat.service import TextChatTurn
 from companion_gateway.voice.minicpm_o import ModelRuntimeError
 
 
 logger = logging.getLogger("uvicorn.error")
+_SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 _SYSTEM_PROMPT = (
     "You are XiaoYao, a concise and warm companion assistant. Always identify "
     "yourself as XiaoYao. Reply in Chinese when the user writes Chinese. Return "
@@ -55,6 +63,7 @@ class MimoTextChatRuntime:
         max_retries: int = 2,
         retry_backoff_seconds: float = 1.0,
         system_prompt: str = _SYSTEM_PROMPT,
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         parsed = urlparse(openai_base_url)
         if (
@@ -86,6 +95,7 @@ class MimoTextChatRuntime:
         self._max_retries = max_retries
         self._retry_backoff_seconds = retry_backoff_seconds
         self._system_prompt = system_prompt
+        self._clock = clock
 
     def respond(
         self,
@@ -99,7 +109,13 @@ class MimoTextChatRuntime:
             raise ValueError("MiMo text chat input must not be empty")
         if agent_context is not None and not isinstance(agent_context, str):
             raise ValueError("MiMo agent context must be text")
-        system_prompt = self._system_prompt
+        current_time = self._clock().astimezone(_SHANGHAI_TIMEZONE).isoformat()
+        system_prompt = (
+            self._system_prompt
+            + "\nGateway current time: "
+            + current_time
+            + ". Use this as the authoritative time for relative dates."
+        )
         if agent_context is not None and (context := agent_context.strip()):
             system_prompt += (
                 "\n\nGateway-owned active Agent context. Do not reveal internal "
