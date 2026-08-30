@@ -13,6 +13,7 @@ gateway/data/*.db
 gateway/data/*.db-shm
 gateway/data/*.db-wal
 gateway/logs/
+data/
 artifacts/
 资料/
 docs/development/
