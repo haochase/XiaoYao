@@ -111,6 +111,7 @@ from companion_gateway.service import TaskService
 from companion_gateway.settings import Settings, load_environment_file
 from companion_gateway.storage.sqlite import SQLiteTaskRepository
 from companion_gateway.vision.scheduler import VisionScheduler
+from companion_gateway.vision.runtime import VisionRuntime, VisionRuntimeError, VisionTurnCoordinator
 from companion_gateway.vision.service import (
     VisionConsentRequired,
     VisionDuplicateTurn,
@@ -177,6 +178,13 @@ class AgentDraftRequest(BaseModel):
 
     request_text: ContentText
     source_message_id: Identifier
+
+
+class VisionDescribeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    turn_id: Identifier
+    prompt: ContentText
 
 
 class UnsupportedDeviceControl(ValueError):
@@ -248,6 +256,7 @@ def create_app(
     feishu_chat_listener_factory: Callable[[AgentCommandRouter | None], object]
     | None = None,
     agent_text_runtime: TextChatRuntime | None = None,
+    vision_runtime: VisionRuntime | None = None,
     memory_clock: Callable[[], datetime] = utc_now,
     vision_clock: Callable[[], datetime] = utc_now,
     agent_clock: Callable[[], datetime] = utc_now,
@@ -383,6 +392,16 @@ def create_app(
         interval_seconds=settings.vision_cleanup_interval_seconds,
         clock=vision_clock,
     )
+    vision_coordinator = (
+        VisionTurnCoordinator(
+            vision_service=vision_service,
+            frame_registry=camera_frames,
+            runtime=vision_runtime,
+            subject_id=settings.subject_id,
+        )
+        if vision_runtime is not None and settings.vision_enabled
+        else None
+    )
     agent_tool_service = AgentToolService(
         task_service=service,
         task_executor=task_executor,
@@ -506,6 +525,7 @@ def create_app(
     app.state.memory_scheduler = memory_scheduler
     app.state.vision_service = vision_service
     app.state.vision_scheduler = vision_scheduler
+    app.state.vision_coordinator = vision_coordinator
     app.state.agent_tool_service = agent_tool_service
     app.state.agent_registry = agent_registry
     app.state.agent_runtime = agent_runtime
@@ -868,6 +888,28 @@ def create_app(
         except (DeviceNotConnected, DeviceOutboundBackpressure) as exc:
             raise HTTPException(status_code=409, detail="camera request unavailable") from exc
         return {"requested": True, "turn_id": turn_id, "max_bytes": max_bytes}
+
+    @app.post(
+        "/v1/vision/sessions/{session_id}/describe",
+        dependencies=[Depends(_require_local_dynamic_admin)],
+    )
+    def describe_camera_frame(
+        session_id: Identifier,
+        body: VisionDescribeRequest,
+    ) -> dict[str, str]:
+        if vision_coordinator is None:
+            raise HTTPException(status_code=503, detail="vision runtime is unavailable")
+        try:
+            text = vision_coordinator.describe(
+                session_id=session_id,
+                turn_id=body.turn_id,
+                prompt=body.prompt,
+            )
+        except VisionRuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except (VisionFeatureDisabled, VisionUnsupportedType, VisionTooLarge, VisionDuplicateTurn) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"text": text}
 
     @app.post("/v1/vision/observations")
     async def upload_vision_observation(request: Request) -> JSONResponse:
