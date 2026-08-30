@@ -333,6 +333,7 @@ class Settings:
     dynamic_agent_owner_id: str | None = None
     dynamic_agent_target_device_id: str | None = None
     dynamic_agent_scheduler_interval_seconds: float = 1.0
+    device_conversation_idle_timeout_seconds: float = 15.0
     recent_context_enabled: bool = False
     recent_context_retention_days: int = 7
     recent_context_max_messages: int = 20
@@ -570,6 +571,10 @@ class Settings:
                     "COMPANION_MIMO_API_KEY is required when dynamic Agents "
                     "are enabled"
                 )
+        if not 0 < self.device_conversation_idle_timeout_seconds <= 300:
+            raise ValueError(
+                "COMPANION_DEVICE_CONVERSATION_IDLE_TIMEOUT_SECONDS must be between 0 and 300"
+            )
         if not isinstance(self.recent_context_enabled, bool):
             raise ValueError(
                 "COMPANION_RECENT_CONTEXT_ENABLED must be true or false"
@@ -750,6 +755,10 @@ class Settings:
             "COMPANION_DYNAMIC_AGENT_SCHEDULER_INTERVAL_SECONDS",
             "1",
         )
+        configured_conversation_idle_timeout = os.environ.get(
+            "COMPANION_DEVICE_CONVERSATION_IDLE_TIMEOUT_SECONDS",
+            "15",
+        )
         recent_context_enabled = _parse_bool(
             os.environ.get("COMPANION_RECENT_CONTEXT_ENABLED"),
             name="COMPANION_RECENT_CONTEXT_ENABLED",
@@ -904,6 +913,14 @@ class Settings:
             raise ValueError(
                 "COMPANION_DYNAMIC_AGENT_SCHEDULER_INTERVAL_SECONDS "
                 "must be a number"
+            ) from exc
+        try:
+            device_conversation_idle_timeout_seconds = float(
+                configured_conversation_idle_timeout
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_DEVICE_CONVERSATION_IDLE_TIMEOUT_SECONDS must be a number"
             ) from exc
         try:
             recent_context_retention_days = int(
@@ -1143,6 +1160,9 @@ class Settings:
             ),
             dynamic_agent_scheduler_interval_seconds=(
                 dynamic_agent_scheduler_interval_seconds
+            ),
+            device_conversation_idle_timeout_seconds=(
+                device_conversation_idle_timeout_seconds
             ),
             recent_context_enabled=recent_context_enabled,
             recent_context_retention_days=recent_context_retention_days,

@@ -662,6 +662,24 @@ def test_recent_context_is_disabled_with_safe_defaults() -> None:
     assert settings.recent_context_max_messages == 20
     assert settings.recent_context_max_bytes == 4096
     assert settings.subject_id == "voice-user"
+    assert settings.device_conversation_idle_timeout_seconds == 15.0
+
+
+def test_settings_loads_conversation_idle_timeout(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_CONVERSATION_IDLE_TIMEOUT_SECONDS", "25")
+
+    settings = Settings.from_environment()
+
+    assert settings.device_conversation_idle_timeout_seconds == 25.0
+
+
+@pytest.mark.parametrize("value", ["0", "301"])
+def test_settings_rejects_invalid_conversation_idle_timeout(value: str) -> None:
+    with pytest.raises(ValueError, match="CONVERSATION_IDLE_TIMEOUT"):
+        Settings(
+            database_path=Path("data/test.db"),
+            device_conversation_idle_timeout_seconds=float(value),
+        )
 
 
 def test_settings_loads_recent_context_configuration(monkeypatch) -> None:
