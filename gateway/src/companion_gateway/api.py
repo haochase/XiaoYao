@@ -629,6 +629,14 @@ def create_app(
                 )
             except Exception:
                 recent_context_count = 0
+        recent_image_count = 0
+        if settings.vision_enabled:
+            try:
+                recent_image_count = len(
+                    vision_service.list(subject_id=settings.subject_id)
+                )
+            except Exception:
+                recent_image_count = 0
         mimo_canary_ok = False
         if agent_text_runtime is not None:
             try:
@@ -666,6 +674,15 @@ def create_app(
             ),
             "recent_context_enabled": recent_context_service.enabled,
             "recent_context_count": recent_context_count,
+            "camera_enabled": settings.camera_enabled,
+            "camera_capable_device_online": (
+                settings.camera_enabled
+                and device_sessions.has_camera_capable_session()
+            ),
+            "recent_image_count": recent_image_count,
+            "conversation_idle_timeout_seconds": (
+                settings.device_conversation_idle_timeout_seconds
+            ),
         }
 
     @app.post(

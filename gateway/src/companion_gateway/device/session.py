@@ -251,6 +251,13 @@ class DeviceSessionRegistry:
                 audio_frames_received=session.audio_frames_received,
             )
 
+    def has_camera_capable_session(self) -> bool:
+        with self._lock:
+            return any(
+                session.hello.features.camera_jpeg
+                for session in self._sessions.values()
+            )
+
 
 def redact_device_id(device_id: str) -> str:
     digest = sha256(device_id.encode("utf-8")).hexdigest()[:12]
