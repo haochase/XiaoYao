@@ -654,6 +654,32 @@ def test_settings_infers_dynamic_owner_and_unique_ota_device(monkeypatch) -> Non
     assert settings.dynamic_agent_target_device_id == "living-room"
 
 
+def test_recent_context_is_disabled_with_safe_defaults() -> None:
+    settings = Settings(database_path=Path("data/test.db"))
+
+    assert settings.recent_context_enabled is False
+    assert settings.recent_context_retention_days == 7
+    assert settings.recent_context_max_messages == 20
+    assert settings.recent_context_max_bytes == 4096
+    assert settings.subject_id == "voice-user"
+
+
+def test_settings_loads_recent_context_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_RECENT_CONTEXT_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_RECENT_CONTEXT_RETENTION_DAYS", "3")
+    monkeypatch.setenv("COMPANION_RECENT_CONTEXT_MAX_MESSAGES", "8")
+    monkeypatch.setenv("COMPANION_RECENT_CONTEXT_MAX_BYTES", "2048")
+    monkeypatch.setenv("COMPANION_SUBJECT_ID", "voice-user")
+
+    settings = Settings.from_environment()
+
+    assert settings.recent_context_enabled is True
+    assert settings.recent_context_retention_days == 3
+    assert settings.recent_context_max_messages == 8
+    assert settings.recent_context_max_bytes == 2048
+    assert settings.subject_id == "voice-user"
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [

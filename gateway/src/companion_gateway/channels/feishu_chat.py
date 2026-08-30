@@ -86,6 +86,12 @@ class FeishuChatListener:
         finally:
             self._available = False
 
+    def set_recent_context(self, context: ConversationContextService | None) -> None:
+        self._service.set_recent_context(context)
+
+    def set_recent_context(self, context: ConversationContextService | None) -> None:
+        self._service.set_recent_context(context)
+
     async def _on_message(self, message) -> None:
         self._received_messages += 1
         inbound = FeishuInboundText(

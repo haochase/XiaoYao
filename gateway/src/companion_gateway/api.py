@@ -45,6 +45,7 @@ from companion_gateway.audio.turn import (
 from companion_gateway.channels.feishu_chat import create_feishu_chat_listener
 from companion_gateway.chat.mimo import MimoTextChatRuntime
 from companion_gateway.chat.service import TextChatRuntime
+from companion_gateway.context.service import ConversationContextService
 from companion_gateway.device.events import (
     BoundedDeviceEventSink,
     DeviceBackpressure,
@@ -245,6 +246,14 @@ def create_app(
 ) -> FastAPI:
     repository = SQLiteTaskRepository(settings.database_path)
     repository.initialize()
+    recent_context_service = ConversationContextService(
+        repository,
+        subject_id=settings.subject_id,
+        enabled=settings.recent_context_enabled,
+        retention_days=settings.recent_context_retention_days,
+        max_messages=settings.recent_context_max_messages,
+        max_bytes=settings.recent_context_max_bytes,
+    )
     service = TaskService(repository)
     task_executor = TaskExecutor(service)
     device_sessions = DeviceSessionRegistry()
@@ -465,8 +474,13 @@ def create_app(
         )
     if feishu_chat_listener is None and feishu_chat_listener_factory is not None:
         feishu_chat_listener = feishu_chat_listener_factory(agent_command_router)
+    if feishu_chat_listener is not None:
+        set_recent_context = getattr(feishu_chat_listener, "set_recent_context", None)
+        if callable(set_recent_context):
+            set_recent_context(recent_context_service)
     app = FastAPI(title="XiaoYao Voice Gateway", version="0.1.0")
     app.state.repository = repository
+    app.state.recent_context_service = recent_context_service
     app.state.service = service
     app.state.task_executor = task_executor
     app.state.device_sessions = device_sessions
@@ -492,6 +506,17 @@ def create_app(
         voice_delivery_service.set_task_service(service)
         voice_delivery_service.set_medication_service(medication_service)
         voice_delivery_service.set_memory_service(memory_service)
+        set_recent_context_provider = getattr(
+            voice_delivery_service,
+            "set_recent_context_provider",
+            None,
+        )
+        if callable(set_recent_context_provider):
+            set_recent_context_provider(
+                lambda _actor_id, _target_device_id: (
+                    recent_context_service.build_context()
+                )
+            )
         if (
             agent_command_router is not None
             and settings.dynamic_agent_owner_id is not None

@@ -66,6 +66,12 @@ class FeishuChatService:
         self._history: dict[str, deque[TextChatTurn]] = {}
         self._lock = Lock()
 
+    def set_recent_context(
+        self,
+        context: ConversationContextService | None,
+    ) -> None:
+        self._recent_context = context
+
     def handle(self, message: InboundTextMessage) -> str | None:
         text = message.text.strip()
         if (

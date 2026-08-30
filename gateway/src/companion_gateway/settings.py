@@ -333,6 +333,11 @@ class Settings:
     dynamic_agent_owner_id: str | None = None
     dynamic_agent_target_device_id: str | None = None
     dynamic_agent_scheduler_interval_seconds: float = 1.0
+    recent_context_enabled: bool = False
+    recent_context_retention_days: int = 7
+    recent_context_max_messages: int = 20
+    recent_context_max_bytes: int = 4096
+    subject_id: str = "voice-user"
     device_hello_timeout_seconds: float = 10.0
     device_audio_frame_max_bytes: int = 4096
     device_auto_stop_idle_seconds: float = 1.2
@@ -565,6 +570,28 @@ class Settings:
                     "COMPANION_MIMO_API_KEY is required when dynamic Agents "
                     "are enabled"
                 )
+        if not isinstance(self.recent_context_enabled, bool):
+            raise ValueError(
+                "COMPANION_RECENT_CONTEXT_ENABLED must be true or false"
+            )
+        if self.recent_context_retention_days <= 0:
+            raise ValueError(
+                "COMPANION_RECENT_CONTEXT_RETENTION_DAYS must be positive"
+            )
+        if self.recent_context_max_messages <= 0:
+            raise ValueError(
+                "COMPANION_RECENT_CONTEXT_MAX_MESSAGES must be positive"
+            )
+        if self.recent_context_max_bytes < 256:
+            raise ValueError(
+                "COMPANION_RECENT_CONTEXT_MAX_BYTES must be at least 256"
+            )
+        normalized_subject_id = _normalize_optional_feishu_value(
+            self.subject_id,
+            name="COMPANION_SUBJECT_ID",
+        )
+        if normalized_subject_id is None:
+            raise ValueError("COMPANION_SUBJECT_ID must not be empty")
         object.__setattr__(self, "ota_device_tokens", ota_tokens)
         object.__setattr__(self, "public_websocket_url", normalized_url)
         object.__setattr__(self, "device_token_hashes", normalized_hashes)
@@ -599,6 +626,7 @@ class Settings:
             "dynamic_agent_target_device_id",
             normalized_dynamic_agent_target_device_id,
         )
+        object.__setattr__(self, "subject_id", normalized_subject_id)
         object.__setattr__(self, "feishu_base_url", normalized_feishu_base_url)
 
     @property
@@ -721,6 +749,27 @@ class Settings:
         configured_dynamic_agent_scheduler_interval = os.environ.get(
             "COMPANION_DYNAMIC_AGENT_SCHEDULER_INTERVAL_SECONDS",
             "1",
+        )
+        recent_context_enabled = _parse_bool(
+            os.environ.get("COMPANION_RECENT_CONTEXT_ENABLED"),
+            name="COMPANION_RECENT_CONTEXT_ENABLED",
+            default=False,
+        )
+        configured_recent_context_retention_days = os.environ.get(
+            "COMPANION_RECENT_CONTEXT_RETENTION_DAYS",
+            "7",
+        )
+        configured_recent_context_max_messages = os.environ.get(
+            "COMPANION_RECENT_CONTEXT_MAX_MESSAGES",
+            "20",
+        )
+        configured_recent_context_max_bytes = os.environ.get(
+            "COMPANION_RECENT_CONTEXT_MAX_BYTES",
+            "4096",
+        )
+        configured_subject_id = os.environ.get(
+            "COMPANION_SUBJECT_ID",
+            "voice-user",
         )
         memory_enabled = _parse_bool(
             os.environ.get("COMPANION_MEMORY_ENABLED"),
@@ -855,6 +904,18 @@ class Settings:
             raise ValueError(
                 "COMPANION_DYNAMIC_AGENT_SCHEDULER_INTERVAL_SECONDS "
                 "must be a number"
+            ) from exc
+        try:
+            recent_context_retention_days = int(
+                configured_recent_context_retention_days
+            )
+            recent_context_max_messages = int(
+                configured_recent_context_max_messages
+            )
+            recent_context_max_bytes = int(configured_recent_context_max_bytes)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_RECENT_CONTEXT limits must be integers"
             ) from exc
         try:
             mimo_timeout_seconds = float(configured_mimo_timeout)
@@ -1083,6 +1144,11 @@ class Settings:
             dynamic_agent_scheduler_interval_seconds=(
                 dynamic_agent_scheduler_interval_seconds
             ),
+            recent_context_enabled=recent_context_enabled,
+            recent_context_retention_days=recent_context_retention_days,
+            recent_context_max_messages=recent_context_max_messages,
+            recent_context_max_bytes=recent_context_max_bytes,
+            subject_id=configured_subject_id,
             device_auto_stop_idle_seconds=device_auto_stop_idle_seconds,
             device_vad_turn_rms_threshold=device_vad_turn_rms_threshold,
             device_auto_turn_rms_threshold=device_auto_turn_rms_threshold,
