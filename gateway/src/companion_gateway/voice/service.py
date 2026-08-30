@@ -56,6 +56,7 @@ class VoiceTurn:
     device_opus_frames: tuple[bytes, ...]
     task: TaskRecord | None = None
     memory_proposal_ids: tuple[str, ...] = ()
+    end_conversation: bool = False
 
     @property
     def device_opus_frame(self) -> bytes:
@@ -192,6 +193,10 @@ class VoiceTurnService:
         if response_pcm is None:
             raise RuntimeError("voice response audio is required")
         memory_proposal_ids: tuple[str, ...] = ()
+        end_conversation = (
+            response.intent is not None
+            and response.intent.type == "end_conversation"
+        )
         if self._memory_service is not None and response.memory_proposals:
             try:
                 proposals = self._memory_service.propose(
@@ -229,6 +234,7 @@ class VoiceTurnService:
             device_opus_frames=device_opus_frames,
             task=task,
             memory_proposal_ids=memory_proposal_ids,
+            end_conversation=end_conversation,
         )
 
     def _resolve_intent(
@@ -238,6 +244,8 @@ class VoiceTurnService:
         target_device_id: str | None,
     ) -> str:
         now = self._clock().astimezone(_SHANGHAI_TIMEZONE)
+        if intent.type == "end_conversation":
+            return "好的，先休息一下。"
         if intent.type == "current_time":
             return f"现在是{now.hour}点{now.minute:02d}分。"
         if intent.type == "current_date":

@@ -51,6 +51,7 @@ from companion_gateway.device.events import (
     DeviceBackpressure,
     DiscardingDeviceEventSink,
 )
+from companion_gateway.device.idle import ConversationIdleController
 from companion_gateway.device.models import (
     AbortControl,
     DeviceHello,
@@ -1004,6 +1005,9 @@ def create_app(
         session: DeviceSession | None = None
         outbound_sender: asyncio.Task[None] | None = None
         auto_stop_task: asyncio.Task[None] | None = None
+        idle_controller: ConversationIdleController | None = None
+        pending_session_close_reason: str | None = None
+        tts_active = False
         close_code: int | None = None
         close_reason_length = 0
         wake_word_frames_ignored = 0
@@ -1064,8 +1068,23 @@ def create_app(
             await websocket.send_json(response_hello)
             transport.register(session.session_id)
 
+            async def close_for_idle(generation: int) -> None:
+                if session is None or tts_active:
+                    return
+                if not session.is_conversation_idle_current(generation):
+                    return
+                session.cancel_conversation_idle()
+                await websocket.close(code=1000, reason="conversation_idle")
+
+            idle_controller = ConversationIdleController(
+                timeout_seconds=settings.device_conversation_idle_timeout_seconds,
+                on_timeout=close_for_idle,
+            )
+
             async def forward_outbound() -> None:
                 nonlocal post_tts_frames_ignored, post_tts_silence_gate
+                nonlocal tts_active, pending_session_close_reason
+                nonlocal close_code, close_reason_length
                 frame_duration_ms = response_hello["audio_params"]["frame_duration"]
                 outbound_kind = "unknown"
                 frames_sent = 0
@@ -1087,6 +1106,10 @@ def create_app(
                             )
                             continue
                         outbound_kind = "tts"
+                        if idle_controller is not None:
+                            idle_controller.cancel()
+                        session.cancel_conversation_idle()
+                        tts_active = True
                         frames_sent = 0
                         total_frames = len(message.opus_frames)
                         tts_interrupted.clear()
@@ -1155,6 +1178,17 @@ def create_app(
                             len(message.opus_frames),
                             round((time.perf_counter() - started_at) * 1_000),
                         )
+                        tts_active = False
+                        if pending_session_close_reason is not None:
+                            reason = pending_session_close_reason
+                            pending_session_close_reason = None
+                            close_code = 1000
+                            close_reason_length = len(reason)
+                            await websocket.close(code=1000, reason=reason)
+                            return
+                        if idle_controller is not None:
+                            generation = session.arm_conversation_idle()
+                            idle_controller.arm(generation)
                 except (RuntimeError, WebSocketDisconnect) as exc:
                     logger.info(
                         "device_ws_outbound_stopped device=%s session=%s kind=%s "
@@ -1171,6 +1205,7 @@ def create_app(
             outbound_sender = asyncio.create_task(forward_outbound())
 
             async def process_voice_turn(*, trigger: str) -> None:
+                nonlocal pending_session_close_reason
                 if voice_delivery_service is None:
                     return
                 try:
@@ -1178,6 +1213,8 @@ def create_app(
                         session_id=session.session_id,
                         target_device_id=session.device_id,
                     )
+                    if turn is not None and turn.end_conversation:
+                        pending_session_close_reason = "user_exit"
                     logger.info(
                         "device_ws_voice_turn_processed device=%s session=%s "
                         "trigger=%s delivered=%s",
@@ -1287,6 +1324,10 @@ def create_app(
                         if message_type == "listen":
                             control = ListenControl.model_validate(payload)
                             session.apply_listen(control)
+                            if control.state == "start":
+                                if idle_controller is not None:
+                                    idle_controller.cancel()
+                                session.cancel_conversation_idle()
                             if control.state == "detect":
                                 post_tts_silence_gate = None
                             if control.state == "start":
@@ -1372,6 +1413,9 @@ def create_app(
                                 elif not (
                                     vad_blocked_segment or vad_turn_discarded
                                 ) and not vad_endpoint_detector.speech_active:
+                                    if idle_controller is not None:
+                                        idle_controller.cancel()
+                                    session.cancel_conversation_idle()
                                     vad_endpoint_detector.start()
                                     if voice_delivery_service is not None:
                                         voice_delivery_service.clear_pending_input(
@@ -1518,16 +1562,30 @@ def create_app(
                                 break
                             elif voice_delivery_service is not None:
                                 await process_voice_turn(trigger="listen_stop")
-                        elif (
-                            message_type == "abort"
-                            and voice_delivery_service is not None
-                        ):
+                        elif message_type == "abort":
                             if auto_stop_task is not None:
                                 auto_stop_task.cancel()
                                 auto_stop_task = None
-                            voice_delivery_service.clear_pending_input(
-                                session_id=session.session_id,
-                            )
+                            if voice_delivery_service is not None:
+                                voice_delivery_service.clear_pending_input(
+                                    session_id=session.session_id,
+                                )
+                            if idle_controller is not None:
+                                idle_controller.cancel()
+                            session.cancel_conversation_idle()
+                            if control.reason in {
+                                "user_exit",
+                                "conversation_idle",
+                                "stop",
+                                "end_conversation",
+                            }:
+                                close_code = 1000
+                                close_reason_length = len("device_abort")
+                                await websocket.close(
+                                    code=1000,
+                                    reason="device_abort",
+                                )
+                                break
                     except (
                         json.JSONDecodeError,
                         ValidationError,
@@ -1901,6 +1959,8 @@ def create_app(
                 auto_stop_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await auto_stop_task
+            if idle_controller is not None:
+                idle_controller.cancel()
             if audio_rms_last is not None and session is not None:
                 logger.info(
                     "device_ws_audio_metrics device=%s session=%s frames=%s "

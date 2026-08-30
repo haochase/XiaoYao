@@ -40,6 +40,7 @@ class VoiceIntent(BaseModel):
         "current_date",
         "current_datetime",
         "reminder_status",
+        "end_conversation",
     ]
 
 

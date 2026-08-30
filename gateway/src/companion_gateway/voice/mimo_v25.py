@@ -43,7 +43,8 @@ _DEFAULT_SYSTEM_PROMPT = (
     " The intent value must be null unless the user asks for the current time, "
     "current date, current date and time, or latest reminder status. For those "
     "queries return exactly one of current_time, current_date, current_datetime, "
-    "or reminder_status as {\"type\": \"...\"}."
+    "or reminder_status as {\"type\": \"...\"}. If the user clearly asks to "
+    "stop or exit the conversation, use end_conversation."
 )
 _MEMORY_PROPOSAL_PROMPT = (
     " Optionally return memory_proposals as a list only when the user explicitly "

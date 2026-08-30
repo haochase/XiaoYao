@@ -75,6 +75,8 @@ class DeviceSession:
     wake_word_detected: bool = False
     listening_started: bool = False
     auto_turn_finished: bool = False
+    conversation_generation: int = 0
+    conversation_idle_armed: bool = False
 
     @classmethod
     def create(
@@ -97,6 +99,18 @@ class DeviceSession:
 
     def touch(self, *, clock: Clock = _utc_now) -> None:
         self.last_seen_at = clock()
+
+    def arm_conversation_idle(self) -> int:
+        self.conversation_generation += 1
+        self.conversation_idle_armed = True
+        return self.conversation_generation
+
+    def cancel_conversation_idle(self) -> None:
+        self.conversation_generation += 1
+        self.conversation_idle_armed = False
+
+    def is_conversation_idle_current(self, generation: int) -> bool:
+        return self.conversation_idle_armed and self.conversation_generation == generation
 
     def apply_listen(self, control: ListenControl) -> None:
         if control.session_id not in (None, self.session_id):
