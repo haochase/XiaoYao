@@ -241,6 +241,8 @@ def test_demo_status_contains_only_sanitized_readiness_fields(tmp_path) -> None:
         "device_online": False,
         "dynamic_agents_enabled": True,
         "dynamic_agent_count": 0,
+        "recent_context_enabled": False,
+        "recent_context_count": 0,
     }
     serialized = json.dumps(payload)
     assert "living-room" not in serialized
