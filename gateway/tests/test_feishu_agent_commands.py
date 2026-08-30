@@ -190,6 +190,18 @@ def test_router_creates_confirms_and_cancels_chat_scoped_drafts() -> None:
     assert "已取消创建" in cancelled.reply
 
 
+def test_router_routes_natural_language_timed_reminders_to_confirmation_flow() -> None:
+    router, registry, _runtime = router_with_agents()
+
+    proposed = handle(router, "今天零点十二分提醒我去洗澡", source="message-timed-reminder")
+
+    assert proposed.handled is True
+    assert "草稿" in proposed.reply
+    assert registry.propose_calls == [
+        ("今天零点十二分提醒我去洗澡", "owner-1", "message-timed-reminder"),
+    ]
+
+
 def test_router_lists_manages_unique_names_and_rejects_ambiguous_or_other_owner_agents() -> None:
     reminder = build_agent(
         agent_id="agent-reminder",

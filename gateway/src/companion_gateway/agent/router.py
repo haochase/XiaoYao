@@ -105,6 +105,18 @@ class AgentCommandRouter:
                 f"已生成“{draft.spec.name}”草稿。回复“确认创建”保存，"
                 "或回复“取消创建”放弃。",
             )
+        if _looks_like_timed_reminder(text):
+            draft = self._registry.propose(
+                text,
+                owner_id=owner_id,
+                source_message_id=source_message_id,
+            )
+            self._pending[key] = draft.draft_id
+            return AgentRouteResult(
+                True,
+                f"已识别提醒“{draft.spec.name}”草稿。回复“确认创建”保存，"
+                "或回复“取消创建”放弃。",
+            )
         if text == "\u786e\u8ba4\u521b\u5efa":
             draft_id = self._pending.get(key)
             if draft_id is None:
@@ -301,6 +313,14 @@ class AgentCommandRouter:
 def _manual_trigger_id(agent_id: str, source_message_id: str) -> str:
     value = f"{agent_id}\x00{source_message_id}".encode("utf-8")
     return f"manual-{sha256(value).hexdigest()[:32]}"
+
+
+def _looks_like_timed_reminder(text: str) -> bool:
+    return (
+        "提醒我" in text
+        and any(token in text for token in ("今天", "明天", "后天"))
+        and any(token in text for token in ("点", "时", ":"))
+    )
 
 
 def _active_context(agent: AgentSpec) -> str:
