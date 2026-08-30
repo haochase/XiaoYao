@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class AudioParameters(BaseModel):
@@ -16,6 +16,15 @@ class DeviceFeatures(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     vad_events: bool = False
+    camera_jpeg: bool = False
+    camera_max_bytes: int | None = None
+
+    @field_validator("camera_max_bytes")
+    @classmethod
+    def validate_camera_max_bytes(cls, value: int | None) -> int | None:
+        if value is not None and not 1 <= value <= 2_097_152:
+            raise ValueError("camera_max_bytes must be between 1 and 2097152")
+        return value
 
 
 class DeviceHello(BaseModel):
