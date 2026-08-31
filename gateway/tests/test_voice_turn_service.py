@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import struct
 import wave
+from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from companion_gateway.audio.bridge import (
     AudioBridge,
@@ -10,8 +14,28 @@ from companion_gateway.audio.bridge import (
     resample_pcm16_mono,
 )
 from companion_gateway.audio.pyav_opus import PyAvOpusCodec
+from companion_gateway.domain.executor import TaskExecutor
+from companion_gateway.domain.memory import MemoryCategory, MemoryProposalCandidate
+from companion_gateway.domain.medication import MedicationOccurrenceStatus
+from companion_gateway.domain.models import (
+    ConfirmationPolicy,
+    TaskCreate,
+    TaskKind,
+    TaskPayload,
+    TaskRecord,
+    TaskSchedule,
+)
+from companion_gateway.domain.tasks import TaskStatus
+from companion_gateway.service import TaskService
+from companion_gateway.storage.sqlite import SQLiteTaskRepository
+from companion_gateway.memory.service import MemoryService
 from companion_gateway.voice.delivery import DeviceVoiceDeliveryService
-from companion_gateway.voice.runtime import FakeModelRuntime
+from companion_gateway.voice.runtime import (
+    FakeModelRuntime,
+    ModelResponse,
+    VoiceAction,
+    VoiceIntent,
+)
 from companion_gateway.voice.service import VoiceTurnService
 
 
@@ -36,9 +60,19 @@ class EchoOpusCodec:
         return b"opus-reply"
 
 
+class SequenceOpusCodec(EchoOpusCodec):
+    def __init__(self, decoded_frames: list[Pcm16Mono]) -> None:
+        super().__init__(decoded_frames[0])
+        self._decoded_frames = iter(decoded_frames)
+
+    def decode_uplink(self, payload: bytes) -> Pcm16Mono:
+        return next(self._decoded_frames)
+
+
 class RecordingTransport:
     def __init__(self) -> None:
         self.messages: list[tuple[str, tuple[bytes, ...]]] = []
+        self.notification_messages: list[tuple[str, tuple[bytes, ...]]] = []
 
     def send_tts_stream(
         self,
@@ -46,6 +80,136 @@ class RecordingTransport:
         opus_frames: tuple[bytes, ...],
     ) -> None:
         self.messages.append((session_id, opus_frames))
+
+    def send_notification_tts_stream(
+        self,
+        session_id: str,
+        opus_frames: tuple[bytes, ...],
+    ) -> None:
+        self.notification_messages.append((session_id, opus_frames))
+
+
+class TaskRuntime(FakeModelRuntime):
+    def __init__(self, task: TaskCreate, response_pcm: Pcm16Mono) -> None:
+        super().__init__(
+            response_text="I scheduled that.",
+            response_pcm=response_pcm,
+        )
+        self._task = task
+
+    def respond(self, pcm: Pcm16Mono) -> ModelResponse:
+        self.received_inputs.append(pcm)
+        return ModelResponse(
+            text="I scheduled that.",
+            pcm=self._response.pcm,
+            task=self._task,
+        )
+
+
+class MedicationActionRuntime(FakeModelRuntime):
+    def __init__(self, response_pcm: Pcm16Mono, action: VoiceAction) -> None:
+        super().__init__(response_text="好的，已记录。", response_pcm=response_pcm)
+        self._action = action
+
+    def respond(self, pcm: Pcm16Mono) -> ModelResponse:
+        self.received_inputs.append(pcm)
+        return ModelResponse(
+            text="好的，已记录。",
+            pcm=self._response.pcm,
+            action=self._action,
+        )
+
+
+class RecordingMedicationService:
+    def __init__(self) -> None:
+        self.acknowledged: list[tuple[str, str, str]] = []
+
+    def acknowledge_occurrence(self, occurrence_id: str, **kwargs):
+        self.acknowledged.append(
+            (occurrence_id, kwargs["actor_id"], kwargs["target_device_id"])
+        )
+        return type(
+            "OccurrenceResult",
+            (),
+            {"status": MedicationOccurrenceStatus.ACKNOWLEDGED},
+        )()
+
+    def disable_plan(self, plan_id: str, **kwargs):
+        return None
+
+
+class MemoryProposalRuntime(FakeModelRuntime):
+    def __init__(self, response_pcm: Pcm16Mono) -> None:
+        super().__init__(response_text="好的", response_pcm=response_pcm)
+        self.contexts: list[str] = []
+
+    def set_memory_context(self, context: str) -> None:
+        self.contexts.append(context)
+
+    def respond(self, pcm: Pcm16Mono) -> ModelResponse:
+        self.received_inputs.append(pcm)
+        return ModelResponse(
+            text="好的",
+            pcm=self._response.pcm,
+            memory_proposals=(
+                MemoryProposalCandidate(
+                    category=MemoryCategory.ADDRESS,
+                    value="Call me Chase",
+                ),
+            ),
+        )
+
+
+class AgentContextRuntime(FakeModelRuntime):
+    def __init__(self, response_pcm: Pcm16Mono) -> None:
+        super().__init__(response_text="好的", response_pcm=response_pcm)
+        self.agent_contexts: list[str] = []
+
+    def set_agent_context(self, context: str) -> None:
+        self.agent_contexts.append(context)
+
+
+class FailingMemoryService:
+    def build_context(self, *, subject_id: str) -> str:
+        return ""
+
+    def propose(self, **kwargs):
+        raise RuntimeError("storage unavailable")
+
+
+class IntentRuntime:
+    def __init__(self, intent: VoiceIntent, response_pcm: Pcm16Mono) -> None:
+        self._intent = intent
+        self._response_pcm = response_pcm
+        self.received_inputs: list[Pcm16Mono] = []
+        self.synthesized_texts: list[str] = []
+
+    def respond(self, pcm: Pcm16Mono) -> ModelResponse:
+        self.received_inputs.append(pcm)
+        return ModelResponse(
+            text="模型自由回复不应被使用",
+            pcm=None,
+            intent=self._intent,
+        )
+
+    def synthesize(self, text: str) -> Pcm16Mono:
+        self.synthesized_texts.append(text)
+        return self._response_pcm
+
+
+class LatestReminderTaskService:
+    def __init__(self, task: TaskRecord | None) -> None:
+        self._task = task
+        self.calls: list[tuple[str, str]] = []
+
+    def get_latest_reminder(
+        self,
+        *,
+        actor_id: str,
+        target_device_id: str,
+    ) -> TaskRecord | None:
+        self.calls.append((actor_id, target_device_id))
+        return self._task
 
 
 def test_voice_turn_consumes_input_and_returns_companion_opus_reply() -> None:
@@ -69,6 +233,314 @@ def test_voice_turn_consumes_input_and_returns_companion_opus_reply() -> None:
     assert codec.downlink_pcm[0].sample_rate == 24_000
     assert codec.downlink_pcm[0].sample_count == 1_440
     assert service.process_next_input() is None
+
+
+@pytest.mark.parametrize(
+    ("intent_type", "expected_text"),
+    [
+        ("current_time", "现在是12点34分。"),
+        ("current_date", "今天是2026年8月13日。"),
+        ("current_datetime", "现在是2026年8月13日12点34分。"),
+    ],
+)
+def test_voice_turn_generates_deterministic_clock_intent_reply(
+    intent_type: str,
+    expected_text: str,
+) -> None:
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    response_pcm = pcm_frame(sample_rate=24_000, sample_count=1_440)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(
+        codec=codec,
+        model_sample_rate=16_000,
+        response_sample_rate=24_000,
+        queue_capacity=1,
+    )
+    runtime = IntentRuntime(VoiceIntent(type=intent_type), response_pcm)
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        clock=lambda: datetime(2026, 8, 13, 4, 34, tzinfo=UTC),
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_next_input(target_device_id="living-room")
+
+    assert turn is not None
+    assert turn.response_text == expected_text
+    assert runtime.synthesized_texts == [expected_text]
+
+
+def test_voice_turn_generates_latest_reminder_status_reply() -> None:
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    response_pcm = pcm_frame(sample_rate=24_000, sample_count=1_440)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(
+        codec=codec,
+        model_sample_rate=16_000,
+        response_sample_rate=24_000,
+        queue_capacity=1,
+    )
+    runtime = IntentRuntime(VoiceIntent(type="reminder_status"), response_pcm)
+    reminder = TaskRecord.model_validate(
+        {
+            "task_id": "tsk-latest",
+            "actor_id": "family-1",
+            "target_device_id": "living-room",
+            "kind": "reminder",
+            "schedule": {
+                "at": "2026-08-13T20:00:00+08:00",
+                "timezone": "Asia/Shanghai",
+            },
+            "payload": {"text": "按时服药"},
+            "confirmation_policy": "required",
+            "idempotency_key": "voice:latest",
+            "status": TaskStatus.ACKNOWLEDGED,
+            "created_at": "2026-08-13T04:00:00+00:00",
+            "trace_id": "trc-latest",
+        }
+    )
+    task_service = LatestReminderTaskService(reminder)
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        task_service=task_service,
+        actor_id="family-1",
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_next_input(target_device_id="living-room")
+
+    assert turn is not None
+    assert turn.response_text == "最近的提醒“按时服药”当前状态是已确认。"
+    assert runtime.synthesized_texts == [turn.response_text]
+    assert task_service.calls == [("family-1", "living-room")]
+
+
+def test_voice_turn_reports_when_no_reminder_exists() -> None:
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    response_pcm = pcm_frame(sample_rate=24_000, sample_count=1_440)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(
+        codec=codec,
+        model_sample_rate=16_000,
+        response_sample_rate=24_000,
+        queue_capacity=1,
+    )
+    runtime = IntentRuntime(VoiceIntent(type="reminder_status"), response_pcm)
+    task_service = LatestReminderTaskService(None)
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        task_service=task_service,
+        actor_id="family-1",
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_next_input(target_device_id="living-room")
+
+    assert turn is not None
+    assert turn.response_text == "目前没有找到提醒。"
+    assert runtime.synthesized_texts == [turn.response_text]
+
+
+def test_voice_turn_processes_all_pending_frames_as_one_turn() -> None:
+    input_frames = [
+        pcm_frame(sample_rate=16_000, sample_count=2, start=10),
+        pcm_frame(sample_rate=16_000, sample_count=2, start=20),
+        pcm_frame(sample_rate=16_000, sample_count=2, start=30),
+    ]
+    response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
+    codec = SequenceOpusCodec(input_frames)
+    bridge = AudioBridge(codec=codec, model_sample_rate=16_000, queue_capacity=4)
+    runtime = FakeModelRuntime(
+        response_text="鎴戝湪杩欓噷锛屾參鎱㈣銆?",
+        response_pcm=response_pcm,
+    )
+    service = VoiceTurnService(audio_bridge=bridge, model_runtime=runtime)
+
+    for index in range(3):
+        bridge.decode_uplink(f"input-opus-{index}".encode())
+
+    turn = service.process_pending_turn()
+
+    assert turn is not None
+    assert len(runtime.received_inputs) == 1
+    assert runtime.received_inputs[0].sample_rate == 16_000
+    assert runtime.received_inputs[0].payload == (
+        b"\n\x00\x0b\x00\x14\x00\x15\x00\x1e\x00\x1f\x00"
+    )
+    assert service.process_pending_turn() is None
+
+
+def test_voice_turn_can_discard_pending_audio() -> None:
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=2)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(codec=codec, model_sample_rate=16_000, queue_capacity=2)
+    runtime = FakeModelRuntime(
+        response_text="鎴戝湪杩欓噷锛屾參鎱㈣銆?",
+        response_pcm=pcm_frame(sample_rate=16_000, sample_count=960),
+    )
+    service = VoiceTurnService(audio_bridge=bridge, model_runtime=runtime)
+    bridge.decode_uplink(b"stale-opus")
+
+    service.clear_pending_input()
+
+    assert service.process_pending_turn() is None
+    assert runtime.received_inputs == []
+
+
+def test_voice_turn_executes_a_validated_model_task(tmp_path) -> None:
+    repository = SQLiteTaskRepository(tmp_path / "voice-task.db")
+    repository.initialize()
+    executor = TaskExecutor(TaskService(repository))
+    command = TaskCreate(
+        actor_id="voice-user",
+        target_device_id="living-room",
+        kind=TaskKind.REMINDER,
+        schedule=TaskSchedule(
+            at="2026-08-07T20:00:00+08:00",
+            timezone="Asia/Shanghai",
+        ),
+        payload=TaskPayload(text="take medicine"),
+        confirmation_policy=ConfirmationPolicy.REQUIRED,
+        idempotency_key="voice:turn:task",
+    )
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(codec=codec, model_sample_rate=16_000, queue_capacity=1)
+    runtime = TaskRuntime(
+        command,
+        pcm_frame(sample_rate=16_000, sample_count=960, start=100),
+    )
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        task_executor=executor,
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_next_input()
+
+    assert turn is not None
+    assert turn.task is not None
+    assert turn.task.status.value == "awaiting_confirmation"
+    assert (
+        repository.get_task(turn.task.task_id).status.value
+        == "awaiting_confirmation"
+    )
+
+
+def test_voice_turn_routes_medication_ack_action_through_gateway_policy() -> None:
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(codec=codec, model_sample_rate=16_000, queue_capacity=1)
+    medication_service = RecordingMedicationService()
+    runtime = MedicationActionRuntime(
+        response_pcm,
+        VoiceAction(
+            type="acknowledge_medication_occurrence",
+            occurrence_id="med-occurrence-1",
+        ),
+    )
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        medication_service=medication_service,
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_next_input(target_device_id="living-room")
+
+    assert turn is not None
+    assert medication_service.acknowledged == [
+        ("med-occurrence-1", "voice-user", "living-room")
+    ]
+
+
+def test_voice_turn_stores_model_proposals_after_reply_and_sets_context(tmp_path) -> None:
+    repository = SQLiteTaskRepository(tmp_path / "voice-memory.db")
+    repository.initialize()
+    ids = iter(["prop-1", "mem-1"])
+    memory_service = MemoryService(
+        repository,
+        enabled=True,
+        clock=lambda: datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+        id_factory=lambda prefix: next(ids),
+    )
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(codec=codec, model_sample_rate=16_000, queue_capacity=1)
+    runtime = MemoryProposalRuntime(
+        pcm_frame(sample_rate=16_000, sample_count=960, start=100),
+    )
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        memory_service=memory_service,
+        actor_id="family-1",
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_next_input()
+
+    assert turn is not None
+    assert turn.memory_proposal_ids == ("prop-1",)
+    assert runtime.contexts == [""]
+    assert memory_service.list_proposals(subject_id="family-1")[0].value == (
+        "Call me Chase"
+    )
+    assert repository.export_memories(
+        subject_id="family-1",
+        now=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+    ) == []
+
+
+def test_voice_turn_passes_actor_and_target_device_to_agent_context_provider_and_clears_empty_context() -> None:
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(codec=codec, model_sample_rate=16_000, queue_capacity=1)
+    runtime = AgentContextRuntime(
+        pcm_frame(sample_rate=16_000, sample_count=960, start=100),
+    )
+    provider_calls: list[tuple[str, str | None]] = []
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        actor_id="family-1",
+        agent_context_provider=lambda actor_id, target_device_id: (
+            provider_calls.append((actor_id, target_device_id)) or ""
+        ),
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_next_input(target_device_id="living-room")
+
+    assert turn is not None
+    assert provider_calls == [("family-1", "living-room")]
+    assert runtime.agent_contexts == [""]
+
+
+def test_voice_turn_keeps_audio_when_memory_proposal_storage_fails() -> None:
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(codec=codec, model_sample_rate=16_000, queue_capacity=1)
+    runtime = MemoryProposalRuntime(
+        pcm_frame(sample_rate=16_000, sample_count=960, start=100),
+    )
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        memory_service=FailingMemoryService(),
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_next_input()
+
+    assert turn is not None
+    assert turn.device_opus_frame == b"opus-reply"
+    assert turn.memory_proposal_ids == ()
 
 
 def test_voice_turn_splits_a_long_response_into_60ms_opus_frames() -> None:
@@ -177,6 +649,192 @@ def test_device_voice_delivery_sends_processed_turn_to_active_session() -> None:
     bridge.decode_uplink(b"input-opus")
 
     turn = delivery.process_and_send(session_id="ses-active")
+
+    assert turn is not None
+    assert transport.messages == [("ses-active", (b"opus-reply",))]
+
+
+def test_device_voice_delivery_propagates_agent_context_provider() -> None:
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=-400)
+    response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(codec=codec, model_sample_rate=16_000, queue_capacity=1)
+    runtime = AgentContextRuntime(response_pcm)
+    voice_turns = VoiceTurnService(audio_bridge=bridge, model_runtime=runtime)
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=voice_turns,
+        device_transport=RecordingTransport(),
+    )
+    delivery.set_agent_context_provider(
+        lambda actor_id, target_device_id: f"{actor_id}:{target_device_id}"
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = delivery.process_and_send(
+        session_id="ses-agent",
+        target_device_id="living-room",
+    )
+
+    assert turn is not None
+    assert runtime.agent_contexts == ["voice-user:living-room"]
+
+
+def test_device_voice_delivery_synthesizes_and_sends_reminder_text() -> None:
+    response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
+    codec = EchoOpusCodec(pcm_frame(sample_rate=16_000, sample_count=960))
+    voice_turns = VoiceTurnService(
+        audio_bridge=AudioBridge(
+            codec=codec,
+            model_sample_rate=16_000,
+            queue_capacity=1,
+        ),
+        model_runtime=FakeModelRuntime(
+            response_text="reply",
+            response_pcm=response_pcm,
+        ),
+    )
+    transport = RecordingTransport()
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=voice_turns,
+        device_transport=transport,
+    )
+
+    delivery.synthesize_and_send(session_id="ses-reminder", text="take medicine")
+
+    assert transport.messages == [("ses-reminder", (b"opus-reply",))]
+
+
+def test_device_voice_delivery_marks_notification_text() -> None:
+    response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
+    transport = RecordingTransport()
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=VoiceTurnService(
+            audio_bridge=AudioBridge(
+                codec=EchoOpusCodec(
+                    pcm_frame(sample_rate=16_000, sample_count=960)
+                ),
+                model_sample_rate=16_000,
+                queue_capacity=1,
+            ),
+            model_runtime=FakeModelRuntime(
+                response_text="reply",
+                response_pcm=response_pcm,
+            ),
+        ),
+        device_transport=transport,
+    )
+
+    delivery.synthesize_notification_and_send(
+        session_id="ses-notification",
+        text="take medicine",
+    )
+
+    assert transport.notification_messages == [
+        ("ses-notification", (b"opus-reply",))
+    ]
+
+
+def test_device_voice_delivery_runs_tts_canary_without_sending() -> None:
+    response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
+    codec = EchoOpusCodec(pcm_frame(sample_rate=16_000, sample_count=960))
+    transport = RecordingTransport()
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=VoiceTurnService(
+            audio_bridge=AudioBridge(
+                codec=codec,
+                model_sample_rate=16_000,
+                queue_capacity=1,
+            ),
+            model_runtime=FakeModelRuntime(
+                response_text="reply",
+                response_pcm=response_pcm,
+            ),
+        ),
+        device_transport=transport,
+    )
+
+    assert delivery.can_synthesize("小瑶在线检查") is True
+    assert transport.messages == []
+
+
+def test_device_voice_delivery_propagates_memory_service(tmp_path) -> None:
+    repository = SQLiteTaskRepository(tmp_path / "delivery-memory.db")
+    repository.initialize()
+    memory_service = MemoryService(
+        repository,
+        enabled=True,
+        clock=lambda: datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+        id_factory=lambda prefix: "prop-delivery",
+    )
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(codec=codec, model_sample_rate=16_000, queue_capacity=1)
+    runtime = MemoryProposalRuntime(
+        pcm_frame(sample_rate=16_000, sample_count=960, start=100),
+    )
+    voice_turns = VoiceTurnService(audio_bridge=bridge, model_runtime=runtime)
+    transport = RecordingTransport()
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=voice_turns,
+        device_transport=transport,
+    )
+    delivery.set_memory_service(memory_service)
+    bridge.decode_uplink(b"input-opus")
+
+    turn = delivery.process_and_send(session_id="ses-memory")
+
+    assert turn is not None
+    assert turn.memory_proposal_ids == ("prop-delivery",)
+
+
+def test_device_voice_delivery_keeps_pending_audio_isolated_by_session() -> None:
+    first_input = pcm_frame(sample_rate=16_000, sample_count=2, start=10)
+    second_input = pcm_frame(sample_rate=16_000, sample_count=2, start=20)
+    codec = SequenceOpusCodec([first_input, second_input])
+    bridge = AudioBridge(codec=codec, model_sample_rate=16_000, queue_capacity=2)
+    runtime = FakeModelRuntime(
+        response_text="reply",
+        response_pcm=pcm_frame(sample_rate=16_000, sample_count=960, start=100),
+    )
+    voice_turns = VoiceTurnService(audio_bridge=bridge, model_runtime=runtime)
+    transport = RecordingTransport()
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=voice_turns,
+        device_transport=transport,
+    )
+
+    delivery.accept_and_send(session_id="ses-first", opus_frame=b"first")
+    delivery.accept_and_send(session_id="ses-second", opus_frame=b"second")
+
+    turn = delivery.process_and_send(session_id="ses-second")
+
+    assert turn is not None
+    assert runtime.received_inputs == [second_input]
+    assert transport.messages == [("ses-second", (b"opus-reply",))]
+
+    delivery.clear_pending_input(session_id="ses-first")
+
+    assert delivery.process_and_send(session_id="ses-first") is None
+
+
+def test_device_voice_delivery_can_process_off_event_loop() -> None:
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=-400)
+    response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
+    codec = EchoOpusCodec(input_pcm)
+    bridge = AudioBridge(codec=codec, model_sample_rate=16_000, queue_capacity=1)
+    runtime = FakeModelRuntime(
+        response_text="鎴戝湪杩欓噷锛屾參鎱㈣銆?",
+        response_pcm=response_pcm,
+    )
+    voice_turns = VoiceTurnService(audio_bridge=bridge, model_runtime=runtime)
+    transport = RecordingTransport()
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=voice_turns,
+        device_transport=transport,
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = asyncio.run(delivery.process_and_send_async(session_id="ses-active"))
 
     assert turn is not None
     assert transport.messages == [("ses-active", (b"opus-reply",))]

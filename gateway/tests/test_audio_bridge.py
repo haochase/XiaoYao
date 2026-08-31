@@ -49,6 +49,15 @@ def test_uplink_16khz_60ms_resamples_to_model_rate() -> None:
     assert result.metrics.non_silent_ratio > 0.99
 
 
+def test_pcm_metrics_include_root_mean_square_amplitude() -> None:
+    pcm = Pcm16Mono(
+        sample_rate=16_000,
+        payload=struct.pack("<4h", -3, -1, 1, 3),
+    )
+
+    assert pcm.metrics.rms_amplitude == pytest.approx((5.0) ** 0.5)
+
+
 def test_model_pcm_is_resampled_to_24khz_before_opus_encoding() -> None:
     codec = StubOpusCodec(pcm_ramp(sample_rate=16_000, sample_count=960))
     bridge = AudioBridge(codec=codec, model_sample_rate=16_000, queue_capacity=2)
@@ -61,6 +70,24 @@ def test_model_pcm_is_resampled_to_24khz_before_opus_encoding() -> None:
     assert codec.encoded[0].sample_rate == 24_000
     assert codec.encoded[0].sample_count == 1_440
     assert codec.encoded[0].duration_ms == pytest.approx(60.0)
+
+
+def test_model_input_and_response_rates_can_differ() -> None:
+    codec = StubOpusCodec(pcm_ramp(sample_rate=16_000, sample_count=960))
+    bridge = AudioBridge(
+        codec=codec,
+        model_sample_rate=16_000,
+        response_sample_rate=24_000,
+        queue_capacity=2,
+    )
+
+    encoded = bridge.encode_downlink(
+        pcm_ramp(sample_rate=24_000, sample_count=1_440)
+    )
+
+    assert encoded.startswith(b"opus:")
+    assert codec.encoded[0].sample_rate == 24_000
+    assert codec.encoded[0].sample_count == 1_440
 
 
 @pytest.mark.parametrize("payload", [b"", b"truncated"])

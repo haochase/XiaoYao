@@ -10,9 +10,11 @@ requires-python = ">=3.11"
 dependencies = [
   "av>=16,<17",
   "fastapi>=0.115,<1",
+  "lark-channel-sdk>=1.2,<2",
   "numpy>=2,<3",
   "pydantic>=2.10,<3",
   "uvicorn>=0.30,<1",
+  "websocket-client>=1.8,<2",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +27,6 @@ test = [
 where = ["src"]
 
 [tool.pytest.ini_options]
-addopts = "-q --basetemp=.pytest-tmp"
+addopts = "-q --basetemp=tests/.pytest-tmp"
 pythonpath = ["src"]
 testpaths = ["tests"]

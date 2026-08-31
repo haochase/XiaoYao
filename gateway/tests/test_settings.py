@@ -1,8 +1,37 @@
+from hashlib import sha256
+import os
 from pathlib import Path
 
 import pytest
 
-from companion_gateway.settings import Settings
+from companion_gateway.settings import Settings, load_environment_file
+
+
+def test_load_environment_file_uses_file_defaults_and_preserves_process_values(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    environment_file = tmp_path / ".env"
+    environment_file.write_text(
+        "# local-only settings\n"
+        "COMPANION_VOICE_RUNTIME=realtime\n"
+        "COMPANION_MINICPM_O_AUTH_TOKEN='file-token'\n"
+        "EMPTY_VALUE=\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "fixture")
+    monkeypatch.delenv("COMPANION_MINICPM_O_AUTH_TOKEN", raising=False)
+
+    loaded = load_environment_file(environment_file)
+
+    assert loaded == {
+        "COMPANION_VOICE_RUNTIME",
+        "COMPANION_MINICPM_O_AUTH_TOKEN",
+        "EMPTY_VALUE",
+    }
+    assert os.environ["COMPANION_VOICE_RUNTIME"] == "fixture"
+    assert os.environ["COMPANION_MINICPM_O_AUTH_TOKEN"] == "file-token"
+    assert os.environ["EMPTY_VALUE"] == ""
 
 
 def test_settings_parse_valid_device_token_hashes(monkeypatch) -> None:
@@ -32,6 +61,517 @@ def test_settings_parse_optional_fake_voice_fixture_path(monkeypatch) -> None:
     )
 
 
+def test_settings_selects_http_voice_runtime(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "http")
+    monkeypatch.setenv(
+        "COMPANION_MINICPM_O_ENDPOINT",
+        "http://127.0.0.1:9000/v1/infer",
+    )
+
+    settings = Settings.from_environment()
+
+    assert settings.voice_runtime == "http"
+    assert settings.minicpm_o_endpoint == "http://127.0.0.1:9000/v1/infer"
+
+
+def test_settings_selects_realtime_voice_runtime(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "realtime")
+    monkeypatch.setenv(
+        "COMPANION_MINICPM_O_ENDPOINT",
+        "wss://minicpm.example.test/v1/realtime?mode=audio",
+    )
+
+    settings = Settings.from_environment()
+
+    assert settings.voice_runtime == "realtime"
+
+
+def test_settings_loads_minicpm_retry_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MINICPM_O_MAX_RETRIES", "4")
+    monkeypatch.setenv("COMPANION_MINICPM_O_RETRY_BACKOFF_SECONDS", "0.25")
+
+    settings = Settings.from_environment()
+
+    assert settings.minicpm_o_max_retries == 4
+    assert settings.minicpm_o_retry_backoff_seconds == 0.25
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("minicpm_o_max_retries", -1, "MAX_RETRIES"),
+        ("minicpm_o_retry_backoff_seconds", -0.1, "RETRY_BACKOFF_SECONDS"),
+    ],
+)
+def test_settings_rejects_negative_minicpm_retry_values(
+    field: str, value: float, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        Settings(database_path=Path("data/test.db"), **{field: value})
+
+
+def test_settings_loads_minicpm_o_chat_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "example-token")
+    monkeypatch.setenv("COMPANION_AUDIO_QUEUE_CAPACITY", "96")
+    monkeypatch.setenv("COMPANION_MINICPM_O_COMPATIBLE_MAX_RETRIES", "3")
+    monkeypatch.setenv("COMPANION_MINICPM_O_COMPATIBLE_RETRY_BACKOFF_SECONDS", "0.25")
+
+    settings = Settings.from_environment()
+
+    assert settings.minicpm_o_compatible_base_url == (
+        "http://127.0.0.1:9000/v1"
+    )
+    assert settings.minicpm_o_auth_token == "example-token"
+    assert settings.minicpm_o_model == "MiniCPM-O-4.5-9B"
+    assert settings.audio_queue_capacity == 96
+    assert settings.minicpm_o_compatible_max_retries == 3
+    assert settings.minicpm_o_compatible_retry_backoff_seconds == 0.25
+
+
+def test_settings_loads_device_auto_stop_idle_seconds(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_AUTO_STOP_IDLE_SECONDS", "1.5")
+
+    settings = Settings.from_environment()
+
+    assert settings.device_auto_stop_idle_seconds == 1.5
+
+
+def test_settings_loads_device_auto_turn_pcm_endpoint(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD", "35")
+    monkeypatch.setenv("COMPANION_DEVICE_VAD_POST_TTS_RMS_THRESHOLD", "42")
+    monkeypatch.setenv("COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES", "12")
+    monkeypatch.setenv("COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES", "5")
+    monkeypatch.setenv("COMPANION_DEVICE_AUTO_TURN_MAX_FRAMES", "150")
+    monkeypatch.setenv("COMPANION_DEVICE_POST_TTS_SILENCE_FRAMES", "5")
+
+    settings = Settings.from_environment()
+
+    assert settings.device_auto_turn_rms_threshold == 35.0
+    assert settings.device_vad_post_tts_rms_threshold == 42.0
+    assert settings.device_auto_turn_silence_frames == 12
+    assert settings.device_auto_turn_min_speech_frames == 5
+    assert settings.device_auto_turn_max_frames == 150
+    assert settings.device_post_tts_silence_frames == 5
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD", "-1"),
+        ("COMPANION_DEVICE_AUTO_TURN_RMS_THRESHOLD", "not-a-number"),
+        ("COMPANION_DEVICE_VAD_POST_TTS_RMS_THRESHOLD", "-1"),
+        ("COMPANION_DEVICE_VAD_POST_TTS_RMS_THRESHOLD", "not-a-number"),
+        ("COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES", "0"),
+        ("COMPANION_DEVICE_AUTO_TURN_SILENCE_FRAMES", "not-a-number"),
+        ("COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES", "0"),
+        ("COMPANION_DEVICE_AUTO_TURN_MIN_SPEECH_FRAMES", "not-a-number"),
+        ("COMPANION_DEVICE_AUTO_TURN_MAX_FRAMES", "0"),
+        ("COMPANION_DEVICE_AUTO_TURN_MAX_FRAMES", "not-a-number"),
+        ("COMPANION_DEVICE_POST_TTS_SILENCE_FRAMES", "0"),
+        ("COMPANION_DEVICE_POST_TTS_SILENCE_FRAMES", "not-a-number"),
+    ],
+)
+def test_settings_rejects_invalid_device_auto_turn_pcm_endpoint(
+    monkeypatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        Settings.from_environment()
+
+
+@pytest.mark.parametrize("value", ["0", "-0.1", "not-a-number"])
+def test_settings_rejects_invalid_device_auto_stop_idle_seconds(
+    monkeypatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_AUTO_STOP_IDLE_SECONDS", value)
+
+    with pytest.raises(ValueError, match="COMPANION_DEVICE_AUTO_STOP_IDLE_SECONDS"):
+        Settings.from_environment()
+
+
+def test_settings_loads_minicpm_o_auth_token(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "ascend-runtime-token")
+
+    settings = Settings.from_environment()
+
+    assert settings.minicpm_o_auth_token == "ascend-runtime-token"
+
+
+def test_settings_rejects_minicpm_o_auth_token_with_whitespace(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "token with spaces")
+
+    with pytest.raises(ValueError, match="COMPANION_MINICPM_O_AUTH_TOKEN"):
+        Settings.from_environment()
+
+
+def test_settings_parse_task_scheduler_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_TASK_SCHEDULER_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_TASK_SCHEDULER_INTERVAL_SECONDS", "2.5")
+
+    settings = Settings.from_environment()
+
+    assert settings.task_scheduler_enabled is True
+    assert settings.task_scheduler_interval_seconds == 2.5
+
+
+def test_settings_loads_feishu_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test_app")
+    monkeypatch.setenv("COMPANION_FEISHU_APP_SECRET", "secret_test_value")
+    monkeypatch.setenv("COMPANION_FEISHU_RECEIVER_OPEN_ID", "ou_test_receiver")
+    monkeypatch.setenv("COMPANION_FEISHU_MAX_RETRIES", "3")
+    monkeypatch.setenv("COMPANION_FEISHU_RETRY_BACKOFF_SECONDS", "0.25")
+
+    settings = Settings.from_environment()
+
+    assert settings.feishu_configured is True
+    assert settings.feishu_app_id == "cli_test_app"
+    assert settings.feishu_receiver_open_id == "ou_test_receiver"
+    assert settings.feishu_max_retries == 3
+    assert settings.feishu_retry_backoff_seconds == 0.25
+
+
+def test_settings_loads_feishu_chat_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test_app")
+    monkeypatch.setenv("COMPANION_FEISHU_APP_SECRET", "secret_test_value")
+    monkeypatch.setenv("COMPANION_FEISHU_RECEIVER_OPEN_ID", "ou_test_receiver")
+    monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "example-token")
+    monkeypatch.setenv("COMPANION_FEISHU_CHAT_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_FEISHU_CHAT_HISTORY_TURNS", "4")
+
+    settings = Settings.from_environment()
+
+    assert settings.feishu_chat_enabled is True
+    assert settings.feishu_chat_history_turns == 4
+
+
+def test_settings_requires_feishu_and_minicpm_o_for_enabled_chat(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_FEISHU_CHAT_ENABLED", "true")
+
+    with pytest.raises(ValueError, match="COMPANION_FEISHU_CHAT_ENABLED"):
+        Settings.from_environment()
+
+
+def test_settings_loads_memory_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MEMORY_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_MEMORY_RETENTION_DAYS", "45")
+    monkeypatch.setenv("COMPANION_MEMORY_QUOTA_BYTES", "1234")
+
+    settings = Settings.from_environment()
+
+    assert settings.memory_enabled is True
+    assert settings.memory_retention_days == 45
+    assert settings.memory_quota_bytes == 1234
+
+
+def test_settings_loads_memory_proposal_ttl(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MEMORY_PROPOSAL_TTL_SECONDS", "90")
+
+    settings = Settings.from_environment()
+
+    assert settings.memory_proposal_ttl_seconds == 90
+
+
+def test_settings_loads_memory_cleanup_interval(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MEMORY_CLEANUP_INTERVAL_SECONDS", "3600")
+
+    settings = Settings.from_environment()
+
+    assert settings.memory_cleanup_interval_seconds == 3600
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("COMPANION_MEMORY_ENABLED", "sometimes"),
+        ("COMPANION_MEMORY_RETENTION_DAYS", "0"),
+        ("COMPANION_MEMORY_QUOTA_BYTES", "0"),
+        ("COMPANION_MEMORY_PROPOSAL_TTL_SECONDS", "0"),
+        ("COMPANION_MEMORY_CLEANUP_INTERVAL_SECONDS", "0"),
+    ],
+)
+def test_settings_rejects_invalid_memory_configuration(
+    monkeypatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        Settings.from_environment()
+
+
+def test_settings_loads_vision_configuration(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("COMPANION_VISION_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_VISION_STORAGE_PATH", str(tmp_path / "vision"))
+    monkeypatch.setenv("COMPANION_VISION_MAX_UPLOAD_BYTES", "9000000")
+    monkeypatch.setenv("COMPANION_VISION_RETENTION_DAYS", "7")
+    monkeypatch.setenv("COMPANION_VISION_QUOTA_BYTES", "123456")
+    monkeypatch.setenv("COMPANION_VISION_CLEANUP_INTERVAL_SECONDS", "3600")
+
+    settings = Settings.from_environment()
+
+    assert settings.vision_enabled is True
+    assert settings.vision_storage_path == tmp_path / "vision"
+    assert settings.vision_max_upload_bytes == 9_000_000
+    assert settings.vision_retention_days == 7
+    assert settings.vision_quota_bytes == 123456
+    assert settings.vision_cleanup_interval_seconds == 3600
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("COMPANION_VISION_ENABLED", "sometimes"),
+        ("COMPANION_VISION_MAX_UPLOAD_BYTES", "0"),
+        ("COMPANION_VISION_RETENTION_DAYS", "0"),
+        ("COMPANION_VISION_QUOTA_BYTES", "0"),
+        ("COMPANION_VISION_CLEANUP_INTERVAL_SECONDS", "0"),
+    ],
+)
+def test_settings_rejects_invalid_vision_configuration(
+    monkeypatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        Settings.from_environment()
+
+
+def test_settings_rejects_partial_feishu_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test_app")
+    monkeypatch.delenv("COMPANION_FEISHU_APP_SECRET", raising=False)
+    monkeypatch.delenv("COMPANION_FEISHU_RECEIVER_OPEN_ID", raising=False)
+
+    with pytest.raises(ValueError, match="COMPANION_FEISHU"):
+        Settings.from_environment()
+
+
+def test_settings_reject_invalid_task_scheduler_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_TASK_SCHEDULER_ENABLED", "sometimes")
+
+    with pytest.raises(ValueError, match="COMPANION_TASK_SCHEDULER_ENABLED"):
+        Settings.from_environment()
+
+
+def test_settings_requires_endpoint_for_http_runtime(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "http")
+    monkeypatch.delenv("COMPANION_MINICPM_O_ENDPOINT", raising=False)
+
+    with pytest.raises(ValueError, match="COMPANION_MINICPM_O_ENDPOINT"):
+        Settings.from_environment()
+
+
+def test_settings_rejects_unknown_voice_runtime(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "unknown")
+
+    with pytest.raises(ValueError, match="COMPANION_VOICE_RUNTIME"):
+        Settings.from_environment()
+
+
+def test_settings_derives_a_device_digest_from_ota_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("COMPANION_DB_PATH", str(tmp_path / "gateway.db"))
+    monkeypatch.setenv(
+        "COMPANION_PUBLIC_WEBSOCKET_URL",
+        "ws://192.0.2.10:8723/v1/devices/ws",
+    )
+    monkeypatch.setenv(
+        "COMPANION_OTA_DEVICE_TOKENS",
+        '{"device-test":"bootstrap-token"}',
+    )
+
+    settings = Settings.from_environment()
+
+    assert settings.ota_device_tokens == {"device-test": "bootstrap-token"}
+    assert settings.device_token_hashes["device-test"] == sha256(
+        b"bootstrap-token"
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "public_url,ota_tokens,device_hashes",
+    [
+        (
+            "http://192.0.2.10:8723/v1/devices/ws",
+            '{"device-test":"bootstrap-token"}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/other",
+            '{"device-test":"bootstrap-token"}',
+            "{}",
+        ),
+        (
+            "ws://user:password@192.0.2.10:8723/v1/devices/ws",
+            '{"device-test":"bootstrap-token"}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/v1/devices/ws?token=secret",
+            '{"device-test":"bootstrap-token"}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/v1/devices/ws#secret",
+            '{"device-test":"bootstrap-token"}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/v1/devices/ws/",
+            '{"device-test":"bootstrap-token"}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/v1/devices/ws",
+            '{"device-test":""}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/v1/devices/ws",
+            '{"device-test":"bootstrap token"}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/v1/devices/ws",
+            '{"device-test":"Bearer token"}',
+            "{}",
+        ),
+        (
+            "ws://192.0.2.10:8723/v1/devices/ws",
+            '{"device-test":"bootstrap-token"}',
+            '{"device-test":"' + ("a" * 64) + '"}',
+        ),
+    ],
+)
+def test_settings_reject_invalid_ota_configuration(
+    monkeypatch,
+    public_url: str,
+    ota_tokens: str,
+    device_hashes: str,
+) -> None:
+    monkeypatch.setenv("COMPANION_PUBLIC_WEBSOCKET_URL", public_url)
+    monkeypatch.setenv("COMPANION_OTA_DEVICE_TOKENS", ota_tokens)
+    monkeypatch.setenv("COMPANION_DEVICE_TOKEN_HASHES", device_hashes)
+
+    with pytest.raises(ValueError, match="(?i)ota|websocket|token"):
+        Settings.from_environment()
+
+
+def test_settings_reject_ota_tokens_without_a_public_url(monkeypatch) -> None:
+    monkeypatch.delenv("COMPANION_PUBLIC_WEBSOCKET_URL", raising=False)
+    monkeypatch.setenv(
+        "COMPANION_OTA_DEVICE_TOKENS",
+        '{"device-test":"bootstrap-token"}',
+    )
+
+    with pytest.raises(ValueError, match="COMPANION_PUBLIC_WEBSOCKET_URL"):
+        Settings.from_environment()
+
+
+def test_direct_settings_configuration_derives_device_digest(tmp_path) -> None:
+    settings = Settings(
+        database_path=tmp_path / "direct.db",
+        public_websocket_url="ws://192.0.2.10:8723/v1/devices/ws",
+        ota_device_tokens={"device-test": "bootstrap-token"},
+    )
+
+    assert settings.device_token_hashes == {
+        "device-test": sha256(b"bootstrap-token").hexdigest()
+    }
+
+
+def test_direct_settings_configuration_rejects_conflicting_digest(tmp_path) -> None:
+    with pytest.raises(ValueError, match="conflicts"):
+        Settings(
+            database_path=tmp_path / "direct-conflict.db",
+            public_websocket_url="ws://192.0.2.10:8723/v1/devices/ws",
+            ota_device_tokens={"device-test": "bootstrap-token"},
+            device_token_hashes={"device-test": "a" * 64},
+        )
+
+
+def test_settings_loads_device_vad_turn_rms_threshold(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD", " 180 ")
+
+    settings = Settings.from_environment()
+
+    assert settings.device_vad_turn_rms_threshold == 180.0
+
+
+def test_settings_blanks_device_vad_turn_rms_threshold(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD", "   ")
+
+    settings = Settings.from_environment()
+
+    assert settings.device_vad_turn_rms_threshold is None
+
+
+def test_settings_defaults_device_vad_turn_rms_threshold_to_none(monkeypatch) -> None:
+    monkeypatch.delenv("COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD", raising=False)
+
+    settings = Settings.from_environment()
+
+    assert settings.device_vad_turn_rms_threshold is None
+
+
+@pytest.mark.parametrize("value", ["-1", "not-a-number"])
+def test_settings_rejects_invalid_device_vad_turn_rms_threshold(
+    monkeypatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD", value)
+
+    with pytest.raises(
+        ValueError,
+        match="COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD",
+    ):
+        Settings.from_environment()
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_settings_rejects_non_finite_device_vad_turn_rms_threshold(
+    monkeypatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD", value)
+
+    with pytest.raises(
+        ValueError,
+        match="COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD",
+    ):
+        Settings.from_environment()
+
+
+def test_direct_settings_rejects_negative_device_vad_turn_rms_threshold() -> None:
+    with pytest.raises(
+        ValueError,
+        match="COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD must not be negative",
+    ):
+        Settings(
+            database_path=Path("data/test.db"),
+            device_vad_turn_rms_threshold=-1,
+        )
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_direct_settings_rejects_non_finite_device_vad_turn_rms_threshold(
+    value: float,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="COMPANION_DEVICE_VAD_TURN_RMS_THRESHOLD",
+    ):
+        Settings(
+            database_path=Path("data/test.db"),
+            device_vad_turn_rms_threshold=value,
+        )
+
+
 @pytest.mark.parametrize(
     "configured",
     [
@@ -49,3 +589,163 @@ def test_settings_reject_invalid_device_token_hashes(
 
     with pytest.raises(ValueError, match="COMPANION_DEVICE_TOKEN_HASHES"):
         Settings.from_environment()
+
+
+def test_dynamic_agents_are_disabled_by_default() -> None:
+    settings = Settings(database_path=Path("data/test.db"))
+
+    assert settings.dynamic_agents_enabled is False
+    assert settings.dynamic_agent_owner_id is None
+    assert settings.dynamic_agent_target_device_id is None
+    assert settings.dynamic_agent_scheduler_interval_seconds == 1.0
+
+
+def test_settings_loads_dynamic_agent_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "example-token")
+    monkeypatch.setenv("COMPANION_DYNAMIC_AGENTS_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_DYNAMIC_AGENT_OWNER_ID", "ou_owner")
+    monkeypatch.setenv(
+        "COMPANION_DYNAMIC_AGENT_TARGET_DEVICE_ID",
+        "living-room",
+    )
+    monkeypatch.setenv(
+        "COMPANION_DYNAMIC_AGENT_SCHEDULER_INTERVAL_SECONDS",
+        "0.25",
+    )
+
+    settings = Settings.from_environment()
+
+    assert settings.dynamic_agents_enabled is True
+    assert settings.dynamic_agent_owner_id == "ou_owner"
+    assert settings.dynamic_agent_target_device_id == "living-room"
+    assert settings.dynamic_agent_scheduler_interval_seconds == 0.25
+
+
+def test_settings_infers_dynamic_owner_and_unique_ota_device(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "example-token")
+    monkeypatch.setenv("COMPANION_DYNAMIC_AGENTS_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test")
+    monkeypatch.setenv("COMPANION_FEISHU_APP_SECRET", "secret_test")
+    monkeypatch.setenv("COMPANION_FEISHU_RECEIVER_OPEN_ID", "ou_owner")
+    monkeypatch.setenv(
+        "COMPANION_OTA_DEVICE_TOKENS",
+        '{"living-room":"device-token"}',
+    )
+    monkeypatch.setenv(
+        "COMPANION_PUBLIC_WEBSOCKET_URL",
+        "ws://192.0.2.20:8723/v1/devices/ws",
+    )
+
+    settings = Settings.from_environment()
+
+    assert settings.dynamic_agent_owner_id == "ou_owner"
+    assert settings.dynamic_agent_target_device_id == "living-room"
+
+
+def test_recent_context_is_disabled_with_safe_defaults() -> None:
+    settings = Settings(database_path=Path("data/test.db"))
+
+    assert settings.recent_context_enabled is False
+    assert settings.recent_context_retention_days == 7
+    assert settings.recent_context_max_messages == 20
+    assert settings.recent_context_max_bytes == 4096
+    assert settings.subject_id == "voice-user"
+    assert settings.device_conversation_idle_timeout_seconds == 15.0
+
+
+def test_settings_loads_conversation_idle_timeout(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_CONVERSATION_IDLE_TIMEOUT_SECONDS", "25")
+
+    settings = Settings.from_environment()
+
+    assert settings.device_conversation_idle_timeout_seconds == 25.0
+
+
+def test_continuous_conversation_is_disabled_with_safe_default() -> None:
+    settings = Settings(database_path=Path("data/test.db"))
+
+    assert settings.device_continuous_conversation_enabled is False
+
+
+def test_settings_loads_continuous_conversation_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_CONTINUOUS_CONVERSATION_ENABLED", "true")
+
+    settings = Settings.from_environment()
+
+    assert settings.device_continuous_conversation_enabled is True
+
+
+def test_camera_is_disabled_with_two_megabyte_safe_default() -> None:
+    settings = Settings(database_path=Path("data/test.db"))
+
+    assert settings.camera_enabled is False
+    assert settings.camera_max_bytes == 2_097_152
+
+
+def test_settings_loads_camera_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_CAMERA_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_CAMERA_MAX_BYTES", "1000000")
+
+    settings = Settings.from_environment()
+
+    assert settings.camera_enabled is True
+    assert settings.camera_max_bytes == 1_000_000
+
+
+@pytest.mark.parametrize("value", [0, 2_097_153])
+def test_settings_rejects_invalid_camera_max_bytes(value: int) -> None:
+    with pytest.raises(ValueError, match="CAMERA_MAX_BYTES"):
+        Settings(database_path=Path("data/test.db"), camera_max_bytes=value)
+
+
+@pytest.mark.parametrize("value", ["0", "301"])
+def test_settings_rejects_invalid_conversation_idle_timeout(value: str) -> None:
+    with pytest.raises(ValueError, match="CONVERSATION_IDLE_TIMEOUT"):
+        Settings(
+            database_path=Path("data/test.db"),
+            device_conversation_idle_timeout_seconds=float(value),
+        )
+
+
+def test_settings_loads_recent_context_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_RECENT_CONTEXT_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_RECENT_CONTEXT_RETENTION_DAYS", "3")
+    monkeypatch.setenv("COMPANION_RECENT_CONTEXT_MAX_MESSAGES", "8")
+    monkeypatch.setenv("COMPANION_RECENT_CONTEXT_MAX_BYTES", "2048")
+    monkeypatch.setenv("COMPANION_SUBJECT_ID", "voice-user")
+
+    settings = Settings.from_environment()
+
+    assert settings.recent_context_enabled is True
+    assert settings.recent_context_retention_days == 3
+    assert settings.recent_context_max_messages == 8
+    assert settings.recent_context_max_bytes == 2048
+    assert settings.subject_id == "voice-user"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("dynamic_agent_owner_id", None, "OWNER_ID"),
+        ("dynamic_agent_target_device_id", None, "TARGET_DEVICE_ID"),
+        ("minicpm_o_auth_token", None, "MINICPM_O_AUTH_TOKEN"),
+        ("dynamic_agent_scheduler_interval_seconds", 0, "INTERVAL_SECONDS"),
+    ],
+)
+def test_enabled_dynamic_agents_require_complete_configuration(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    values: dict[str, object] = {
+        "database_path": Path("data/test.db"),
+        "dynamic_agents_enabled": True,
+        "dynamic_agent_owner_id": "ou_owner",
+        "dynamic_agent_target_device_id": "living-room",
+        "dynamic_agent_scheduler_interval_seconds": 1.0,
+        "minicpm_o_auth_token": "example-token",
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        Settings(**values)

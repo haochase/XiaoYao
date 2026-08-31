@@ -7,7 +7,7 @@ from companion_gateway.audio.bridge import AudioBridge, Pcm16Mono
 from companion_gateway.audio.pyav_opus import PyAvOpusCodec
 from companion_gateway.device.transport import DeviceTransport
 from companion_gateway.voice.delivery import DeviceVoiceDeliveryService
-from companion_gateway.voice.runtime import FakeModelRuntime
+from companion_gateway.voice.runtime import FakeModelRuntime, ModelRuntime
 from companion_gateway.voice.service import VoiceTurnService
 
 
@@ -30,21 +30,38 @@ def create_fixture_voice_delivery(
     *,
     fixture_path: Path,
     device_transport: DeviceTransport,
+    queue_capacity: int = 8,
 ) -> DeviceVoiceDeliveryService:
     response_pcm = load_pcm16_mono_wave(fixture_path)
+    return create_voice_delivery(
+        model_runtime=FakeModelRuntime(
+            response_text=FIXTURE_RESPONSE_TEXT,
+            response_pcm=response_pcm,
+        ),
+        device_transport=device_transport,
+        model_sample_rate=response_pcm.sample_rate,
+        queue_capacity=queue_capacity,
+    )
+
+
+def create_voice_delivery(
+    *,
+    model_runtime: ModelRuntime,
+    device_transport: DeviceTransport,
+    model_sample_rate: int = 16_000,
+    response_sample_rate: int | None = None,
+    queue_capacity: int = 8,
+) -> DeviceVoiceDeliveryService:
     bridge = AudioBridge(
         codec=PyAvOpusCodec(),
-        model_sample_rate=response_pcm.sample_rate,
-        queue_capacity=8,
-    )
-    runtime = FakeModelRuntime(
-        response_text=FIXTURE_RESPONSE_TEXT,
-        response_pcm=response_pcm,
+        model_sample_rate=model_sample_rate,
+        response_sample_rate=response_sample_rate,
+        queue_capacity=queue_capacity,
     )
     return DeviceVoiceDeliveryService(
         voice_turn_service=VoiceTurnService(
             audio_bridge=bridge,
-            model_runtime=runtime,
+            model_runtime=model_runtime,
         ),
         device_transport=device_transport,
     )

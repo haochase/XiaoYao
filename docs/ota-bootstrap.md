@@ -36,9 +36,10 @@ For an enrolled device, the endpoint returns:
 }
 ```
 
-The response includes `Cache-Control: no-store`. A missing device identifier is
-rejected with `400`; an unknown device or disabled bootstrap configuration is
-rejected without revealing enrolled identifiers or tokens.
+All responses from this endpoint include `Cache-Control: no-store`. A missing
+device identifier is rejected with `400`; an unknown device or disabled
+bootstrap configuration is rejected without revealing enrolled identifiers or
+tokens.
 
 ## Boundaries
 
@@ -51,6 +52,15 @@ rejected without revealing enrolled identifiers or tokens.
   uses the current response to select its WebSocket protocol.
 - This interface does not add a model runtime, task scheduler, or external
   messaging channel.
+
+## Hardware compatibility note
+
+Hardware acceptance is intentionally kept separate from this public contract.
+The gateway can verify transport, authentication, the server `hello`, and the
+subsequent `listen`/audio exchange, but a successful OTA response alone is not
+proof that a board completed a voice round trip. Private acceptance records
+must keep serial-port names, LAN addresses, device identifiers, firmware
+versions, tokens, and model credentials out of this repository.
 
 ## Verification
 

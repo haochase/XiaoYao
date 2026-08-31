@@ -4,6 +4,7 @@ from hashlib import sha256
 import pytest
 from pydantic import ValidationError
 
+import companion_gateway.device.models as device_models
 from companion_gateway.device.events import (
     BoundedDeviceEventSink,
     DeviceBackpressure,
@@ -43,6 +44,25 @@ def test_device_hello_accepts_xiaozhi_v1_and_ignores_future_fields() -> None:
     assert hello.version == 1
     assert hello.audio_params.sample_rate == 16000
     assert hello.audio_params.frame_duration == 60
+
+
+def test_device_hello_parses_vad_event_capability() -> None:
+    payload = hello_payload()
+    payload["features"]["vad_events"] = True
+
+    hello = DeviceHello.model_validate(payload)
+
+    assert hello.features.vad_events is True
+
+
+def test_vad_control_accepts_only_speech_boundaries() -> None:
+    start = device_models.VadControl.model_validate(
+        {"type": "vad", "state": "start", "session_id": "ses_1"}
+    )
+
+    assert start.state == "start"
+    with pytest.raises(ValidationError):
+        device_models.VadControl.model_validate({"type": "vad", "state": "pause"})
 
 
 @pytest.mark.parametrize(
@@ -158,6 +178,73 @@ def test_session_stop_returns_to_idle_and_rejects_more_audio() -> None:
     assert session.phase is DevicePhase.IDLE
     with pytest.raises(InvalidDevicePhase):
         session.accept_audio_frame()
+
+
+def test_auto_listening_session_can_finish_only_once() -> None:
+    session = DeviceSession.create(
+        device_id="dev-test",
+        client_id="client-test",
+        hello=DeviceHello.model_validate(hello_payload()),
+    )
+    session.apply_listen(
+        ListenControl.model_validate(
+            {"type": "listen", "state": "start", "mode": "auto"}
+        )
+    )
+
+    assert session.finish_auto_listening() is True
+    assert session.phase is DevicePhase.IDLE
+    assert session.finish_auto_listening() is False
+
+
+def test_session_accepts_vad_only_when_capability_was_advertised() -> None:
+    legacy_session = DeviceSession.create(
+        device_id="dev-test",
+        client_id="client-test",
+        hello=DeviceHello.model_validate(hello_payload()),
+    )
+    legacy_session.apply_listen(
+        ListenControl.model_validate(
+            {"type": "listen", "state": "start", "mode": "auto"}
+        )
+    )
+    vad_start = device_models.VadControl.model_validate(
+        {"type": "vad", "state": "start"}
+    )
+
+    with pytest.raises(InvalidDevicePhase, match="not advertised"):
+        legacy_session.apply_vad(vad_start)
+
+    capable_payload = hello_payload()
+    capable_payload["features"]["vad_events"] = True
+    capable_session = DeviceSession.create(
+        device_id="dev-test",
+        client_id="client-test",
+        hello=DeviceHello.model_validate(capable_payload),
+    )
+    capable_session.apply_listen(
+        ListenControl.model_validate(
+            {"type": "listen", "state": "start", "mode": "auto"}
+        )
+    )
+
+    capable_session.apply_vad(vad_start)
+
+
+def test_auto_turn_finished_session_ignores_tail_audio() -> None:
+    session = DeviceSession.create(
+        device_id="dev-test",
+        client_id="client-test",
+        hello=DeviceHello.model_validate(hello_payload()),
+    )
+    session.apply_listen(
+        ListenControl.model_validate(
+            {"type": "listen", "state": "start", "mode": "auto"}
+        )
+    )
+    assert session.finish_auto_listening() is True
+
+    assert session.should_ignore_auto_turn_tail_audio() is True
 
 
 def test_abort_returns_listening_session_to_idle() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+from math import sqrt
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
@@ -25,6 +26,7 @@ class AudioMetrics:
     duration_ms: float
     duration_error_ms: float
     peak_abs: int
+    rms_amplitude: float
     non_silent_ratio: float
 
 
@@ -54,10 +56,12 @@ class Pcm16Mono:
     def metrics(self) -> AudioMetrics:
         samples = struct.unpack(f"<{self.sample_count}h", self.payload)
         non_silent = sum(sample != 0 for sample in samples)
+        mean_square = sum(sample * sample for sample in samples) / self.sample_count
         return AudioMetrics(
             duration_ms=self.duration_ms,
             duration_error_ms=self.duration_error_ms,
             peak_abs=max(abs(sample) for sample in samples),
+            rms_amplitude=sqrt(mean_square),
             non_silent_ratio=non_silent / self.sample_count,
         )
 
@@ -103,46 +107,58 @@ class AudioBridge:
         *,
         codec: OpusCodec,
         model_sample_rate: int,
+        response_sample_rate: int | None = None,
         queue_capacity: int,
         max_uplink_frame_bytes: int = 4_096,
     ) -> None:
         if model_sample_rate < 1:
             raise ValueError("model_sample_rate must be positive")
+        if response_sample_rate is not None and response_sample_rate < 1:
+            raise ValueError("response_sample_rate must be positive")
         if queue_capacity < 1:
             raise ValueError("queue_capacity must be positive")
         if max_uplink_frame_bytes < 1:
             raise ValueError("max_uplink_frame_bytes must be positive")
         self._codec = codec
         self._model_sample_rate = model_sample_rate
+        self._response_sample_rate = response_sample_rate or model_sample_rate
         self._queue_capacity = queue_capacity
         self._max_uplink_frame_bytes = max_uplink_frame_bytes
         self._uplink_queue: deque[Pcm16Mono] = deque()
         self._lock = RLock()
 
     def decode_uplink(self, payload: bytes) -> Pcm16Mono:
-        if not payload:
-            raise AudioFrameRejected("opus frame is empty")
-        if len(payload) > self._max_uplink_frame_bytes:
-            raise AudioFrameRejected("opus frame is too large")
         with self._lock:
             if len(self._uplink_queue) >= self._queue_capacity:
                 raise AudioQueueFull("decoded audio queue is full")
 
-        decoded = self._codec.decode_uplink(bytes(payload))
-        if decoded.sample_rate != UPLINK_SAMPLE_RATE:
-            raise AudioFrameRejected(
-                f"uplink codec returned {decoded.sample_rate} Hz PCM, expected "
-                f"{UPLINK_SAMPLE_RATE} Hz"
-            )
-        model_pcm = resample_pcm16_mono(
-            decoded,
-            target_sample_rate=self._model_sample_rate,
-        )
+        model_pcm = self.decode_uplink_frame(payload)
         with self._lock:
             if len(self._uplink_queue) >= self._queue_capacity:
                 raise AudioQueueFull("decoded audio queue is full")
             self._uplink_queue.append(model_pcm)
         return model_pcm
+
+    def decode_uplink_frame(self, payload: bytes) -> Pcm16Mono:
+        if not payload:
+            raise AudioFrameRejected("opus frame is empty")
+        if len(payload) > self._max_uplink_frame_bytes:
+            raise AudioFrameRejected("opus frame is too large")
+        with self._lock:
+            decoded = self._codec.decode_uplink(bytes(payload))
+            if decoded.sample_rate != UPLINK_SAMPLE_RATE:
+                raise AudioFrameRejected(
+                    f"uplink codec returned {decoded.sample_rate} Hz PCM, expected "
+                    f"{UPLINK_SAMPLE_RATE} Hz"
+                )
+            return resample_pcm16_mono(
+                decoded,
+                target_sample_rate=self._model_sample_rate,
+            )
+
+    @property
+    def queue_capacity(self) -> int:
+        return self._queue_capacity
 
     def pop_uplink(self) -> Pcm16Mono | None:
         with self._lock:
@@ -150,18 +166,25 @@ class AudioBridge:
                 return None
             return self._uplink_queue.popleft()
 
+    def drain_uplink(self) -> tuple[Pcm16Mono, ...]:
+        with self._lock:
+            frames = tuple(self._uplink_queue)
+            self._uplink_queue.clear()
+            return frames
+
     def queued_uplink(self) -> Iterator[Pcm16Mono]:
         with self._lock:
             return iter(tuple(self._uplink_queue))
 
     def encode_downlink(self, model_pcm: Pcm16Mono) -> bytes:
-        if model_pcm.sample_rate != self._model_sample_rate:
+        if model_pcm.sample_rate != self._response_sample_rate:
             raise AudioFrameRejected(
                 f"model PCM is {model_pcm.sample_rate} Hz, expected "
-                f"{self._model_sample_rate} Hz"
+                f"{self._response_sample_rate} Hz"
             )
         device_pcm = resample_pcm16_mono(
             model_pcm,
             target_sample_rate=DOWNLINK_SAMPLE_RATE,
         )
-        return self._codec.encode_downlink(device_pcm)
+        with self._lock:
+            return self._codec.encode_downlink(device_pcm)

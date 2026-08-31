@@ -5,9 +5,15 @@ from enum import StrEnum
 from hashlib import sha256
 from secrets import compare_digest
 from threading import RLock
+from typing import Literal
 from uuid import uuid4
 
-from companion_gateway.device.models import AbortControl, DeviceHello, ListenControl
+from companion_gateway.device.models import (
+    AbortControl,
+    DeviceHello,
+    ListenControl,
+    VadControl,
+)
 
 
 Clock = Callable[[], datetime]
@@ -22,6 +28,18 @@ class DevicePhase(StrEnum):
     LISTENING = "listening"
     SPEAKING = "speaking"
     CLOSED = "closed"
+
+
+@dataclass(frozen=True)
+class DeviceStatusSnapshot:
+    device_id: str
+    status: Literal["online", "offline"]
+    session_id: str | None = None
+    connected_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    phase: DevicePhase | None = None
+    listening_mode: str | None = None
+    audio_frames_received: int = 0
 
 
 class InvalidDevicePhase(ValueError):
@@ -53,6 +71,12 @@ class DeviceSession:
     last_seen_at: datetime
     phase: DevicePhase = DevicePhase.IDLE
     audio_frames_received: int = 0
+    listening_mode: str | None = None
+    wake_word_detected: bool = False
+    listening_started: bool = False
+    auto_turn_finished: bool = False
+    conversation_generation: int = 0
+    conversation_idle_armed: bool = False
 
     @classmethod
     def create(
@@ -76,6 +100,18 @@ class DeviceSession:
     def touch(self, *, clock: Clock = _utc_now) -> None:
         self.last_seen_at = clock()
 
+    def arm_conversation_idle(self) -> int:
+        self.conversation_generation += 1
+        self.conversation_idle_armed = True
+        return self.conversation_generation
+
+    def cancel_conversation_idle(self) -> None:
+        self.conversation_generation += 1
+        self.conversation_idle_armed = False
+
+    def is_conversation_idle_current(self, generation: int) -> bool:
+        return self.conversation_idle_armed and self.conversation_generation == generation
+
     def apply_listen(self, control: ListenControl) -> None:
         if control.session_id not in (None, self.session_id):
             raise InvalidDevicePhase("listen message has the wrong session_id")
@@ -85,10 +121,15 @@ class DeviceSession:
                 raise InvalidDevicePhase(
                     f"cannot start listening while {self.phase.value}"
                 )
+            self.listening_mode = control.mode
+            self.listening_started = True
+            self.auto_turn_finished = False
             self.phase = DevicePhase.LISTENING
             return
 
         if control.state == "stop":
+            if self.phase is DevicePhase.IDLE and self.auto_turn_finished:
+                return
             if self.phase is not DevicePhase.LISTENING:
                 raise InvalidDevicePhase(
                     f"cannot stop listening while {self.phase.value}"
@@ -99,6 +140,42 @@ class DeviceSession:
         if self.phase not in (DevicePhase.IDLE, DevicePhase.LISTENING):
             raise InvalidDevicePhase(
                 f"cannot report wake word while {self.phase.value}"
+            )
+        self.wake_word_detected = True
+        if control.mode is not None:
+            self.listening_mode = control.mode
+
+    def should_ignore_wake_word_audio(self) -> bool:
+        return (
+            self.phase is DevicePhase.IDLE
+            and not self.wake_word_detected
+            and not self.listening_started
+        )
+
+    def should_ignore_auto_turn_tail_audio(self) -> bool:
+        return self.phase is DevicePhase.IDLE and self.auto_turn_finished
+
+    def finish_auto_listening(self) -> bool:
+        if self.phase is not DevicePhase.LISTENING or self.listening_mode != "auto":
+            return False
+        self.phase = DevicePhase.IDLE
+        self.auto_turn_finished = True
+        return True
+
+    def apply_vad(self, control: VadControl) -> None:
+        if not self.hello.features.vad_events:
+            raise InvalidDevicePhase("VAD events were not advertised")
+        if control.session_id not in (None, self.session_id):
+            raise InvalidDevicePhase("VAD message has the wrong session_id")
+        if (
+            control.state == "stop"
+            and self.phase is DevicePhase.IDLE
+            and self.auto_turn_finished
+        ):
+            return
+        if self.phase is not DevicePhase.LISTENING:
+            raise InvalidDevicePhase(
+                f"cannot report VAD while {self.phase.value}"
             )
 
     def accept_audio_frame(self) -> None:
@@ -154,6 +231,44 @@ class DeviceSessionRegistry:
     def get(self, device_id: str) -> DeviceSession | None:
         with self._lock:
             return self._sessions.get(device_id)
+
+    def get_by_identity(
+        self,
+        *,
+        device_id: str,
+        client_id: str,
+    ) -> DeviceSession | None:
+        with self._lock:
+            session = self._sessions.get(device_id)
+            if session is None or session.client_id != client_id:
+                return None
+            return session
+
+    def status(self, device_id: str) -> DeviceStatusSnapshot:
+        with self._lock:
+            session = self._sessions.get(device_id)
+            if session is None:
+                return DeviceStatusSnapshot(
+                    device_id=device_id,
+                    status="offline",
+                )
+            return DeviceStatusSnapshot(
+                device_id=session.device_id,
+                status="online",
+                session_id=session.session_id,
+                connected_at=session.connected_at,
+                last_seen_at=session.last_seen_at,
+                phase=session.phase,
+                listening_mode=session.listening_mode,
+                audio_frames_received=session.audio_frames_received,
+            )
+
+    def has_camera_capable_session(self) -> bool:
+        with self._lock:
+            return any(
+                session.hello.features.camera_jpeg
+                for session in self._sessions.values()
+            )
 
 
 def redact_device_id(device_id: str) -> str:

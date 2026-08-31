@@ -2,7 +2,12 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from companion_gateway.domain.models import TaskCreate, TaskEvent, TaskRecord
+from companion_gateway.domain.medication import (
+    MedicationOccurrence,
+    MedicationPlan,
+    MedicationPlanCreate,
+)
+from companion_gateway.domain.models import TaskCreate, TaskEvent, TaskKind, TaskRecord
 from companion_gateway.domain.tasks import TaskEventType
 from companion_gateway.storage.sqlite import SQLiteTaskRepository
 
@@ -48,8 +53,54 @@ class TaskService:
     def get_task(self, task_id: str) -> TaskRecord | None:
         return self._repository.get_task(task_id)
 
+    def get_latest_reminder(
+        self,
+        *,
+        actor_id: str,
+        target_device_id: str,
+    ) -> TaskRecord | None:
+        return self._repository.get_latest_task(
+            actor_id=actor_id,
+            target_device_id=target_device_id,
+            kind=TaskKind.REMINDER,
+        )
+
     def get_events(self, task_id: str) -> list[TaskEvent]:
         return self._repository.list_events(task_id)
+
+    def list_due_tasks(self, *, now: datetime) -> list[TaskRecord]:
+        return self._repository.list_due_tasks(now=now)
+
+    def create_medication_plan(
+        self,
+        plan: MedicationPlanCreate,
+        *,
+        trace_id: str,
+    ) -> tuple[MedicationPlan, bool]:
+        return self._repository.create_medication_plan(
+            plan,
+            plan_id=self._id_factory("medplan"),
+            occurred_at=self._clock(),
+        )
+
+    def get_medication_plan(self, plan_id: str) -> MedicationPlan | None:
+        return self._repository.get_medication_plan(plan_id)
+
+    def list_medication_plans(
+        self, *, enabled: bool | None = None
+    ) -> list[MedicationPlan]:
+        return self._repository.list_medication_plans(enabled=enabled)
+
+    def disable_medication_plan(
+        self, plan_id: str, *, occurred_at: datetime
+    ) -> MedicationPlan:
+        return self._repository.disable_medication_plan(
+            plan_id,
+            occurred_at=occurred_at,
+        )
+
+    def list_medication_occurrences(self) -> list[MedicationOccurrence]:
+        return self._repository.list_medication_occurrences()
 
     def record_event(
         self,
