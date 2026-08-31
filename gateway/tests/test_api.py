@@ -34,6 +34,14 @@ class RecordingReminderVoiceDelivery:
     def synthesize_and_send(self, *, session_id: str, text: str) -> None:
         self.messages.append((session_id, text))
 
+    def synthesize_notification_and_send(
+        self,
+        *,
+        session_id: str,
+        text: str,
+    ) -> None:
+        self.messages.append((session_id, text))
+
     def clear_pending_input(self, *, session_id: str | None = None) -> None:
         return None
 
@@ -363,7 +371,7 @@ def test_task_delivery_logs_outbound_backpressure(tmp_path, monkeypatch) -> None
 
     monkeypatch.setattr(
         voice_delivery,
-        "synthesize_and_send",
+        "synthesize_notification_and_send",
         fail_synthesize_and_send,
     )
     task, _ = app.state.task_executor.create_and_schedule(

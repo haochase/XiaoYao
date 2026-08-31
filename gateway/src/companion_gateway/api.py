@@ -355,7 +355,7 @@ def create_app(
                     task.task_id,
                 )
                 return send_feishu_fallback(task)
-            voice_delivery_service.synthesize_and_send(
+            voice_delivery_service.synthesize_notification_and_send(
                 session_id=session.session_id,
                 text=task.payload.text,
             )
@@ -1245,6 +1245,7 @@ def create_app(
         session: DeviceSession | None = None
         camera_upload: CameraUploadState | None = None
         outbound_sender: asyncio.Task[None] | None = None
+        keepalive_sender: asyncio.Task[None] | None = None
         auto_stop_task: asyncio.Task[None] | None = None
         idle_controller: ConversationIdleController | None = None
         pending_session_close_reason: str | None = None
@@ -1369,6 +1370,7 @@ def create_app(
                             {
                                 "type": "tts",
                                 "state": "start",
+                                "purpose": message.purpose,
                                 "session_id": message.session_id,
                             }
                         )
@@ -1438,6 +1440,9 @@ def create_app(
                             close_reason_length = len(reason)
                             await websocket.close(code=1000, reason=reason)
                             return
+                        if message.purpose == "notification":
+                            post_tts_silence_gate = None
+                            continue
                         if (
                             settings.device_continuous_conversation_enabled
                             and idle_controller is not None
@@ -1464,6 +1469,22 @@ def create_app(
                     )
 
             outbound_sender = asyncio.create_task(forward_outbound())
+
+            async def send_keepalives() -> None:
+                while True:
+                    await asyncio.sleep(settings.device_control_keepalive_seconds)
+                    try:
+                        transport.send_control(
+                            session.session_id,
+                            {
+                                "type": "keepalive",
+                                "session_id": session.session_id,
+                            },
+                        )
+                    except (DeviceNotConnected, DeviceOutboundBackpressure):
+                        return
+
+            keepalive_sender = asyncio.create_task(send_keepalives())
             if settings.camera_enabled and vision_coordinator is not None:
                 if settings.public_websocket_url:
                     transport.send_control(
@@ -2282,6 +2303,10 @@ def create_app(
                 outbound_sender.cancel()
                 with suppress(asyncio.CancelledError):
                     await outbound_sender
+            if keepalive_sender is not None:
+                keepalive_sender.cancel()
+                with suppress(asyncio.CancelledError):
+                    await keepalive_sender
             if session is not None:
                 transport.unregister(session.session_id)
                 device_sessions.disconnect(session)

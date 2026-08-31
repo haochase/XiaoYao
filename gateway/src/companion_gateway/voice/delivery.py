@@ -23,6 +23,12 @@ class TtsTransport(Protocol):
         opus_frames: tuple[bytes, ...],
     ) -> None: ...
 
+    def send_notification_tts_stream(
+        self,
+        session_id: str,
+        opus_frames: tuple[bytes, ...],
+    ) -> None: ...
+
 
 class DeviceVoiceDeliveryService:
     def __init__(
@@ -63,6 +69,19 @@ class DeviceVoiceDeliveryService:
             session_id=session_id,
             opus_frames=self._voice_turn_service.synthesize_text(text),
         )
+
+    def synthesize_notification_and_send(
+        self,
+        *,
+        session_id: str,
+        text: str,
+    ) -> None:
+        opus_frames = self._voice_turn_service.synthesize_text(text)
+        for offset in range(0, len(opus_frames), MAX_TTS_FRAMES):
+            self._device_transport.send_notification_tts_stream(
+                session_id,
+                opus_frames[offset : offset + MAX_TTS_FRAMES],
+            )
 
     def can_synthesize(self, text: str) -> bool:
         """Run a bounded synthesis canary without sending audio to a device."""

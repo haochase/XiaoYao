@@ -26,7 +26,7 @@ _KCONFIG_WEBSOCKET_ONLY_PROFILE = (
     "        configuration. This prevents a failed OTA round from falling back to MQTT.\n\n"
     "choice\n"
 )
-_KCONFIG_PROFILE = (
+_KCONFIG_VAD_PROFILE = (
     "        The application will access this URL to check for new firmwares and server address.\n\n"
     "config XIAOYAO_WEBSOCKET_ONLY\n"
     "    bool \"Force WebSocket protocol\"\n"
@@ -41,6 +41,17 @@ _KCONFIG_PROFILE = (
     "    help\n"
     "        Advertise VAD event support and send speech start and stop controls.\n\n"
     "choice\n"
+)
+_KCONFIG_PROFILE = _KCONFIG_VAD_PROFILE.replace(
+    "choice\n",
+    "config XIAOYAO_PERSISTENT_CONTROL_CHANNEL\n"
+    "    bool \"Keep a low-traffic control channel while idle\"\n"
+    "    default n\n"
+    "    depends on XIAOYAO_WEBSOCKET_ONLY\n"
+    "    help\n"
+    "        Connect after activation and reconnect while idle so reminders can\n"
+    "        play without a wake word. Microphone audio remains disabled in idle.\n\n"
+    "choice\n",
 )
 _PROTOCOL_ANCHOR = (
     "    if (ota_->HasMqttConfig()) {\n"
@@ -143,6 +154,135 @@ _WEBSOCKET_FEATURE_PROFILE = (
     "#endif\n"
     "    cJSON_AddItemToObject(root, \"features\", features);\n"
 )
+_CLOCK_TICK_ANCHOR = (
+    "        if (bits & MAIN_EVENT_CLOCK_TICK) {\n"
+    "            clock_ticks_++;\n"
+    "            auto display = Board::GetInstance().GetDisplay();\n"
+    "            display->UpdateStatusBar();\n\n"
+)
+_CLOCK_TICK_PROFILE = _CLOCK_TICK_ANCHOR + (
+    "#if CONFIG_XIAOYAO_PERSISTENT_CONTROL_CHANNEL\n"
+    "            if (clock_ticks_ % 5 == 0) {\n"
+    "                EnsureIdleControlChannel();\n"
+    "            }\n"
+    "#endif\n\n"
+)
+_NETWORK_CONNECTED_ANCHOR = (
+    "void Application::HandleNetworkConnectedEvent() {\n"
+    "    ESP_LOGI(TAG, \"Network connected\");\n"
+    "    auto state = GetDeviceState();\n"
+)
+_NETWORK_CONNECTED_PROFILE = (
+    "void Application::HandleNetworkConnectedEvent() {\n"
+    "    ESP_LOGI(TAG, \"Network connected\");\n"
+    "    network_connected_ = true;\n"
+    "    auto state = GetDeviceState();\n"
+)
+_NETWORK_DISCONNECTED_ANCHOR = (
+    "void Application::HandleNetworkDisconnectedEvent() {\n"
+    "    // Close current conversation when network disconnected\n"
+    "    auto state = GetDeviceState();\n"
+    "    if (state == kDeviceStateConnecting || state == kDeviceStateListening ||\n"
+    "        state == kDeviceStateSpeaking) {\n"
+    "        ESP_LOGI(TAG, \"Closing audio channel due to network disconnection\");\n"
+    "        protocol_->CloseAudioChannel();\n"
+    "    }\n"
+)
+_NETWORK_DISCONNECTED_PROFILE = (
+    "void Application::HandleNetworkDisconnectedEvent() {\n"
+    "    network_connected_ = false;\n"
+    "    // Close both conversations and the idle control channel.\n"
+    "    if (protocol_ && protocol_->IsAudioChannelOpened()) {\n"
+    "        ESP_LOGI(TAG, \"Closing audio channel due to network disconnection\");\n"
+    "        protocol_->CloseAudioChannel();\n"
+    "    }\n"
+)
+_ACTIVATION_DONE_ANCHOR = (
+    "    SystemInfo::PrintHeapStats();\n"
+    "    SetDeviceState(kDeviceStateIdle);\n\n"
+    "    has_server_time_ = ota_->HasServerTime();\n"
+)
+_ACTIVATION_DONE_PROFILE = (
+    "    SystemInfo::PrintHeapStats();\n"
+    "    SetDeviceState(kDeviceStateIdle);\n"
+    "    EnsureIdleControlChannel();\n\n"
+    "    has_server_time_ = ota_->HasServerTime();\n"
+)
+_TTS_STATE_ANCHOR = (
+    "            if (strcmp(state->valuestring, \"start\") == 0) {\n"
+    "                Schedule([this]() {\n"
+    "                    aborted_ = false;\n"
+    "                    SetDeviceState(kDeviceStateSpeaking);\n"
+    "                });\n"
+    "            } else if (strcmp(state->valuestring, \"stop\") == 0) {\n"
+    "                Schedule([this]() {\n"
+    "                    if (GetDeviceState() == kDeviceStateSpeaking) {\n"
+    "                        if (listening_mode_ == kListeningModeManualStop) {\n"
+    "                            SetDeviceState(kDeviceStateIdle);\n"
+    "                        } else {\n"
+    "                            SetDeviceState(kDeviceStateListening);\n"
+    "                        }\n"
+    "                    }\n"
+    "                });\n"
+)
+_TTS_STATE_PROFILE = (
+    "            if (strcmp(state->valuestring, \"start\") == 0) {\n"
+    "                auto purpose = cJSON_GetObjectItem(root, \"purpose\");\n"
+    "                bool notification = cJSON_IsString(purpose) &&\n"
+    "                    strcmp(purpose->valuestring, \"notification\") == 0;\n"
+    "                Schedule([this, notification]() {\n"
+    "                    aborted_ = false;\n"
+    "                    notification_tts_ = notification;\n"
+    "                    SetDeviceState(kDeviceStateSpeaking);\n"
+    "                });\n"
+    "            } else if (strcmp(state->valuestring, \"stop\") == 0) {\n"
+    "                Schedule([this]() {\n"
+    "                    if (GetDeviceState() == kDeviceStateSpeaking) {\n"
+    "                        if (notification_tts_ ||\n"
+    "                            listening_mode_ == kListeningModeManualStop) {\n"
+    "                            notification_tts_ = false;\n"
+    "                            SetDeviceState(kDeviceStateIdle);\n"
+    "                        } else {\n"
+    "                            SetDeviceState(kDeviceStateListening);\n"
+    "                        }\n"
+    "                    }\n"
+    "                });\n"
+)
+_APP_FIELDS_ANCHOR = (
+    "    bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)\n"
+    "    int clock_ticks_ = 0;\n"
+)
+_APP_FIELDS_PROFILE = (
+    "    bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)\n"
+    "    bool network_connected_ = false;\n"
+    "    bool notification_tts_ = false;\n"
+    "    int clock_ticks_ = 0;\n"
+)
+_APP_METHODS_ANCHOR = (
+    "    void ContinueOpenAudioChannel(ListeningMode mode);\n"
+    "    void BeginWakeWordInvoke(const std::string& wake_word);\n"
+)
+_APP_METHODS_PROFILE = (
+    "    void ContinueOpenAudioChannel(ListeningMode mode);\n"
+    "    void EnsureIdleControlChannel();\n"
+    "    void BeginWakeWordInvoke(const std::string& wake_word);\n"
+)
+_CONTINUE_CHANNEL_ANCHOR = "void Application::ContinueOpenAudioChannel(ListeningMode mode) {\n"
+_CONTINUE_CHANNEL_PROFILE = (
+    "void Application::EnsureIdleControlChannel() {\n"
+    "#if CONFIG_XIAOYAO_PERSISTENT_CONTROL_CHANNEL\n"
+    "    if (!network_connected_ || GetDeviceState() != kDeviceStateIdle ||\n"
+    "        !protocol_ || protocol_->IsAudioChannelOpened()) {\n"
+    "        return;\n"
+    "    }\n"
+    "    ESP_LOGI(TAG, \"Opening idle control channel\");\n"
+    "    if (protocol_->OpenAudioChannel()) {\n"
+    "        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);\n"
+    "    }\n"
+    "#endif\n"
+    "}\n\n"
+    "void Application::ContinueOpenAudioChannel(ListeningMode mode) {\n"
+)
 _BUILD_IDF_ANCHOR = '    command = ["idf.py"]\n'
 _BUILD_IDF_PROFILE = (
     '    command = [os.environ.get("XIAOYAO_IDF_COMMAND", "idf.py")]\n'
@@ -196,7 +336,10 @@ def apply_vendor_profile(source_root: Path) -> None:
         source_root / "main" / "Kconfig.projbuild",
         _KCONFIG_ANCHOR,
         _KCONFIG_PROFILE,
-        previous_profiles=(_KCONFIG_WEBSOCKET_ONLY_PROFILE,),
+        previous_profiles=(
+            _KCONFIG_WEBSOCKET_ONLY_PROFILE,
+            _KCONFIG_VAD_PROFILE,
+        ),
     )
     _apply_exact_profile(
         source_root / "main" / "application.cc",
@@ -212,6 +355,46 @@ def apply_vendor_profile(source_root: Path) -> None:
         source_root / "main" / "application.cc",
         _VAD_CALLBACK_ANCHOR,
         _VAD_CALLBACK_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.cc",
+        _CLOCK_TICK_ANCHOR,
+        _CLOCK_TICK_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.cc",
+        _NETWORK_CONNECTED_ANCHOR,
+        _NETWORK_CONNECTED_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.cc",
+        _NETWORK_DISCONNECTED_ANCHOR,
+        _NETWORK_DISCONNECTED_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.cc",
+        _ACTIVATION_DONE_ANCHOR,
+        _ACTIVATION_DONE_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.cc",
+        _TTS_STATE_ANCHOR,
+        _TTS_STATE_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.cc",
+        _CONTINUE_CHANNEL_ANCHOR,
+        _CONTINUE_CHANNEL_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.h",
+        _APP_FIELDS_ANCHOR,
+        _APP_FIELDS_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.h",
+        _APP_METHODS_ANCHOR,
+        _APP_METHODS_PROFILE,
     )
     _apply_exact_profile(
         source_root / "main" / "protocols" / "protocol.h",

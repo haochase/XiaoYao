@@ -70,6 +70,22 @@ def test_device_transport_preserves_tts_and_task_when_both_are_ready() -> None:
     asyncio.run(scenario())
 
 
+def test_device_transport_marks_notification_tts() -> None:
+    async def scenario() -> None:
+        transport = DeviceTransport()
+        transport.register("ses-notification")
+
+        transport.send_notification_tts_stream(
+            "ses-notification",
+            (b"notification-opus",),
+        )
+
+        message = await transport.next_tts("ses-notification")
+        assert message.purpose == "notification"
+
+    asyncio.run(scenario())
+
+
 def test_cancelling_outbound_wait_cleans_up_both_internal_waiters(
     monkeypatch,
 ) -> None:

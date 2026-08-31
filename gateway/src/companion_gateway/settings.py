@@ -337,6 +337,7 @@ class Settings:
     dynamic_agent_scheduler_interval_seconds: float = 1.0
     device_conversation_idle_timeout_seconds: float = 15.0
     device_continuous_conversation_enabled: bool = False
+    device_control_keepalive_seconds: float = 60.0
     recent_context_enabled: bool = False
     recent_context_retention_days: int = 7
     recent_context_max_messages: int = 20

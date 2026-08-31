@@ -4,6 +4,7 @@ import asyncio
 from concurrent.futures import Future
 from dataclasses import dataclass
 from threading import RLock
+from typing import Literal
 
 from companion_gateway.domain.models import TaskRecord
 
@@ -24,6 +25,7 @@ class DeviceOutboundBackpressure(RuntimeError):
 class OutboundTts:
     session_id: str
     opus_frames: tuple[bytes, ...]
+    purpose: Literal["conversation", "notification"] = "conversation"
 
 
 @dataclass(frozen=True)
@@ -129,6 +131,30 @@ class DeviceTransport:
         session_id: str,
         opus_frames: tuple[bytes, ...],
     ) -> None:
+        self._send_tts_stream(
+            session_id,
+            opus_frames,
+            purpose="conversation",
+        )
+
+    def send_notification_tts_stream(
+        self,
+        session_id: str,
+        opus_frames: tuple[bytes, ...],
+    ) -> None:
+        self._send_tts_stream(
+            session_id,
+            opus_frames,
+            purpose="notification",
+        )
+
+    def _send_tts_stream(
+        self,
+        session_id: str,
+        opus_frames: tuple[bytes, ...],
+        *,
+        purpose: Literal["conversation", "notification"],
+    ) -> None:
         frames = tuple(bytes(frame) for frame in opus_frames)
         if not frames:
             raise ValueError("opus_frames must not be empty")
@@ -143,7 +169,11 @@ class DeviceTransport:
         if channel is None:
             raise DeviceNotConnected(session_id)
 
-        message = OutboundTts(session_id=session_id, opus_frames=frames)
+        message = OutboundTts(
+            session_id=session_id,
+            opus_frames=frames,
+            purpose=purpose,
+        )
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:

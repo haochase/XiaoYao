@@ -30,6 +30,7 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     protocols.mkdir()
     kconfig_path = main / "Kconfig.projbuild"
     application_path = main / "application.cc"
+    application_header_path = main / "application.h"
     protocol_header_path = protocols / "protocol.h"
     protocol_source_path = protocols / "protocol.cc"
     websocket_source_path = protocols / "websocket_protocol.cc"
@@ -73,8 +74,37 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
         "                audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());\n"
         "            }\n"
         "            break;\n"
-        "    }\n"
-        "}\n",
+            "    }\n"
+            "}\n"
+            "\n"
+            "void Application::RunClockFixture() {\n"
+            + firmware_profile._CLOCK_TICK_ANCHOR
+            + "    }\n"
+            "}\n"
+            "\n"
+            + firmware_profile._NETWORK_CONNECTED_ANCHOR
+            + "}\n"
+            "\n"
+            + firmware_profile._NETWORK_DISCONNECTED_ANCHOR
+            + "}\n"
+            "\n"
+            "void Application::HandleActivationDoneEvent() {\n"
+            + firmware_profile._ACTIVATION_DONE_ANCHOR
+            + "}\n"
+            "\n"
+            "void Application::HandleTtsFixture() {\n"
+            + firmware_profile._TTS_STATE_ANCHOR
+            + "}\n"
+            "\n"
+            + firmware_profile._CONTINUE_CHANNEL_ANCHOR
+            + "}\n",
+            encoding="utf-8",
+        )
+    application_header_path.write_text(
+        "class Application {\n"
+        + firmware_profile._APP_FIELDS_ANCHOR
+        + firmware_profile._APP_METHODS_ANCHOR
+        + "};\n",
         encoding="utf-8",
     )
     protocol_header_path.write_text(
@@ -122,6 +152,12 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     assert "#if CONFIG_USE_CUSTOM_WAKE_WORD" in application
     assert "audio_service_.EnableWakeWordDetection(false);" in application
     assert "protocol_->SendVadState(speaking);" in application
+    assert "EnsureIdleControlChannel();" in application
+    assert "clock_ticks_ % 5 == 0" in application
+    assert "notification_tts_ = notification;" in application
+    application_header = application_header_path.read_text(encoding="utf-8")
+    assert "bool network_connected_ = false;" in application_header
+    assert "void EnsureIdleControlChannel();" in application_header
     protocol_header = protocol_header_path.read_text(encoding="utf-8")
     assert "virtual void SendVadState(bool speaking);" in protocol_header
     protocol_source = protocol_source_path.read_text(encoding="utf-8")
@@ -144,11 +180,26 @@ def test_public_xiaoyao_profile_selects_an_esp32s3_chinese_multinet_model() -> N
     assert "CONFIG_XIAOYAO_VAD_EVENTS=y" in template["builds"][0][
         "sdkconfig_append"
     ]
+    assert "CONFIG_XIAOYAO_PERSISTENT_CONTROL_CHANNEL=y" in template["builds"][0][
+        "sdkconfig_append"
+    ]
     assert "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=50" in template["builds"][0][
         "sdkconfig_append"
     ]
     assert "CONFIG_CAMERA_OV2640=y" in template["builds"][0]["sdkconfig_append"]
     assert "CONFIG_SPIRAM=y" in template["builds"][0]["sdkconfig_append"]
+
+
+def test_vendor_profile_contains_persistent_control_channel_boundaries() -> None:
+    source = Path(firmware_profile.__file__).read_text(encoding="utf-8")
+
+    assert "config XIAOYAO_PERSISTENT_CONTROL_CHANNEL" in source
+    assert "EnsureIdleControlChannel" in source
+    assert "clock_ticks_ % 5 == 0" in firmware_profile._CLOCK_TICK_PROFILE
+    assert (
+        'strcmp(purpose->valuestring, "notification") == 0'
+        in firmware_profile._TTS_STATE_PROFILE
+    )
 
 
 def test_exact_profile_can_upgrade_a_previous_rendered_profile(tmp_path: Path) -> None:
