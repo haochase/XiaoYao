@@ -5,6 +5,7 @@ import companion_gateway.device.transport as transport_module
 
 from companion_gateway.device.transport import (
     DeviceTransport,
+    OutboundControl,
     OutboundTask,
     OutboundTts,
 )
@@ -70,6 +71,42 @@ def test_device_transport_preserves_tts_and_task_when_both_are_ready() -> None:
     asyncio.run(scenario())
 
 
+def test_device_transport_marks_notification_tts() -> None:
+    async def scenario() -> None:
+        transport = DeviceTransport()
+        transport.register("ses-notification")
+
+        transport.send_notification_tts_stream(
+            "ses-notification",
+            (b"notification-opus",),
+        )
+
+        message = await transport.next_tts("ses-notification")
+        assert message.purpose == "notification"
+
+    asyncio.run(scenario())
+
+
+def test_device_transport_delivers_control_messages_through_outbound_queue() -> None:
+    async def scenario() -> None:
+        transport = DeviceTransport()
+        transport.register("ses-control")
+
+        transport.send_control(
+            "ses-control",
+            {"type": "keepalive", "session_id": "ses-control"},
+        )
+
+        message = await transport.next_outbound("ses-control")
+        assert isinstance(message, OutboundControl)
+        assert message.payload == {
+            "type": "keepalive",
+            "session_id": "ses-control",
+        }
+
+    asyncio.run(scenario())
+
+
 def test_cancelling_outbound_wait_cleans_up_both_internal_waiters(
     monkeypatch,
 ) -> None:
@@ -96,7 +133,7 @@ def test_cancelling_outbound_wait_cleans_up_both_internal_waiters(
             pass
 
         await asyncio.sleep(0)
-        assert len(created_waiters) == 2
+        assert len(created_waiters) == 3
         assert all(waiter.done() for waiter in created_waiters)
         assert all(waiter.cancelled() for waiter in created_waiters)
 

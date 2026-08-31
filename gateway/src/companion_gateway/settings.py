@@ -374,6 +374,7 @@ class Settings:
     meeting_lookahead_hours: int = 24
     meeting_reminder_lead_seconds: int = 600
     meeting_context_ttl_seconds: float = 300.0
+    device_control_keepalive_seconds: float = 60.0
     device_hello_timeout_seconds: float = 10.0
     device_audio_frame_max_bytes: int = 4096
     device_auto_stop_idle_seconds: float = 1.2

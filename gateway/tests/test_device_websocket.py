@@ -296,6 +296,7 @@ def test_active_device_receives_tts_control_and_binary_audio(
         assert websocket.receive_json() == {
             "type": "tts",
             "state": "start",
+            "purpose": "conversation",
             "session_id": server_hello["session_id"],
         }
         assert websocket.receive_bytes() == opus_frame
@@ -336,6 +337,61 @@ def test_active_device_receives_a_multi_frame_tts_stream(
         assert websocket.receive_json()["state"] == "stop"
 
     assert delays == [0.06, 0.06]
+
+
+def test_notification_tts_keeps_control_connection_open(
+    client: TestClient,
+    app_and_sink,
+) -> None:
+    app, _ = app_and_sink
+
+    with client.websocket_connect(
+        "/v1/devices/ws",
+        headers=websocket_headers(),
+    ) as websocket:
+        websocket.send_json(hello_payload())
+        server_hello = websocket.receive_json()
+        app.state.device_transport.send_notification_tts_stream(
+            server_hello["session_id"],
+            (b"notification-opus",),
+        )
+
+        assert websocket.receive_json() == {
+            "type": "tts",
+            "state": "start",
+            "purpose": "notification",
+            "session_id": server_hello["session_id"],
+        }
+        assert websocket.receive_bytes() == b"notification-opus"
+        assert websocket.receive_json()["state"] == "stop"
+        time.sleep(0.05)
+        assert app.state.device_sessions.get(DEVICE_ID) is not None
+
+
+def test_idle_device_connection_receives_keepalive(tmp_path) -> None:
+    app = create_app(
+        Settings(
+            database_path=tmp_path / "device-keepalive.db",
+            device_token_hashes={
+                DEVICE_ID: sha256(DEVICE_TOKEN.encode("utf-8")).hexdigest()
+            },
+            device_control_keepalive_seconds=0.01,
+        )
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/v1/devices/ws",
+            headers=websocket_headers(),
+        ) as websocket:
+            websocket.send_json(hello_payload())
+            server_hello = websocket.receive_json()
+            assert websocket.receive_json() == {
+                "type": "keepalive",
+                "session_id": server_hello["session_id"],
+            }
+
+
 
 
 def test_tts_disconnect_log_includes_failure_details(
@@ -421,6 +477,7 @@ def test_abort_interrupts_an_active_tts_stream(
         assert websocket.receive_json() == {
             "type": "tts",
             "state": "start",
+            "purpose": "conversation",
             "session_id": session_id,
         }
         assert websocket.receive_bytes() == b"next-opus"
@@ -552,6 +609,7 @@ def test_uplink_audio_can_complete_an_injected_fake_voice_turn(tmp_path) -> None
             assert websocket.receive_json() == {
                 "type": "tts",
                 "state": "start",
+                "purpose": "conversation",
                 "session_id": server_hello["session_id"],
             }
             assert websocket.receive_bytes() == b"voice-loop-opus"

@@ -72,6 +72,7 @@ class SequenceOpusCodec(EchoOpusCodec):
 class RecordingTransport:
     def __init__(self) -> None:
         self.messages: list[tuple[str, tuple[bytes, ...]]] = []
+        self.notification_messages: list[tuple[str, tuple[bytes, ...]]] = []
 
     def send_tts_stream(
         self,
@@ -79,6 +80,13 @@ class RecordingTransport:
         opus_frames: tuple[bytes, ...],
     ) -> None:
         self.messages.append((session_id, opus_frames))
+
+    def send_notification_tts_stream(
+        self,
+        session_id: str,
+        opus_frames: tuple[bytes, ...],
+    ) -> None:
+        self.notification_messages.append((session_id, opus_frames))
 
 
 class TaskRuntime(FakeModelRuntime):
@@ -635,6 +643,59 @@ def test_device_voice_delivery_synthesizes_and_sends_reminder_text() -> None:
     delivery.synthesize_and_send(session_id="ses-reminder", text="take medicine")
 
     assert transport.messages == [("ses-reminder", (b"opus-reply",))]
+
+
+def test_device_voice_delivery_marks_notification_text() -> None:
+    response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
+    transport = RecordingTransport()
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=VoiceTurnService(
+            audio_bridge=AudioBridge(
+                codec=EchoOpusCodec(
+                    pcm_frame(sample_rate=16_000, sample_count=960)
+                ),
+                model_sample_rate=16_000,
+                queue_capacity=1,
+            ),
+            model_runtime=FakeModelRuntime(
+                response_text="reply",
+                response_pcm=response_pcm,
+            ),
+        ),
+        device_transport=transport,
+    )
+
+    delivery.synthesize_notification_and_send(
+        session_id="ses-notification",
+        text="take medicine",
+    )
+
+    assert transport.notification_messages == [
+        ("ses-notification", (b"opus-reply",))
+    ]
+
+
+def test_device_voice_delivery_runs_tts_canary_without_sending() -> None:
+    response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
+    codec = EchoOpusCodec(pcm_frame(sample_rate=16_000, sample_count=960))
+    transport = RecordingTransport()
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=VoiceTurnService(
+            audio_bridge=AudioBridge(
+                codec=codec,
+                model_sample_rate=16_000,
+                queue_capacity=1,
+            ),
+            model_runtime=FakeModelRuntime(
+                response_text="reply",
+                response_pcm=response_pcm,
+            ),
+        ),
+        device_transport=transport,
+    )
+
+    assert delivery.can_synthesize("小瑶在线检查") is True
+    assert transport.messages == []
 
 
 def test_device_voice_delivery_propagates_memory_service(tmp_path) -> None:

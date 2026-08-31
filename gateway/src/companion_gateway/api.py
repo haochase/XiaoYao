@@ -53,6 +53,7 @@ from companion_gateway.device.transport import (
     DeviceNotConnected,
     DeviceOutboundBackpressure,
     DeviceTransport,
+    OutboundControl,
     OutboundTask,
 )
 from companion_gateway.domain.memory import MemoryCandidate, MemoryCategory, utc_now
@@ -330,7 +331,7 @@ def create_app(
                         task.task_id,
                     )
                     return TaskDeliveryAttempt.failed("voice_synthesis_unavailable")
-                voice_delivery_service.synthesize_and_send(
+                voice_delivery_service.synthesize_notification_and_send(
                     session_id=session.session_id,
                     text=task.payload.text,
                 )
@@ -340,7 +341,17 @@ def create_app(
                     task.task_id,
                 )
             else:
-                transport.send_task(session.session_id, task)
+                if voice_delivery_service is None:
+                    return TaskDeliveryAttempt.failed("voice_synthesis_unavailable")
+                voice_delivery_service.synthesize_notification_and_send(
+                    session_id=session.session_id,
+                    text=task.payload.text,
+                )
+                logger.info(
+                    "task_voice_enqueued device=%s task=%s",
+                    redact_device_id(task.target_device_id),
+                    task.task_id,
+                )
         except DeviceNotConnected:
             logger.info(
                 "task_delivery_failed device=%s task=%s reason=device_offline",
@@ -973,6 +984,7 @@ def create_app(
         await websocket.accept()
         session: DeviceSession | None = None
         outbound_sender: asyncio.Task[None] | None = None
+        keepalive_sender: asyncio.Task[None] | None = None
         auto_stop_task: asyncio.Task[None] | None = None
         close_code: int | None = None
         close_reason_length = 0
@@ -1043,6 +1055,12 @@ def create_app(
                 try:
                     while True:
                         message = await transport.next_outbound(session.session_id)
+                        if isinstance(message, OutboundControl):
+                            outbound_kind = "control"
+                            frames_sent = 0
+                            total_frames = 0
+                            await websocket.send_json(message.payload)
+                            continue
                         if isinstance(message, OutboundTask):
                             outbound_kind = "task"
                             frames_sent = 0
@@ -1064,6 +1082,7 @@ def create_app(
                             {
                                 "type": "tts",
                                 "state": "start",
+                                "purpose": message.purpose,
                                 "session_id": message.session_id,
                             }
                         )
@@ -1100,19 +1119,22 @@ def create_app(
                                 len(message.opus_frames),
                             )
                             continue
-                        post_tts_rms_threshold = (
-                            settings.device_vad_post_tts_rms_threshold
-                            if hello.features.vad_events
-                            else settings.device_auto_turn_rms_threshold
-                        )
-                        if post_tts_rms_threshold is not None:
-                            post_tts_frames_ignored = 0
-                            post_tts_silence_gate = ConsecutiveSilenceGate(
-                                rms_threshold=post_tts_rms_threshold,
-                                consecutive_silent_frames=(
-                                    settings.device_post_tts_silence_frames
-                                ),
+                        if message.purpose == "notification":
+                            post_tts_silence_gate = None
+                        else:
+                            post_tts_rms_threshold = (
+                                settings.device_vad_post_tts_rms_threshold
+                                if hello.features.vad_events
+                                else settings.device_auto_turn_rms_threshold
                             )
+                            if post_tts_rms_threshold is not None:
+                                post_tts_frames_ignored = 0
+                                post_tts_silence_gate = ConsecutiveSilenceGate(
+                                    rms_threshold=post_tts_rms_threshold,
+                                    consecutive_silent_frames=(
+                                        settings.device_post_tts_silence_frames
+                                    ),
+                                )
                         await websocket.send_json(
                             {
                                 "type": "tts",
@@ -1142,6 +1164,22 @@ def create_app(
                     )
 
             outbound_sender = asyncio.create_task(forward_outbound())
+
+            async def send_keepalives() -> None:
+                while True:
+                    await asyncio.sleep(settings.device_control_keepalive_seconds)
+                    try:
+                        transport.send_control(
+                            session.session_id,
+                            {
+                                "type": "keepalive",
+                                "session_id": session.session_id,
+                            },
+                        )
+                    except (DeviceNotConnected, DeviceOutboundBackpressure):
+                        return
+
+            keepalive_sender = asyncio.create_task(send_keepalives())
 
             async def process_voice_turn(*, trigger: str) -> None:
                 if voice_delivery_service is None:
@@ -1889,6 +1927,10 @@ def create_app(
                 outbound_sender.cancel()
                 with suppress(asyncio.CancelledError):
                     await outbound_sender
+            if keepalive_sender is not None:
+                keepalive_sender.cancel()
+                with suppress(asyncio.CancelledError):
+                    await keepalive_sender
             if session is not None:
                 transport.unregister(session.session_id)
                 device_sessions.disconnect(session)

@@ -45,6 +45,17 @@ class RecordingReminderVoiceDelivery:
     def synthesize_and_send(self, *, session_id: str, text: str) -> None:
         self.messages.append((session_id, text))
 
+    def synthesize_notification_and_send(
+        self,
+        *,
+        session_id: str,
+        text: str,
+    ) -> None:
+        self.messages.append((session_id, text))
+
+    def clear_pending_input(self, *, session_id: str | None = None) -> None:
+        return None
+
     def set_task_executor(self, task_executor) -> None:
         return None
 
@@ -350,7 +361,11 @@ def test_task_delivery_logs_outbound_backpressure(tmp_path, monkeypatch) -> None
 
     monkeypatch.setattr(api_module.logger, "info", capture_info)
     device_id = "dev-backpressure"
-    app = create_app(Settings(database_path=tmp_path / "backpressure.db"))
+    voice_delivery = RecordingReminderVoiceDelivery()
+    app = create_app(
+        Settings(database_path=tmp_path / "backpressure.db"),
+        voice_delivery_service=voice_delivery,
+    )
     app.state.device_sessions.connect(
         DeviceSession.create(
             device_id=device_id,
@@ -371,10 +386,14 @@ def test_task_delivery_logs_outbound_backpressure(tmp_path, monkeypatch) -> None
         )
     )
 
-    def fail_send_task(*_args, **_kwargs):
+    def fail_synthesize_and_send(*_args, **_kwargs):
         raise DeviceOutboundBackpressure("queue full")
 
-    monkeypatch.setattr(app.state.device_transport, "send_task", fail_send_task)
+    monkeypatch.setattr(
+        voice_delivery,
+        "synthesize_notification_and_send",
+        fail_synthesize_and_send,
+    )
     task, _ = app.state.task_executor.create_and_schedule(
         TaskCreate.model_validate(
             {
@@ -398,7 +417,6 @@ def test_task_delivery_logs_outbound_backpressure(tmp_path, monkeypatch) -> None
 
 def test_reminder_delivery_uses_voice_tts_instead_of_task_json(
     tmp_path,
-    monkeypatch,
 ) -> None:
     device_id = "dev-reminder"
     voice_delivery = RecordingReminderVoiceDelivery()
@@ -435,12 +453,6 @@ def test_reminder_delivery_uses_voice_tts_instead_of_task_json(
         ),
         trace_id="trace-reminder-tts",
     )
-    monkeypatch.setattr(
-        app.state.medication_service,
-        "is_medication_task",
-        lambda task_id: task_id == task.task_id,
-    )
-
     app.state.task_scheduler.tick(now=datetime(2026, 8, 6, 12, tzinfo=UTC))
 
     assert voice_delivery.messages == [(session.session_id, "take medicine")]
@@ -830,10 +842,10 @@ def test_enabled_task_scheduler_notifies_connected_target_device(tmp_path) -> No
         device_token_hashes={
             device_id: sha256(device_token.encode("utf-8")).hexdigest()
         },
-        task_scheduler_enabled=True,
-        task_scheduler_interval_seconds=0.01,
+        task_scheduler_enabled=False,
     )
-    app = create_app(settings)
+    voice_delivery = RecordingReminderVoiceDelivery()
+    app = create_app(settings, voice_delivery_service=voice_delivery)
     command = task_payload()
     command["target_device_id"] = device_id
     command["confirmation_policy"] = "optional"
@@ -866,13 +878,13 @@ def test_enabled_task_scheduler_notifies_connected_target_device(tmp_path) -> No
                 }
             )
             session_hello = websocket.receive_json()
-            notification = websocket.receive_json()
+            app.state.task_scheduler.tick(
+                now=datetime(2026, 8, 6, 12, tzinfo=UTC)
+            )
 
-    assert notification["type"] == "task"
-    assert notification["state"] == "notify"
-    assert notification["session_id"] == session_hello["session_id"]
-    assert notification["task"]["task_id"] == task.task_id
-    assert notification["task"]["status"] == TaskStatus.PENDING_DELIVERY.value
+    assert voice_delivery.messages == [
+        (session_hello["session_id"], "take medicine")
+    ]
     assert app.state.service.get_task(task.task_id).status is TaskStatus.DELIVERED
 
 

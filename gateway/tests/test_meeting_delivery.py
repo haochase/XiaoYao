@@ -42,7 +42,12 @@ class RecordingVoiceDelivery:
         self._error = error
         self.calls: list[tuple[str, str]] = []
 
-    def synthesize_and_send(self, *, session_id: str, text: str) -> None:
+    def synthesize_notification_and_send(
+        self,
+        *,
+        session_id: str,
+        text: str,
+    ) -> None:
         self.calls.append((session_id, text))
         if self._error is not None:
             raise self._error

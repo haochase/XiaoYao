@@ -4,6 +4,7 @@ import asyncio
 from concurrent.futures import Future
 from dataclasses import dataclass
 from threading import RLock
+from typing import Literal
 
 from companion_gateway.domain.models import TaskRecord
 
@@ -24,6 +25,7 @@ class DeviceOutboundBackpressure(RuntimeError):
 class OutboundTts:
     session_id: str
     opus_frames: tuple[bytes, ...]
+    purpose: Literal["conversation", "notification"] = "conversation"
 
 
 @dataclass(frozen=True)
@@ -33,10 +35,17 @@ class OutboundTask:
 
 
 @dataclass(frozen=True)
+class OutboundControl:
+    session_id: str
+    payload: dict[str, object]
+
+
+@dataclass(frozen=True)
 class _OutboundChannel:
     loop: asyncio.AbstractEventLoop
     queue: asyncio.Queue[OutboundTts]
     task_queue: asyncio.Queue[OutboundTask]
+    control_queue: asyncio.Queue[OutboundControl]
 
 
 class DeviceTransport:
@@ -54,6 +63,7 @@ class DeviceTransport:
             loop=asyncio.get_running_loop(),
             queue=asyncio.Queue(maxsize=self._queue_capacity),
             task_queue=asyncio.Queue(maxsize=self._queue_capacity),
+            control_queue=asyncio.Queue(maxsize=self._queue_capacity),
         )
         with self._lock:
             self._channels[session_id] = channel
@@ -76,7 +86,10 @@ class DeviceTransport:
             raise DeviceNotConnected(session_id)
         return await channel.task_queue.get()
 
-    async def next_outbound(self, session_id: str) -> OutboundTts | OutboundTask:
+    async def next_outbound(
+        self,
+        session_id: str,
+    ) -> OutboundTts | OutboundTask | OutboundControl:
         with self._lock:
             channel = self._channels.get(session_id)
         if channel is None:
@@ -85,10 +98,13 @@ class DeviceTransport:
             return channel.queue.get_nowait()
         if not channel.task_queue.empty():
             return channel.task_queue.get_nowait()
+        if not channel.control_queue.empty():
+            return channel.control_queue.get_nowait()
 
         tts_waiter = asyncio.create_task(channel.queue.get())
         task_waiter = asyncio.create_task(channel.task_queue.get())
-        waiters = (tts_waiter, task_waiter)
+        control_waiter = asyncio.create_task(channel.control_queue.get())
+        waiters = (tts_waiter, task_waiter, control_waiter)
         try:
             done, _ = await asyncio.wait(
                 waiters,
@@ -101,8 +117,10 @@ class DeviceTransport:
                 message = waiter.result()
                 if isinstance(message, OutboundTask):
                     channel.task_queue.put_nowait(message)
-                else:
+                elif isinstance(message, OutboundTts):
                     channel.queue.put_nowait(message)
+                else:
+                    channel.control_queue.put_nowait(message)
             return selected.result()
         finally:
             for waiter in waiters:
@@ -118,6 +136,30 @@ class DeviceTransport:
         session_id: str,
         opus_frames: tuple[bytes, ...],
     ) -> None:
+        self._send_tts_stream(
+            session_id,
+            opus_frames,
+            purpose="conversation",
+        )
+
+    def send_notification_tts_stream(
+        self,
+        session_id: str,
+        opus_frames: tuple[bytes, ...],
+    ) -> None:
+        self._send_tts_stream(
+            session_id,
+            opus_frames,
+            purpose="notification",
+        )
+
+    def _send_tts_stream(
+        self,
+        session_id: str,
+        opus_frames: tuple[bytes, ...],
+        *,
+        purpose: Literal["conversation", "notification"],
+    ) -> None:
         frames = tuple(bytes(frame) for frame in opus_frames)
         if not frames:
             raise ValueError("opus_frames must not be empty")
@@ -132,7 +174,11 @@ class DeviceTransport:
         if channel is None:
             raise DeviceNotConnected(session_id)
 
-        message = OutboundTts(session_id=session_id, opus_frames=frames)
+        message = OutboundTts(
+            session_id=session_id,
+            opus_frames=frames,
+            purpose=purpose,
+        )
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -168,6 +214,29 @@ class DeviceTransport:
         completion: Future[None] = Future()
         channel.loop.call_soon_threadsafe(
             self._enqueue_task_with_completion,
+            channel,
+            message,
+            completion,
+        )
+        completion.result(timeout=1.0)
+
+    def send_control(self, session_id: str, payload: dict[str, object]) -> None:
+        with self._lock:
+            channel = self._channels.get(session_id)
+        if channel is None:
+            raise DeviceNotConnected(session_id)
+        message = OutboundControl(session_id=session_id, payload=dict(payload))
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is channel.loop:
+            self._enqueue_control(channel, message)
+            return
+
+        completion: Future[None] = Future()
+        channel.loop.call_soon_threadsafe(
+            self._enqueue_control_with_completion,
             channel,
             message,
             completion,
@@ -218,6 +287,32 @@ class DeviceTransport:
             if active is not channel:
                 raise DeviceNotConnected(message.session_id)
             self._enqueue_task(channel, message)
+        except BaseException as exc:
+            completion.set_exception(exc)
+        else:
+            completion.set_result(None)
+
+    @staticmethod
+    def _enqueue_control(
+        channel: _OutboundChannel,
+        message: OutboundControl,
+    ) -> None:
+        if channel.control_queue.full():
+            raise DeviceOutboundBackpressure("device outbound queue is full")
+        channel.control_queue.put_nowait(message)
+
+    def _enqueue_control_with_completion(
+        self,
+        channel: _OutboundChannel,
+        message: OutboundControl,
+        completion: Future[None],
+    ) -> None:
+        try:
+            with self._lock:
+                active = self._channels.get(message.session_id)
+            if active is not channel:
+                raise DeviceNotConnected(message.session_id)
+            self._enqueue_control(channel, message)
         except BaseException as exc:
             completion.set_exception(exc)
         else:

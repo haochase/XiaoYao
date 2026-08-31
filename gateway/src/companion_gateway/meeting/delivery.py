@@ -29,7 +29,7 @@ class MeetingDeliveryService:
         session = self._sessions.get(task.target_device_id)
         if session is not None and self._voice is not None:
             try:
-                self._voice.synthesize_and_send(
+                self._voice.synthesize_notification_and_send(
                     session_id=session.session_id,
                     text=task.payload.text,
                 )
