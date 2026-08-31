@@ -347,26 +347,23 @@ def create_app(
             )
             return send_feishu_fallback(task)
         try:
-            if medication_service.is_medication_task(task.task_id):
-                if voice_delivery_service is None:
-                    logger.info(
-                        "task_delivery_failed device=%s task=%s "
-                        "reason=voice_synthesis_unavailable",
-                        redact_device_id(task.target_device_id),
-                        task.task_id,
-                    )
-                    return TaskDeliveryAttempt.failed("voice_synthesis_unavailable")
-                voice_delivery_service.synthesize_and_send(
-                    session_id=session.session_id,
-                    text=task.payload.text,
-                )
+            if voice_delivery_service is None:
                 logger.info(
-                    "medication_voice_enqueued device=%s task=%s",
+                    "task_delivery_failed device=%s task=%s "
+                    "reason=voice_synthesis_unavailable",
                     redact_device_id(task.target_device_id),
                     task.task_id,
                 )
-            else:
-                transport.send_task(session.session_id, task)
+                return send_feishu_fallback(task)
+            voice_delivery_service.synthesize_and_send(
+                session_id=session.session_id,
+                text=task.payload.text,
+            )
+            logger.info(
+                "task_voice_enqueued device=%s task=%s",
+                redact_device_id(task.target_device_id),
+                task.task_id,
+            )
         except DeviceNotConnected:
             logger.info(
                 "task_delivery_failed device=%s task=%s reason=device_offline",
@@ -388,7 +385,7 @@ def create_app(
                 redact_device_id(task.target_device_id),
                 task.task_id,
             )
-            return TaskDeliveryAttempt.failed("voice_synthesis_failed")
+            return send_feishu_fallback(task)
         logger.info(
             "task_delivery_succeeded device=%s task=%s",
             redact_device_id(task.target_device_id),
