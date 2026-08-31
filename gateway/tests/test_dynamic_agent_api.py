@@ -63,7 +63,7 @@ class RecordingListener:
 def dynamic_settings(tmp_path) -> Settings:
     return Settings(
         database_path=tmp_path / "dynamic-agent-api.db",
-        mimo_api_key="example-token",
+        minicpm_o_auth_token="example-token",
         dynamic_agents_enabled=True,
         dynamic_agent_owner_id="ou_owner",
         dynamic_agent_target_device_id="living-room",
@@ -199,9 +199,9 @@ def test_default_app_injects_dynamic_agent_router_into_feishu_listener(
         "create_feishu_chat_listener",
         fake_create_feishu_chat_listener,
     )
-    monkeypatch.setattr(api_module, "MimoTextChatRuntime", RecordingTextRuntime)
+    monkeypatch.setattr(api_module, "MinicpmOTextChatRuntime", RecordingTextRuntime)
     monkeypatch.setenv("COMPANION_DB_PATH", str(tmp_path / "default.db"))
-    monkeypatch.setenv("COMPANION_MIMO_API_KEY", "example-token")
+    monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "example-token")
     monkeypatch.setenv("COMPANION_DYNAMIC_AGENTS_ENABLED", "true")
     monkeypatch.setenv("COMPANION_DYNAMIC_AGENT_OWNER_ID", "ou_owner")
     monkeypatch.setenv(
@@ -233,8 +233,8 @@ def test_demo_status_contains_only_sanitized_readiness_fields(tmp_path) -> None:
         payload = client.get("/v1/demo/status").json()
 
     assert payload == {
-        "mimo_configured": True,
-        "mimo_canary_ok": True,
+        "model_configured": True,
+        "model_canary_ok": True,
         "tts_configured": False,
         "tts_canary_ok": False,
         "feishu_available": False,
@@ -295,8 +295,8 @@ def test_dynamic_agent_demo_check_uses_read_only_endpoints() -> None:
                 "checks": {"database": "ok"},
             },
             "/v1/demo/status": {
-                "mimo_configured": True,
-                "mimo_canary_ok": True,
+                "model_configured": True,
+                "model_canary_ok": True,
                 "tts_configured": True,
                 "tts_canary_ok": True,
                 "feishu_available": True,
@@ -314,8 +314,8 @@ def test_dynamic_agent_demo_check_uses_read_only_endpoints() -> None:
     )
 
     assert result["status"] == "ok"
-    assert result["checks"]["mimo_configured"] is True
-    assert result["checks"]["mimo_canary_ok"] is True
+    assert result["checks"]["model_configured"] is True
+    assert result["checks"]["model_canary_ok"] is True
     assert result["checks"]["device_online"] is False
     assert [request.method for request in requests] == ["GET", "GET", "GET"]
     assert "health" not in result

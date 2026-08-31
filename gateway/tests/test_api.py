@@ -23,7 +23,6 @@ from companion_gateway.voice.minicpm_o import (
     MinicpmOHttpRuntime,
     MinicpmORealtimeRuntime,
 )
-from companion_gateway.voice.mimo_v25 import MimoV25Runtime
 
 
 class RecordingReminderVoiceDelivery:
@@ -210,7 +209,7 @@ def test_default_app_builds_feishu_chat_listener_when_enabled(
     monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test_app")
     monkeypatch.setenv("COMPANION_FEISHU_APP_SECRET", "secret_test_value")
     monkeypatch.setenv("COMPANION_FEISHU_RECEIVER_OPEN_ID", "ou_owner")
-    monkeypatch.setenv("COMPANION_MIMO_API_KEY", "example-token")
+    monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "example-token")
     monkeypatch.setenv("COMPANION_FEISHU_CHAT_ENABLED", "true")
 
     app = create_default_app()
@@ -672,20 +671,18 @@ def test_default_app_loads_gateway_dotenv_file(tmp_path, monkeypatch) -> None:
     environment_file = tmp_path / ".env"
     database_path = tmp_path / "dotenv-default.db"
     environment_file.write_text(
-        "COMPANION_VOICE_RUNTIME=mimo\n"
-        "COMPANION_MIMO_API_KEY=dotenv-token\n"
+        "COMPANION_VOICE_RUNTIME=none\n"
+        "COMPANION_MINICPM_O_AUTH_TOKEN=dotenv-token\n"
         f"COMPANION_DB_PATH={database_path}\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(api_module, "LOCAL_ENV_PATH", environment_file)
     monkeypatch.delenv("COMPANION_VOICE_RUNTIME", raising=False)
-    monkeypatch.delenv("COMPANION_MIMO_API_KEY", raising=False)
+    monkeypatch.delenv("COMPANION_MINICPM_O_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("COMPANION_DB_PATH", raising=False)
 
     app = create_default_app()
 
-    runtime = app.state.voice_delivery_service._voice_turn_service._model_runtime
-    assert isinstance(runtime, MimoV25Runtime)
     assert app.state.repository._database_path == database_path
 
 
@@ -740,43 +737,6 @@ def test_default_app_selects_minicpm_o_realtime_runtime(monkeypatch, tmp_path) -
         delivery._voice_turn_service._model_runtime,
         MinicpmORealtimeRuntime,
     )
-
-
-def test_default_app_selects_mimo_v25_runtime(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("COMPANION_DB_PATH", str(tmp_path / "mimo-runtime.db"))
-    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "mimo")
-    monkeypatch.setenv("COMPANION_MIMO_API_KEY", "example-token")
-    monkeypatch.setenv("COMPANION_AUDIO_QUEUE_CAPACITY", "96")
-    monkeypatch.setenv("COMPANION_MIMO_MAX_RETRIES", "3")
-    monkeypatch.setenv("COMPANION_MIMO_RETRY_BACKOFF_SECONDS", "0.25")
-
-    app = create_default_app()
-
-    delivery = app.state.voice_delivery_service
-    assert delivery is not None
-    assert isinstance(delivery._voice_turn_service._model_runtime, MimoV25Runtime)
-    bridge = delivery._voice_turn_service._audio_bridge
-    assert bridge._model_sample_rate == 16_000
-    assert bridge._response_sample_rate == 24_000
-    assert bridge._queue_capacity == 96
-    runtime = delivery._voice_turn_service._model_runtime
-    assert runtime._max_retries == 3
-    assert runtime._retry_backoff_seconds == 0.25
-
-
-def test_default_app_enables_mimo_memory_proposal_prompt_only_when_configured(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    monkeypatch.setenv("COMPANION_DB_PATH", str(tmp_path / "mimo-memory.db"))
-    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "mimo")
-    monkeypatch.setenv("COMPANION_MIMO_API_KEY", "example-token")
-    monkeypatch.setenv("COMPANION_MEMORY_ENABLED", "true")
-
-    app = create_default_app()
-
-    runtime = app.state.voice_delivery_service._voice_turn_service._model_runtime
-    assert "memory_proposals" in runtime._system_prompt
 
 
 def test_default_app_passes_minicpm_o_auth_token_to_runtime(

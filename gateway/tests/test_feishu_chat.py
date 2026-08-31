@@ -123,7 +123,7 @@ def test_chat_service_keeps_bounded_context_and_can_clear_it() -> None:
     assert runtime.calls[2][1] == ()
 
 
-def test_chat_service_calls_optional_agent_router_after_local_commands_and_before_mimo() -> None:
+def test_chat_service_calls_optional_agent_router_after_local_commands_and_before_minicpm_o() -> None:
     runtime = RecordingRuntime(["ordinary reply"])
     router = RecordingAgentRouter(
         result=AgentRouteResult(handled=True, reply="agent reply"),

@@ -46,8 +46,8 @@ def test_check_gateway_reports_enabled_agent_count() -> None:
                 f"{base_url}/v1/demo/status": FakeResponse(
                     status=200,
                     payload={
-                        "mimo_configured": True,
-                        "mimo_canary_ok": True,
+                        "model_configured": True,
+                        "model_canary_ok": True,
                         "tts_configured": True,
                         "tts_canary_ok": True,
                         "feishu_available": True,
@@ -84,8 +84,8 @@ def test_check_gateway_fails_when_database_is_not_ready() -> None:
                 f"{base_url}/v1/demo/status": FakeResponse(
                     status=200,
                     payload={
-                        "mimo_configured": True,
-                        "mimo_canary_ok": False,
+                        "model_configured": True,
+                        "model_canary_ok": False,
                         "tts_configured": True,
                         "tts_canary_ok": False,
                         "feishu_available": False,
@@ -100,5 +100,5 @@ def test_check_gateway_fails_when_database_is_not_ready() -> None:
 
     assert result["status"] == "error"
     assert result["checks"]["dynamic_agents_enabled"] is False
-    assert result["checks"]["mimo_canary_ok"] is False
+    assert result["checks"]["model_canary_ok"] is False
     assert result["checks"]["tts_canary_ok"] is False

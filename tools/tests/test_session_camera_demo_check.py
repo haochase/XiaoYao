@@ -30,8 +30,8 @@ def test_session_camera_check_returns_sanitized_readiness_fields() -> None:
             "/v1/demo/status": Response(
                 200,
                 {
-                    "mimo_configured": True,
-                    "mimo_canary_ok": True,
+                    "model_configured": True,
+                    "model_canary_ok": True,
                     "tts_configured": True,
                     "tts_canary_ok": True,
                     "feishu_available": True,

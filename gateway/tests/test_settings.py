@@ -14,23 +14,23 @@ def test_load_environment_file_uses_file_defaults_and_preserves_process_values(
     environment_file = tmp_path / ".env"
     environment_file.write_text(
         "# local-only settings\n"
-        "COMPANION_VOICE_RUNTIME=mimo\n"
-        "COMPANION_MIMO_API_KEY='file-token'\n"
+        "COMPANION_VOICE_RUNTIME=realtime\n"
+        "COMPANION_MINICPM_O_AUTH_TOKEN='file-token'\n"
         "EMPTY_VALUE=\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "fixture")
-    monkeypatch.delenv("COMPANION_MIMO_API_KEY", raising=False)
+    monkeypatch.delenv("COMPANION_MINICPM_O_AUTH_TOKEN", raising=False)
 
     loaded = load_environment_file(environment_file)
 
     assert loaded == {
         "COMPANION_VOICE_RUNTIME",
-        "COMPANION_MIMO_API_KEY",
+        "COMPANION_MINICPM_O_AUTH_TOKEN",
         "EMPTY_VALUE",
     }
     assert os.environ["COMPANION_VOICE_RUNTIME"] == "fixture"
-    assert os.environ["COMPANION_MIMO_API_KEY"] == "file-token"
+    assert os.environ["COMPANION_MINICPM_O_AUTH_TOKEN"] == "file-token"
     assert os.environ["EMPTY_VALUE"] == ""
 
 
@@ -110,26 +110,22 @@ def test_settings_rejects_negative_minicpm_retry_values(
         Settings(database_path=Path("data/test.db"), **{field: value})
 
 
-def test_settings_loads_mimo_runtime_configuration(monkeypatch) -> None:
-    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "mimo")
-    monkeypatch.setenv("COMPANION_MIMO_API_KEY", "example-token")
+def test_settings_loads_minicpm_o_chat_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "example-token")
     monkeypatch.setenv("COMPANION_AUDIO_QUEUE_CAPACITY", "96")
-    monkeypatch.setenv("COMPANION_MIMO_MAX_RETRIES", "3")
-    monkeypatch.setenv("COMPANION_MIMO_RETRY_BACKOFF_SECONDS", "0.25")
+    monkeypatch.setenv("COMPANION_MINICPM_O_COMPATIBLE_MAX_RETRIES", "3")
+    monkeypatch.setenv("COMPANION_MINICPM_O_COMPATIBLE_RETRY_BACKOFF_SECONDS", "0.25")
 
     settings = Settings.from_environment()
 
-    assert settings.voice_runtime == "mimo"
-    assert settings.mimo_openai_base_url == (
-        "https://token-plan-cn.xiaomimimo.com/v1"
+    assert settings.minicpm_o_compatible_base_url == (
+        "http://127.0.0.1:9000/v1"
     )
-    assert settings.mimo_anthropic_base_url == (
-        "https://token-plan-cn.xiaomimimo.com/anthropic"
-    )
-    assert settings.mimo_api_key == "example-token"
+    assert settings.minicpm_o_auth_token == "example-token"
+    assert settings.minicpm_o_model == "MiniCPM-O-4.5-9B"
     assert settings.audio_queue_capacity == 96
-    assert settings.mimo_max_retries == 3
-    assert settings.mimo_retry_backoff_seconds == 0.25
+    assert settings.minicpm_o_compatible_max_retries == 3
+    assert settings.minicpm_o_compatible_retry_backoff_seconds == 0.25
 
 
 def test_settings_loads_device_auto_stop_idle_seconds(monkeypatch) -> None:
@@ -197,14 +193,6 @@ def test_settings_rejects_invalid_device_auto_stop_idle_seconds(
         Settings.from_environment()
 
 
-def test_settings_requires_mimo_api_key(monkeypatch) -> None:
-    monkeypatch.setenv("COMPANION_VOICE_RUNTIME", "mimo")
-    monkeypatch.delenv("COMPANION_MIMO_API_KEY", raising=False)
-
-    with pytest.raises(ValueError, match="COMPANION_MIMO_API_KEY"):
-        Settings.from_environment()
-
-
 def test_settings_loads_minicpm_o_auth_token(monkeypatch) -> None:
     monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "ascend-runtime-token")
 
@@ -250,7 +238,7 @@ def test_settings_loads_feishu_chat_configuration(monkeypatch) -> None:
     monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test_app")
     monkeypatch.setenv("COMPANION_FEISHU_APP_SECRET", "secret_test_value")
     monkeypatch.setenv("COMPANION_FEISHU_RECEIVER_OPEN_ID", "ou_test_receiver")
-    monkeypatch.setenv("COMPANION_MIMO_API_KEY", "example-token")
+    monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "example-token")
     monkeypatch.setenv("COMPANION_FEISHU_CHAT_ENABLED", "true")
     monkeypatch.setenv("COMPANION_FEISHU_CHAT_HISTORY_TURNS", "4")
 
@@ -260,7 +248,7 @@ def test_settings_loads_feishu_chat_configuration(monkeypatch) -> None:
     assert settings.feishu_chat_history_turns == 4
 
 
-def test_settings_requires_feishu_and_mimo_for_enabled_chat(monkeypatch) -> None:
+def test_settings_requires_feishu_and_minicpm_o_for_enabled_chat(monkeypatch) -> None:
     monkeypatch.setenv("COMPANION_FEISHU_CHAT_ENABLED", "true")
 
     with pytest.raises(ValueError, match="COMPANION_FEISHU_CHAT_ENABLED"):
@@ -613,7 +601,7 @@ def test_dynamic_agents_are_disabled_by_default() -> None:
 
 
 def test_settings_loads_dynamic_agent_configuration(monkeypatch) -> None:
-    monkeypatch.setenv("COMPANION_MIMO_API_KEY", "example-token")
+    monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "example-token")
     monkeypatch.setenv("COMPANION_DYNAMIC_AGENTS_ENABLED", "true")
     monkeypatch.setenv("COMPANION_DYNAMIC_AGENT_OWNER_ID", "ou_owner")
     monkeypatch.setenv(
@@ -634,7 +622,7 @@ def test_settings_loads_dynamic_agent_configuration(monkeypatch) -> None:
 
 
 def test_settings_infers_dynamic_owner_and_unique_ota_device(monkeypatch) -> None:
-    monkeypatch.setenv("COMPANION_MIMO_API_KEY", "example-token")
+    monkeypatch.setenv("COMPANION_MINICPM_O_AUTH_TOKEN", "example-token")
     monkeypatch.setenv("COMPANION_DYNAMIC_AGENTS_ENABLED", "true")
     monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test")
     monkeypatch.setenv("COMPANION_FEISHU_APP_SECRET", "secret_test")
@@ -740,7 +728,7 @@ def test_settings_loads_recent_context_configuration(monkeypatch) -> None:
     [
         ("dynamic_agent_owner_id", None, "OWNER_ID"),
         ("dynamic_agent_target_device_id", None, "TARGET_DEVICE_ID"),
-        ("mimo_api_key", None, "MIMO_API_KEY"),
+        ("minicpm_o_auth_token", None, "MINICPM_O_AUTH_TOKEN"),
         ("dynamic_agent_scheduler_interval_seconds", 0, "INTERVAL_SECONDS"),
     ],
 )
@@ -755,7 +743,7 @@ def test_enabled_dynamic_agents_require_complete_configuration(
         "dynamic_agent_owner_id": "ou_owner",
         "dynamic_agent_target_device_id": "living-room",
         "dynamic_agent_scheduler_interval_seconds": 1.0,
-        "mimo_api_key": "example-token",
+        "minicpm_o_auth_token": "example-token",
     }
     values[field] = value
 

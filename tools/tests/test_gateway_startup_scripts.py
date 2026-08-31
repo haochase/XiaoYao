@@ -74,7 +74,7 @@ def test_runtime_check_uses_local_health_without_reading_or_printing_secrets() -
     assert "expected_host_resolved" in runtime_check
     assert "expected_host_listening" in runtime_check
     assert "GET-CONTENT" not in normalized
-    assert "COMPANION_MIMO_API_KEY" not in normalized
+    assert "COMPANION_MINICPM_O_AUTH_TOKEN" not in normalized
     assert "COMPANION_OTA_DEVICE_TOKENS" not in normalized
 
 

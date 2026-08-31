@@ -21,7 +21,7 @@ from starlette.websockets import WebSocketDisconnect
 from companion_gateway.agent.compiler import (
     AGENT_COMPILER_SYSTEM_PROMPT,
     AgentSpecCompileError,
-    MimoAgentSpecCompiler,
+    MinicpmOAgentSpecCompiler,
 )
 from companion_gateway.agent.registry import AgentRegistry
 from companion_gateway.agent.router import AgentCommandRouter
@@ -45,7 +45,7 @@ from companion_gateway.audio.turn import (
     VadTurnEndpointDetector,
 )
 from companion_gateway.channels.feishu_chat import create_feishu_chat_listener
-from companion_gateway.chat.mimo import MimoTextChatRuntime
+from companion_gateway.chat.minicpm_o import MinicpmOTextChatRuntime
 from companion_gateway.chat.service import TextChatRuntime
 from companion_gateway.context.service import ConversationContextService
 from companion_gateway.device.events import (
@@ -135,7 +135,6 @@ from companion_gateway.voice.minicpm_o import (
     MinicpmORealtimeRuntime,
     ModelRuntimeError,
 )
-from companion_gateway.voice.mimo_v25 import MimoV25Runtime
 
 
 Reason = Annotated[
@@ -480,20 +479,20 @@ def create_app(
         if owner_id is None or target_device_id is None:
             raise ValueError("dynamic Agent settings are incomplete")
         if agent_text_runtime is None:
-            if settings.mimo_api_key is None:
-                raise ValueError("dynamic Agents require a MiMo API key")
-            agent_text_runtime = MimoTextChatRuntime(
-                openai_base_url=settings.mimo_openai_base_url,
-                api_key=settings.mimo_api_key,
-                model=settings.mimo_model,
-                timeout_seconds=settings.mimo_timeout_seconds,
-                max_retries=settings.mimo_max_retries,
-                retry_backoff_seconds=settings.mimo_retry_backoff_seconds,
+            if settings.minicpm_o_auth_token is None:
+                raise ValueError("dynamic Agents require a MiniCPM-o 4.5 API key")
+            agent_text_runtime = MinicpmOTextChatRuntime(
+                openai_base_url=settings.minicpm_o_compatible_base_url,
+                api_key=settings.minicpm_o_auth_token,
+                model=settings.minicpm_o_model,
+                timeout_seconds=settings.minicpm_o_compatible_timeout_seconds,
+                max_retries=settings.minicpm_o_compatible_max_retries,
+                retry_backoff_seconds=settings.minicpm_o_compatible_retry_backoff_seconds,
                 system_prompt=AGENT_COMPILER_SYSTEM_PROMPT,
             )
         agent_registry = AgentRegistry(
             repository=repository,
-            compiler=MimoAgentSpecCompiler(runtime=agent_text_runtime),
+            compiler=MinicpmOAgentSpecCompiler(runtime=agent_text_runtime),
         )
 
         def send_dynamic_feishu(text: str) -> bool:
@@ -698,24 +697,24 @@ def create_app(
                 )
             except Exception:
                 recent_image_count = 0
-        mimo_canary_ok = False
+        model_canary_ok = False
         if agent_text_runtime is not None:
             try:
-                mimo_canary_ok = bool(
+                model_canary_ok = bool(
                     agent_text_runtime.respond(
                         'Return exactly this JSON object: {"status":"ok"}',
                         history=(),
                     ).strip()
                 )
             except Exception:
-                mimo_canary_ok = False
+                model_canary_ok = False
         tts_canary_ok = bool(
             voice_delivery_service is not None
             and voice_delivery_service.can_synthesize("小瑶在线检查")
         )
         return {
-            "mimo_configured": settings.mimo_api_key is not None,
-            "mimo_canary_ok": mimo_canary_ok,
+            "model_configured": settings.minicpm_o_auth_token is not None,
+            "model_canary_ok": model_canary_ok,
             "tts_configured": voice_delivery_service is not None,
             "tts_canary_ok": tts_canary_ok,
             "feishu_available": bool(
@@ -2690,36 +2689,16 @@ def create_default_app() -> FastAPI:
             response_sample_rate=24_000,
             queue_capacity=settings.audio_queue_capacity,
         )
-    elif settings.voice_runtime == "mimo":
-        if settings.mimo_api_key is None:
-            raise ValueError("mimo voice runtime requires COMPANION_MIMO_API_KEY")
-        voice_delivery_service = create_voice_delivery(
-            model_runtime=MimoV25Runtime(
-                openai_base_url=settings.mimo_openai_base_url,
-                api_key=settings.mimo_api_key,
-                model=settings.mimo_model,
-                tts_model=settings.mimo_tts_model,
-                tts_voice=settings.mimo_tts_voice,
-                timeout_seconds=settings.mimo_timeout_seconds,
-                max_retries=settings.mimo_max_retries,
-                retry_backoff_seconds=settings.mimo_retry_backoff_seconds,
-                memory_proposals_enabled=settings.memory_enabled,
-            ),
-            device_transport=transport,
-            model_sample_rate=16_000,
-            response_sample_rate=24_000,
-            queue_capacity=settings.audio_queue_capacity,
-        )
     if settings.dynamic_agents_enabled:
-        if settings.mimo_api_key is None:
-            raise ValueError("text Agent runtime requires COMPANION_MIMO_API_KEY")
-        agent_text_runtime = MimoTextChatRuntime(
-            openai_base_url=settings.mimo_openai_base_url,
-            api_key=settings.mimo_api_key,
-            model=settings.mimo_model,
-            timeout_seconds=settings.mimo_timeout_seconds,
-            max_retries=settings.mimo_max_retries,
-            retry_backoff_seconds=settings.mimo_retry_backoff_seconds,
+        if settings.minicpm_o_auth_token is None:
+            raise ValueError("text Agent runtime requires COMPANION_MINICPM_O_AUTH_TOKEN")
+        agent_text_runtime = MinicpmOTextChatRuntime(
+            openai_base_url=settings.minicpm_o_compatible_base_url,
+            api_key=settings.minicpm_o_auth_token,
+            model=settings.minicpm_o_model,
+            timeout_seconds=settings.minicpm_o_compatible_timeout_seconds,
+            max_retries=settings.minicpm_o_compatible_max_retries,
+            retry_backoff_seconds=settings.minicpm_o_compatible_retry_backoff_seconds,
             system_prompt=AGENT_COMPILER_SYSTEM_PROMPT,
         )
     if settings.feishu_chat_enabled:
@@ -2727,16 +2706,16 @@ def create_default_app() -> FastAPI:
             settings.feishu_app_id is None
             or settings.feishu_app_secret is None
             or settings.feishu_receiver_open_id is None
-            or settings.mimo_api_key is None
+            or settings.minicpm_o_auth_token is None
         ):
             raise ValueError("Feishu chat settings are incomplete")
-        feishu_text_runtime = MimoTextChatRuntime(
-            openai_base_url=settings.mimo_openai_base_url,
-            api_key=settings.mimo_api_key,
-            model=settings.mimo_model,
-            timeout_seconds=settings.mimo_timeout_seconds,
-            max_retries=settings.mimo_max_retries,
-            retry_backoff_seconds=settings.mimo_retry_backoff_seconds,
+        feishu_text_runtime = MinicpmOTextChatRuntime(
+            openai_base_url=settings.minicpm_o_compatible_base_url,
+            api_key=settings.minicpm_o_auth_token,
+            model=settings.minicpm_o_model,
+            timeout_seconds=settings.minicpm_o_compatible_timeout_seconds,
+            max_retries=settings.minicpm_o_compatible_max_retries,
+            retry_backoff_seconds=settings.minicpm_o_compatible_retry_backoff_seconds,
         )
 
         def feishu_chat_listener_factory(agent_router):

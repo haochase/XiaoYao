@@ -63,8 +63,8 @@ def check_gateway(
         urlopen=urlopen,
     )
     expected_demo_fields = {
-        "mimo_configured",
-        "mimo_canary_ok",
+        "model_configured",
+        "model_canary_ok",
         "tts_configured",
         "tts_canary_ok",
         "feishu_available",
@@ -85,8 +85,8 @@ def check_gateway(
         and ready_status == 200
         and ready.get("status") == "ready"
         and demo_status == 200
-        and demo["mimo_configured"] is True
-        and demo["mimo_canary_ok"] is True
+        and demo["model_configured"] is True
+        and demo["model_canary_ok"] is True
         and demo["tts_configured"] is True
         and demo["tts_canary_ok"] is True
         and demo["feishu_available"] is True

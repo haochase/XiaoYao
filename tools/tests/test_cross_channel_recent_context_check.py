@@ -30,8 +30,8 @@ def test_recent_context_check_returns_only_safe_fields() -> None:
             "/v1/demo/status": Response(
                 200,
                 {
-                    "mimo_configured": True,
-                    "mimo_canary_ok": True,
+                    "model_configured": True,
+                    "model_canary_ok": True,
                     "tts_configured": True,
                     "tts_canary_ok": True,
                     "feishu_available": True,
@@ -53,8 +53,8 @@ def test_recent_context_check_returns_only_safe_fields() -> None:
         "dynamic_agent_count": 3,
         "dynamic_agents_enabled": True,
         "feishu_available": True,
-        "mimo_canary_ok": True,
-        "mimo_configured": True,
+        "model_canary_ok": True,
+        "model_configured": True,
         "recent_context_count": 1,
         "recent_context_enabled": True,
         "tts_canary_ok": True,

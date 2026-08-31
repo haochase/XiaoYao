@@ -198,36 +198,31 @@ Use `http://127.0.0.1:9000/v1/infer` for the HTTP adapter or
 `ws://127.0.0.1:9000/v1/realtime?mode=audio` for the realtime adapter. The
 mock returns generated audio only and must not be used as a production runtime.
 
-For pre-production voice testing with MiMo-V2.5, use the OpenAI-compatible
-Token Plan endpoint. The gateway sends the stopped 16 kHz PCM turn to
-`mimo-v2.5`, then sends the returned reply text to `mimo-v2.5-tts` and receives
-24 kHz PCM16 audio for the ESP32:
+The Feishu and dynamic-Agent text channels use the official Chat Completions
+request shape with Bearer authentication. Configure their base URL, model, and
+bounded retry policy separately from the voice endpoint:
 
 ```powershell
-$env:COMPANION_VOICE_RUNTIME = 'mimo'
-$env:COMPANION_MIMO_API_KEY = '<your-token-plan-key>'
-$env:COMPANION_MIMO_OPENAI_BASE_URL = 'https://token-plan-cn.xiaomimimo.com/v1'
-$env:COMPANION_MIMO_ANTHROPIC_BASE_URL = 'https://token-plan-cn.xiaomimimo.com/anthropic'
-$env:COMPANION_MIMO_MODEL = 'mimo-v2.5'
-$env:COMPANION_MIMO_TTS_MODEL = 'mimo-v2.5-tts'
-$env:COMPANION_MIMO_TTS_VOICE = 'mimo_default'
-$env:COMPANION_MIMO_MAX_RETRIES = '2'
-$env:COMPANION_MIMO_RETRY_BACKOFF_SECONDS = '1'
-$env:COMPANION_AUDIO_QUEUE_CAPACITY = '256'
+$env:COMPANION_MINICPM_O_AUTH_TOKEN = '<your-runtime-token>'
+$env:COMPANION_MINICPM_O_COMPATIBLE_BASE_URL = 'http://127.0.0.1:9000/v1'
+$env:COMPANION_MINICPM_O_MODEL = 'MiniCPM-O-4.5-9B'
+$env:COMPANION_MINICPM_O_COMPATIBLE_MAX_RETRIES = '2'
+$env:COMPANION_MINICPM_O_COMPATIBLE_RETRY_BACKOFF_SECONDS = '1'
 ```
 
-The public endpoints and non-secret defaults are also listed in `.env.example`.
-For local development, put the real API key only in the ignored `gateway/.env`
-file (or in the current process environment as `COMPANION_MIMO_API_KEY`); do
-not add it to `.env.example`, source files, logs, test output, commits, or
-GitHub. The Anthropic-compatible URL is retained for future tool integrations;
-the current audio gateway uses the OpenAI-compatible URL because it supports
-the documented audio input and TTS request shapes.
+The public non-secret defaults are also listed in `.env.example`. For local
+development, put the real token only in the ignored `gateway/.env` file (or in
+the current process environment as `COMPANION_MINICPM_O_AUTH_TOKEN`); do not add
+it to `.env.example`, source files, logs, test output, commits, or GitHub.
+
+Existing deployments must migrate former provider-specific environment names
+to `COMPANION_MINICPM_O_*` before restarting the gateway. Keep
+`COMPANION_VOICE_RUNTIME=none` until the new endpoint and token are configured.
 
 Only HTTP 429 and 500-599 responses are retried. The default policy allows two
 retries with 1s then 2s exponential backoff. Network failures, authentication
 errors, and malformed responses fail immediately as `model_unavailable`; adjust
-`COMPANION_MIMO_MAX_RETRIES` and `COMPANION_MIMO_RETRY_BACKOFF_SECONDS` for a
+`COMPANION_MINICPM_O_COMPATIBLE_MAX_RETRIES` and `COMPANION_MINICPM_O_COMPATIBLE_RETRY_BACKOFF_SECONDS` for a
 different deployment policy.
 
 For firmware that advertises VAD events, audio outside a complete VAD speech
@@ -328,7 +323,7 @@ COMPANION_FEISHU_RETRY_BACKOFF_SECONDS=1
 The outbound adapter caches `tenant_access_token` in memory and retries only
 transport errors, HTTP 429, and HTTP 5xx responses. An optional single-user
 private text-chat channel can receive Feishu message events over the official
-long connection and route plain text to the configured MiMo model:
+long connection and route plain text to the configured MiniCPM-o 4.5 model:
 
 ```text
 COMPANION_FEISHU_CHAT_ENABLED=true
@@ -387,6 +382,8 @@ JPEG, PNG, or WebP image for one voice turn to `/v1/vision/observations` with
 stored only under `COMPANION_VISION_STORAGE_PATH`, limited to 10 MB, retained
 for seven days, and removed by the opt-in cleanup loop. The upload response
 contains metadata and a digest, never image bytes or an absolute path. The
+default app does not inject a model vision runtime, so image description stays
+unavailable and returns HTTP 503 until a deployment supplies that adapter. The
 ESP32 audio WebSocket and model runtime remain audio-only until a separate
 multimodal adapter contract is added.
 
@@ -401,9 +398,8 @@ The local policy layer exposes only two tool routes:
   idempotency key.
 
 Neither route sends Feishu, writes memory, controls a device, calls an external
-URL, or enables automatic execution. See
-[`docs/verification/agent-tools-local.md`](../docs/verification/agent-tools-local.md)
-for the local policy check.
+URL, or enables automatic execution. The policy is covered by the gateway test
+suite.
 
 ## Repeatable voice check
 

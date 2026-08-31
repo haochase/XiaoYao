@@ -30,13 +30,13 @@ _SYSTEM_PROMPT = (
 
 def _response_text(payload: object) -> str:
     if not isinstance(payload, dict):
-        raise ModelRuntimeError("MiMo response must be a JSON object")
+        raise ModelRuntimeError("MiniCPM-o 4.5 response must be a JSON object")
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
-        raise ModelRuntimeError("MiMo response choices are required")
+        raise ModelRuntimeError("MiniCPM-o 4.5 response choices are required")
     choice = choices[0]
     if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
-        raise ModelRuntimeError("MiMo response message is required")
+        raise ModelRuntimeError("MiniCPM-o 4.5 response message is required")
     content = choice["message"].get("content")
     if isinstance(content, str) and content.strip():
         return content.strip()
@@ -49,16 +49,16 @@ def _response_text(payload: object) -> str:
         text = "".join(parts).strip()
         if text:
             return text
-    raise ModelRuntimeError("MiMo response text is required")
+    raise ModelRuntimeError("MiniCPM-o 4.5 response text is required")
 
 
-class MimoTextChatRuntime:
+class MinicpmOTextChatRuntime:
     def __init__(
         self,
         *,
         openai_base_url: str,
         api_key: str,
-        model: str = "mimo-v2.5",
+        model: str = "MiniCPM-O-4.5-9B",
         timeout_seconds: float = 30.0,
         max_retries: int = 2,
         retry_backoff_seconds: float = 1.0,
@@ -74,20 +74,20 @@ class MimoTextChatRuntime:
             or parsed.query
             or parsed.fragment
         ):
-            raise ValueError("MiMo OpenAI base URL must be an absolute URL")
+            raise ValueError("MiniCPM-o 4.5 OpenAI base URL must be an absolute URL")
         if not api_key or api_key != api_key.strip() or any(
             character.isspace() or ord(character) < 32 or ord(character) == 127
             for character in api_key
         ):
-            raise ValueError("MiMo API key must be a non-empty token")
+            raise ValueError("MiniCPM-o 4.5 API key must be a non-empty token")
         if not model.strip() or not system_prompt.strip():
-            raise ValueError("MiMo text chat settings must not be empty")
+            raise ValueError("MiniCPM-o 4.5 text chat settings must not be empty")
         if timeout_seconds <= 0:
-            raise ValueError("MiMo timeout_seconds must be positive")
+            raise ValueError("MiniCPM-o 4.5 timeout_seconds must be positive")
         if max_retries < 0:
-            raise ValueError("MiMo max_retries must not be negative")
+            raise ValueError("MiniCPM-o 4.5 max_retries must not be negative")
         if retry_backoff_seconds < 0:
-            raise ValueError("MiMo retry_backoff_seconds must not be negative")
+            raise ValueError("MiniCPM-o 4.5 retry_backoff_seconds must not be negative")
         self._base_url = openai_base_url.rstrip("/")
         self._api_key = api_key
         self._model = model
@@ -106,9 +106,9 @@ class MimoTextChatRuntime:
     ) -> str:
         normalized = text.strip()
         if not normalized:
-            raise ValueError("MiMo text chat input must not be empty")
+            raise ValueError("MiniCPM-o 4.5 text chat input must not be empty")
         if agent_context is not None and not isinstance(agent_context, str):
-            raise ValueError("MiMo agent context must be text")
+            raise ValueError("MiniCPM-o 4.5 agent context must be text")
         current_time = self._clock().astimezone(_SHANGHAI_TIMEZONE).isoformat()
         system_prompt = (
             self._system_prompt
@@ -139,7 +139,7 @@ class MimoTextChatRuntime:
         started_at = time.perf_counter()
         reply = self._request(payload)
         logger.info(
-            "mimo_text_chat_completed model=%s duration_ms=%s history_messages=%s",
+            "minicpm_o_text_chat_completed model=%s duration_ms=%s history_messages=%s",
             self._model,
             round((time.perf_counter() - started_at) * 1_000),
             len(history),
@@ -155,7 +155,7 @@ class MimoTextChatRuntime:
                 headers={
                     "Accept": "application/json",
                     "Content-Type": "application/json",
-                    "api-key": self._api_key,
+                "Authorization": f"Bearer {self._api_key}",
                 },
                 method="POST",
             )
@@ -168,20 +168,20 @@ class MimoTextChatRuntime:
                 if self._should_retry(status, attempt):
                     self._sleep(attempt)
                     continue
-                raise ModelRuntimeError(f"MiMo returned HTTP {status}") from exc
+                raise ModelRuntimeError(f"MiniCPM-o 4.5 returned HTTP {status}") from exc
             except (URLError, OSError, TimeoutError) as exc:
-                raise ModelRuntimeError("MiMo request failed") from exc
+                raise ModelRuntimeError("MiniCPM-o 4.5 request failed") from exc
             if status < 200 or status >= 300:
                 if self._should_retry(status, attempt):
                     self._sleep(attempt)
                     continue
-                raise ModelRuntimeError(f"MiMo returned HTTP {status}")
+                raise ModelRuntimeError(f"MiniCPM-o 4.5 returned HTTP {status}")
             try:
                 decoded = json.loads(body)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ModelRuntimeError("MiMo response is not valid JSON") from exc
+                raise ModelRuntimeError("MiniCPM-o 4.5 response is not valid JSON") from exc
             return _response_text(decoded)
-        raise ModelRuntimeError("MiMo retry budget exhausted")
+        raise ModelRuntimeError("MiniCPM-o 4.5 retry budget exhausted")
 
     def _should_retry(self, status: int, attempt: int) -> bool:
         return (status == 429 or 500 <= status <= 599) and attempt < self._max_retries

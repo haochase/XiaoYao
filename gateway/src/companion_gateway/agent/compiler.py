@@ -28,7 +28,7 @@ AGENT_COMPILER_SYSTEM_PROMPT = (
 
 
 class AgentSpecCompileError(ValueError):
-    """Raised when MiMo does not produce a safe AgentSpec candidate."""
+    """Raised when MiniCPM-o 4.5 does not produce a safe AgentSpec candidate."""
 
 
 class AgentSpecCompiler(Protocol):
@@ -100,7 +100,7 @@ def _compiler_prompt(request_text: str) -> str:
         "image_observation": {},
     }
     return (
-        "MiMo thinking is disabled. Compile the user request into exactly one "
+        "MiniCPM-o 4.5 thinking is disabled. Compile the user request into exactly one "
         "valid JSON object for an AgentSpec candidate. Return JSON only, with no "
         "markdown or explanation. Do not include identity fields such as agent_id, "
         "owner_id, draft_id, or source_message_id. Use only these agent kinds: "
@@ -124,7 +124,7 @@ def _compiler_prompt(request_text: str) -> str:
     )
 
 
-class MimoAgentSpecCompiler:
+class MinicpmOAgentSpecCompiler:
     def __init__(
         self,
         *,
@@ -162,7 +162,7 @@ class MimoAgentSpecCompiler:
         try:
             spec = AgentSpec.model_validate(candidate)
         except ValidationError as exc:
-            raise AgentSpecCompileError("MiMo AgentSpec candidate is invalid") from exc
+            raise AgentSpecCompileError("MiniCPM-o 4.5 AgentSpec candidate is invalid") from exc
         try:
             return AgentDraft(
                 draft_id=self._id_factory(),
@@ -177,16 +177,16 @@ class MimoAgentSpecCompiler:
     @staticmethod
     def _parse_candidate(response: object) -> dict[str, Any]:
         if not isinstance(response, str):
-            raise AgentSpecCompileError("MiMo response must be text")
+            raise AgentSpecCompileError("MiniCPM-o 4.5 response must be text")
         normalized = response.strip()
         if normalized.startswith("```json\n") and normalized.endswith("\n```"):
             normalized = normalized[len("```json\n") : -len("\n```")].strip()
         try:
             candidate = json.loads(normalized)
         except json.JSONDecodeError as exc:
-            raise AgentSpecCompileError("MiMo response must be valid JSON") from exc
+            raise AgentSpecCompileError("MiniCPM-o 4.5 response must be valid JSON") from exc
         if not isinstance(candidate, dict):
-            raise AgentSpecCompileError("MiMo response must be a JSON object")
+            raise AgentSpecCompileError("MiniCPM-o 4.5 response must be a JSON object")
         return dict(candidate)
 
     @staticmethod
@@ -195,11 +195,11 @@ class MimoAgentSpecCompiler:
         if not isinstance(raw_tools, list) or not all(
             isinstance(tool, str) for tool in raw_tools
         ):
-            raise AgentSpecCompileError("MiMo allowed_tools must be a JSON string list")
+            raise AgentSpecCompileError("MiniCPM-o 4.5 allowed_tools must be a JSON string list")
         try:
             return tuple(AgentToolName(tool) for tool in raw_tools)
         except ValueError as exc:
-            raise AgentSpecCompileError("MiMo allowed tool is not gateway-approved") from exc
+            raise AgentSpecCompileError("MiniCPM-o 4.5 allowed tool is not gateway-approved") from exc
 
     @staticmethod
     def _validated_channel_tools(
@@ -211,11 +211,11 @@ class MimoAgentSpecCompiler:
         if not isinstance(raw_channels, list) or not all(
             isinstance(channel, str) for channel in raw_channels
         ):
-            raise AgentSpecCompileError("MiMo channels must be a JSON string list")
+            raise AgentSpecCompileError("MiniCPM-o 4.5 channels must be a JSON string list")
         try:
             channels = tuple(AgentChannel(channel) for channel in raw_channels)
         except ValueError as exc:
-            raise AgentSpecCompileError("MiMo Agent channel is invalid") from exc
+            raise AgentSpecCompileError("MiniCPM-o 4.5 Agent channel is invalid") from exc
         requirements = {
             AgentChannel.FEISHU: AgentToolName.SEND_FEISHU,
             AgentChannel.ESP32: AgentToolName.SPEAK_ESP32,
@@ -224,7 +224,7 @@ class MimoAgentSpecCompiler:
             required_tool = requirements[channel]
             if required_tool not in allowed_tools:
                 raise AgentSpecCompileError(
-                    f"MiMo channel {channel.value} requires {required_tool.value}"
+                    f"MiniCPM-o 4.5 channel {channel.value} requires {required_tool.value}"
                 )
 
     @staticmethod
@@ -232,16 +232,16 @@ class MimoAgentSpecCompiler:
         try:
             kind = AgentKind(candidate.get("kind"))
         except (TypeError, ValueError) as exc:
-            raise AgentSpecCompileError("MiMo Agent kind is invalid") from exc
+            raise AgentSpecCompileError("MiniCPM-o 4.5 Agent kind is invalid") from exc
         config = candidate.get("config")
         if not isinstance(config, dict):
-            raise AgentSpecCompileError("MiMo Agent config must be an object")
+            raise AgentSpecCompileError("MiniCPM-o 4.5 Agent config must be an object")
 
         def require_text(field: str) -> str:
             value = config.get(field)
             if not isinstance(value, str) or not value.strip():
                 raise AgentSpecCompileError(
-                    f"MiMo {kind.value} config.{field} is required"
+                    f"MiniCPM-o 4.5 {kind.value} config.{field} is required"
                 )
             return value.strip()
 
@@ -251,7 +251,7 @@ class MimoAgentSpecCompiler:
             require_text("city")
         elif kind is AgentKind.ENGLISH:
             if require_text("level") not in {"beginner", "intermediate", "advanced"}:
-                raise AgentSpecCompileError("MiMo English config.level is invalid")
+                raise AgentSpecCompileError("MiniCPM-o 4.5 English config.level is invalid")
             if require_text("scenario") not in {
                 "daily",
                 "travel",
@@ -259,16 +259,16 @@ class MimoAgentSpecCompiler:
                 "workplace",
                 "interview",
             }:
-                raise AgentSpecCompileError("MiMo English config.scenario is invalid")
+                raise AgentSpecCompileError("MiniCPM-o 4.5 English config.scenario is invalid")
             if require_text("input_mode") not in {"voice", "text"}:
-                raise AgentSpecCompileError("MiMo English config.input_mode is invalid")
+                raise AgentSpecCompileError("MiniCPM-o 4.5 English config.input_mode is invalid")
 
     @staticmethod
     def _trusted_prompt(candidate: dict[str, Any]) -> str:
         try:
             kind = AgentKind(candidate.get("kind"))
         except (TypeError, ValueError) as exc:
-            raise AgentSpecCompileError("MiMo Agent kind is invalid") from exc
+            raise AgentSpecCompileError("MiniCPM-o 4.5 Agent kind is invalid") from exc
         if kind is AgentKind.COMPANION:
             max_turns = candidate.get("max_turns")
             if not isinstance(max_turns, int):
