@@ -114,11 +114,16 @@ _PROTOCOL_HEADER_ANCHOR = (
     "    virtual void SendStopListening();\n"
     "    virtual void SendAbortSpeaking(AbortReason reason);\n"
 )
-_PROTOCOL_HEADER_PROFILE = (
+_PROTOCOL_HEADER_VAD_PROFILE = (
     "    virtual void SendStartListening(ListeningMode mode);\n"
     "    virtual void SendStopListening();\n"
     "    virtual void SendVadState(bool speaking);\n"
     "    virtual void SendAbortSpeaking(AbortReason reason);\n"
+)
+_PROTOCOL_HEADER_PROFILE = _PROTOCOL_HEADER_VAD_PROFILE.replace(
+    "    virtual void SendAbortSpeaking(AbortReason reason);\n",
+    "    virtual void SendTtsReady();\n"
+    "    virtual void SendAbortSpeaking(AbortReason reason);\n",
 )
 _PROTOCOL_SOURCE_ANCHOR = (
     "void Protocol::SendStopListening() {\n"
@@ -128,7 +133,7 @@ _PROTOCOL_SOURCE_ANCHOR = (
     "}\n\n"
     "void Protocol::SendMcpMessage(const std::string& payload) {\n"
 )
-_PROTOCOL_SOURCE_PROFILE = (
+_PROTOCOL_SOURCE_VAD_PROFILE = (
     "void Protocol::SendStopListening() {\n"
     "    std::string message =\n"
     "        \"{\\\"session_id\\\":\\\"\" + session_id_ + \"\\\",\\\"type\\\":\\\"listen\\\",\\\"state\\\":\\\"stop\\\"}\";\n"
@@ -142,6 +147,15 @@ _PROTOCOL_SOURCE_PROFILE = (
     "    SendText(message);\n"
     "}\n\n"
     "void Protocol::SendMcpMessage(const std::string& payload) {\n"
+)
+_PROTOCOL_SOURCE_PROFILE = _PROTOCOL_SOURCE_VAD_PROFILE.replace(
+    "void Protocol::SendMcpMessage(const std::string& payload) {\n",
+    "void Protocol::SendTtsReady() {\n"
+    "    std::string message = \"{\\\"session_id\\\":\\\"\" + session_id_ +\n"
+    "                          \"\\\",\\\"type\\\":\\\"tts\\\",\\\"state\\\":\\\"ready\\\"}\";\n"
+    "    SendText(message);\n"
+    "}\n\n"
+    "void Protocol::SendMcpMessage(const std::string& payload) {\n",
 )
 _WEBSOCKET_FEATURE_ANCHOR = (
     "    cJSON_AddBoolToObject(features, \"mcp\", true);\n"
@@ -234,6 +248,9 @@ _TTS_STATE_PROFILE = (
     "                    aborted_ = false;\n"
     "                    notification_tts_ = notification;\n"
     "                    SetDeviceState(kDeviceStateSpeaking);\n"
+    "                    if (notification && protocol_) {\n"
+    "                        protocol_->SendTtsReady();\n"
+    "                    }\n"
     "                });\n"
     "            } else if (strcmp(state->valuestring, \"stop\") == 0) {\n"
     "                Schedule([this]() {\n"
@@ -247,6 +264,12 @@ _TTS_STATE_PROFILE = (
     "                        }\n"
     "                    }\n"
     "                });\n"
+)
+_TTS_STATE_PRE_READY_PROFILE = _TTS_STATE_PROFILE.replace(
+    "                    if (notification && protocol_) {\n"
+    "                        protocol_->SendTtsReady();\n"
+    "                    }\n",
+    "",
 )
 _APP_FIELDS_ANCHOR = (
     "    bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)\n"
@@ -380,6 +403,7 @@ def apply_vendor_profile(source_root: Path) -> None:
         source_root / "main" / "application.cc",
         _TTS_STATE_ANCHOR,
         _TTS_STATE_PROFILE,
+        previous_profiles=(_TTS_STATE_PRE_READY_PROFILE,),
     )
     _apply_exact_profile(
         source_root / "main" / "application.cc",
@@ -400,11 +424,13 @@ def apply_vendor_profile(source_root: Path) -> None:
         source_root / "main" / "protocols" / "protocol.h",
         _PROTOCOL_HEADER_ANCHOR,
         _PROTOCOL_HEADER_PROFILE,
+        previous_profiles=(_PROTOCOL_HEADER_VAD_PROFILE,),
     )
     _apply_exact_profile(
         source_root / "main" / "protocols" / "protocol.cc",
         _PROTOCOL_SOURCE_ANCHOR,
         _PROTOCOL_SOURCE_PROFILE,
+        previous_profiles=(_PROTOCOL_SOURCE_VAD_PROFILE,),
     )
     _apply_exact_profile(
         source_root / "main" / "protocols" / "websocket_protocol.cc",

@@ -148,6 +148,10 @@ async def _sleep_between_tts_frames(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
+async def _sleep_before_tts_audio(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
 class EventRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1266,6 +1270,7 @@ def create_app(
         post_tts_silence_gate: ConsecutiveSilenceGate | None = None
         post_tts_frames_ignored = 0
         tts_interrupted = asyncio.Event()
+        tts_ready = asyncio.Event()
         trace_id = f"trc_{uuid4().hex}"
         logger.info("device_ws_accepted device=%s", redact_device_id(device_id))
         try:
@@ -1366,6 +1371,7 @@ def create_app(
                         frames_sent = 0
                         total_frames = len(message.opus_frames)
                         tts_interrupted.clear()
+                        tts_ready.clear()
                         await websocket.send_json(
                             {
                                 "type": "tts",
@@ -1383,6 +1389,18 @@ def create_app(
                             len(message.opus_frames),
                             frame_duration_ms,
                         )
+                        if message.purpose == "notification":
+                            try:
+                                await asyncio.wait_for(
+                                    tts_ready.wait(),
+                                    timeout=1.5,
+                                )
+                            except asyncio.TimeoutError as exc:
+                                raise RuntimeError(
+                                    "notification TTS ready timeout"
+                                ) from exc
+                        else:
+                            await _sleep_before_tts_audio(0.12)
                         for frame_index, opus_frame in enumerate(message.opus_frames):
                             if tts_interrupted.is_set():
                                 break
@@ -1614,6 +1632,23 @@ def create_app(
                             if isinstance(payload, dict)
                             else None
                         )
+                        if message_type == "tts":
+                            if (
+                                not isinstance(payload, dict)
+                                or payload.get("state") != "ready"
+                                or payload.get("session_id")
+                                not in (None, session.session_id)
+                            ):
+                                raise UnsupportedDeviceControl(
+                                    "unsupported TTS control message"
+                                )
+                            tts_ready.set()
+                            logger.info(
+                                "device_ws_tts_ready device=%s session=%s",
+                                redact_device_id(device_id),
+                                session.session_id,
+                            )
+                            continue
                         if message_type == "camera":
                             if camera_upload is None:
                                 await send_device_error(

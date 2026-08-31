@@ -314,11 +314,20 @@ def test_active_device_receives_a_multi_frame_tts_stream(
 ) -> None:
     app, _ = app_and_sink
     delays: list[float] = []
+    start_delays: list[float] = []
 
     async def capture_delay(seconds: float) -> None:
         delays.append(seconds)
 
+    async def capture_start_delay(seconds: float) -> None:
+        start_delays.append(seconds)
+
     monkeypatch.setattr(api_module, "_sleep_between_tts_frames", capture_delay)
+    monkeypatch.setattr(
+        api_module,
+        "_sleep_before_tts_audio",
+        capture_start_delay,
+    )
 
     with client.websocket_connect(
         "/v1/devices/ws",
@@ -337,6 +346,7 @@ def test_active_device_receives_a_multi_frame_tts_stream(
         assert websocket.receive_json()["state"] == "stop"
 
     assert delays == [0.06]
+    assert start_delays == [0.12]
 
 
 def test_notification_tts_keeps_control_connection_open(
@@ -362,6 +372,13 @@ def test_notification_tts_keeps_control_connection_open(
             "purpose": "notification",
             "session_id": server_hello["session_id"],
         }
+        websocket.send_json(
+            {
+                "type": "tts",
+                "state": "ready",
+                "session_id": server_hello["session_id"],
+            }
+        )
         assert websocket.receive_bytes() == b"notification-opus"
         assert websocket.receive_json()["state"] == "stop"
         time.sleep(0.05)

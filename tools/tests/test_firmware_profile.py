@@ -160,9 +160,11 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     assert "void EnsureIdleControlChannel();" in application_header
     protocol_header = protocol_header_path.read_text(encoding="utf-8")
     assert "virtual void SendVadState(bool speaking);" in protocol_header
+    assert "virtual void SendTtsReady();" in protocol_header
     protocol_source = protocol_source_path.read_text(encoding="utf-8")
     assert r'\"type\":\"vad\"' in protocol_source
     assert 'speaking ? "start" : "stop"' in protocol_source
+    assert r'\"type\":\"tts\",\"state\":\"ready\"' in protocol_source
     websocket_source = websocket_source_path.read_text(encoding="utf-8")
     assert 'cJSON_AddBoolToObject(features, "vad_events", true);' in websocket_source
     assert 'os.environ.get("XIAOYAO_IDF_COMMAND", "idf.py")' in build_path.read_text(
