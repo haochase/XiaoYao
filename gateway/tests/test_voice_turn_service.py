@@ -743,3 +743,152 @@ def test_device_voice_delivery_splits_long_opus_response_across_streams() -> Non
     delivery.process_and_send(session_id="ses-active")
 
     assert [len(frames) for _, frames in transport.messages] == [128, 2]
+def meeting(*, summary: str = "产品周会", minutes: int = 20, location: str = "3A会议室"):
+    from companion_gateway.meeting.models import MeetingEvent
+
+    now = datetime(2026, 8, 27, 4, 0, tzinfo=UTC)
+    return MeetingEvent(
+        fingerprint="a" * 64,
+        summary=summary,
+        description_excerpt="",
+        start_at=now + __import__("datetime").timedelta(minutes=minutes),
+        end_at=now + __import__("datetime").timedelta(minutes=minutes + 30),
+        location=location,
+        status="confirmed",
+        rsvp_status="accept",
+        is_all_day=False,
+    )
+
+
+def next_meeting_turn(
+    *,
+    meeting_context,
+    clock=lambda: datetime(2026, 8, 27, 4, 0, tzinfo=UTC),
+):
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    response_pcm = pcm_frame(sample_rate=24_000, sample_count=1_440)
+    bridge = AudioBridge(
+        codec=EchoOpusCodec(input_pcm),
+        model_sample_rate=16_000,
+        response_sample_rate=24_000,
+        queue_capacity=1,
+    )
+    runtime = IntentRuntime(VoiceIntent(type="next_meeting"), response_pcm)
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        meeting_context=meeting_context,
+        clock=clock,
+    )
+    bridge.decode_uplink(b"input-opus")
+    return service.process_pending_turn(target_device_id="desk-device"), runtime
+
+
+def test_next_meeting_intent_uses_fresh_calendar_facts() -> None:
+    from companion_gateway.meeting.context import MeetingContextStore
+
+    now = datetime(2026, 8, 27, 4, 0, tzinfo=UTC)
+    context = MeetingContextStore(ttl_seconds=300)
+    context.replace((meeting(),), refreshed_at=now)
+    turn, runtime = next_meeting_turn(meeting_context=context)
+
+    assert turn is not None
+    assert turn.response_text == "下一场会议是产品周会，12点20分开始，地点是3A会议室。"
+    assert runtime.synthesized_texts == [turn.response_text]
+
+
+def test_next_meeting_intent_omits_empty_location_and_ignores_model_text() -> None:
+    from companion_gateway.meeting.context import MeetingContextStore
+
+    now = datetime(2026, 8, 27, 4, 0, tzinfo=UTC)
+    context = MeetingContextStore(ttl_seconds=300)
+    context.replace((meeting(location=""),), refreshed_at=now)
+    turn, runtime = next_meeting_turn(meeting_context=context)
+
+    assert turn is not None
+    assert turn.response_text == "下一场会议是产品周会，12点20分开始。"
+    assert "模型自由回复不应被使用" not in turn.response_text
+    assert runtime.synthesized_texts == [turn.response_text]
+
+
+def test_next_meeting_intent_reports_when_no_future_meeting_exists() -> None:
+    from companion_gateway.meeting.context import MeetingContextStore
+
+    now = datetime(2026, 8, 27, 4, 0, tzinfo=UTC)
+    context = MeetingContextStore(ttl_seconds=300)
+    context.replace((meeting(minutes=-1),), refreshed_at=now)
+    turn, runtime = next_meeting_turn(meeting_context=context)
+
+    assert turn is not None
+    assert turn.response_text == "未来24小时没有查到会议。"
+    assert runtime.synthesized_texts == [turn.response_text]
+
+
+@pytest.mark.parametrize("context_kind", ("missing", "stale"))
+def test_next_meeting_intent_reports_unavailable_without_fresh_context(
+    context_kind: str,
+) -> None:
+    from companion_gateway.meeting.context import MeetingContextStore
+
+    now = datetime(2026, 8, 27, 4, 0, tzinfo=UTC)
+    context = None
+    if context_kind == "stale":
+        context = MeetingContextStore(ttl_seconds=300)
+        context.replace((
+            meeting(),
+        ), refreshed_at=now - __import__("datetime").timedelta(seconds=301))
+    turn, runtime = next_meeting_turn(meeting_context=context)
+
+    assert turn is not None
+    assert turn.response_text == "暂时无法读取飞书日历，请稍后再试。"
+    assert runtime.synthesized_texts == [turn.response_text]
+
+
+def test_next_meeting_intent_captures_the_clock_once() -> None:
+    from companion_gateway.meeting.context import MeetingContextStore
+
+    now = datetime(2026, 8, 27, 4, 0, tzinfo=UTC)
+    context = MeetingContextStore(ttl_seconds=300)
+    context.replace((meeting(),), refreshed_at=now)
+    calls = 0
+
+    def clock() -> datetime:
+        nonlocal calls
+        calls += 1
+        return now
+
+    turn, _ = next_meeting_turn(meeting_context=context, clock=clock)
+
+    assert turn is not None
+    assert calls == 1
+
+
+def test_device_voice_delivery_delegates_meeting_context() -> None:
+    from companion_gateway.meeting.context import MeetingContextStore
+
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    now = datetime(2026, 8, 27, 4, 0, tzinfo=UTC)
+    response_pcm = pcm_frame(sample_rate=24_000, sample_count=1_440)
+    bridge = AudioBridge(
+        codec=EchoOpusCodec(input_pcm),
+        model_sample_rate=16_000,
+        response_sample_rate=24_000,
+        queue_capacity=1,
+    )
+    runtime = IntentRuntime(VoiceIntent(type="next_meeting"), response_pcm)
+    voice_turns = VoiceTurnService(
+        audio_bridge=bridge, model_runtime=runtime, clock=lambda: now
+    )
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=voice_turns,
+        device_transport=RecordingTransport(),
+    )
+    context = MeetingContextStore(ttl_seconds=300)
+    context.replace((meeting(),), refreshed_at=now)
+
+    delivery.set_meeting_context(context)
+    bridge.decode_uplink(b"input-opus")
+    turn = delivery.process_and_send(session_id="ses-meeting")
+
+    assert turn is not None
+    assert turn.response_text == "下一场会议是产品周会，12点20分开始，地点是3A会议室。"

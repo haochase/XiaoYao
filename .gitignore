@@ -12,6 +12,7 @@ __pycache__/
 gateway/data/*.db
 gateway/data/*.db-shm
 gateway/data/*.db-wal
+gateway/data/feishu-user-token.json*
 gateway/logs/
 artifacts/
 资料/

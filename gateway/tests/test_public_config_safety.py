@@ -44,6 +44,65 @@ def test_feishu_chat_example_is_disabled_and_contains_no_credentials() -> None:
     assert "secret_test_value" not in example
 
 
+def test_meeting_assistant_example_is_disabled_and_has_no_target_identifier() -> None:
+    example = (WORKTREE_ROOT / "gateway" / ".env.example").read_text(
+        encoding="utf-8"
+    )
+
+    assert "COMPANION_MEETING_ASSISTANT_ENABLED=false" in example
+    assert "COMPANION_MEETING_TARGET_DEVICE_ID=" in example
+    assert "COMPANION_MEETING_POLL_INTERVAL_SECONDS=30" in example
+    assert "COMPANION_MEETING_LOOKAHEAD_HOURS=24" in example
+    assert "COMPANION_MEETING_REMINDER_LEAD_SECONDS=600" in example
+    assert "COMPANION_MEETING_CONTEXT_TTL_SECONDS=300" in example
+    assert "desk-device" not in example
+
+
+def test_meeting_assistant_runbook_covers_public_safe_operator_contract() -> None:
+    readme = (WORKTREE_ROOT / "gateway" / "README.md").read_text(
+        encoding="utf-8"
+    )
+
+    for required in (
+        "calendar:calendar:readonly",
+        "/open-apis/calendar/v4/calendars/primarys?user_id_type=open_id",
+        "tools\\feishu_calendar_check.py --hours 24",
+        "tools\\feishu_calendar_check.py --hours 24 --dry-run",
+        "mode: \"dry_run\"",
+        "device: \"offline\"",
+        "COMPANION_MEETING_ASSISTANT_ENABLED",
+        "COMPANION_MEETING_TARGET_DEVICE_ID",
+        "COMPANION_MEETING_POLL_INTERVAL_SECONDS",
+        "COMPANION_MEETING_LOOKAHEAD_HOURS",
+        "COMPANION_MEETING_REMINDER_LEAD_SECONDS",
+        "COMPANION_MEETING_CONTEXT_TTL_SECONDS",
+        "exactly 10 minutes",
+        "deterministic fallback",
+        "device-offline fallback",
+        "raw event IDs",
+        "Real Feishu owner authentication, token rotation, and calendar read:",
+        "`PASS` on 2026-09-02 through two read-only dry-runs",
+        "Real eligible meeting reminder candidate: `PASS` on 2026-09-02",
+        "Real MiMo briefing leaf: `PASS` on 2026-09-02",
+        "Real Feishu bot message leaf: `PASS` on 2026-09-02",
+        "recipient confirmed receipt in Feishu",
+        "Real ESP32 meeting TTS: `PASS` on 2026-09-02",
+        "Real state-driven RGB meeting cue: `PASS` on 2026-09-02",
+        "Standalone custom RGB color or blink command: `NOT_IMPLEMENTED`",
+        "Real grounded `next_meeting` voice query: `PASS` on 2026-09-02",
+        "Real calendar-to-MiMo-to-Feishu offline fallback: provider-level `PASS`",
+        "Recipient confirmation for that end-to-end fallback message: `PASS`",
+        "Real bounded gateway scheduler: `PASS` on 2026-09-02",
+        "Persistent local gateway activation: `PASS` on 2026-09-02",
+        "Real Feishu private text channel: `PASS` on 2026-09-02",
+        "Real medication reminder: `PASS` on 2026-09-02",
+        "Full competition rehearsal: `PASS` on 2026-09-02",
+    ):
+        assert required in readme
+
+    assert "COMPANION_MEETING_INDICATOR" not in readme
+
+
 def test_ascend_runbook_is_public_safe_and_covers_d1_tools() -> None:
     runbook = (WORKTREE_ROOT / "deploy" / "ascend" / "README.md").read_text(
         encoding="utf-8"

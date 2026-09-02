@@ -44,6 +44,9 @@ _DEFAULT_SYSTEM_PROMPT = (
     "current date, current date and time, or latest reminder status. For those "
     "queries return exactly one of current_time, current_date, current_datetime, "
     "or reminder_status as {\"type\": \"...\"}."
+    " If the user asks about their next or upcoming meeting, return intent "
+    "{\"type\":\"next_meeting\"} and an empty reply; do not answer meeting facts "
+    "yourself; the gateway will ground them from Feishu Calendar."
 )
 _MEMORY_PROPOSAL_PROMPT = (
     " Optionally return memory_proposals as a list only when the user explicitly "

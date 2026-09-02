@@ -284,6 +284,17 @@ def _normalize_feishu_base_url(value: str) -> str:
     return normalized.rstrip("/")
 
 
+def _normalize_meeting_target_device_id(value: str | None) -> str | None:
+    if value is None or value == "":
+        return None
+    if not _validate_device_id(value):
+        raise ValueError(
+            "COMPANION_MEETING_TARGET_DEVICE_ID must be a non-empty device ID "
+            "of at most 128 characters without surrounding whitespace"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     database_path: Path
@@ -309,6 +320,12 @@ class Settings:
     feishu_app_id: str | None = None
     feishu_app_secret: str | None = None
     feishu_receiver_open_id: str | None = None
+    feishu_owner_user_access_token: str | None = None
+    feishu_owner_refresh_token: str | None = None
+    feishu_owner_calendar_id: str | None = None
+    feishu_user_token_state_path: Path = Path(
+        "data/feishu-user-token.json"
+    )
     feishu_base_url: str = "https://open.feishu.cn"
     feishu_timeout_seconds: float = 10.0
     feishu_max_retries: int = 2
@@ -329,6 +346,12 @@ class Settings:
     vision_cleanup_interval_seconds: float = 86_400.0
     task_scheduler_enabled: bool = False
     task_scheduler_interval_seconds: float = 1.0
+    meeting_assistant_enabled: bool = False
+    meeting_target_device_id: str | None = None
+    meeting_poll_interval_seconds: float = 30.0
+    meeting_lookahead_hours: int = 24
+    meeting_reminder_lead_seconds: int = 600
+    meeting_context_ttl_seconds: float = 300.0
     device_hello_timeout_seconds: float = 10.0
     device_audio_frame_max_bytes: int = 4096
     device_auto_stop_idle_seconds: float = 1.2
@@ -376,6 +399,21 @@ class Settings:
             self.feishu_receiver_open_id,
             name="COMPANION_FEISHU_RECEIVER_OPEN_ID",
         )
+        normalized_feishu_owner_user_access_token = _normalize_optional_feishu_value(
+            self.feishu_owner_user_access_token,
+            name="COMPANION_FEISHU_OWNER_USER_ACCESS_TOKEN",
+        )
+        normalized_feishu_owner_refresh_token = _normalize_optional_feishu_value(
+            self.feishu_owner_refresh_token,
+            name="COMPANION_FEISHU_OWNER_REFRESH_TOKEN",
+        )
+        normalized_feishu_owner_calendar_id = _normalize_optional_feishu_value(
+            self.feishu_owner_calendar_id,
+            name="COMPANION_FEISHU_OWNER_CALENDAR_ID",
+        )
+        normalized_meeting_target_device_id = _normalize_meeting_target_device_id(
+            self.meeting_target_device_id
+        )
         feishu_values = (
             normalized_feishu_app_id,
             normalized_feishu_app_secret,
@@ -387,6 +425,26 @@ class Settings:
             raise ValueError(
                 "COMPANION_FEISHU_APP_ID, COMPANION_FEISHU_APP_SECRET, and "
                 "COMPANION_FEISHU_RECEIVER_OPEN_ID must be configured together"
+            )
+        owner_user_values = (
+            normalized_feishu_owner_user_access_token,
+            normalized_feishu_owner_refresh_token,
+            normalized_feishu_owner_calendar_id,
+        )
+        if any(value is not None for value in owner_user_values) and not all(
+            value is not None for value in owner_user_values
+        ):
+            raise ValueError(
+                "COMPANION_FEISHU_OWNER_USER_ACCESS_TOKEN, "
+                "COMPANION_FEISHU_OWNER_REFRESH_TOKEN, and "
+                "COMPANION_FEISHU_OWNER_CALENDAR_ID must be configured together"
+            )
+        if all(value is not None for value in owner_user_values) and not all(
+            value is not None for value in feishu_values
+        ):
+            raise ValueError(
+                "COMPANION_FEISHU_OWNER credentials require Feishu application "
+                "credentials and receiver open_id"
             )
         normalized_feishu_base_url = _normalize_feishu_base_url(self.feishu_base_url)
         configured_runtime = self.voice_runtime
@@ -526,6 +584,45 @@ class Settings:
             raise ValueError(
                 "COMPANION_TASK_SCHEDULER_INTERVAL_SECONDS must be positive"
             )
+        if not isinstance(self.meeting_assistant_enabled, bool):
+            raise ValueError(
+                "COMPANION_MEETING_ASSISTANT_ENABLED must be true or false"
+            )
+        if (
+            not math.isfinite(self.meeting_poll_interval_seconds)
+            or self.meeting_poll_interval_seconds <= 0
+        ):
+            raise ValueError(
+                "COMPANION_MEETING_POLL_INTERVAL_SECONDS must be positive"
+            )
+        if not 1 <= self.meeting_lookahead_hours <= 72:
+            raise ValueError(
+                "COMPANION_MEETING_LOOKAHEAD_HOURS must be between 1 and 72"
+            )
+        if not 60 <= self.meeting_reminder_lead_seconds <= 3_600:
+            raise ValueError(
+                "COMPANION_MEETING_REMINDER_LEAD_SECONDS must be between 60 and 3600"
+            )
+        if (
+            not math.isfinite(self.meeting_context_ttl_seconds)
+            or self.meeting_context_ttl_seconds < self.meeting_poll_interval_seconds
+        ):
+            raise ValueError(
+                "COMPANION_MEETING_CONTEXT_TTL_SECONDS must be at least "
+                "COMPANION_MEETING_POLL_INTERVAL_SECONDS"
+            )
+        if self.meeting_assistant_enabled and (
+            not all(feishu_values)
+            or normalized_mimo_api_key is None
+            or normalized_meeting_target_device_id is None
+            or not self.task_scheduler_enabled
+        ):
+            raise ValueError(
+                "COMPANION_MEETING_ASSISTANT_ENABLED requires complete Feishu "
+                "credentials, COMPANION_MIMO_API_KEY, "
+                "COMPANION_MEETING_TARGET_DEVICE_ID, and "
+                "COMPANION_TASK_SCHEDULER_ENABLED=true"
+            )
         object.__setattr__(self, "ota_device_tokens", ota_tokens)
         object.__setattr__(self, "public_websocket_url", normalized_url)
         object.__setattr__(self, "device_token_hashes", normalized_hashes)
@@ -550,7 +647,32 @@ class Settings:
             "feishu_receiver_open_id",
             normalized_feishu_receiver_open_id,
         )
+        object.__setattr__(
+            self,
+            "feishu_owner_user_access_token",
+            normalized_feishu_owner_user_access_token,
+        )
+        object.__setattr__(
+            self,
+            "feishu_owner_refresh_token",
+            normalized_feishu_owner_refresh_token,
+        )
+        object.__setattr__(
+            self,
+            "feishu_owner_calendar_id",
+            normalized_feishu_owner_calendar_id,
+        )
+        object.__setattr__(
+            self,
+            "feishu_user_token_state_path",
+            Path(self.feishu_user_token_state_path),
+        )
         object.__setattr__(self, "feishu_base_url", normalized_feishu_base_url)
+        object.__setattr__(
+            self,
+            "meeting_target_device_id",
+            normalized_meeting_target_device_id,
+        )
 
     @property
     def feishu_configured(self) -> bool:
@@ -608,6 +730,19 @@ class Settings:
         configured_feishu_receiver_open_id = os.environ.get(
             "COMPANION_FEISHU_RECEIVER_OPEN_ID"
         )
+        configured_feishu_owner_user_access_token = os.environ.get(
+            "COMPANION_FEISHU_OWNER_USER_ACCESS_TOKEN"
+        )
+        configured_feishu_owner_refresh_token = os.environ.get(
+            "COMPANION_FEISHU_OWNER_REFRESH_TOKEN"
+        )
+        configured_feishu_owner_calendar_id = os.environ.get(
+            "COMPANION_FEISHU_OWNER_CALENDAR_ID"
+        )
+        configured_feishu_user_token_state_path = os.environ.get(
+            "COMPANION_FEISHU_USER_TOKEN_STATE_PATH",
+            "data/feishu-user-token.json",
+        )
         configured_feishu_base_url = os.environ.get(
             "COMPANION_FEISHU_BASE_URL",
             "https://open.feishu.cn",
@@ -657,6 +792,30 @@ class Settings:
         configured_scheduler_interval = os.environ.get(
             "COMPANION_TASK_SCHEDULER_INTERVAL_SECONDS",
             "1",
+        )
+        meeting_assistant_enabled = _parse_bool(
+            os.environ.get("COMPANION_MEETING_ASSISTANT_ENABLED"),
+            name="COMPANION_MEETING_ASSISTANT_ENABLED",
+            default=False,
+        )
+        configured_meeting_target_device_id = os.environ.get(
+            "COMPANION_MEETING_TARGET_DEVICE_ID"
+        )
+        configured_meeting_poll_interval = os.environ.get(
+            "COMPANION_MEETING_POLL_INTERVAL_SECONDS",
+            "30",
+        )
+        configured_meeting_lookahead_hours = os.environ.get(
+            "COMPANION_MEETING_LOOKAHEAD_HOURS",
+            "24",
+        )
+        configured_meeting_reminder_lead = os.environ.get(
+            "COMPANION_MEETING_REMINDER_LEAD_SECONDS",
+            "600",
+        )
+        configured_meeting_context_ttl = os.environ.get(
+            "COMPANION_MEETING_CONTEXT_TTL_SECONDS",
+            "300",
         )
         memory_enabled = _parse_bool(
             os.environ.get("COMPANION_MEMORY_ENABLED"),
@@ -771,6 +930,34 @@ class Settings:
         except ValueError as exc:
             raise ValueError(
                 "COMPANION_TASK_SCHEDULER_INTERVAL_SECONDS must be a number"
+            ) from exc
+        try:
+            meeting_poll_interval_seconds = float(
+                configured_meeting_poll_interval
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_MEETING_POLL_INTERVAL_SECONDS must be a number"
+            ) from exc
+        try:
+            meeting_lookahead_hours = int(configured_meeting_lookahead_hours)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_MEETING_LOOKAHEAD_HOURS must be an integer"
+            ) from exc
+        try:
+            meeting_reminder_lead_seconds = int(
+                configured_meeting_reminder_lead
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_MEETING_REMINDER_LEAD_SECONDS must be an integer"
+            ) from exc
+        try:
+            meeting_context_ttl_seconds = float(configured_meeting_context_ttl)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_MEETING_CONTEXT_TTL_SECONDS must be a number"
             ) from exc
         try:
             mimo_timeout_seconds = float(configured_mimo_timeout)
@@ -969,6 +1156,14 @@ class Settings:
             feishu_app_id=configured_feishu_app_id,
             feishu_app_secret=configured_feishu_app_secret,
             feishu_receiver_open_id=configured_feishu_receiver_open_id,
+            feishu_owner_user_access_token=(
+                configured_feishu_owner_user_access_token
+            ),
+            feishu_owner_refresh_token=configured_feishu_owner_refresh_token,
+            feishu_owner_calendar_id=configured_feishu_owner_calendar_id,
+            feishu_user_token_state_path=Path(
+                configured_feishu_user_token_state_path
+            ),
             feishu_base_url=configured_feishu_base_url,
             feishu_timeout_seconds=feishu_timeout_seconds,
             feishu_max_retries=feishu_max_retries,
@@ -991,6 +1186,12 @@ class Settings:
             vision_cleanup_interval_seconds=vision_cleanup_interval_seconds,
             task_scheduler_enabled=task_scheduler_enabled,
             task_scheduler_interval_seconds=task_scheduler_interval_seconds,
+            meeting_assistant_enabled=meeting_assistant_enabled,
+            meeting_target_device_id=configured_meeting_target_device_id,
+            meeting_poll_interval_seconds=meeting_poll_interval_seconds,
+            meeting_lookahead_hours=meeting_lookahead_hours,
+            meeting_reminder_lead_seconds=meeting_reminder_lead_seconds,
+            meeting_context_ttl_seconds=meeting_context_ttl_seconds,
             device_auto_stop_idle_seconds=device_auto_stop_idle_seconds,
             device_vad_turn_rms_threshold=device_vad_turn_rms_threshold,
             device_auto_turn_rms_threshold=device_auto_turn_rms_threshold,

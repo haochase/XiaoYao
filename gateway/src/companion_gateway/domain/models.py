@@ -22,6 +22,7 @@ class TaskKind(StrEnum):
     REMINDER = "reminder"
     ANNOUNCEMENT = "announcement"
     ROUTINE = "routine"
+    MEETING_REMINDER = "meeting_reminder"
 
 
 class ConfirmationPolicy(StrEnum):

@@ -99,6 +99,10 @@ def test_task_contract_serializes_exact_enum_values() -> None:
     }
 
 
+def test_meeting_reminder_kind_serializes_exact_value() -> None:
+    assert TaskKind.MEETING_REMINDER.value == "meeting_reminder"
+
+
 def test_created_event_is_a_valid_append_only_event() -> None:
     event = TaskEvent(
         event_id="evt-1",

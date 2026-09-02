@@ -319,6 +319,10 @@ contains names and non-secret defaults, never application credentials:
 COMPANION_FEISHU_APP_ID=<enterprise-app-id>
 COMPANION_FEISHU_APP_SECRET=<enterprise-app-secret>
 COMPANION_FEISHU_RECEIVER_OPEN_ID=<receiver-open-id>
+COMPANION_FEISHU_OWNER_USER_ACCESS_TOKEN=<owner-user-access-token>
+COMPANION_FEISHU_OWNER_REFRESH_TOKEN=<owner-refresh-token>
+COMPANION_FEISHU_OWNER_CALENDAR_ID=<owner-calendar-id>
+COMPANION_FEISHU_USER_TOKEN_STATE_PATH=data/feishu-user-token.json
 COMPANION_FEISHU_BASE_URL=https://open.feishu.cn
 COMPANION_FEISHU_TIMEOUT_SECONDS=10
 COMPANION_FEISHU_MAX_RETRIES=2
@@ -326,9 +330,14 @@ COMPANION_FEISHU_RETRY_BACKOFF_SECONDS=1
 ```
 
 The outbound adapter caches `tenant_access_token` in memory and retries only
-transport errors, HTTP 429, and HTTP 5xx responses. An optional single-user
-private text-chat channel can receive Feishu message events over the official
-long connection and route plain text to the configured MiMo model:
+transport errors, HTTP 429, and HTTP 5xx responses. Optional owner credentials
+make calendar reads use the configured calendar directly. When that access
+token expires, the OAuth v3 refresh response is written atomically to the
+ignored token state path before the rotated token is used; subsequent
+processes prefer that state over stale `.env` token values. Separately, an
+optional single-user private text-chat channel can receive Feishu message
+events over the official long connection and route plain text to the
+configured MiMo model:
 
 ```text
 COMPANION_FEISHU_CHAT_ENABLED=true
@@ -342,6 +351,165 @@ in-memory conversation context. `帮助` and `清除上下文` are local command
 It does not expose a public callback, accept arbitrary tools, or call Home
 Assistant. The database stays on the gateway host and is never stored on the
 ESP32.
+
+## Feishu meeting assistant (opt-in)
+
+The single-owner meeting assistant is disabled by default. In the Feishu
+enterprise app, grant the read-only `calendar:calendar:readonly` permission and
+enable the bot capability for the configured owner so the gateway can send
+delivery status and fallback text. Publish the app permission change before
+testing newly created events.
+
+When owner user credentials are configured, calendar reads use the configured
+calendar ID directly and refresh an expired access token through OAuth v3. The
+rotated access and refresh tokens are stored atomically at the ignored local
+state path. Without owner user credentials, the compatibility path discovers
+the readable primary calendar with
+`POST /open-apis/calendar/v4/calendars/primarys?user_id_type=open_id`.
+
+Keep credentials only in the ignored `gateway/.env`. Before enabling the
+assistant, run the read-only sanitized check from the repository root:
+
+```powershell
+$env:PYTHONPATH='gateway\src'
+python -B tools\feishu_calendar_check.py --hours 24
+```
+
+The command performs no writes. Its JSON contains only `configured`,
+`event_count`, and event `summary`, `start_at`, `end_at`, `location`,
+`status`, `rsvp_status`, and `is_all_day`. It excludes raw event IDs,
+calendar IDs, owner Open IDs, access tokens, descriptions, credentials,
+request URLs, absolute private paths, and target device IDs.
+
+When no ESP32 session is available, add --dry-run to print eligible meeting
+reminders without calling MiMo, TTS, or the Feishu send API.
+
+~~~powershell
+$env:PYTHONPATH='gateway\src'
+python -B tools\feishu_calendar_check.py --hours 24 --dry-run
+~~~
+
+The dry-run JSON is marked with mode: "dry_run" and device: "offline",
+contains only reminders in the configured lead window, and uses the same
+deterministic fallback text as online device-offline handling. This is local
+diagnostic output, not delivery evidence.
+
+After the sanitized check succeeds, configure the exact P0 settings in
+`gateway/.env`:
+
+```text
+COMPANION_TASK_SCHEDULER_ENABLED=true
+COMPANION_MEETING_ASSISTANT_ENABLED=true
+COMPANION_MEETING_TARGET_DEVICE_ID=<device-id>
+COMPANION_MEETING_POLL_INTERVAL_SECONDS=30
+COMPANION_MEETING_LOOKAHEAD_HOURS=24
+COMPANION_MEETING_REMINDER_LEAD_SECONDS=600
+COMPANION_MEETING_CONTEXT_TTL_SECONDS=300
+```
+
+Enabling requires complete Feishu credentials, a MiMo API key, a target device,
+and the task scheduler. A meeting is eligible while
+`0 < start_at - now <= 600 seconds`: a meeting exactly 10 minutes away is
+included, a late poll can recover it before it starts, and a started or
+ineligible event is excluded. The persisted idempotency key prevents repeated
+polls or a restart from creating another reminder task. This is task-creation
+deduplication; it is not an exactly-once guarantee for external delivery.
+
+MiMo returns one strict preparation label from a fixed allowlist. The gateway
+then composes the at-most-80-character briefing deterministically from the
+event title, remaining minutes, optional location, and the label's fixed
+phrase. Any free-form text, JSON, calendar text, prompt echo, unknown label,
+blank output, or model failure uses the deterministic fallback instead. For an
+online device, the reminder uses ESP32 TTS and the bot receives a best-effort
+delivery-status writeback. If no matching device session exists or TTS fails,
+the device-offline fallback sends the same reminder through Feishu.
+
+External delivery is at-least-once across process crash windows. During an
+uninterrupted run, a successful attempt is persisted as `DELIVERED` and normal
+later ticks do not resend it. A crash after ESP32 TTS or Feishu message creation
+but before local `DELIVERED` persistence can replay that side effect on retry;
+neither provider has an implemented shared idempotency receipt in this P0.
+Grounded `next_meeting` answers use only a fresh, eligible in-memory calendar
+snapshot; stale or missing context is reported as unavailable rather than
+guessed.
+
+Automated local proof uses fake calendar, model, notifier, and device leaves and
+does not prove any external service or hardware:
+
+```powershell
+python -B -m pytest gateway\tests tools\tests -p no:cacheprovider
+```
+
+Real acceptance uses one owner, one target device, and newly created test
+meetings:
+
+1. Run the sanitized check, then create a meeting approximately 12 minutes in
+   the future.
+2. Start this worktree's gateway on an unused port and confirm one real calendar
+   read and one AI briefing.
+3. During an uninterrupted run, confirm one ESP32 TTS reminder at the
+   10-minute boundary.
+4. Ask for the next meeting and confirm title, time, and location match Feishu.
+5. Confirm one Feishu delivery-status writeback.
+6. Create a second short-term meeting with the device disconnected and, during
+   an uninterrupted run, confirm one Feishu fallback and no TTS.
+
+Current real-gate status:
+
+- Real Feishu owner authentication, token rotation, and calendar read:
+  `PASS` on 2026-09-02 through two read-only dry-runs; the 24-hour window
+  contained zero events, and the second process reused the rotated token state.
+- Real eligible meeting reminder candidate: `PASS` on 2026-09-02; one event
+  remained visible while the dry-run count changed from zero outside the lead
+  window to one inside the 10-minute boundary.
+- Real MiMo briefing leaf: `PASS` on 2026-09-02 with an explicitly synthetic
+  XiaoYao demo meeting; the validated result used `mode=ai`.
+- Real Feishu bot message leaf: `PASS` on 2026-09-02 for the same synthetic
+  reminder; the provider returned success and a message ID, and the configured
+  recipient confirmed receipt in Feishu.
+- Real ESP32 meeting TTS: `PASS` on 2026-09-02. The configured device played
+  the full reminder clearly after one negotiated 60 ms frame interval was
+  added between `tts.start` and the first Opus frame.
+- Real state-driven RGB meeting cue: `PASS` on 2026-09-02. The device ring was
+  observed red while listening, briefly green while speaking, and off after
+  returning to idle.
+- Standalone custom RGB color or blink command: `NOT_IMPLEMENTED`; the current
+  xiaozhi 2.4.1 firmware has a six-pixel WS2812 ring but exposes no LED MCP
+  tool, so custom control requires a firmware change and flash.
+- Real grounded `next_meeting` voice query: `PASS` on 2026-09-02. During the
+  full rehearsal, the device answered with the temporary meeting's correct
+  name, start time, and location; the user confirmed all three fields.
+- Real calendar-to-MiMo-to-Feishu offline fallback: provider-level `PASS` on
+  2026-09-02 as one transaction. One temporary event produced one candidate,
+  one valid MiMo label, one persisted reminder task, and one delivered fallback;
+  the temporary event was deleted and its absence was verified afterward.
+- Recipient confirmation for that end-to-end fallback message: `PASS`; the
+  configured recipient confirmed receipt in Feishu.
+- Real bounded gateway scheduler: `PASS` on 2026-09-02. A temporary local
+  configuration started the scheduler, completed two real calendar polls,
+  kept a fresh context, stopped cleanly, invoked neither MiMo nor Feishu while
+  the calendar was empty, and removed its temporary database after shutdown.
+- Persistent local gateway activation: `PASS` on 2026-09-02. The existing
+  `XiaoYao Voice Gateway` task was updated to this Feishu worktree, remained
+  running across a complete 30-second meeting poll interval, and returned
+  healthy and ready responses before and after that interval.
+- Real Feishu private text channel: `PASS` on 2026-09-02. The configured owner
+  sent a normal chat message, received a MiMo reply, and then completed the
+  local `清除上下文` command; gateway counters reached three received and three
+  replied messages.
+- Real medication reminder: `PASS` on 2026-09-02. A temporary one-time plan
+  created one occurrence, delivered one stable ESP32 voice reminder confirmed
+  by the user, acknowledged the occurrence, disabled the plan, and left no
+  enabled plan or pending Feishu fallback.
+- Full competition rehearsal: `PASS` on 2026-09-02 for calendar polling,
+  T-10 selection, MiMo briefing, stable ESP32 TTS, state-driven RGB indication,
+  and grounded next-meeting voice response. The temporary event was deleted
+  after the rehearsal.
+
+Do not treat automated substitutes, fixtures, or old logs as real acceptance.
+P0 is not complete until one fresh Feishu to AI to ESP32 to Feishu loop is
+observed. Meeting indicator behavior and its settings belong to the separate
+P1 scope.
 
 ## Long-term memory (local API, opt-in)
 

@@ -230,6 +230,114 @@ def test_settings_parse_task_scheduler_configuration(monkeypatch) -> None:
     assert settings.task_scheduler_interval_seconds == 2.5
 
 
+def configure_meeting_dependencies(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test_app")
+    monkeypatch.setenv("COMPANION_FEISHU_APP_SECRET", "secret_test_value")
+    monkeypatch.setenv("COMPANION_FEISHU_RECEIVER_OPEN_ID", "ou_test_receiver")
+    monkeypatch.setenv("COMPANION_MIMO_API_KEY", "example-token")
+    monkeypatch.setenv("COMPANION_TASK_SCHEDULER_ENABLED", "true")
+
+
+def test_settings_loads_meeting_assistant_configuration(monkeypatch) -> None:
+    configure_meeting_dependencies(monkeypatch)
+    monkeypatch.setenv("COMPANION_MEETING_ASSISTANT_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_MEETING_TARGET_DEVICE_ID", "desk-device")
+    monkeypatch.setenv("COMPANION_MEETING_POLL_INTERVAL_SECONDS", "30")
+    monkeypatch.setenv("COMPANION_MEETING_LOOKAHEAD_HOURS", "24")
+    monkeypatch.setenv("COMPANION_MEETING_REMINDER_LEAD_SECONDS", "600")
+    monkeypatch.setenv("COMPANION_MEETING_CONTEXT_TTL_SECONDS", "300")
+
+    settings = Settings.from_environment()
+
+    assert settings.meeting_assistant_enabled is True
+    assert settings.meeting_target_device_id == "desk-device"
+    assert settings.meeting_poll_interval_seconds == 30
+    assert settings.meeting_lookahead_hours == 24
+    assert settings.meeting_reminder_lead_seconds == 600
+    assert settings.meeting_context_ttl_seconds == 300
+
+
+def test_meeting_assistant_defaults_disabled_without_a_target() -> None:
+    settings = Settings(database_path=Path("data/test.db"))
+
+    assert settings.meeting_assistant_enabled is False
+    assert settings.meeting_target_device_id is None
+
+
+def test_meeting_assistant_requires_complete_dependencies() -> None:
+    with pytest.raises(ValueError, match="COMPANION_MEETING_ASSISTANT_ENABLED"):
+        Settings(
+            database_path=Path("data/test.db"),
+            meeting_assistant_enabled=True,
+        )
+
+
+def test_meeting_assistant_accepts_complete_dependencies() -> None:
+    settings = Settings(
+        database_path=Path("data/test.db"),
+        meeting_assistant_enabled=True,
+        meeting_target_device_id="desk-device",
+        task_scheduler_enabled=True,
+        feishu_app_id="app",
+        feishu_app_secret="secret",
+        feishu_receiver_open_id="owner",
+        mimo_api_key="mimo-key",
+    )
+
+    assert settings.meeting_assistant_enabled is True
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("COMPANION_MEETING_ASSISTANT_ENABLED", "sometimes"),
+        ("COMPANION_MEETING_TARGET_DEVICE_ID", "   "),
+        ("COMPANION_MEETING_TARGET_DEVICE_ID", "x" * 129),
+        ("COMPANION_MEETING_POLL_INTERVAL_SECONDS", "0"),
+        ("COMPANION_MEETING_POLL_INTERVAL_SECONDS", "not-a-number"),
+        ("COMPANION_MEETING_POLL_INTERVAL_SECONDS", "nan"),
+        ("COMPANION_MEETING_POLL_INTERVAL_SECONDS", "inf"),
+        ("COMPANION_MEETING_LOOKAHEAD_HOURS", "0"),
+        ("COMPANION_MEETING_LOOKAHEAD_HOURS", "73"),
+        ("COMPANION_MEETING_LOOKAHEAD_HOURS", "not-an-integer"),
+        ("COMPANION_MEETING_REMINDER_LEAD_SECONDS", "59"),
+        ("COMPANION_MEETING_REMINDER_LEAD_SECONDS", "3601"),
+        ("COMPANION_MEETING_REMINDER_LEAD_SECONDS", "not-an-integer"),
+        ("COMPANION_MEETING_CONTEXT_TTL_SECONDS", "0"),
+        ("COMPANION_MEETING_CONTEXT_TTL_SECONDS", "not-a-number"),
+        ("COMPANION_MEETING_CONTEXT_TTL_SECONDS", "nan"),
+        ("COMPANION_MEETING_CONTEXT_TTL_SECONDS", "inf"),
+    ],
+)
+def test_settings_rejects_invalid_meeting_configuration(
+    monkeypatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        Settings.from_environment()
+
+
+def test_settings_rejects_meeting_context_ttl_shorter_than_poll() -> None:
+    with pytest.raises(ValueError, match="COMPANION_MEETING_CONTEXT_TTL_SECONDS"):
+        Settings(
+            database_path=Path("data/test.db"),
+            meeting_poll_interval_seconds=31,
+            meeting_context_ttl_seconds=30,
+        )
+
+
+def test_enabled_meeting_assistant_rejects_an_empty_target(monkeypatch) -> None:
+    configure_meeting_dependencies(monkeypatch)
+    monkeypatch.setenv("COMPANION_MEETING_ASSISTANT_ENABLED", "true")
+    monkeypatch.setenv("COMPANION_MEETING_TARGET_DEVICE_ID", "")
+
+    with pytest.raises(ValueError, match="COMPANION_MEETING_ASSISTANT_ENABLED"):
+        Settings.from_environment()
+
+
 def test_settings_loads_feishu_configuration(monkeypatch) -> None:
     monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test_app")
     monkeypatch.setenv("COMPANION_FEISHU_APP_SECRET", "secret_test_value")
@@ -244,6 +352,45 @@ def test_settings_loads_feishu_configuration(monkeypatch) -> None:
     assert settings.feishu_receiver_open_id == "ou_test_receiver"
     assert settings.feishu_max_retries == 3
     assert settings.feishu_retry_backoff_seconds == 0.25
+
+
+def test_settings_loads_owner_user_token_configuration(monkeypatch, tmp_path) -> None:
+    state_path = tmp_path / "feishu-user-token.json"
+    monkeypatch.setenv("COMPANION_FEISHU_APP_ID", "cli_test_app")
+    monkeypatch.setenv("COMPANION_FEISHU_APP_SECRET", "secret_test_value")
+    monkeypatch.setenv("COMPANION_FEISHU_RECEIVER_OPEN_ID", "ou_test_receiver")
+    monkeypatch.setenv("COMPANION_FEISHU_OWNER_USER_ACCESS_TOKEN", "user_access")
+    monkeypatch.setenv("COMPANION_FEISHU_OWNER_REFRESH_TOKEN", "user_refresh")
+    monkeypatch.setenv("COMPANION_FEISHU_OWNER_CALENDAR_ID", "calendar_id")
+    monkeypatch.setenv("COMPANION_FEISHU_USER_TOKEN_STATE_PATH", str(state_path))
+
+    settings = Settings.from_environment()
+
+    assert settings.feishu_owner_user_access_token == "user_access"
+    assert settings.feishu_owner_refresh_token == "user_refresh"
+    assert settings.feishu_owner_calendar_id == "calendar_id"
+    assert settings.feishu_user_token_state_path == state_path
+
+
+@pytest.mark.parametrize(
+    "missing_name",
+    [
+        "COMPANION_FEISHU_OWNER_USER_ACCESS_TOKEN",
+        "COMPANION_FEISHU_OWNER_REFRESH_TOKEN",
+        "COMPANION_FEISHU_OWNER_CALENDAR_ID",
+    ],
+)
+def test_settings_rejects_partial_owner_user_token_configuration(
+    monkeypatch,
+    missing_name: str,
+) -> None:
+    monkeypatch.setenv("COMPANION_FEISHU_OWNER_USER_ACCESS_TOKEN", "user_access")
+    monkeypatch.setenv("COMPANION_FEISHU_OWNER_REFRESH_TOKEN", "user_refresh")
+    monkeypatch.setenv("COMPANION_FEISHU_OWNER_CALENDAR_ID", "calendar_id")
+    monkeypatch.delenv(missing_name)
+
+    with pytest.raises(ValueError, match="COMPANION_FEISHU_OWNER"):
+        Settings.from_environment()
 
 
 def test_settings_loads_feishu_chat_configuration(monkeypatch) -> None:

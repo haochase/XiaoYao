@@ -55,3 +55,7 @@ def test_model_response_rejects_missing_audio_without_structured_intent() -> Non
 def test_voice_intent_rejects_unknown_types() -> None:
     with pytest.raises(ValueError):
         VoiceIntent(type="weather")
+
+
+def test_voice_intent_accepts_next_meeting() -> None:
+    assert VoiceIntent(type="next_meeting").type == "next_meeting"

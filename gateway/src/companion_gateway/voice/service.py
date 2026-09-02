@@ -20,6 +20,7 @@ from companion_gateway.domain.models import TaskRecord
 from companion_gateway.domain.tasks import TaskStatus
 from companion_gateway.medication.service import MedicationReminderService
 from companion_gateway.memory.service import MemoryService
+from companion_gateway.meeting.context import MeetingContextStore
 from companion_gateway.service import TaskService
 from companion_gateway.voice.runtime import ModelRuntime, VoiceAction, VoiceIntent
 
@@ -72,6 +73,7 @@ class VoiceTurnService:
         medication_service: MedicationReminderService | None = None,
         memory_service: MemoryService | None = None,
         task_service: TaskService | None = None,
+        meeting_context: MeetingContextStore | None = None,
         actor_id: str = "voice-user",
         clock: Clock = _utc_now,
     ) -> None:
@@ -81,6 +83,7 @@ class VoiceTurnService:
         self._medication_service = medication_service
         self._memory_service = memory_service
         self._task_service = task_service
+        self._meeting_context = meeting_context
         self._actor_id = actor_id
         self._clock = clock
         self._session_uplink: dict[str, deque[Pcm16Mono]] = {}
@@ -143,6 +146,9 @@ class VoiceTurnService:
 
     def set_task_service(self, task_service: TaskService) -> None:
         self._task_service = task_service
+
+    def set_meeting_context(self, meeting_context: MeetingContextStore) -> None:
+        self._meeting_context = meeting_context
 
     def synthesize_text(self, text: str) -> tuple[bytes, ...]:
         synthesize = getattr(self._model_runtime, "synthesize", None)
@@ -228,6 +234,20 @@ class VoiceTurnService:
             return (
                 f"现在是{now.year}年{now.month}月{now.day}日"
                 f"{now.hour}点{now.minute:02d}分。"
+            )
+        if intent.type == "next_meeting":
+            if self._meeting_context is None or not self._meeting_context.is_fresh(
+                now=now
+            ):
+                return "暂时无法读取飞书日历，请稍后再试。"
+            meeting = self._meeting_context.next_meeting(now=now)
+            if meeting is None:
+                return "未来24小时没有查到会议。"
+            local = meeting.start_at.astimezone(_SHANGHAI_TIMEZONE)
+            location = f"，地点是{meeting.location}" if meeting.location else ""
+            return (
+                f"下一场会议是{meeting.summary}，{local.hour}点"
+                f"{local.minute:02d}分开始{location}。"
             )
         if self._task_service is None or target_device_id is None:
             return "目前没有找到提醒。"

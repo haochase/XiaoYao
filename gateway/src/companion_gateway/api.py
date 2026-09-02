@@ -62,6 +62,7 @@ from companion_gateway.domain.models import (
     ContentText,
     Identifier,
     TaskCreate,
+    TaskKind,
     TaskRecord,
 )
 from companion_gateway.domain.scheduler import TaskScheduler
@@ -71,6 +72,12 @@ from companion_gateway.medication.service import (
     MedicationReminderService,
     UnconfiguredMedicationNotifier,
 )
+from companion_gateway.meeting.briefing import MeetingBriefingService
+from companion_gateway.meeting.context import MeetingContextStore
+from companion_gateway.meeting.delivery import MeetingDeliveryService
+from companion_gateway.meeting.feishu import FeishuCalendarClient
+from companion_gateway.meeting.scheduler import MeetingScheduler
+from companion_gateway.meeting.service import MeetingReminderService
 from companion_gateway.memory.service import (
     MemoryConsentRequired,
     MemoryFeatureDisabled,
@@ -171,7 +178,12 @@ def create_app(
     ) = None,
     device_transport: DeviceTransport | None = None,
     voice_delivery_service: DeviceVoiceDeliveryService | None = None,
+    meeting_delivery_service=None,
     medication_notifier: MedicationNotifier | None = None,
+    meeting_calendar=None,
+    meeting_briefing_runtime=None,
+    meeting_notifier=None,
+    meeting_clock: Callable[[], datetime] = utc_now,
     feishu_chat_listener=None,
     memory_clock: Callable[[], datetime] = utc_now,
     vision_clock: Callable[[], datetime] = utc_now,
@@ -187,6 +199,15 @@ def create_app(
     sink = device_event_sink or DiscardingDeviceEventSink()
 
     def deliver_task(task: TaskRecord) -> TaskDeliveryAttempt:
+        if task.kind is TaskKind.MEETING_REMINDER:
+            if meeting_delivery_service is None:
+                logger.info(
+                    "meeting_delivery_unavailable device=%s task=%s",
+                    redact_device_id(task.target_device_id),
+                    task.task_id,
+                )
+                return TaskDeliveryAttempt.failed("meeting_delivery_unavailable")
+            return meeting_delivery_service.deliver(task)
         session = device_sessions.get(task.target_device_id)
         if session is None:
             logger.info(
@@ -266,6 +287,82 @@ def create_app(
             max_retries=settings.feishu_max_retries,
             retry_backoff_seconds=settings.feishu_retry_backoff_seconds,
         )
+    meeting_context = None
+    meeting_calendar_client = None
+    meeting_briefing_service = None
+    meeting_service = None
+    meeting_scheduler = None
+    if settings.meeting_assistant_enabled:
+        if (
+            settings.feishu_app_id is None
+            or settings.feishu_app_secret is None
+            or settings.feishu_receiver_open_id is None
+            or settings.mimo_api_key is None
+            or settings.meeting_target_device_id is None
+            or medication_notifier is None
+        ):
+            raise ValueError("Meeting assistant settings are incomplete")
+        meeting_context = MeetingContextStore(
+            ttl_seconds=settings.meeting_context_ttl_seconds
+        )
+        meeting_calendar_client = (
+            meeting_calendar
+            if meeting_calendar is not None
+            else FeishuCalendarClient(
+                app_id=settings.feishu_app_id,
+                app_secret=settings.feishu_app_secret,
+                base_url=settings.feishu_base_url,
+                timeout_seconds=settings.feishu_timeout_seconds,
+                max_retries=settings.feishu_max_retries,
+                retry_backoff_seconds=settings.feishu_retry_backoff_seconds,
+                owner_user_access_token=settings.feishu_owner_user_access_token,
+                owner_refresh_token=settings.feishu_owner_refresh_token,
+                owner_calendar_id=settings.feishu_owner_calendar_id,
+                user_token_state_path=settings.feishu_user_token_state_path,
+            )
+        )
+        briefing_runtime = (
+            meeting_briefing_runtime
+            if meeting_briefing_runtime is not None
+            else MimoTextChatRuntime(
+                openai_base_url=settings.mimo_openai_base_url,
+                api_key=settings.mimo_api_key,
+                model=settings.mimo_model,
+                timeout_seconds=settings.mimo_timeout_seconds,
+                max_retries=settings.mimo_max_retries,
+                retry_backoff_seconds=settings.mimo_retry_backoff_seconds,
+            )
+        )
+        meeting_briefing_service = MeetingBriefingService(
+            runtime=briefing_runtime
+        )
+        meeting_service = MeetingReminderService(
+            calendar=meeting_calendar_client,
+            context=meeting_context,
+            briefing=meeting_briefing_service,
+            task_service=service,
+            task_executor=task_executor,
+            owner_open_id=settings.feishu_receiver_open_id,
+            target_device_id=settings.meeting_target_device_id,
+            lookahead_hours=settings.meeting_lookahead_hours,
+            lead_seconds=settings.meeting_reminder_lead_seconds,
+        )
+        meeting_scheduler = MeetingScheduler(
+            service=meeting_service,
+            interval_seconds=settings.meeting_poll_interval_seconds,
+            clock=meeting_clock,
+        )
+        if meeting_delivery_service is None:
+            selected_meeting_notifier = (
+                meeting_notifier
+                if meeting_notifier is not None
+                else medication_notifier
+            )
+            meeting_delivery_service = MeetingDeliveryService(
+                sessions=device_sessions,
+                voice=voice_delivery_service,
+                notifier=selected_meeting_notifier,
+            )
     medication_service = MedicationReminderService(
         repository=repository,
         task_service=service,
@@ -316,6 +413,12 @@ def create_app(
     app.state.device_event_sink = sink
     app.state.device_transport = transport
     app.state.voice_delivery_service = voice_delivery_service
+    app.state.meeting_context = meeting_context
+    app.state.meeting_calendar = meeting_calendar_client
+    app.state.meeting_briefing_service = meeting_briefing_service
+    app.state.meeting_service = meeting_service
+    app.state.meeting_scheduler = meeting_scheduler
+    app.state.meeting_delivery_service = meeting_delivery_service
     app.state.task_scheduler = task_scheduler
     app.state.medication_service = medication_service
     app.state.medication_scheduler = medication_scheduler
@@ -331,11 +434,17 @@ def create_app(
         voice_delivery_service.set_task_service(service)
         voice_delivery_service.set_medication_service(medication_service)
         voice_delivery_service.set_memory_service(memory_service)
+        if meeting_context is not None:
+            voice_delivery_service.set_meeting_context(meeting_context)
     if settings.task_scheduler_enabled:
         app.add_event_handler("startup", task_scheduler.start)
-        app.add_event_handler("shutdown", task_scheduler.stop)
         app.add_event_handler("startup", medication_scheduler.start)
+    if meeting_scheduler is not None:
+        app.add_event_handler("startup", meeting_scheduler.start)
+        app.add_event_handler("shutdown", meeting_scheduler.stop)
+    if settings.task_scheduler_enabled:
         app.add_event_handler("shutdown", medication_scheduler.stop)
+        app.add_event_handler("shutdown", task_scheduler.stop)
     if settings.memory_enabled:
         app.add_event_handler("startup", memory_scheduler.start)
         app.add_event_handler("shutdown", memory_scheduler.stop)
@@ -672,6 +781,9 @@ def create_app(
                             session.session_id,
                             len(message.opus_frames),
                             frame_duration_ms,
+                        )
+                        await _sleep_between_tts_frames(
+                            frame_duration_ms / 1_000
                         )
                         for frame_index, opus_frame in enumerate(message.opus_frames):
                             if tts_interrupted.is_set():

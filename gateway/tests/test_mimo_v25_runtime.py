@@ -629,3 +629,28 @@ def test_mimo_runtime_disables_reasoning_for_voice_chat(monkeypatch) -> None:
     runtime.respond(input_pcm())
 
     assert requests[0]["thinking"] == {"type": "disabled"}
+def test_mimo_prompt_allows_only_the_grounded_next_meeting_intent(monkeypatch) -> None:
+    requests: list[dict[str, object]] = []
+
+    def fake_urlopen(request, *, timeout):
+        requests.append(json.loads(request.data))
+        return FakeResponse(chat_payload(
+            '{"reply":"","task":null,"action":null,'
+            '"intent":{"type":"next_meeting"}}'
+        ))
+
+    monkeypatch.setattr(mimo_v25, "urlopen", fake_urlopen)
+    runtime = MimoV25Runtime(
+        openai_base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        api_key="example-token",
+    )
+
+    response = runtime.respond(input_pcm())
+
+    assert response.intent is not None
+    assert response.intent.type == "next_meeting"
+    assert response.text == ""
+    assert response.pcm is None
+    prompt = requests[0]["messages"][0]["content"]
+    assert "next_meeting" in prompt
+    assert "do not answer meeting facts yourself" in prompt

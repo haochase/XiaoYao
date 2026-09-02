@@ -1,5 +1,5 @@
 from collections.abc import Iterator
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from hashlib import sha256
 import os
 from pathlib import Path
@@ -15,9 +15,17 @@ from companion_gateway.audio.pyav_opus import PyAvOpusCodec
 from companion_gateway.device.models import DeviceHello
 from companion_gateway.device.session import DeviceSession
 from companion_gateway.device.transport import DeviceOutboundBackpressure
-from companion_gateway.domain.models import TaskCreate
+from companion_gateway.domain.models import (
+    ConfirmationPolicy,
+    TaskCreate,
+    TaskKind,
+    TaskPayload,
+    TaskRecord,
+)
+from companion_gateway.domain.executor import TaskDeliveryAttempt
 from companion_gateway.domain.medication import FeishuSendResult, MedicationPlanCreate
 from companion_gateway.domain.tasks import TaskEventType, TaskStatus
+from companion_gateway.meeting.models import MeetingEvent
 from companion_gateway.settings import Settings
 from companion_gateway.voice.minicpm_o import (
     MinicpmOHttpRuntime,
@@ -30,6 +38,7 @@ class RecordingReminderVoiceDelivery:
     def __init__(self) -> None:
         self.messages: list[tuple[str, str]] = []
         self.task_service = None
+        self.meeting_context = None
 
     def synthesize_and_send(self, *, session_id: str, text: str) -> None:
         self.messages.append((session_id, text))
@@ -45,6 +54,9 @@ class RecordingReminderVoiceDelivery:
 
     def set_memory_service(self, memory_service) -> None:
         return None
+
+    def set_meeting_context(self, meeting_context) -> None:
+        self.meeting_context = meeting_context
 
 
 def task_payload() -> dict[str, object]:
@@ -1216,3 +1228,415 @@ def test_invalid_task_payload_returns_422(client: TestClient) -> None:
     response = client.post("/v1/tasks", json=payload)
 
     assert response.status_code == 422
+
+
+class RecordingMeetingDelivery:
+    def __init__(self, outcome: TaskDeliveryAttempt | None = None) -> None:
+        self._outcome = outcome or TaskDeliveryAttempt.succeeded()
+        self.calls: list[TaskRecord] = []
+
+    def deliver(self, task: TaskRecord) -> TaskDeliveryAttempt:
+        self.calls.append(task)
+        return self._outcome
+
+
+def meeting_delivery_task() -> TaskRecord:
+    return TaskRecord.model_construct(
+        task_id="task-meeting-api-1",
+        actor_id="family-1",
+        target_device_id="meeting-device",
+        kind=TaskKind.MEETING_REMINDER,
+        schedule=None,
+        payload=TaskPayload(text="10分钟后产品周会"),
+        confirmation_policy=ConfirmationPolicy.OPTIONAL,
+        idempotency_key="meeting-api-1",
+        status=TaskStatus.PENDING_DELIVERY,
+        created_at=datetime(2026, 8, 27, 9, tzinfo=UTC),
+        trace_id="trace-meeting-api-1",
+    )
+
+
+def test_meeting_task_uses_injected_delivery_service(tmp_path) -> None:
+    delivery = RecordingMeetingDelivery()
+    app = create_app(
+        Settings(database_path=tmp_path / "meeting-delivery-api.db"),
+        meeting_delivery_service=delivery,
+    )
+    task = meeting_delivery_task()
+
+    result = app.state.task_scheduler._deliver(task)
+
+    assert result.delivered is True
+    assert delivery.calls == [task]
+
+
+def test_meeting_task_without_delivery_service_is_retryable(tmp_path) -> None:
+    app = create_app(Settings(database_path=tmp_path / "meeting-unavailable-api.db"))
+
+    result = app.state.task_scheduler._deliver(meeting_delivery_task())
+
+    assert result.delivered is False
+    assert result.failure_reason == "meeting_delivery_unavailable"
+
+
+class RecordingCalendar:
+    def __init__(self, events: tuple[MeetingEvent, ...]) -> None:
+        self.events = events
+        self.calls: list[dict[str, object]] = []
+
+    def list_upcoming(
+        self,
+        *,
+        owner_open_id: str,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> tuple[MeetingEvent, ...]:
+        self.calls.append(
+            {
+                "owner_open_id": owner_open_id,
+                "start_at": start_at,
+                "end_at": end_at,
+            }
+        )
+        return self.events
+
+
+class RecordingTextRuntime:
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.prompts: list[str] = []
+
+    def respond(self, text: str, *, history=()) -> str:
+        self.prompts.append(text)
+        return self.response
+
+
+class FalseyCalendar(RecordingCalendar):
+    def __bool__(self) -> bool:
+        return False
+
+
+class FalseyTextRuntime(RecordingTextRuntime):
+    def __bool__(self) -> bool:
+        return False
+
+
+class FalseyNotifier(FakeMedicationNotifier):
+    def __bool__(self) -> bool:
+        return False
+
+
+def meeting_settings(tmp_path, **overrides) -> Settings:
+    values = {
+        "database_path": tmp_path / "meeting-api.db",
+        "meeting_assistant_enabled": True,
+        "meeting_target_device_id": "meeting-device",
+        "meeting_poll_interval_seconds": 30,
+        "meeting_lookahead_hours": 24,
+        "meeting_reminder_lead_seconds": 600,
+        "meeting_context_ttl_seconds": 300,
+        "task_scheduler_enabled": True,
+        "feishu_app_id": "meeting-app",
+        "feishu_app_secret": "meeting-secret",
+        "feishu_receiver_open_id": "meeting-owner",
+        "mimo_api_key": "meeting-mimo-key",
+    }
+    values.update(overrides)
+    return Settings(**values)
+
+
+def upcoming_meeting(now: datetime) -> MeetingEvent:
+    return MeetingEvent(
+        fingerprint="a" * 64,
+        summary="产品周会",
+        description_excerpt="确认演示分工",
+        start_at=now + timedelta(minutes=10),
+        end_at=now + timedelta(minutes=40),
+        location="3A会议室",
+        status="confirmed",
+        rsvp_status="accept",
+        is_all_day=False,
+    )
+
+
+def meeting_device_session() -> DeviceSession:
+    return DeviceSession.create(
+        device_id="meeting-device",
+        client_id="meeting-client",
+        hello=DeviceHello.model_validate(
+            {
+                "type": "hello",
+                "version": 1,
+                "transport": "websocket",
+                "audio_params": {
+                    "format": "opus",
+                    "sample_rate": 16_000,
+                    "channels": 1,
+                    "frame_duration": 60,
+                },
+            }
+        ),
+    )
+
+
+def test_disabled_meeting_assistant_constructs_no_external_runtime(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    def unexpected_constructor(**_kwargs):
+        raise AssertionError("disabled meeting assistant constructed an external leaf")
+
+    monkeypatch.setattr(api_module, "FeishuCalendarClient", unexpected_constructor)
+    monkeypatch.setattr(api_module, "MimoTextChatRuntime", unexpected_constructor)
+
+    app = create_app(Settings(database_path=tmp_path / "meeting-disabled.db"))
+
+    assert app.state.meeting_context is None
+    assert app.state.meeting_calendar is None
+    assert app.state.meeting_briefing_service is None
+    assert app.state.meeting_service is None
+    assert app.state.meeting_scheduler is None
+    assert app.state.meeting_delivery_service is None
+
+
+def test_enabled_meeting_scheduler_starts_and_stops_with_app(tmp_path) -> None:
+    calendar = RecordingCalendar(())
+    now = datetime(2026, 8, 27, 4, tzinfo=UTC)
+    app = create_app(
+        meeting_settings(
+            tmp_path,
+            meeting_poll_interval_seconds=0.01,
+            meeting_context_ttl_seconds=1,
+        ),
+        meeting_calendar=calendar,
+        meeting_briefing_runtime=RecordingTextRuntime("简报"),
+        meeting_clock=lambda: now,
+        medication_notifier=FakeMedicationNotifier(),
+    )
+
+    with TestClient(app):
+        assert app.state.meeting_scheduler.is_running is True
+
+    assert app.state.meeting_scheduler.is_running is False
+
+
+def test_meeting_producer_stops_before_task_delivery_consumer(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    lifecycle: list[str] = []
+
+    async def task_start(_self) -> None:
+        lifecycle.append("task.start")
+
+    async def task_stop(_self) -> None:
+        lifecycle.append("task.stop")
+
+    async def medication_start(_self) -> None:
+        lifecycle.append("medication.start")
+
+    async def medication_stop(_self) -> None:
+        lifecycle.append("medication.stop")
+
+    async def meeting_start(_self) -> None:
+        lifecycle.append("meeting.start")
+
+    async def meeting_stop(_self) -> None:
+        lifecycle.append("meeting.stop")
+
+    monkeypatch.setattr(api_module.TaskScheduler, "start", task_start)
+    monkeypatch.setattr(api_module.TaskScheduler, "stop", task_stop)
+    monkeypatch.setattr(api_module.MedicationScheduler, "start", medication_start)
+    monkeypatch.setattr(api_module.MedicationScheduler, "stop", medication_stop)
+    monkeypatch.setattr(api_module.MeetingScheduler, "start", meeting_start)
+    monkeypatch.setattr(api_module.MeetingScheduler, "stop", meeting_stop)
+    app = create_app(
+        meeting_settings(tmp_path),
+        medication_notifier=FakeMedicationNotifier(),
+        meeting_calendar=RecordingCalendar(()),
+        meeting_briefing_runtime=RecordingTextRuntime("简报"),
+    )
+
+    with TestClient(app):
+        assert lifecycle == [
+            "task.start",
+            "medication.start",
+            "meeting.start",
+        ]
+
+    assert lifecycle == [
+        "task.start",
+        "medication.start",
+        "meeting.start",
+        "meeting.stop",
+        "medication.stop",
+        "task.stop",
+    ]
+
+
+def test_falsey_meeting_calendar_is_retained_without_default_construction(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    calendar = FalseyCalendar(())
+
+    def unexpected_calendar(**_kwargs):
+        raise AssertionError("default calendar constructed")
+
+    monkeypatch.setattr(api_module, "FeishuCalendarClient", unexpected_calendar)
+    app = create_app(
+        meeting_settings(tmp_path),
+        medication_notifier=FakeMedicationNotifier(),
+        meeting_calendar=calendar,
+        meeting_briefing_runtime=RecordingTextRuntime("简报"),
+    )
+
+    assert app.state.meeting_calendar is calendar
+
+
+def test_default_meeting_calendar_receives_owner_user_credentials(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    calendar = RecordingCalendar(())
+    captured = {}
+
+    def construct_calendar(**kwargs):
+        captured.update(kwargs)
+        return calendar
+
+    monkeypatch.setattr(api_module, "FeishuCalendarClient", construct_calendar)
+    state_path = tmp_path / "feishu-user-token.json"
+    app = create_app(
+        meeting_settings(
+            tmp_path,
+            feishu_owner_user_access_token="user-access",
+            feishu_owner_refresh_token="user-refresh",
+            feishu_owner_calendar_id="calendar-id",
+            feishu_user_token_state_path=state_path,
+        ),
+        medication_notifier=FakeMedicationNotifier(),
+        meeting_briefing_runtime=RecordingTextRuntime("简报"),
+    )
+
+    assert app.state.meeting_calendar is calendar
+    assert captured["owner_user_access_token"] == "user-access"
+    assert captured["owner_refresh_token"] == "user-refresh"
+    assert captured["owner_calendar_id"] == "calendar-id"
+    assert captured["user_token_state_path"] == state_path
+
+
+def test_falsey_meeting_runtime_is_retained_without_default_construction(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    runtime = FalseyTextRuntime("简报")
+
+    def unexpected_runtime(**_kwargs):
+        raise AssertionError("default briefing runtime constructed")
+
+    monkeypatch.setattr(api_module, "MimoTextChatRuntime", unexpected_runtime)
+    app = create_app(
+        meeting_settings(tmp_path),
+        medication_notifier=FakeMedicationNotifier(),
+        meeting_calendar=RecordingCalendar(()),
+        meeting_briefing_runtime=runtime,
+    )
+
+    assert app.state.meeting_briefing_service._runtime is runtime
+
+
+def test_falsey_meeting_notifier_is_retained_without_shared_fallback(
+    tmp_path,
+) -> None:
+    medication_notifier = FakeMedicationNotifier()
+    meeting_notifier = FalseyNotifier()
+    app = create_app(
+        meeting_settings(tmp_path),
+        medication_notifier=medication_notifier,
+        meeting_notifier=meeting_notifier,
+        meeting_calendar=RecordingCalendar(()),
+        meeting_briefing_runtime=RecordingTextRuntime("简报"),
+    )
+
+    assert app.state.meeting_delivery_service._notifier is meeting_notifier
+
+
+def test_meeting_components_reuse_notifier_and_inject_voice_context(tmp_path) -> None:
+    notifier = FakeMedicationNotifier()
+    voice = RecordingReminderVoiceDelivery()
+    calendar = RecordingCalendar(())
+    app = create_app(
+        meeting_settings(tmp_path),
+        voice_delivery_service=voice,
+        medication_notifier=notifier,
+        meeting_calendar=calendar,
+        meeting_briefing_runtime=RecordingTextRuntime("简报"),
+    )
+
+    assert app.state.meeting_calendar is calendar
+    assert app.state.meeting_delivery_service._notifier is notifier
+    assert voice.meeting_context is app.state.meeting_context
+
+
+def test_explicit_meeting_notifier_overrides_medication_notifier(tmp_path) -> None:
+    medication_notifier = FakeMedicationNotifier()
+    meeting_notifier = FakeMedicationNotifier()
+    app = create_app(
+        meeting_settings(tmp_path),
+        medication_notifier=medication_notifier,
+        meeting_notifier=meeting_notifier,
+        meeting_calendar=RecordingCalendar(()),
+        meeting_briefing_runtime=RecordingTextRuntime("简报"),
+    )
+
+    assert app.state.medication_notifier is medication_notifier
+    assert app.state.meeting_delivery_service._notifier is meeting_notifier
+
+
+def test_meeting_event_creates_one_reminder_then_tts_and_status(tmp_path) -> None:
+    now = datetime(2026, 8, 27, 4, tzinfo=UTC)
+    calendar = RecordingCalendar((upcoming_meeting(now),))
+    runtime = RecordingTextRuntime("prepare_materials")
+    notifier = FakeMedicationNotifier()
+    voice = RecordingReminderVoiceDelivery()
+    app = create_app(
+        meeting_settings(tmp_path),
+        voice_delivery_service=voice,
+        medication_notifier=notifier,
+        meeting_calendar=calendar,
+        meeting_briefing_runtime=runtime,
+    )
+    session = meeting_device_session()
+    app.state.device_sessions.connect(session)
+
+    meeting_result = app.state.meeting_scheduler.tick(now=now)
+    app.state.task_scheduler.tick(now=now)
+
+    assert len(meeting_result.created_task_ids) == 1
+    assert voice.messages == [
+        (session.session_id, "提醒你，10分钟后参加产品周会，地点是3A会议室，请提前准备材料。")
+    ]
+    assert notifier.calls == ["桌面设备已完成会前提醒。"]
+
+
+def test_meeting_event_uses_feishu_fallback_when_device_is_offline(tmp_path) -> None:
+    now = datetime(2026, 8, 27, 4, tzinfo=UTC)
+    notifier = FakeMedicationNotifier()
+    voice = RecordingReminderVoiceDelivery()
+    app = create_app(
+        meeting_settings(tmp_path),
+        voice_delivery_service=voice,
+        medication_notifier=notifier,
+        meeting_calendar=RecordingCalendar((upcoming_meeting(now),)),
+        meeting_briefing_runtime=RecordingTextRuntime("none"),
+    )
+
+    meeting_result = app.state.meeting_scheduler.tick(now=now)
+    app.state.task_scheduler.tick(now=now)
+
+    assert len(meeting_result.created_task_ids) == 1
+    assert voice.messages == []
+    assert notifier.calls == [
+        "提醒你，10分钟后参加产品周会，地点是3A会议室，请提前准备。"
+    ]

@@ -128,6 +128,21 @@ def test_repository_recovers_after_new_instance_opens_same_database(tmp_path) ->
     assert len(reopened_repository.list_events(task.task_id)) == 1
 
 
+def test_repository_gets_task_by_idempotency_key(tmp_path) -> None:
+    repository = SQLiteTaskRepository(tmp_path / "tasks.db")
+    repository.initialize()
+    task, _ = repository.create_task(
+        task_command(idempotency_key="meeting:abc:1787803800"),
+        task_id="tsk-meeting",
+        event_id="evt-created",
+        trace_id="trc-create",
+        occurred_at=NOW,
+    )
+
+    assert repository.get_task_by_idempotency_key("meeting:abc:1787803800") == task
+    assert repository.get_task_by_idempotency_key("meeting:missing") is None
+
+
 def test_missing_task_returns_none_and_no_events(tmp_path) -> None:
     repository = SQLiteTaskRepository(tmp_path / "tasks.db")
     repository.initialize()

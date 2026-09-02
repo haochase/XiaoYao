@@ -7,6 +7,7 @@ from companion_gateway.device.transport import MAX_TTS_FRAMES
 from companion_gateway.domain.executor import TaskExecutor
 from companion_gateway.medication.service import MedicationReminderService
 from companion_gateway.memory.service import MemoryService
+from companion_gateway.meeting.context import MeetingContextStore
 from companion_gateway.service import TaskService
 from companion_gateway.voice.service import VoiceTurn, VoiceTurnService
 
@@ -99,6 +100,9 @@ class DeviceVoiceDeliveryService:
 
     def set_task_service(self, task_service: TaskService) -> None:
         self._voice_turn_service.set_task_service(task_service)
+
+    def set_meeting_context(self, meeting_context: MeetingContextStore) -> None:
+        self._voice_turn_service.set_meeting_context(meeting_context)
 
     def _send_tts_frames(
         self,

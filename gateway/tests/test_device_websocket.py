@@ -335,7 +335,7 @@ def test_active_device_receives_a_multi_frame_tts_stream(
         assert websocket.receive_bytes() == b"second-opus"
         assert websocket.receive_json()["state"] == "stop"
 
-    assert delays == [0.06]
+    assert delays == [0.06, 0.06]
 
 
 def test_tts_disconnect_log_includes_failure_details(

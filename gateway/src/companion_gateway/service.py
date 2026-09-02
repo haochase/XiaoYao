@@ -53,6 +53,11 @@ class TaskService:
     def get_task(self, task_id: str) -> TaskRecord | None:
         return self._repository.get_task(task_id)
 
+    def get_task_by_idempotency_key(
+        self, idempotency_key: str
+    ) -> TaskRecord | None:
+        return self._repository.get_task_by_idempotency_key(idempotency_key)
+
     def get_latest_reminder(
         self,
         *,

@@ -962,6 +962,16 @@ class SQLiteTaskRepository:
             ).fetchone()
         return self._task_from_row(row) if row is not None else None
 
+    def get_task_by_idempotency_key(
+        self, idempotency_key: str
+    ) -> TaskRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        return self._task_from_row(row) if row is not None else None
+
     def get_latest_task(
         self,
         *,
