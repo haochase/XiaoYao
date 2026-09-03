@@ -7,7 +7,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
@@ -98,6 +98,16 @@ from companion_gateway.vision.service import (
     VisionUnsupportedType,
 )
 from companion_gateway.notifications.feishu import FeishuNotifier
+from companion_gateway.project.models import (
+    AnswerKind,
+    EvidenceRef,
+    ProjectContextPackage,
+)
+from companion_gateway.project.service import (
+    ProjectContextUnavailable,
+    ProjectMemoryError,
+    ProjectMemoryService,
+)
 from companion_gateway.domain.tasks import InvalidTaskTransition, TaskEventType
 from companion_gateway.service import TaskService
 from companion_gateway.settings import Settings, load_environment_file
@@ -116,6 +126,18 @@ from companion_gateway.voice.mimo_v25 import MimoV25Runtime
 
 
 Reason = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=256),
+]
+ProjectQueryText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=2000),
+]
+ProjectIdentifier = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
+]
+ProjectReviewer = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=256),
 ]
@@ -154,6 +176,32 @@ class MemoryProposalConfirmRequest(BaseModel):
     subject_id: Identifier
 
 
+class ProjectQueryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: ProjectQueryText
+    kind: AnswerKind
+
+
+class ConflictProposalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision_id: ProjectIdentifier
+    observed_text: ProjectQueryText
+    reason: ProjectQueryText
+    evidence_refs: tuple[EvidenceRef, ...]
+
+
+class ConflictReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reviewer_id: ProjectReviewer
+    action: Literal["accept", "reject"]
+    change_reason: ProjectQueryText
+    new_decision_text: ProjectQueryText | None = None
+    evidence_refs: tuple[EvidenceRef, ...] = ()
+
+
 class UnsupportedDeviceControl(ValueError):
     pass
 
@@ -184,6 +232,8 @@ def create_app(
     meeting_briefing_runtime=None,
     meeting_notifier=None,
     meeting_clock: Callable[[], datetime] = utc_now,
+    project_memory_service: ProjectMemoryService | None = None,
+    project_clock: Callable[[], datetime] = utc_now,
     feishu_chat_listener=None,
     memory_clock: Callable[[], datetime] = utc_now,
     vision_clock: Callable[[], datetime] = utc_now,
@@ -401,6 +451,7 @@ def create_app(
         task_executor=task_executor,
         clock=agent_clock,
     )
+    project_memory = project_memory_service or ProjectMemoryService(clock=project_clock)
     medication_scheduler = MedicationScheduler(
         service=medication_service,
         interval_seconds=settings.task_scheduler_interval_seconds,
@@ -429,6 +480,8 @@ def create_app(
     app.state.vision_service = vision_service
     app.state.vision_scheduler = vision_scheduler
     app.state.agent_tool_service = agent_tool_service
+    app.state.project_memory_service = project_memory
+    app.state.project_clock = project_clock
     if voice_delivery_service is not None:
         voice_delivery_service.set_task_executor(task_executor)
         voice_delivery_service.set_task_service(service)
@@ -494,6 +547,94 @@ def create_app(
                 getattr(feishu_chat_listener, "replied_messages", 0)
             ),
         }
+
+    @app.post("/v1/projects/{project_id}/context")
+    def replace_project_context(
+        project_id: str,
+        package: ProjectContextPackage,
+    ) -> JSONResponse:
+        if package.project_id != project_id:
+            raise HTTPException(status_code=400, detail="project_id path mismatch")
+        project_memory.replace_context(package)
+        return JSONResponse(
+            status_code=201,
+            content={"context": jsonable_encoder(package)},
+        )
+
+    @app.post("/v1/projects/{project_id}/query")
+    def query_project_context(
+        project_id: str,
+        body: ProjectQueryRequest,
+    ) -> dict[str, object]:
+        try:
+            answer = project_memory.answer(
+                project_id,
+                body.query,
+                kind=body.kind,
+                now=project_clock(),
+            )
+        except ProjectContextUnavailable as exc:
+            status_code = 409 if str(exc) == "context_expired" else 404
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        return {"answer": jsonable_encoder(answer)}
+
+    @app.post("/v1/projects/{project_id}/conflicts")
+    def propose_project_conflict(
+        project_id: str,
+        body: ConflictProposalRequest,
+    ) -> JSONResponse:
+        try:
+            candidate, created = project_memory.propose_conflict(
+                project_id,
+                decision_id=body.decision_id,
+                observed_text=body.observed_text,
+                reason=body.reason,
+                evidence_refs=body.evidence_refs,
+                now=project_clock(),
+            )
+        except ProjectContextUnavailable as exc:
+            status_code = 409 if str(exc) == "context_expired" else 404
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        except ProjectMemoryError as exc:
+            status_code = 403 if str(exc) == "source_scope_mismatch" else 409
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse(
+            status_code=201 if created else 200,
+            content={"created": created, "candidate": jsonable_encoder(candidate)},
+        )
+
+    @app.post("/v1/projects/conflicts/{candidate_id}/review")
+    def review_project_conflict(
+        candidate_id: str,
+        body: ConflictReviewRequest,
+    ) -> dict[str, object]:
+        try:
+            result = project_memory.review_conflict(
+                candidate_id,
+                reviewer_id=body.reviewer_id,
+                action=body.action,
+                change_reason=body.change_reason,
+                new_decision_text=body.new_decision_text,
+                evidence_refs=body.evidence_refs,
+                now=project_clock(),
+            )
+        except ProjectContextUnavailable as exc:
+            status_code = 409 if str(exc) == "context_expired" else 404
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        except ProjectMemoryError as exc:
+            status_code = 404 if str(exc) == "conflict_not_found" else 409
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if isinstance(result, tuple):
+            candidate, version = result
+            return {
+                "candidate": jsonable_encoder(candidate),
+                "version": jsonable_encoder(version),
+            }
+        return {"candidate": jsonable_encoder(result)}
 
     @app.get("/v1/devices/{device_id}/status")
     def device_status(device_id: Identifier) -> dict[str, object]:
