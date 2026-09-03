@@ -9,6 +9,7 @@ from companion_gateway.project.models import (
     DecisionStatus,
     DecisionVersion,
     EvidenceRef,
+    ProjectAnswer,
     ProjectContextPackage,
 )
 
@@ -155,3 +156,8 @@ def test_answer_kind_is_explicitly_bounded() -> None:
         AnswerKind.SUGGESTION,
         AnswerKind.DECISION_CHECK,
     }
+
+
+def test_fact_answer_requires_source_refs() -> None:
+    with pytest.raises(ValidationError, match="source_refs"):
+        ProjectAnswer(kind=AnswerKind.FACT, text="无来源的事实")

@@ -195,3 +195,88 @@ class ProjectContextPackage(BaseModel):
             if source.permission_scope != self.permission_scope:
                 raise ValueError("all sources must use the context permission scope")
         return self
+
+
+class ProjectAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: AnswerKind
+    text: str = Field(min_length=1, max_length=4000)
+    source_refs: tuple[EvidenceRef, ...] = ()
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    _text = field_validator("text")(
+        lambda value: _require_non_blank(value, "text")
+    )
+
+    @model_validator(mode="after")
+    def validate_fact_sources(self) -> "ProjectAnswer":
+        requires_sources = {
+            AnswerKind.FACT,
+            AnswerKind.CURRENT_STATE,
+            AnswerKind.DECISION_CHECK,
+        }
+        if self.kind in requires_sources and not self.source_refs:
+            raise ValueError("factual answers require source_refs")
+        return self
+
+
+class ConflictCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    candidate_id: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(min_length=1, max_length=128)
+    decision_id: str = Field(min_length=1, max_length=128)
+    observed_text: str = Field(min_length=1, max_length=2000)
+    active_decision_text: str = Field(min_length=1, max_length=2000)
+    reason: str = Field(min_length=1, max_length=2000)
+    source_refs: tuple[EvidenceRef, ...] = Field(min_length=1)
+    status: ConflictStatus = ConflictStatus.PROPOSED
+    created_at: datetime
+    reviewed_by: str | None = Field(default=None, max_length=256)
+    reviewed_at: datetime | None = None
+
+    _candidate_id = field_validator("candidate_id")(
+        lambda value: _require_non_blank(value, "candidate_id")
+    )
+    _project_id = field_validator("project_id")(
+        lambda value: _require_non_blank(value, "project_id")
+    )
+    _decision_id = field_validator("decision_id")(
+        lambda value: _require_non_blank(value, "decision_id")
+    )
+    _observed_text = field_validator("observed_text")(
+        lambda value: _require_non_blank(value, "observed_text")
+    )
+    _active_decision_text = field_validator("active_decision_text")(
+        lambda value: _require_non_blank(value, "active_decision_text")
+    )
+    _reason = field_validator("reason")(
+        lambda value: _require_non_blank(value, "reason")
+    )
+    _created_at = field_validator("created_at")(
+        lambda value: _require_aware(value, "created_at")
+    )
+    _reviewed_by = field_validator("reviewed_by")(
+        lambda value: _require_non_blank(value, "reviewed_by")
+        if value is not None
+        else value
+    )
+    _reviewed_at = field_validator("reviewed_at")(
+        lambda value: _require_aware(value, "reviewed_at")
+        if value is not None
+        else value
+    )
+
+    @model_validator(mode="after")
+    def validate_review_fields(self) -> "ConflictCandidate":
+        terminal = {ConflictStatus.ACCEPTED, ConflictStatus.REJECTED}
+        if self.status in terminal and (
+            self.reviewed_by is None or self.reviewed_at is None
+        ):
+            raise ValueError("reviewed conflict requires reviewed fields")
+        if self.status is ConflictStatus.PROPOSED and (
+            self.reviewed_by is not None or self.reviewed_at is not None
+        ):
+            raise ValueError("proposed conflict cannot have review fields")
+        return self
