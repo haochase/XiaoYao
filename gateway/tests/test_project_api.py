@@ -148,3 +148,28 @@ def test_project_conflict_rejects_foreign_source_scope(client: TestClient) -> No
 
     assert response.status_code == 403
     assert response.json()["detail"] == "source_scope_mismatch"
+
+
+def test_project_context_survives_app_recreation(tmp_path) -> None:
+    database_path = tmp_path / "project-restart.db"
+    first_app = create_app(
+        Settings(database_path=database_path),
+        project_clock=lambda: NOW,
+    )
+    with TestClient(first_app) as first_client:
+        assert first_client.post(
+            "/v1/projects/project-1/context", json=context()
+        ).status_code == 201
+
+    second_app = create_app(
+        Settings(database_path=database_path),
+        project_clock=lambda: NOW,
+    )
+    with TestClient(second_app) as second_client:
+        response = second_client.post(
+            "/v1/projects/project-1/query",
+            json={"query": "终端方案", "kind": "fact"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["answer"]["text"] == "采用方案 B"

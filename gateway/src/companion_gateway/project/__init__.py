@@ -16,6 +16,7 @@ from companion_gateway.project.service import (
     ProjectMemoryError,
     ProjectMemoryService,
 )
+from companion_gateway.project.repository import ProjectMemoryRepository
 
 __all__ = [
     "AnswerKind",
@@ -30,4 +31,5 @@ __all__ = [
     "ProjectContextUnavailable",
     "ProjectMemoryError",
     "ProjectMemoryService",
+    "ProjectMemoryRepository",
 ]

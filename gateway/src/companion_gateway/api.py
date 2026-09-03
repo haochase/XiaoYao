@@ -108,6 +108,7 @@ from companion_gateway.project.service import (
     ProjectMemoryError,
     ProjectMemoryService,
 )
+from companion_gateway.project.repository import ProjectMemoryRepository
 from companion_gateway.domain.tasks import InvalidTaskTransition, TaskEventType
 from companion_gateway.service import TaskService
 from companion_gateway.settings import Settings, load_environment_file
@@ -451,7 +452,12 @@ def create_app(
         task_executor=task_executor,
         clock=agent_clock,
     )
-    project_memory = project_memory_service or ProjectMemoryService(clock=project_clock)
+    project_repository = ProjectMemoryRepository(settings.database_path)
+    project_repository.initialize()
+    project_memory = project_memory_service or ProjectMemoryService(
+        clock=project_clock,
+        repository=project_repository,
+    )
     medication_scheduler = MedicationScheduler(
         service=medication_service,
         interval_seconds=settings.task_scheduler_interval_seconds,
@@ -481,6 +487,7 @@ def create_app(
     app.state.vision_scheduler = vision_scheduler
     app.state.agent_tool_service = agent_tool_service
     app.state.project_memory_service = project_memory
+    app.state.project_memory_repository = project_repository
     app.state.project_clock = project_clock
     if voice_delivery_service is not None:
         voice_delivery_service.set_task_executor(task_executor)

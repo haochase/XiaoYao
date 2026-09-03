@@ -17,6 +17,7 @@ from companion_gateway.project.models import (
     ProjectAnswer,
     ProjectContextPackage,
 )
+from companion_gateway.project.repository import ProjectMemoryRepository
 
 
 class ProjectMemoryError(RuntimeError):
@@ -28,8 +29,14 @@ class ProjectContextUnavailable(ProjectMemoryError):
 
 
 class ProjectMemoryService:
-    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        repository: ProjectMemoryRepository | None = None,
+    ) -> None:
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._repository = repository
         self._contexts: dict[str, ProjectContextPackage] = {}
         self._versions: dict[tuple[str, str], list[DecisionVersion]] = {}
         self._conflicts: dict[str, ConflictCandidate] = {}
@@ -38,10 +45,17 @@ class ProjectMemoryService:
     def replace_context(self, package: ProjectContextPackage) -> None:
         with self._lock:
             self._contexts[package.project_id] = package
+            if self._repository is not None:
+                self._repository.save_context(package)
             for item in package.active_decisions:
                 key = (package.project_id, item.decision_id)
                 if key not in self._versions:
-                    self._versions[key] = [
+                    versions = (
+                        self._repository.list_versions(*key)
+                        if self._repository is not None
+                        else []
+                    )
+                    self._versions[key] = versions or [
                         DecisionVersion(
                             decision_id=item.decision_id,
                             version=1,
@@ -53,6 +67,8 @@ class ProjectMemoryService:
                             evidence_refs=item.source_refs,
                         )
                     ]
+                    if self._repository is not None and not versions:
+                        self._repository.save_version(package.project_id, self._versions[key][0])
 
     def answer(
         self,
@@ -142,6 +158,8 @@ class ProjectMemoryService:
                 created_at=timestamp,
             )
             self._conflicts[candidate_id] = candidate
+            if self._repository is not None:
+                self._repository.save_conflict(candidate)
             return candidate, True
 
     def review_conflict(
@@ -158,6 +176,11 @@ class ProjectMemoryService:
         timestamp = now or self._clock()
         with self._lock:
             candidate = self._conflicts.get(candidate_id)
+        if candidate is None and self._repository is not None:
+            candidate = self._repository.get_conflict(candidate_id)
+            if candidate is not None:
+                with self._lock:
+                    self._conflicts[candidate_id] = candidate
         if candidate is None:
             raise ProjectMemoryError("conflict_not_found")
         if candidate.status is not ConflictStatus.PROPOSED:
@@ -178,6 +201,8 @@ class ProjectMemoryService:
             )
             with self._lock:
                 self._conflicts[candidate_id] = reviewed
+                if self._repository is not None:
+                    self._repository.save_conflict(reviewed)
             return reviewed
 
         if action != "accept":
@@ -192,7 +217,10 @@ class ProjectMemoryService:
         )
         key = (candidate.project_id, candidate.decision_id)
         with self._lock:
-            versions = self._versions.setdefault(key, [])
+            versions = self._versions.get(key, [])
+            if not versions and self._repository is not None:
+                versions = self._repository.list_versions(*key)
+            self._versions[key] = versions
             previous_version = versions[-1].version if versions else 1
             version = DecisionVersion(
                 decision_id=candidate.decision_id,
@@ -228,6 +256,8 @@ class ProjectMemoryService:
                 }
             )
             self._contexts[candidate.project_id] = updated_context
+            if self._repository is not None:
+                self._repository.save_context(updated_context)
             reviewed = candidate.model_copy(
                 update={
                     "status": ConflictStatus.ACCEPTED,
@@ -236,6 +266,9 @@ class ProjectMemoryService:
                 }
             )
             self._conflicts[candidate_id] = reviewed
+            if self._repository is not None:
+                self._repository.save_version(candidate.project_id, version)
+                self._repository.save_conflict(reviewed)
         return reviewed, version
 
     def _require_fresh_context(
@@ -244,6 +277,11 @@ class ProjectMemoryService:
         timestamp = now or self._clock()
         with self._lock:
             context = self._contexts.get(project_id)
+        if context is None and self._repository is not None:
+            context = self._repository.get_context(project_id)
+            if context is not None:
+                with self._lock:
+                    self._contexts[project_id] = context
         if context is None:
             raise ProjectContextUnavailable("context_not_found")
         age_seconds = (timestamp - context.generated_at).total_seconds()
