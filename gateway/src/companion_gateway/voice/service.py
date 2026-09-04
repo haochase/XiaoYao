@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import RLock
@@ -77,7 +77,7 @@ class VoiceTurnService:
         task_service: TaskService | None = None,
         meeting_context: MeetingContextStore | None = None,
         project_memory: ProjectMemoryService | None = None,
-        project_id: str | None = None,
+        project_ids_by_device: Mapping[str, str] | None = None,
         actor_id: str = "voice-user",
         clock: Clock = _utc_now,
     ) -> None:
@@ -89,7 +89,7 @@ class VoiceTurnService:
         self._task_service = task_service
         self._meeting_context = meeting_context
         self._project_memory = project_memory
-        self._project_id = project_id
+        self._project_ids_by_device = dict(project_ids_by_device or {})
         self._actor_id = actor_id
         self._clock = clock
         self._session_uplink: dict[str, deque[Pcm16Mono]] = {}
@@ -159,8 +159,8 @@ class VoiceTurnService:
     def set_project_memory(self, project_memory: ProjectMemoryService) -> None:
         self._project_memory = project_memory
 
-    def set_project_id(self, project_id: str) -> None:
-        self._project_id = project_id
+    def set_device_project_ids(self, project_ids_by_device: Mapping[str, str]) -> None:
+        self._project_ids_by_device = dict(project_ids_by_device)
 
     def synthesize_text(self, text: str) -> tuple[bytes, ...]:
         synthesize = getattr(self._model_runtime, "synthesize", None)
@@ -262,15 +262,20 @@ class VoiceTurnService:
                 f"{local.minute:02d}分开始{location}。"
             )
         if intent.type == "project_query":
+            project_id = (
+                self._project_ids_by_device.get(target_device_id)
+                if target_device_id is not None
+                else None
+            )
             if (
                 self._project_memory is None
-                or self._project_id is None
+                or project_id is None
                 or intent.query is None
             ):
                 return "暂时无法确认项目记忆，请稍后再试。"
             try:
                 answer = self._project_memory.answer(
-                    self._project_id,
+                    project_id,
                     intent.query,
                     kind=AnswerKind.DECISION_CHECK,
                     now=self._clock(),

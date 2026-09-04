@@ -558,9 +558,13 @@ def create_app(
         )
         if set_project_memory is not None:
             set_project_memory(project_memory)
-        set_project_id = getattr(voice_delivery_service, "set_project_id", None)
-        if settings.project_id is not None and set_project_id is not None:
-            set_project_id(settings.project_id)
+        set_device_project_ids = getattr(
+            voice_delivery_service,
+            "set_device_project_ids",
+            None,
+        )
+        if set_device_project_ids is not None:
+            set_device_project_ids(settings.device_project_ids)
     if settings.task_scheduler_enabled:
         app.add_event_handler("startup", task_scheduler.start)
         app.add_event_handler("startup", medication_scheduler.start)

@@ -47,6 +47,11 @@ _DEFAULT_SYSTEM_PROMPT = (
     " If the user asks about their next or upcoming meeting, return intent "
     "{\"type\":\"next_meeting\"} and an empty reply; do not answer meeting facts "
     "yourself; the gateway will ground them from Feishu Calendar."
+    " If the user asks about project decisions, their rationale, prior meeting "
+    "conclusions, or whether a statement conflicts with an existing decision, "
+    "return intent {\"type\":\"project_query\",\"query\":\"the user's focused "
+    "project question\"} and an empty reply; the gateway will ground the answer "
+    "from authorized project sources."
 )
 _MEMORY_PROPOSAL_PROMPT = (
     " Optionally return memory_proposals as a list only when the user explicitly "

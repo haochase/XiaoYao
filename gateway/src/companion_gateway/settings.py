@@ -300,21 +300,25 @@ def _normalize_meeting_target_device_id(value: str | None) -> str | None:
     return value
 
 
-def _normalize_project_id(value: str | None) -> str | None:
-    if value is None or value == "":
-        return None
-    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) is None:
+def _normalize_device_project_ids(bindings: object) -> dict[str, str]:
+    if not isinstance(bindings, Mapping) or not all(
+        _validate_device_id(device_id)
+        and isinstance(project_id, str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", project_id)
+        is not None
+        for device_id, project_id in bindings.items()
+    ):
         raise ValueError(
-            "COMPANION_PROJECT_ID must contain only letters, digits, dots, "
-            "underscores, or hyphens and start with a letter or digit"
+            "COMPANION_DEVICE_PROJECT_IDS must map non-empty device IDs to valid "
+            "project IDs"
         )
-    return value
+    return dict(bindings)
 
 
 @dataclass(frozen=True)
 class Settings:
     database_path: Path
-    project_id: str | None = None
+    device_project_ids: Mapping[str, str] = field(default_factory=dict)
     project_api_principals: tuple[ProjectApiPrincipal, ...] = ()
     device_token_hashes: Mapping[str, str] = field(default_factory=dict)
     fake_voice_fixture_path: Path | None = None
@@ -383,7 +387,9 @@ class Settings:
     audio_queue_capacity: int = 256
 
     def __post_init__(self) -> None:
-        normalized_project_id = _normalize_project_id(self.project_id)
+        normalized_device_project_ids = _normalize_device_project_ids(
+            self.device_project_ids
+        )
         normalized_project_api_principals = tuple(self.project_api_principals)
         if not all(
             isinstance(item, ProjectApiPrincipal)
@@ -651,7 +657,11 @@ class Settings:
                 "COMPANION_TASK_SCHEDULER_ENABLED=true"
             )
         object.__setattr__(self, "ota_device_tokens", ota_tokens)
-        object.__setattr__(self, "project_id", normalized_project_id)
+        object.__setattr__(
+            self,
+            "device_project_ids",
+            normalized_device_project_ids,
+        )
         object.__setattr__(
             self,
             "project_api_principals",
@@ -721,7 +731,9 @@ class Settings:
     @classmethod
     def from_environment(cls) -> "Settings":
         configured_path = os.environ.get("COMPANION_DB_PATH")
-        configured_project_id = os.environ.get("COMPANION_PROJECT_ID")
+        configured_device_project_ids = json.loads(
+            os.environ.get("COMPANION_DEVICE_PROJECT_IDS", "{}")
+        )
         configured_project_api_principals = parse_project_api_principals(
             os.environ.get("COMPANION_PROJECT_API_PRINCIPALS")
         )
@@ -1169,7 +1181,7 @@ class Settings:
             database_path=(
                 Path(configured_path) if configured_path else Path("data/companion.db")
             ),
-            project_id=configured_project_id,
+            device_project_ids=configured_device_project_ids,
             project_api_principals=configured_project_api_principals,
             device_token_hashes=token_hashes,
             fake_voice_fixture_path=(

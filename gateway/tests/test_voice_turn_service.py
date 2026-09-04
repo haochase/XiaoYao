@@ -921,7 +921,7 @@ def test_project_query_intent_uses_project_memory_sources() -> None:
         audio_bridge=bridge,
         model_runtime=runtime,
         project_memory=project_memory,
-        project_id="project-project-query",
+        project_ids_by_device={"desk-device": "project-project-query"},
         clock=lambda: now,
     )
     bridge.decode_uplink(b"input-opus")
@@ -930,6 +930,12 @@ def test_project_query_intent_uses_project_memory_sources() -> None:
 
     assert turn is not None
     assert turn.response_text == "当前有效决策：采用方案 B"
+
+    bridge.decode_uplink(b"input-opus")
+    unbound_turn = service.process_pending_turn(target_device_id="other-device")
+
+    assert unbound_turn is not None
+    assert unbound_turn.response_text == "暂时无法确认项目记忆，请稍后再试。"
 
 
 def test_project_query_intent_fails_closed_without_project_memory() -> None:

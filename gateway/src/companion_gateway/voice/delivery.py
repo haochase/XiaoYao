@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from typing import Protocol
 
 from companion_gateway.device.transport import MAX_TTS_FRAMES
@@ -108,8 +109,8 @@ class DeviceVoiceDeliveryService:
     def set_project_memory(self, project_memory: ProjectMemoryService) -> None:
         self._voice_turn_service.set_project_memory(project_memory)
 
-    def set_project_id(self, project_id: str) -> None:
-        self._voice_turn_service.set_project_id(project_id)
+    def set_device_project_ids(self, project_ids_by_device: Mapping[str, str]) -> None:
+        self._voice_turn_service.set_device_project_ids(project_ids_by_device)
 
     def _send_tts_frames(
         self,

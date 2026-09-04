@@ -151,6 +151,36 @@ def test_mimo_runtime_returns_structured_intent_without_early_tts(
     assert "current_time" in system_prompt
 
 
+def test_mimo_runtime_exposes_grounded_project_query_intent(monkeypatch) -> None:
+    requests: list[dict[str, object]] = []
+
+    def fake_urlopen(request, *, timeout):
+        requests.append(json.loads(request.data))
+        return FakeResponse(
+            chat_payload(
+                '{"reply":"","task":null,"action":null,'
+                '"intent":{"type":"project_query","query":"终端方案"}}'
+            )
+        )
+
+    monkeypatch.setattr(mimo_v25, "urlopen", fake_urlopen)
+    runtime = MimoV25Runtime(
+        openai_base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        api_key="example-token",
+    )
+
+    response = runtime.respond(input_pcm())
+
+    assert response.intent is not None
+    assert response.intent.type == "project_query"
+    assert response.intent.query == "终端方案"
+    assert response.pcm is None
+    system_prompt = requests[0]["messages"][0]["content"]
+    assert "project_query" in system_prompt
+    assert '"query"' in system_prompt
+    assert "gateway will ground" in system_prompt
+
+
 @pytest.mark.parametrize("reply_fragment", ["", '"reply":"",'])
 def test_mimo_runtime_accepts_intent_without_model_reply(
     monkeypatch,

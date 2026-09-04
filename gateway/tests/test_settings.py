@@ -259,23 +259,33 @@ def test_settings_loads_meeting_assistant_configuration(monkeypatch) -> None:
     assert settings.meeting_context_ttl_seconds == 300
 
 
-def test_settings_loads_project_id_for_device_project_binding(monkeypatch) -> None:
-    monkeypatch.setenv("COMPANION_PROJECT_ID", "project-star-retail")
+def test_settings_loads_device_project_bindings(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "COMPANION_DEVICE_PROJECT_IDS",
+        json.dumps({"desk-device": "project-star-retail"}),
+    )
 
     settings = Settings.from_environment()
 
-    assert settings.project_id == "project-star-retail"
+    assert settings.device_project_ids == {"desk-device": "project-star-retail"}
 
 
-@pytest.mark.parametrize("value", [" project-1", "project 1", ""])
-def test_settings_rejects_invalid_project_id(monkeypatch, value: str) -> None:
-    monkeypatch.setenv("COMPANION_PROJECT_ID", value)
+@pytest.mark.parametrize(
+    "value",
+    [
+        {" desk-device": "project-1"},
+        {"desk-device": "project 1"},
+        {"desk-device": ""},
+    ],
+)
+def test_settings_rejects_invalid_device_project_bindings(
+    monkeypatch,
+    value: dict[str, str],
+) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_PROJECT_IDS", json.dumps(value))
 
-    if value == "":
-        assert Settings.from_environment().project_id is None
-    else:
-        with pytest.raises(ValueError, match="COMPANION_PROJECT_ID"):
-            Settings.from_environment()
+    with pytest.raises(ValueError, match="COMPANION_DEVICE_PROJECT_IDS"):
+        Settings.from_environment()
 
 
 def test_settings_loads_project_api_principals(monkeypatch) -> None:
