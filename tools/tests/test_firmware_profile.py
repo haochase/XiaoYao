@@ -161,6 +161,8 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     assert "FinishNotificationIfPlaybackDrained();" in application
     assert "audio_service_.IsPlaybackIdle()" in application
     assert "notification_stop_received_ = true;" in application
+    assert "Return to wake-word standby after each conversation turn." in application
+    assert "SetDeviceState(kDeviceStateListening);" not in application
     application_header = application_header_path.read_text(encoding="utf-8")
     assert "bool network_connected_ = false;" in application_header
     assert "bool notification_stop_received_ = false;" in application_header

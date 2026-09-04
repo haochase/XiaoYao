@@ -306,7 +306,7 @@ _TTS_STATE_IMMEDIATE_DONE_PROFILE = _TTS_STATE_READY_PROFILE.replace(
     "                                protocol_->SendTtsDone();\n"
     "                            }\n",
 )
-_TTS_STATE_PROFILE = _TTS_STATE_READY_PROFILE.replace(
+_TTS_STATE_CONTINUOUS_PROFILE = _TTS_STATE_READY_PROFILE.replace(
     "                    notification_tts_ = notification;\n",
     "                    notification_tts_ = notification;\n"
     "                    notification_stop_received_ = false;\n",
@@ -326,6 +326,18 @@ _TTS_STATE_PROFILE = _TTS_STATE_READY_PROFILE.replace(
     "                            SetDeviceState(kDeviceStateIdle);\n"
     "                        } else {\n"
     "                            SetDeviceState(kDeviceStateListening);\n"
+    "                        }\n",
+)
+_TTS_STATE_PROFILE = _TTS_STATE_CONTINUOUS_PROFILE.replace(
+    "                        } else if (\n"
+    "                            listening_mode_ == kListeningModeManualStop) {\n"
+    "                            SetDeviceState(kDeviceStateIdle);\n"
+    "                        } else {\n"
+    "                            SetDeviceState(kDeviceStateListening);\n"
+    "                        }\n",
+    "                        } else {\n"
+    "                            // Return to wake-word standby after each conversation turn.\n"
+    "                            SetDeviceState(kDeviceStateIdle);\n"
     "                        }\n",
 )
 _APP_FIELDS_ANCHOR = (
@@ -504,6 +516,7 @@ def apply_vendor_profile(source_root: Path) -> None:
         previous_profiles=(
             _TTS_STATE_READY_PROFILE,
             _TTS_STATE_IMMEDIATE_DONE_PROFILE,
+            _TTS_STATE_CONTINUOUS_PROFILE,
         ),
     )
     _apply_exact_profile(
