@@ -976,3 +976,11 @@ def test_direct_settings_reject_non_contract_project_sync_types(
 ) -> None:
     with pytest.raises(ValueError):
         Settings(database_path=Path("data/test.db"), **{field: value})
+
+
+def test_settings_preserves_legacy_device_token_hashes_position() -> None:
+    token_hashes = {"device-test": "a" * 64}
+
+    settings = Settings(Path("data/test.db"), {}, (), token_hashes)
+
+    assert settings.device_token_hashes == token_hashes

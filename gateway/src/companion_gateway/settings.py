@@ -320,12 +320,6 @@ class Settings:
     database_path: Path
     device_project_ids: Mapping[str, str] = field(default_factory=dict)
     project_api_principals: tuple[ProjectApiPrincipal, ...] = ()
-    project_sync_host: str = "127.0.0.1"
-    project_sync_port: int = 8731
-    project_sync_max_body_bytes: int = 2_097_152
-    project_sync_clock_skew_seconds: float = 300.0
-    project_retrieval_ttl_seconds: int = 1_800
-    project_source_freshness_seconds: int = 1_800
     device_token_hashes: Mapping[str, str] = field(default_factory=dict)
     fake_voice_fixture_path: Path | None = None
     public_websocket_url: str | None = None
@@ -393,6 +387,12 @@ class Settings:
     device_vad_post_tts_rms_threshold: float = 35.0
     device_post_tts_silence_frames: int = 3
     audio_queue_capacity: int = 256
+    project_sync_host: str = "127.0.0.1"
+    project_sync_port: int = 8731
+    project_sync_max_body_bytes: int = 2_097_152
+    project_sync_clock_skew_seconds: float = 300.0
+    project_retrieval_ttl_seconds: int = 1_800
+    project_source_freshness_seconds: int = 1_800
 
     def __post_init__(self) -> None:
         normalized_device_project_ids = _normalize_device_project_ids(
