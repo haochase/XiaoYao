@@ -76,8 +76,10 @@ _SAFE_CONFLICT_ERRORS = frozenset(
 class RetrievalRequestCreate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    request_id: str = Field(min_length=1, max_length=256)
-    query_hash: str = Field(pattern=r"[0-9a-f]{64}")
+    request_id: str = Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    )
+    query_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_refs: tuple[EvidenceRef, ...] = Field(min_length=1, max_length=30)
 
 
@@ -150,10 +152,11 @@ class _SyncBoundaryMiddleware:
                 return
             if message["type"] != "http.request":
                 continue
-            body.extend(message.get("body", b""))
-            if len(body) > self._max_body_bytes:
+            chunk = message.get("body", b"")
+            if len(chunk) > self._max_body_bytes - len(body):
                 await self._body_too_large(scope, receive, send)
                 return
+            body.extend(chunk)
             if not message.get("more_body", False):
                 break
 

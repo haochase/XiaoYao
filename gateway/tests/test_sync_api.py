@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
@@ -8,6 +9,7 @@ from typing import Iterator
 import pytest
 from fastapi.testclient import TestClient
 
+import companion_gateway.sync_api as sync_api_module
 from companion_gateway.api import create_app
 from companion_gateway.project import (
     EvidenceChunk,
@@ -273,6 +275,59 @@ def test_sync_api_rejects_oversized_stream_without_content_length(
     assert response.json()["detail"] == "sync_body_too_large"
 
 
+def test_sync_middleware_rejects_one_oversized_chunk_before_extending(
+    monkeypatch,
+) -> None:
+    class ExtendForbiddenBytearray(bytearray):
+        def extend(self, value) -> None:  # type: ignore[no-untyped-def]
+            raise AssertionError("oversized chunk was extended")
+
+    async def exercise() -> list[dict[str, object]]:
+        async def downstream(_scope, _receive, _send) -> None:
+            raise AssertionError("oversized request reached downstream")
+
+        middleware = sync_api_module._SyncBoundaryMiddleware(
+            downstream,
+            max_body_bytes=1_024,
+        )
+        messages = [
+            {
+                "type": "http.request",
+                "body": b"x" * 1_025,
+                "more_body": False,
+            }
+        ]
+        sent: list[dict[str, object]] = []
+
+        async def receive() -> dict[str, object]:
+            return messages.pop(0)
+
+        async def send(message: dict[str, object]) -> None:
+            sent.append(message)
+
+        await middleware(
+            {
+                "type": "http",
+                "method": "POST",
+                "headers": ((b"host", b"127.0.0.1:8731"),),
+            },
+            receive,
+            send,
+        )
+        return sent
+
+    monkeypatch.setattr(
+        sync_api_module,
+        "bytearray",
+        ExtendForbiddenBytearray,
+        raising=False,
+    )
+
+    sent = asyncio.run(exercise())
+
+    assert sent[0]["status"] == 413
+
+
 def test_sync_api_applies_authenticated_matching_envelope(
     client: TestClient,
     sync_service: StubSyncService,
@@ -400,6 +455,42 @@ def test_retrieval_request_rejects_unregistered_source_summary(
     )
     assert response.status_code == 409
     assert response.json()["detail"] == "source_unavailable"
+
+
+def test_retrieval_request_rejects_path_unsafe_request_id(
+    client: TestClient,
+    sync_service: StubSyncService,
+) -> None:
+    body = retrieval_body()
+    body["request_id"] = "a/b"
+
+    response = client.post(
+        f"/v1/projects/{PROJECT_ID}/retrieval-requests",
+        json=body,
+        headers=AUTH,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "sync_invalid_request"
+    assert sync_service.required_refs == []
+
+
+def test_retrieval_request_rejects_hash_with_valid_substring(
+    client: TestClient,
+    sync_service: StubSyncService,
+) -> None:
+    body = retrieval_body()
+    body["query_hash"] = "x" + "a" * 64 + "y"
+
+    response = client.post(
+        f"/v1/projects/{PROJECT_ID}/retrieval-requests",
+        json=body,
+        headers=AUTH,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "sync_invalid_request"
+    assert sync_service.required_refs == []
 
 
 def test_retrieval_request_has_no_independent_complete_mutation(
