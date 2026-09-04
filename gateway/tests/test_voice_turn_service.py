@@ -1097,6 +1097,49 @@ def test_project_query_intent_fails_closed_without_project_memory() -> None:
     assert turn.response_text == "暂时无法确认项目记忆，请稍后再试。"
 
 
+@pytest.mark.parametrize(
+    ("error_label", "expected_text"),
+    [
+        ("source_stale", "相关项目资料已过期，请先同步。"),
+        ("evidence_pending", "后台正在同步补充证据，请稍后再试。"),
+    ],
+)
+def test_project_query_intent_maps_source_aware_failures(
+    error_label: str,
+    expected_text: str,
+) -> None:
+    from companion_gateway.project.service import ProjectContextUnavailable
+
+    class UnavailableProjectMemory:
+        def answer(self, *args, **kwargs):
+            raise ProjectContextUnavailable(error_label)
+
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    response_pcm = pcm_frame(sample_rate=24_000, sample_count=1_440)
+    bridge = AudioBridge(
+        codec=EchoOpusCodec(input_pcm),
+        model_sample_rate=16_000,
+        response_sample_rate=24_000,
+        queue_capacity=1,
+    )
+    runtime = IntentRuntime(
+        VoiceIntent(type="project_query", query="终端方案"),
+        response_pcm,
+    )
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        project_memory=UnavailableProjectMemory(),
+        project_ids_by_device={"desk-device": "project-1"},
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_pending_turn(target_device_id="desk-device")
+
+    assert turn is not None
+    assert turn.response_text == expected_text
+
+
 def test_device_voice_delivery_delegates_meeting_context() -> None:
     from companion_gateway.meeting.context import MeetingContextStore
 

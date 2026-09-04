@@ -22,7 +22,11 @@ from companion_gateway.medication.service import MedicationReminderService
 from companion_gateway.memory.service import MemoryService
 from companion_gateway.meeting.context import MeetingContextStore
 from companion_gateway.project.models import AnswerKind
-from companion_gateway.project.service import ProjectMemoryError, ProjectMemoryService
+from companion_gateway.project.service import (
+    ProjectContextUnavailable,
+    ProjectMemoryError,
+    ProjectMemoryService,
+)
 from companion_gateway.service import TaskService
 from companion_gateway.voice.runtime import ModelRuntime, VoiceAction, VoiceIntent
 
@@ -280,6 +284,12 @@ class VoiceTurnService:
                     kind=AnswerKind.DECISION_CHECK,
                     now=self._clock(),
                 )
+            except ProjectContextUnavailable as exc:
+                if str(exc) == "source_stale":
+                    return "相关项目资料已过期，请先同步。"
+                if str(exc) == "evidence_pending":
+                    return "后台正在同步补充证据，请稍后再试。"
+                return "暂时无法确认项目记忆，请稍后再试。"
             except (ProjectMemoryError, ValueError):
                 return "暂时无法确认项目记忆，请稍后再试。"
             return answer.text

@@ -4,7 +4,12 @@ import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from threading import RLock
-from typing import Callable, Literal
+from typing import Callable, Literal, Protocol
+
+from companion_gateway.project.index import (
+    EvidenceSource,
+    ProjectRuntimeSnapshot,
+)
 
 from companion_gateway.project.models import (
     AnswerKind,
@@ -18,6 +23,12 @@ from companion_gateway.project.models import (
     ProjectContextPackage,
 )
 from companion_gateway.project.repository import ProjectMemoryRepository
+from companion_gateway.project.sync_models import (
+    RetrievalRequest,
+    RetrievalRequestStatus,
+    SyncSourceType,
+)
+from companion_gateway.project.sync_service import ProjectSourceUnavailable
 
 
 class ProjectMemoryError(RuntimeError):
@@ -28,15 +39,59 @@ class ProjectContextUnavailable(ProjectMemoryError):
     """Raised when a project context cannot safely answer a request."""
 
 
+class ProjectSourcePolicy(Protocol):
+    def require_sources_fresh(
+        self,
+        project_id: str,
+        source_refs: tuple[EvidenceRef, ...],
+        *,
+        now: datetime,
+    ) -> None: ...
+
+
+class ProjectSnapshotReader(Protocol):
+    def get(self, project_id: str) -> ProjectRuntimeSnapshot | None: ...
+
+
+class RetrievalRequestWriter(Protocol):
+    def save_retrieval_request(
+        self,
+        request: RetrievalRequest,
+    ) -> RetrievalRequest: ...
+
+
 class ProjectMemoryService:
     def __init__(
         self,
         *,
         clock: Callable[[], datetime] | None = None,
         repository: ProjectMemoryRepository | None = None,
+        source_policy: ProjectSourcePolicy | None = None,
+        snapshot_reader: ProjectSnapshotReader | None = None,
+        retrieval_writer: RetrievalRequestWriter | None = None,
+        retrieval_ttl_seconds: int = 1800,
     ) -> None:
+        integration_dependencies = (
+            source_policy,
+            snapshot_reader,
+            retrieval_writer,
+        )
+        if sum(item is not None for item in integration_dependencies) not in {0, 3}:
+            raise ValueError(
+                "project query integration dependencies must be supplied together"
+            )
+        if (
+            not isinstance(retrieval_ttl_seconds, int)
+            or isinstance(retrieval_ttl_seconds, bool)
+            or not 60 <= retrieval_ttl_seconds <= 86_400
+        ):
+            raise ValueError("retrieval_ttl_seconds_invalid")
         self._clock = clock or (lambda: datetime.now(UTC))
         self._repository = repository
+        self._source_policy = source_policy
+        self._snapshot_reader = snapshot_reader
+        self._retrieval_writer = retrieval_writer
+        self._retrieval_ttl_seconds = retrieval_ttl_seconds
         self._contexts: dict[str, ProjectContextPackage] = {}
         self._versions: dict[tuple[str, str], list[DecisionVersion]] = {}
         self._conflicts: dict[str, ConflictCandidate] = {}
@@ -129,7 +184,8 @@ class ProjectMemoryService:
         kind: AnswerKind,
         now: datetime | None = None,
     ) -> ProjectAnswer:
-        context = self._require_fresh_context(project_id, now)
+        timestamp = now or self._clock()
+        context = self._require_fresh_context(project_id, timestamp)
         normalized_query = self._normalize(query)
         if not normalized_query:
             raise ProjectContextUnavailable("source_not_found")
@@ -144,7 +200,21 @@ class ProjectMemoryService:
                 None,
             )
         if match is None:
-            raise ProjectContextUnavailable("source_not_found")
+            if not self._query_integration_enabled:
+                raise ProjectContextUnavailable("source_not_found")
+            return self._answer_from_snapshot(
+                project_id,
+                query,
+                normalized_query,
+                timestamp,
+            )
+
+        if self._source_policy is not None:
+            self._require_query_sources_fresh(
+                project_id,
+                match.source_refs,
+                timestamp,
+            )
 
         if kind is AnswerKind.SUGGESTION:
             text = f"建议参考当前决策：{match.decision_text}"
@@ -158,6 +228,146 @@ class ProjectMemoryService:
             source_refs=match.source_refs,
             confidence=match.confidence,
         )
+
+    @property
+    def _query_integration_enabled(self) -> bool:
+        return self._source_policy is not None
+
+    def _answer_from_snapshot(
+        self,
+        project_id: str,
+        query: str,
+        normalized_query: str,
+        timestamp: datetime,
+    ) -> ProjectAnswer:
+        assert self._source_policy is not None
+        assert self._snapshot_reader is not None
+        assert self._retrieval_writer is not None
+        snapshot = self._snapshot_reader.get(project_id)
+        if snapshot is None:
+            raise ProjectContextUnavailable("source_not_found")
+
+        source_refs_by_hash = self._usable_evidence_sources(
+            project_id,
+            snapshot,
+            timestamp,
+        )
+        allowed_source_hashes = frozenset(sorted(source_refs_by_hash))
+        source_types = frozenset(
+            {SyncSourceType.DOCUMENT, SyncSourceType.MEETING_NOTE}
+        )
+        hits = snapshot.evidence_index.search(
+            query,
+            allowed_source_hashes=allowed_source_hashes,
+            source_types=source_types,
+            limit=5,
+        )
+        if hits:
+            hit = hits[0]
+            source_ref = self._evidence_ref(
+                snapshot,
+                hit.source,
+                excerpt=hit.chunk.text[:2000],
+            )
+            self._require_query_sources_fresh(
+                project_id,
+                (source_ref,),
+                timestamp,
+            )
+            return ProjectAnswer(
+                kind=AnswerKind.FACT,
+                text=hit.chunk.text,
+                source_refs=(source_ref,),
+                confidence=min(0.95, 0.5 + hit.score / 4000),
+            )
+
+        source_hashes = tuple(sorted(source_refs_by_hash))
+        if not source_hashes:
+            raise ProjectContextUnavailable("source_stale")
+        query_hash = hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()
+        request_material = "\0".join(
+            (project_id, query_hash, *source_hashes)
+        ).encode("utf-8")
+        request_id = "ret_" + hashlib.sha256(request_material).hexdigest()[:32]
+        self._retrieval_writer.save_retrieval_request(
+            RetrievalRequest(
+                request_id=request_id,
+                project_id=project_id,
+                query_hash=query_hash,
+                source_id_hashes=source_hashes,
+                status=RetrievalRequestStatus.PENDING,
+                created_at=timestamp,
+                expires_at=timestamp
+                + timedelta(seconds=self._retrieval_ttl_seconds),
+            )
+        )
+        raise ProjectContextUnavailable("evidence_pending")
+
+    def _usable_evidence_sources(
+        self,
+        project_id: str,
+        snapshot: ProjectRuntimeSnapshot,
+        timestamp: datetime,
+    ) -> dict[str, EvidenceRef]:
+        source_refs_by_hash: dict[str, EvidenceRef] = {}
+        for source in snapshot.sources:
+            if source.source_type not in {
+                SyncSourceType.DOCUMENT,
+                SyncSourceType.MEETING_NOTE,
+            }:
+                continue
+            source_ref = self._evidence_ref(
+                snapshot,
+                source,
+                excerpt=source.source_title,
+            )
+            try:
+                assert self._source_policy is not None
+                self._source_policy.require_sources_fresh(
+                    project_id,
+                    (source_ref,),
+                    now=timestamp,
+                )
+            except ProjectSourceUnavailable:
+                continue
+            source_refs_by_hash[source.source_id_hash] = source_ref
+        return source_refs_by_hash
+
+    @staticmethod
+    def _evidence_ref(
+        snapshot: ProjectRuntimeSnapshot,
+        source: EvidenceSource,
+        *,
+        excerpt: str,
+    ) -> EvidenceRef:
+        return EvidenceRef(
+            source_type=source.source_type.value,
+            source_id=source.source_id,
+            source_title=source.source_title,
+            source_url=source.source_url,
+            source_time=source.source_time,
+            excerpt=excerpt,
+            permission_scope=snapshot.context.permission_scope,
+        )
+
+    def _require_query_sources_fresh(
+        self,
+        project_id: str,
+        source_refs: tuple[EvidenceRef, ...],
+        timestamp: datetime,
+    ) -> None:
+        assert self._source_policy is not None
+        try:
+            self._source_policy.require_sources_fresh(
+                project_id,
+                source_refs,
+                now=timestamp,
+            )
+        except ProjectSourceUnavailable as exc:
+            label = str(exc)
+            if label in {"source_stale", "clock_untrusted"}:
+                raise ProjectContextUnavailable("source_stale") from None
+            raise ProjectContextUnavailable("source_unavailable") from None
 
     def current_decision(
         self, project_id: str, decision_id: str, *, now: datetime | None = None
