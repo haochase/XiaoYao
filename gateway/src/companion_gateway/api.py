@@ -657,14 +657,35 @@ def create_app(
     ) -> JSONResponse:
         if package.project_id != project_id:
             raise HTTPException(status_code=400, detail="project_id path mismatch")
-        _authenticate_project_request(
+        principal = _authenticate_project_request(
             project_authenticator,
             request,
+            project_id=project_id,
+        )
+        try:
+            existing = project_memory.get_context(project_id)
+        except ProjectContextUnavailable:
+            existing = None
+        if existing is not None:
+            _authorize_project_principal(
+                project_authenticator,
+                principal,
+                project_id=project_id,
+                permission_scope=existing.permission_scope,
+            )
+        _authorize_project_principal(
+            project_authenticator,
+            principal,
             project_id=project_id,
             permission_scope=package.permission_scope,
         )
         try:
-            project_memory.replace_context(package)
+            project_memory.replace_context(
+                package,
+                expected_permission_scope=(
+                    existing.permission_scope if existing is not None else None
+                ),
+            )
         except ProjectMemoryError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return JSONResponse(

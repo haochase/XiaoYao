@@ -297,6 +297,41 @@ def test_stale_conflict_uses_base_version_even_when_text_is_unchanged() -> None:
         )
 
 
+def test_same_observation_can_create_a_new_candidate_for_a_new_base_version() -> None:
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(decision(),)))
+    first, _ = service.propose_conflict(
+        "project-1",
+        decision_id="decision-1",
+        observed_text="改用方案 A",
+        reason="供应商交期发生变化",
+        evidence_refs=(source("meeting-2"),),
+        now=NOW,
+    )
+    service.review_conflict(
+        first.candidate_id,
+        reviewer_id="owner-1",
+        action="accept",
+        new_decision_text="采用方案 A",
+        change_reason="供应商交期发生变化",
+        evidence_refs=(source("meeting-2"),),
+        now=NOW + timedelta(minutes=1),
+    )
+
+    second, created = service.propose_conflict(
+        "project-1",
+        decision_id="decision-1",
+        observed_text="改用方案 A",
+        reason="供应商交期发生变化",
+        evidence_refs=(source("meeting-2"),),
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert created is True
+    assert second.base_version == 2
+    assert second.candidate_id != first.candidate_id
+
+
 def test_context_refresh_cannot_replace_an_active_decision() -> None:
     service = ProjectMemoryService(clock=lambda: NOW)
     service.replace_context(context(decisions=(decision(),)))

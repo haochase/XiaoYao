@@ -266,6 +266,139 @@ def test_duplicate_proposal_cannot_overwrite_reviewed_terminal_state(tmp_path) -
     assert duplicate.reviewed_by == "owner-1"
 
 
+def test_precached_proposal_refreshes_terminal_state_from_repository(tmp_path) -> None:
+    database_path = tmp_path / "project-memory.db"
+    repository = ProjectMemoryRepository(database_path)
+    repository.initialize()
+    first = ProjectMemoryService(repository=repository, clock=lambda: NOW)
+    first.replace_context(context())
+    proposed, _ = first.propose_conflict(
+        "project-1",
+        decision_id="decision-1",
+        observed_text="改用方案 A",
+        reason="供应商交期发生变化",
+        evidence_refs=(source("meeting-2"),),
+        now=NOW,
+    )
+    second = ProjectMemoryService(
+        repository=ProjectMemoryRepository(database_path),
+        clock=lambda: NOW,
+    )
+    cached, _ = second.propose_conflict(
+        "project-1",
+        decision_id="decision-1",
+        observed_text="改用方案 A",
+        reason="供应商交期发生变化",
+        evidence_refs=(source("meeting-2"),),
+        now=NOW,
+    )
+    assert cached.status is ConflictStatus.PROPOSED
+    first.review_conflict(
+        proposed.candidate_id,
+        reviewer_id="owner-1",
+        action="reject",
+        change_reason="保留原决策",
+        now=NOW + timedelta(minutes=1),
+    )
+
+    refreshed, created = second.propose_conflict(
+        "project-1",
+        decision_id="decision-1",
+        observed_text="改用方案 A",
+        reason="供应商交期发生变化",
+        evidence_refs=(source("meeting-2"),),
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert created is False
+    assert refreshed.status is ConflictStatus.REJECTED
+
+
+def test_service_reloads_context_after_another_instance_accepts_review(tmp_path) -> None:
+    database_path = tmp_path / "project-memory.db"
+    repository = ProjectMemoryRepository(database_path)
+    repository.initialize()
+    first = ProjectMemoryService(repository=repository, clock=lambda: NOW)
+    first.replace_context(context())
+    second = ProjectMemoryService(
+        repository=ProjectMemoryRepository(database_path),
+        clock=lambda: NOW,
+    )
+    assert second.answer("project-1", "终端方案", kind="fact", now=NOW).text == "采用方案 B"
+    proposed, _ = first.propose_conflict(
+        "project-1",
+        decision_id="decision-1",
+        observed_text="改用方案 A",
+        reason="供应商交期发生变化",
+        evidence_refs=(source("meeting-2"),),
+        now=NOW,
+    )
+    first.review_conflict(
+        proposed.candidate_id,
+        reviewer_id="owner-1",
+        action="accept",
+        new_decision_text="采用方案 A",
+        change_reason="供应商交期发生变化",
+        evidence_refs=(source("meeting-2"),),
+        now=NOW + timedelta(minutes=1),
+    )
+
+    answer = second.answer(
+        "project-1",
+        "终端方案",
+        kind="fact",
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert answer.text == "采用方案 A"
+
+
+def test_persistent_context_without_any_version_history_is_rejected(tmp_path) -> None:
+    database_path = tmp_path / "project-memory.db"
+    repository = ProjectMemoryRepository(database_path)
+    repository.initialize()
+    repository.save_context(context())
+    service = ProjectMemoryService(repository=repository, clock=lambda: NOW)
+
+    with pytest.raises(ProjectMemoryError, match="decision_history_incomplete"):
+        service.propose_conflict(
+            "project-1",
+            decision_id="decision-1",
+            observed_text="改用方案 A",
+            reason="供应商交期发生变化",
+            evidence_refs=(source("meeting-2"),),
+            now=NOW,
+        )
+
+
+def test_context_refresh_rejects_out_of_order_package(tmp_path) -> None:
+    database_path = tmp_path / "project-memory.db"
+    repository = ProjectMemoryRepository(database_path)
+    repository.initialize()
+    service = ProjectMemoryService(repository=repository, clock=lambda: NOW)
+    current = context().model_copy(
+        update={
+            "generated_at": NOW,
+            "open_actions": ("当前行动项",),
+        }
+    )
+    delayed = context().model_copy(
+        update={
+            "generated_at": NOW - timedelta(minutes=1),
+            "open_actions": ("过期行动项",),
+        }
+    )
+    service.replace_context(current)
+
+    with pytest.raises(ProjectMemoryError, match="context_refresh_stale"):
+        service.replace_context(delayed)
+
+    stored = repository.get_context("project-1")
+    assert stored is not None
+    assert stored.open_actions == ("当前行动项",)
+    assert stored.generated_at == NOW
+
+
 def test_failed_atomic_review_keeps_in_memory_state_unchanged(
     tmp_path,
     monkeypatch,

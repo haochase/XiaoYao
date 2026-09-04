@@ -42,14 +42,28 @@ class ProjectMemoryService:
         self._conflicts: dict[str, ConflictCandidate] = {}
         self._lock = RLock()
 
-    def replace_context(self, package: ProjectContextPackage) -> None:
+    def replace_context(
+        self,
+        package: ProjectContextPackage,
+        *,
+        expected_permission_scope: str | None = None,
+    ) -> None:
         with self._lock:
             timestamp = self._clock()
             if package.generated_at > timestamp + timedelta(seconds=30):
                 raise ProjectMemoryError("context_from_future")
-            existing = self._contexts.get(package.project_id)
-            if existing is None and self._repository is not None:
-                existing = self._repository.get_context(package.project_id)
+            existing = (
+                self._repository.get_context(package.project_id)
+                if self._repository is not None
+                else self._contexts.get(package.project_id)
+            )
+            if expected_permission_scope is None and existing is not None:
+                expected_permission_scope = existing.permission_scope
+            if (
+                existing is not None
+                and existing.permission_scope != expected_permission_scope
+            ):
+                raise ProjectMemoryError("context_permission_changed")
             if existing is not None and (
                 existing.active_decisions != package.active_decisions
             ):
@@ -58,9 +72,17 @@ class ProjectMemoryService:
                 self._initial_version(item) for item in package.active_decisions
             )
             if self._repository is not None:
-                result = self._repository.replace_context(package, initial_versions)
+                result = self._repository.replace_context(
+                    package,
+                    initial_versions,
+                    expected_permission_scope=expected_permission_scope,
+                )
                 if result == "decision_conflict":
                     raise ProjectMemoryError("decision_change_requires_review")
+                if result == "permission_conflict":
+                    raise ProjectMemoryError("context_permission_changed")
+                if result == "stale_context":
+                    raise ProjectMemoryError("context_refresh_stale")
             self._contexts[package.project_id] = package
             for item in package.active_decisions:
                 key = (package.project_id, item.decision_id)
@@ -87,13 +109,14 @@ class ProjectMemoryService:
         )
 
     def get_context(self, project_id: str) -> ProjectContextPackage:
-        with self._lock:
-            context = self._contexts.get(project_id)
-        if context is None and self._repository is not None:
+        if self._repository is not None:
             context = self._repository.get_context(project_id)
             if context is not None:
                 with self._lock:
                     self._contexts[project_id] = context
+        else:
+            with self._lock:
+                context = self._contexts.get(project_id)
         if context is None:
             raise ProjectContextUnavailable("context_not_found")
         return context
@@ -164,27 +187,26 @@ class ProjectMemoryService:
             raise ValueError("reason must not be blank")
         self._require_source_scope(context, evidence_refs)
         timestamp = now or self._clock()
-        candidate_id = self._conflict_id(
-            project_id,
-            decision_id,
-            observed_text,
-            reason,
-            evidence_refs,
-        )
         with self._lock:
             versions = self._decision_versions(project_id, active)
-            existing = self._conflicts.get(candidate_id)
-            if existing is None and self._repository is not None:
-                existing = self._repository.get_conflict(candidate_id)
+            base_version = versions[-1].version
+            candidate_id = self._conflict_id(
+                project_id,
+                decision_id,
+                base_version,
+                observed_text,
+                reason,
+                evidence_refs,
+            )
+            if self._repository is None:
+                existing = self._conflicts.get(candidate_id)
                 if existing is not None:
-                    self._conflicts[candidate_id] = existing
-            if existing is not None:
-                return existing, False
+                    return existing, False
             candidate = ConflictCandidate(
                 candidate_id=candidate_id,
                 project_id=project_id,
                 decision_id=decision_id,
-                base_version=versions[-1].version,
+                base_version=base_version,
                 observed_text=observed_text,
                 active_decision_text=active.decision_text,
                 reason=reason,
@@ -199,13 +221,14 @@ class ProjectMemoryService:
             return stored, created
 
     def get_conflict(self, candidate_id: str) -> ConflictCandidate:
-        with self._lock:
-            candidate = self._conflicts.get(candidate_id)
-        if candidate is None and self._repository is not None:
+        if self._repository is not None:
             candidate = self._repository.get_conflict(candidate_id)
             if candidate is not None:
                 with self._lock:
                     self._conflicts[candidate_id] = candidate
+        else:
+            with self._lock:
+                candidate = self._conflicts.get(candidate_id)
         if candidate is None:
             raise ProjectMemoryError("conflict_not_found")
         return candidate
@@ -342,10 +365,13 @@ class ProjectMemoryService:
         active: DecisionCard,
     ) -> list[DecisionVersion]:
         key = (project_id, active.decision_id)
-        versions = self._versions.get(key, [])
-        if not versions and self._repository is not None:
+        if self._repository is not None:
             versions = self._repository.list_versions(*key)
-        if not versions:
+            if not versions:
+                raise ProjectMemoryError("decision_history_incomplete")
+        else:
+            versions = self._versions.get(key, [])
+        if not versions and self._repository is None:
             versions = [self._initial_version(active)]
         expected_numbers = list(range(1, len(versions) + 1))
         active_versions = [
@@ -408,6 +434,7 @@ class ProjectMemoryService:
     def _conflict_id(
         project_id: str,
         decision_id: str,
+        base_version: int,
         observed_text: str,
         reason: str,
         evidence_refs: tuple[EvidenceRef, ...],
@@ -415,6 +442,7 @@ class ProjectMemoryService:
         payload = {
             "project_id": project_id,
             "decision_id": decision_id,
+            "base_version": base_version,
             "observed_text": observed_text.strip(),
             "reason": reason.strip(),
             "source_ids": sorted(item.source_id for item in evidence_refs),

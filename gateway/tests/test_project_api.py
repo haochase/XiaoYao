@@ -331,3 +331,30 @@ def test_project_api_rejects_same_project_principal_without_context_scope(
     assert conflict.status_code == 403
     assert review.status_code == 403
     assert query.json()["detail"] == "project_scope_denied"
+
+
+def test_project_context_refresh_requires_access_to_existing_scope(
+    client: TestClient,
+) -> None:
+    first = context()
+    first["active_decisions"] = []
+    assert client.post(
+        "/v1/projects/project-1/context",
+        json=first,
+        headers=OWNER_HEADERS,
+    ).status_code == 201
+    replacement = {
+        **first,
+        "generated_at": (NOW + timedelta(seconds=1)).isoformat(),
+        "source_refs": [source("other-source", "project:other")],
+        "permission_scope": "project:other",
+    }
+
+    response = client.post(
+        "/v1/projects/project-1/context",
+        json=replacement,
+        headers={"Authorization": f"Bearer {WRONG_SCOPE_TOKEN}"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "project_scope_denied"

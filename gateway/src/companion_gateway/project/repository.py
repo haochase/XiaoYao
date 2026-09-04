@@ -66,7 +66,15 @@ class ProjectMemoryRepository:
         self,
         package: ProjectContextPackage,
         initial_versions: tuple[DecisionVersion, ...],
-    ) -> Literal["inserted", "refreshed", "decision_conflict"]:
+        *,
+        expected_permission_scope: str | None,
+    ) -> Literal[
+        "inserted",
+        "refreshed",
+        "decision_conflict",
+        "permission_conflict",
+        "stale_context",
+    ]:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -75,13 +83,25 @@ class ProjectMemoryRepository:
             ).fetchone()
             if row is not None:
                 stored = ProjectContextPackage.model_validate_json(row["payload_json"])
+                if (
+                    expected_permission_scope is None
+                    or stored.permission_scope != expected_permission_scope
+                ):
+                    return "permission_conflict"
                 if stored.active_decisions != package.active_decisions:
                     return "decision_conflict"
+                if package.generated_at < stored.generated_at or (
+                    package.generated_at == stored.generated_at and package != stored
+                ):
+                    return "stale_context"
                 connection.execute(
                     "UPDATE project_contexts SET payload_json = ? WHERE project_id = ?",
                     (package.model_dump_json(), package.project_id),
                 )
                 return "refreshed"
+
+            if expected_permission_scope is not None:
+                return "permission_conflict"
 
             connection.execute(
                 "INSERT INTO project_contexts(project_id, payload_json) VALUES (?, ?)",
