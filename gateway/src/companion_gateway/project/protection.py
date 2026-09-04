@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import sys
+from collections.abc import Callable
 from ctypes import wintypes
 from functools import lru_cache
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 TOKEN_QUERY = 0x0008
 TOKEN_USER = 1
+
+
+_Result = TypeVar("_Result")
 
 
 class ProtectionError(RuntimeError):
@@ -118,6 +123,25 @@ def _raise_protection_error() -> None:
     raise ProtectionError("dpapi_operation_failed") from None
 
 
+def _call_windows_api(
+    operation: Callable[..., _Result],
+    *arguments: object,
+) -> _Result:
+    try:
+        return operation(*arguments)
+    except OSError:
+        _raise_protection_error()
+
+
+def _run_cleanup(operation: Callable[[], None]) -> None:
+    primary_exception = sys.exc_info()[0] is not None
+    try:
+        operation()
+    except ProtectionError:
+        if not primary_exception:
+            raise
+
+
 def _entropy(project_id: str) -> bytes:
     return hashlib.sha256(
         b"xiaoyao-project-sync-v1\0" + project_id.encode("utf-8")
@@ -141,99 +165,101 @@ def _blob_bytes(blob: _DataBlob) -> bytes:
     return ctypes.string_at(blob.pbData, blob.cbData)
 
 
-def _free_blob(blob: _DataBlob) -> None:
-    if blob.pbData and _windows_apis().local_free(blob.pbData):
+def _local_free(apis: _WindowsApis, pointer: object) -> None:
+    if _call_windows_api(apis.local_free, pointer):
+        _raise_protection_error()
+
+
+def _free_blob(apis: _WindowsApis, blob: _DataBlob) -> None:
+    if blob.pbData:
+        _local_free(apis, blob.pbData)
+
+
+def _close_handle(apis: _WindowsApis, handle: wintypes.HANDLE) -> None:
+    if not _call_windows_api(apis.close_handle, handle):
         _raise_protection_error()
 
 
 class WindowsDpapiProtector:
     def protect(self, project_id: str, plaintext: bytes) -> bytes:
+        apis = _windows_apis()
         plaintext_blob, _plaintext_buffer = _data_blob(plaintext)
         entropy_blob, _entropy_buffer = _data_blob(_entropy(project_id))
         protected_blob = _DataBlob()
         try:
-            try:
-                protected = _windows_apis().crypt_protect_data(
-                    ctypes.byref(plaintext_blob),
-                    None,
-                    ctypes.byref(entropy_blob),
-                    None,
-                    None,
-                    CRYPTPROTECT_UI_FORBIDDEN,
-                    ctypes.byref(protected_blob),
-                )
-            except OSError:
-                _raise_protection_error()
+            protected = _call_windows_api(
+                apis.crypt_protect_data,
+                ctypes.byref(plaintext_blob),
+                None,
+                ctypes.byref(entropy_blob),
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                ctypes.byref(protected_blob),
+            )
             if not protected:
                 _raise_protection_error()
             return _blob_bytes(protected_blob)
         finally:
-            _free_blob(protected_blob)
+            _run_cleanup(lambda: _free_blob(apis, protected_blob))
 
     def unprotect(self, project_id: str, protected: bytes) -> bytes:
+        apis = _windows_apis()
         protected_blob, _protected_buffer = _data_blob(protected)
         entropy_blob, _entropy_buffer = _data_blob(_entropy(project_id))
         plaintext_blob = _DataBlob()
         try:
-            try:
-                plaintext = _windows_apis().crypt_unprotect_data(
-                    ctypes.byref(protected_blob),
-                    None,
-                    ctypes.byref(entropy_blob),
-                    None,
-                    None,
-                    CRYPTPROTECT_UI_FORBIDDEN,
-                    ctypes.byref(plaintext_blob),
-                )
-            except OSError:
-                _raise_protection_error()
+            plaintext = _call_windows_api(
+                apis.crypt_unprotect_data,
+                ctypes.byref(protected_blob),
+                None,
+                ctypes.byref(entropy_blob),
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                ctypes.byref(plaintext_blob),
+            )
             if not plaintext:
                 _raise_protection_error()
             return _blob_bytes(plaintext_blob)
         finally:
-            _free_blob(plaintext_blob)
+            _run_cleanup(lambda: _free_blob(apis, plaintext_blob))
 
 
 def protection_identity_digest() -> str:
     apis = _windows_apis()
     token = wintypes.HANDLE()
     try:
-        try:
-            opened = apis.open_process_token(
-                apis.get_current_process(),
-                TOKEN_QUERY,
-                ctypes.byref(token),
-            )
-        except OSError:
-            _raise_protection_error()
+        opened = _call_windows_api(
+            apis.open_process_token,
+            _call_windows_api(apis.get_current_process),
+            TOKEN_QUERY,
+            ctypes.byref(token),
+        )
         if not opened:
             _raise_protection_error()
 
         size = wintypes.DWORD()
-        try:
-            apis.get_token_information(
-                token,
-                TOKEN_USER,
-                None,
-                0,
-                ctypes.byref(size),
-            )
-        except OSError:
-            _raise_protection_error()
+        _call_windows_api(
+            apis.get_token_information,
+            token,
+            TOKEN_USER,
+            None,
+            0,
+            ctypes.byref(size),
+        )
         if not size.value:
             _raise_protection_error()
 
         token_buffer = (ctypes.c_byte * size.value)()
-        try:
-            received = apis.get_token_information(
-                token,
-                TOKEN_USER,
-                token_buffer,
-                size,
-                ctypes.byref(size),
-            )
-        except OSError:
-            _raise_protection_error()
+        received = _call_windows_api(
+            apis.get_token_information,
+            token,
+            TOKEN_USER,
+            token_buffer,
+            size,
+            ctypes.byref(size),
+        )
         if not received:
             _raise_protection_error()
 
@@ -242,13 +268,11 @@ def protection_identity_digest() -> str:
             ctypes.POINTER(_TokenUser),
         ).contents
         sid = wintypes.LPWSTR()
-        try:
-            converted = apis.convert_sid_to_string_sid(
-                token_user.User.Sid,
-                ctypes.byref(sid),
-            )
-        except OSError:
-            _raise_protection_error()
+        converted = _call_windows_api(
+            apis.convert_sid_to_string_sid,
+            token_user.User.Sid,
+            ctypes.byref(sid),
+        )
         if not converted:
             _raise_protection_error()
         try:
@@ -256,8 +280,7 @@ def protection_identity_digest() -> str:
                 _raise_protection_error()
             return hashlib.sha256(sid.value.encode("utf-8")).hexdigest()
         finally:
-            if apis.local_free(sid):
-                _raise_protection_error()
+            _run_cleanup(lambda: _local_free(apis, sid))
     finally:
-        if token and not apis.close_handle(token):
-            _raise_protection_error()
+        if token:
+            _run_cleanup(lambda: _close_handle(apis, token))
