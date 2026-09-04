@@ -59,3 +59,18 @@ def test_voice_intent_rejects_unknown_types() -> None:
 
 def test_voice_intent_accepts_next_meeting() -> None:
     assert VoiceIntent(type="next_meeting").type == "next_meeting"
+
+
+def test_project_query_intent_requires_a_query() -> None:
+    intent = VoiceIntent(type="project_query", query="终端方案")
+
+    assert intent.type == "project_query"
+    assert intent.query == "终端方案"
+
+    with pytest.raises(ValueError, match="query"):
+        VoiceIntent(type="project_query")
+
+
+def test_non_project_intent_rejects_a_project_query_field() -> None:
+    with pytest.raises(ValueError, match="query only"):
+        VoiceIntent(type="next_meeting", query="终端方案")

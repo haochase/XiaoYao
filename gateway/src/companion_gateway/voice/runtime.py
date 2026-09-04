@@ -41,7 +41,18 @@ class VoiceIntent(BaseModel):
         "current_datetime",
         "reminder_status",
         "next_meeting",
+        "project_query",
     ]
+    query: str | None = None
+
+    @model_validator(mode="after")
+    def validate_project_query(self) -> "VoiceIntent":
+        if self.type == "project_query":
+            if self.query is None or not self.query.strip():
+                raise ValueError("project_query requires query")
+        elif self.query is not None:
+            raise ValueError("query only applies to project_query")
+        return self
 
 
 @dataclass(frozen=True)

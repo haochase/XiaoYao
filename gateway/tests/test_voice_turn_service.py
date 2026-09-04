@@ -863,6 +863,97 @@ def test_next_meeting_intent_captures_the_clock_once() -> None:
     assert calls == 1
 
 
+def test_project_query_intent_uses_project_memory_sources() -> None:
+    from companion_gateway.project.models import (
+        DecisionCard,
+        DecisionStatus,
+        EvidenceRef,
+        ProjectContextPackage,
+    )
+    from companion_gateway.project.service import ProjectMemoryService
+
+    now = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+    source = EvidenceRef(
+        source_type="meeting_note",
+        source_id="meeting-project-query",
+        source_title="方案评审会",
+        source_url="https://example.invalid/meeting-project-query",
+        source_time=now,
+        excerpt="会议决定采用方案 B。",
+        permission_scope="project:star-retail",
+    )
+    project_decision = DecisionCard(
+        decision_id="decision-project-query",
+        project_id="project-project-query",
+        topic="终端方案",
+        decision_text="采用方案 B",
+        rationale="交付风险更低",
+        owner="owner-1",
+        decided_at=now,
+        source_refs=(source,),
+        status=DecisionStatus.ACTIVE,
+        confidence=0.92,
+    )
+    package = ProjectContextPackage(
+        project_id="project-project-query",
+        project_name="项目记忆测试项目",
+        generated_at=now,
+        source_refs=(source,),
+        active_decisions=(project_decision,),
+        permission_scope="project:star-retail",
+    )
+    project_memory = ProjectMemoryService(clock=lambda: now)
+    project_memory.replace_context(package)
+
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    response_pcm = pcm_frame(sample_rate=24_000, sample_count=1_440)
+    bridge = AudioBridge(
+        codec=EchoOpusCodec(input_pcm),
+        model_sample_rate=16_000,
+        response_sample_rate=24_000,
+        queue_capacity=1,
+    )
+    runtime = IntentRuntime(
+        VoiceIntent(type="project_query", query="终端方案"),
+        response_pcm,
+    )
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        project_memory=project_memory,
+        project_id="project-project-query",
+        clock=lambda: now,
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_pending_turn(target_device_id="desk-device")
+
+    assert turn is not None
+    assert turn.response_text == "当前有效决策：采用方案 B"
+
+
+def test_project_query_intent_fails_closed_without_project_memory() -> None:
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    response_pcm = pcm_frame(sample_rate=24_000, sample_count=1_440)
+    bridge = AudioBridge(
+        codec=EchoOpusCodec(input_pcm),
+        model_sample_rate=16_000,
+        response_sample_rate=24_000,
+        queue_capacity=1,
+    )
+    runtime = IntentRuntime(
+        VoiceIntent(type="project_query", query="终端方案"),
+        response_pcm,
+    )
+    service = VoiceTurnService(audio_bridge=bridge, model_runtime=runtime)
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_pending_turn(target_device_id="desk-device")
+
+    assert turn is not None
+    assert turn.response_text == "暂时无法确认项目记忆，请稍后再试。"
+
+
 def test_device_voice_delivery_delegates_meeting_context() -> None:
     from companion_gateway.meeting.context import MeetingContextStore
 

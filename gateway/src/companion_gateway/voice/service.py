@@ -21,6 +21,8 @@ from companion_gateway.domain.tasks import TaskStatus
 from companion_gateway.medication.service import MedicationReminderService
 from companion_gateway.memory.service import MemoryService
 from companion_gateway.meeting.context import MeetingContextStore
+from companion_gateway.project.models import AnswerKind
+from companion_gateway.project.service import ProjectMemoryError, ProjectMemoryService
 from companion_gateway.service import TaskService
 from companion_gateway.voice.runtime import ModelRuntime, VoiceAction, VoiceIntent
 
@@ -74,6 +76,8 @@ class VoiceTurnService:
         memory_service: MemoryService | None = None,
         task_service: TaskService | None = None,
         meeting_context: MeetingContextStore | None = None,
+        project_memory: ProjectMemoryService | None = None,
+        project_id: str | None = None,
         actor_id: str = "voice-user",
         clock: Clock = _utc_now,
     ) -> None:
@@ -84,6 +88,8 @@ class VoiceTurnService:
         self._memory_service = memory_service
         self._task_service = task_service
         self._meeting_context = meeting_context
+        self._project_memory = project_memory
+        self._project_id = project_id
         self._actor_id = actor_id
         self._clock = clock
         self._session_uplink: dict[str, deque[Pcm16Mono]] = {}
@@ -149,6 +155,12 @@ class VoiceTurnService:
 
     def set_meeting_context(self, meeting_context: MeetingContextStore) -> None:
         self._meeting_context = meeting_context
+
+    def set_project_memory(self, project_memory: ProjectMemoryService) -> None:
+        self._project_memory = project_memory
+
+    def set_project_id(self, project_id: str) -> None:
+        self._project_id = project_id
 
     def synthesize_text(self, text: str) -> tuple[bytes, ...]:
         synthesize = getattr(self._model_runtime, "synthesize", None)
@@ -249,6 +261,23 @@ class VoiceTurnService:
                 f"下一场会议是{meeting.summary}，{local.hour}点"
                 f"{local.minute:02d}分开始{location}。"
             )
+        if intent.type == "project_query":
+            if (
+                self._project_memory is None
+                or self._project_id is None
+                or intent.query is None
+            ):
+                return "暂时无法确认项目记忆，请稍后再试。"
+            try:
+                answer = self._project_memory.answer(
+                    self._project_id,
+                    intent.query,
+                    kind=AnswerKind.DECISION_CHECK,
+                    now=self._clock(),
+                )
+            except (ProjectMemoryError, ValueError):
+                return "暂时无法确认项目记忆，请稍后再试。"
+            return answer.text
         if self._task_service is None or target_device_id is None:
             return "目前没有找到提醒。"
         task = self._task_service.get_latest_reminder(
