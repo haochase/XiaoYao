@@ -149,6 +149,21 @@ def test_context_package_requires_single_project_scope_and_freshness() -> None:
         )
 
 
+def test_context_package_rejects_foreign_nested_decision_sources() -> None:
+    foreign_source = source(permission_scope="project:other")
+    foreign_decision = decision(source_refs=(foreign_source,))
+
+    with pytest.raises(ValidationError, match="decision sources"):
+        ProjectContextPackage(
+            project_id="project-1",
+            project_name="星河零售终端升级项目",
+            generated_at=NOW,
+            source_refs=(source(),),
+            active_decisions=(foreign_decision,),
+            permission_scope="project:star-retail",
+        )
+
+
 def test_answer_kind_is_explicitly_bounded() -> None:
     assert set(AnswerKind) == {
         AnswerKind.FACT,

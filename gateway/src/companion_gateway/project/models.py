@@ -191,6 +191,13 @@ class ProjectContextPackage(BaseModel):
         for decision in self.active_decisions:
             if decision.project_id != self.project_id:
                 raise ValueError("all decisions must belong to the same project")
+            if any(
+                source.permission_scope != self.permission_scope
+                for source in decision.source_refs
+            ):
+                raise ValueError(
+                    "all decision sources must use the context permission scope"
+                )
         for source in self.source_refs:
             if source.permission_scope != self.permission_scope:
                 raise ValueError("all sources must use the context permission scope")

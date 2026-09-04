@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from typing import Iterator
 
 import pytest
@@ -6,10 +7,44 @@ from fastapi.testclient import TestClient
 
 from companion_gateway.api import create_app
 from companion_gateway.project.models import AnswerKind
+from companion_gateway.project.auth import ProjectApiPrincipal
 from companion_gateway.settings import Settings
 
 
 NOW = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+OWNER_TOKEN = "owner-project-token"
+OTHER_TOKEN = "other-project-token"
+VIEWER_TOKEN = "viewer-project-token"
+OWNER_HEADERS = {"Authorization": f"Bearer {OWNER_TOKEN}"}
+
+
+def project_settings(database_path) -> Settings:
+    return Settings(
+        database_path=database_path,
+        project_api_principals=(
+            ProjectApiPrincipal(
+                principal_id="owner-1",
+                token_sha256=sha256(OWNER_TOKEN.encode()).hexdigest(),
+                project_ids=frozenset({"project-1"}),
+                permission_scopes=frozenset({"project:star-retail"}),
+                can_review=True,
+            ),
+            ProjectApiPrincipal(
+                principal_id="owner-2",
+                token_sha256=sha256(OTHER_TOKEN.encode()).hexdigest(),
+                project_ids=frozenset({"project-2"}),
+                permission_scopes=frozenset({"project:other"}),
+                can_review=True,
+            ),
+            ProjectApiPrincipal(
+                principal_id="viewer-1",
+                token_sha256=sha256(VIEWER_TOKEN.encode()).hexdigest(),
+                project_ids=frozenset({"project-1"}),
+                permission_scopes=frozenset({"project:star-retail"}),
+                can_review=False,
+            ),
+        ),
+    )
 
 
 def source(source_id: str = "meeting-1", scope: str = "project:star-retail") -> dict[str, object]:
@@ -58,7 +93,7 @@ def context(*, generated_at: datetime = NOW) -> dict[str, object]:
 def client(tmp_path) -> Iterator[TestClient]:
     clock = {"now": NOW}
     app = create_app(
-        Settings(database_path=tmp_path / "project-api.db"),
+        project_settings(tmp_path / "project-api.db"),
         project_clock=lambda: clock["now"],
     )
     app.state.project_test_clock = clock
@@ -67,7 +102,11 @@ def client(tmp_path) -> Iterator[TestClient]:
 
 
 def test_project_context_and_fact_query_return_a_source(client: TestClient) -> None:
-    stored = client.post("/v1/projects/project-1/context", json=context())
+    stored = client.post(
+        "/v1/projects/project-1/context",
+        json=context(),
+        headers=OWNER_HEADERS,
+    )
 
     assert stored.status_code == 201
     assert stored.json()["context"]["project_id"] == "project-1"
@@ -75,6 +114,7 @@ def test_project_context_and_fact_query_return_a_source(client: TestClient) -> N
     answer = client.post(
         "/v1/projects/project-1/query",
         json={"query": "终端方案", "kind": AnswerKind.FACT.value},
+        headers=OWNER_HEADERS,
     )
 
     assert answer.status_code == 200
@@ -83,12 +123,15 @@ def test_project_context_and_fact_query_return_a_source(client: TestClient) -> N
 
 
 def test_project_query_rejects_expired_context(client: TestClient) -> None:
-    client.post("/v1/projects/project-1/context", json=context())
+    client.post(
+        "/v1/projects/project-1/context", json=context(), headers=OWNER_HEADERS
+    )
     client.app.state.project_test_clock["now"] = NOW + timedelta(seconds=301)
 
     response = client.post(
         "/v1/projects/project-1/query",
         json={"query": "终端方案", "kind": "fact"},
+        headers=OWNER_HEADERS,
     )
 
     assert response.status_code == 409
@@ -98,7 +141,9 @@ def test_project_query_rejects_expired_context(client: TestClient) -> None:
 def test_project_conflict_review_accepts_new_decision_and_returns_version(
     client: TestClient,
 ) -> None:
-    client.post("/v1/projects/project-1/context", json=context())
+    client.post(
+        "/v1/projects/project-1/context", json=context(), headers=OWNER_HEADERS
+    )
     proposal = client.post(
         "/v1/projects/project-1/conflicts",
         json={
@@ -107,6 +152,7 @@ def test_project_conflict_review_accepts_new_decision_and_returns_version(
             "reason": "供应商交期发生变化",
             "evidence_refs": [source("meeting-2")],
         },
+        headers=OWNER_HEADERS,
     )
 
     assert proposal.status_code == 201
@@ -115,12 +161,12 @@ def test_project_conflict_review_accepts_new_decision_and_returns_version(
     review = client.post(
         f"/v1/projects/conflicts/{candidate_id}/review",
         json={
-            "reviewer_id": "owner-1",
             "action": "accept",
             "new_decision_text": "采用方案 A",
             "change_reason": "供应商交期发生变化",
             "evidence_refs": [source("meeting-2")],
         },
+        headers=OWNER_HEADERS,
     )
 
     assert review.status_code == 200
@@ -130,12 +176,15 @@ def test_project_conflict_review_accepts_new_decision_and_returns_version(
     answer = client.post(
         "/v1/projects/project-1/query",
         json={"query": "终端方案", "kind": "decision_check"},
+        headers=OWNER_HEADERS,
     )
     assert answer.json()["answer"]["text"] == "当前有效决策：采用方案 A"
 
 
 def test_project_conflict_rejects_foreign_source_scope(client: TestClient) -> None:
-    client.post("/v1/projects/project-1/context", json=context())
+    client.post(
+        "/v1/projects/project-1/context", json=context(), headers=OWNER_HEADERS
+    )
     response = client.post(
         "/v1/projects/project-1/conflicts",
         json={
@@ -144,6 +193,7 @@ def test_project_conflict_rejects_foreign_source_scope(client: TestClient) -> No
             "reason": "来源不属于当前项目",
             "evidence_refs": [source("meeting-foreign", "project:other")],
         },
+        headers=OWNER_HEADERS,
     )
 
     assert response.status_code == 403
@@ -153,23 +203,77 @@ def test_project_conflict_rejects_foreign_source_scope(client: TestClient) -> No
 def test_project_context_survives_app_recreation(tmp_path) -> None:
     database_path = tmp_path / "project-restart.db"
     first_app = create_app(
-        Settings(database_path=database_path),
+        project_settings(database_path),
         project_clock=lambda: NOW,
     )
     with TestClient(first_app) as first_client:
-        assert first_client.post(
-            "/v1/projects/project-1/context", json=context()
-        ).status_code == 201
+        assert (
+            first_client.post(
+                "/v1/projects/project-1/context",
+                json=context(),
+                headers=OWNER_HEADERS,
+            ).status_code
+            == 201
+        )
 
     second_app = create_app(
-        Settings(database_path=database_path),
+        project_settings(database_path),
         project_clock=lambda: NOW,
     )
     with TestClient(second_app) as second_client:
         response = second_client.post(
             "/v1/projects/project-1/query",
             json={"query": "终端方案", "kind": "fact"},
+            headers=OWNER_HEADERS,
         )
 
     assert response.status_code == 200
     assert response.json()["answer"]["text"] == "采用方案 B"
+
+
+def test_project_api_rejects_missing_or_cross_project_credentials(
+    client: TestClient,
+) -> None:
+    missing = client.post("/v1/projects/project-1/context", json=context())
+    cross_project = client.post(
+        "/v1/projects/project-1/context",
+        json=context(),
+        headers={"Authorization": f"Bearer {OTHER_TOKEN}"},
+    )
+
+    assert missing.status_code == 401
+    assert cross_project.status_code == 403
+
+
+def test_project_review_uses_authenticated_principal_and_requires_review_role(
+    client: TestClient,
+) -> None:
+    client.post(
+        "/v1/projects/project-1/context", json=context(), headers=OWNER_HEADERS
+    )
+    proposal = client.post(
+        "/v1/projects/project-1/conflicts",
+        json={
+            "decision_id": "decision-1",
+            "observed_text": "改用方案 A",
+            "reason": "供应商交期发生变化",
+            "evidence_refs": [source("meeting-2")],
+        },
+        headers=OWNER_HEADERS,
+    )
+    candidate_id = proposal.json()["candidate"]["candidate_id"]
+
+    forbidden = client.post(
+        f"/v1/projects/conflicts/{candidate_id}/review",
+        json={"action": "reject", "change_reason": "缺少审批权"},
+        headers={"Authorization": f"Bearer {VIEWER_TOKEN}"},
+    )
+    reviewed = client.post(
+        f"/v1/projects/conflicts/{candidate_id}/review",
+        json={"action": "reject", "change_reason": "保留原决策"},
+        headers=OWNER_HEADERS,
+    )
+
+    assert forbidden.status_code == 403
+    assert reviewed.status_code == 200
+    assert reviewed.json()["candidate"]["reviewed_by"] == "owner-1"

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from threading import RLock
 from typing import Callable, Literal
 
@@ -44,6 +44,16 @@ class ProjectMemoryService:
 
     def replace_context(self, package: ProjectContextPackage) -> None:
         with self._lock:
+            timestamp = self._clock()
+            if package.generated_at > timestamp + timedelta(seconds=30):
+                raise ProjectMemoryError("context_from_future")
+            existing = self._contexts.get(package.project_id)
+            if existing is None and self._repository is not None:
+                existing = self._repository.get_context(package.project_id)
+            if existing is not None and (
+                existing.active_decisions != package.active_decisions
+            ):
+                raise ProjectMemoryError("decision_change_requires_review")
             self._contexts[package.project_id] = package
             if self._repository is not None:
                 self._repository.save_context(package)
@@ -162,6 +172,18 @@ class ProjectMemoryService:
                 self._repository.save_conflict(candidate)
             return candidate, True
 
+    def get_conflict(self, candidate_id: str) -> ConflictCandidate:
+        with self._lock:
+            candidate = self._conflicts.get(candidate_id)
+        if candidate is None and self._repository is not None:
+            candidate = self._repository.get_conflict(candidate_id)
+            if candidate is not None:
+                with self._lock:
+                    self._conflicts[candidate_id] = candidate
+        if candidate is None:
+            raise ProjectMemoryError("conflict_not_found")
+        return candidate
+
     def review_conflict(
         self,
         candidate_id: str,
@@ -174,15 +196,7 @@ class ProjectMemoryService:
         now: datetime | None = None,
     ) -> ConflictCandidate | tuple[ConflictCandidate, DecisionVersion]:
         timestamp = now or self._clock()
-        with self._lock:
-            candidate = self._conflicts.get(candidate_id)
-        if candidate is None and self._repository is not None:
-            candidate = self._repository.get_conflict(candidate_id)
-            if candidate is not None:
-                with self._lock:
-                    self._conflicts[candidate_id] = candidate
-        if candidate is None:
-            raise ProjectMemoryError("conflict_not_found")
+        candidate = self.get_conflict(candidate_id)
         if candidate.status is not ConflictStatus.PROPOSED:
             raise ProjectMemoryError("conflict_already_reviewed")
         context = self._require_fresh_context(candidate.project_id, timestamp)

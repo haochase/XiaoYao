@@ -1,9 +1,11 @@
 from hashlib import sha256
+import json
 import os
 from pathlib import Path
 
 import pytest
 
+from companion_gateway.project.auth import ProjectApiPrincipal
 from companion_gateway.settings import Settings, load_environment_file
 
 
@@ -274,6 +276,32 @@ def test_settings_rejects_invalid_project_id(monkeypatch, value: str) -> None:
     else:
         with pytest.raises(ValueError, match="COMPANION_PROJECT_ID"):
             Settings.from_environment()
+
+
+def test_settings_loads_project_api_principals(monkeypatch) -> None:
+    token_digest = sha256(b"owner-token").hexdigest()
+    monkeypatch.setenv(
+        "COMPANION_PROJECT_API_PRINCIPALS",
+        json.dumps(
+            {
+                "owner-1": {
+                    "token_sha256": token_digest,
+                    "project_ids": ["project-1"],
+                    "permission_scopes": ["project:star-retail"],
+                    "can_review": True,
+                }
+            }
+        ),
+    )
+
+    settings = Settings.from_environment()
+
+    assert settings.project_api_principals[0].principal_id == "owner-1"
+    assert settings.project_api_principals[0].project_ids == frozenset({"project-1"})
+    assert settings.project_api_principals[0].permission_scopes == frozenset(
+        {"project:star-retail"}
+    )
+    assert settings.project_api_principals[0].can_review is True
 
 
 def test_meeting_assistant_defaults_disabled_without_a_target() -> None:

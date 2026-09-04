@@ -98,6 +98,12 @@ from companion_gateway.vision.service import (
     VisionUnsupportedType,
 )
 from companion_gateway.notifications.feishu import FeishuNotifier
+from companion_gateway.project.auth import (
+    ProjectApiAuthenticator,
+    ProjectApiPrincipal,
+    ProjectAuthenticationError,
+    ProjectAuthorizationError,
+)
 from companion_gateway.project.models import (
     AnswerKind,
     EvidenceRef,
@@ -138,12 +144,6 @@ ProjectIdentifier = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
 ]
-ProjectReviewer = Annotated[
-    str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=256),
-]
-
-
 async def _sleep_between_tts_frames(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
@@ -196,7 +196,6 @@ class ConflictProposalRequest(BaseModel):
 class ConflictReviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    reviewer_id: ProjectReviewer
     action: Literal["accept", "reject"]
     change_reason: ProjectQueryText
     new_decision_text: ProjectQueryText | None = None
@@ -217,6 +216,60 @@ LOCAL_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 
 def _request_trace_id(request: Request) -> str:
     return request.state.trace_id
+
+
+def _identify_project_request(
+    authenticator: ProjectApiAuthenticator,
+    request: Request,
+) -> ProjectApiPrincipal:
+    try:
+        return authenticator.identify(request.headers.get("Authorization"))
+    except ProjectAuthenticationError as exc:
+        status_code = 503 if str(exc) == "project_api_disabled" else 401
+        headers = None if status_code == 503 else {"WWW-Authenticate": "Bearer"}
+        raise HTTPException(
+            status_code=status_code,
+            detail=str(exc),
+            headers=headers,
+        ) from exc
+
+
+def _authorize_project_principal(
+    authenticator: ProjectApiAuthenticator,
+    principal: ProjectApiPrincipal,
+    *,
+    project_id: str,
+    permission_scope: str | None = None,
+    require_review: bool = False,
+) -> None:
+    try:
+        authenticator.authorize(
+            principal,
+            project_id=project_id,
+            permission_scope=permission_scope,
+            require_review=require_review,
+        )
+    except ProjectAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+def _authenticate_project_request(
+    authenticator: ProjectApiAuthenticator,
+    request: Request,
+    *,
+    project_id: str,
+    permission_scope: str | None = None,
+    require_review: bool = False,
+) -> ProjectApiPrincipal:
+    principal = _identify_project_request(authenticator, request)
+    _authorize_project_principal(
+        authenticator,
+        principal,
+        project_id=project_id,
+        permission_scope=permission_scope,
+        require_review=require_review,
+    )
+    return principal
 
 
 def create_app(
@@ -458,6 +511,7 @@ def create_app(
         clock=project_clock,
         repository=project_repository,
     )
+    project_authenticator = ProjectApiAuthenticator(settings.project_api_principals)
     medication_scheduler = MedicationScheduler(
         service=medication_service,
         interval_seconds=settings.task_scheduler_interval_seconds,
@@ -488,6 +542,7 @@ def create_app(
     app.state.agent_tool_service = agent_tool_service
     app.state.project_memory_service = project_memory
     app.state.project_memory_repository = project_repository
+    app.state.project_api_authenticator = project_authenticator
     app.state.project_clock = project_clock
     if voice_delivery_service is not None:
         voice_delivery_service.set_task_executor(task_executor)
@@ -567,12 +622,22 @@ def create_app(
 
     @app.post("/v1/projects/{project_id}/context")
     def replace_project_context(
+        request: Request,
         project_id: str,
         package: ProjectContextPackage,
     ) -> JSONResponse:
         if package.project_id != project_id:
             raise HTTPException(status_code=400, detail="project_id path mismatch")
-        project_memory.replace_context(package)
+        _authenticate_project_request(
+            project_authenticator,
+            request,
+            project_id=project_id,
+            permission_scope=package.permission_scope,
+        )
+        try:
+            project_memory.replace_context(package)
+        except ProjectMemoryError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return JSONResponse(
             status_code=201,
             content={"context": jsonable_encoder(package)},
@@ -580,9 +645,15 @@ def create_app(
 
     @app.post("/v1/projects/{project_id}/query")
     def query_project_context(
+        request: Request,
         project_id: str,
         body: ProjectQueryRequest,
     ) -> dict[str, object]:
+        _authenticate_project_request(
+            project_authenticator,
+            request,
+            project_id=project_id,
+        )
         try:
             answer = project_memory.answer(
                 project_id,
@@ -597,9 +668,15 @@ def create_app(
 
     @app.post("/v1/projects/{project_id}/conflicts")
     def propose_project_conflict(
+        request: Request,
         project_id: str,
         body: ConflictProposalRequest,
     ) -> JSONResponse:
+        _authenticate_project_request(
+            project_authenticator,
+            request,
+            project_id=project_id,
+        )
         try:
             candidate, created = project_memory.propose_conflict(
                 project_id,
@@ -624,13 +701,22 @@ def create_app(
 
     @app.post("/v1/projects/conflicts/{candidate_id}/review")
     def review_project_conflict(
+        request: Request,
         candidate_id: str,
         body: ConflictReviewRequest,
     ) -> dict[str, object]:
+        principal = _identify_project_request(project_authenticator, request)
         try:
+            candidate = project_memory.get_conflict(candidate_id)
+            _authorize_project_principal(
+                project_authenticator,
+                principal,
+                project_id=candidate.project_id,
+                require_review=True,
+            )
             result = project_memory.review_conflict(
                 candidate_id,
-                reviewer_id=body.reviewer_id,
+                reviewer_id=principal.principal_id,
                 action=body.action,
                 change_reason=body.change_reason,
                 new_decision_text=body.new_decision_text,

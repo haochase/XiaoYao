@@ -209,3 +209,28 @@ def test_conflict_rejects_evidence_from_another_permission_scope() -> None:
             evidence_refs=(foreign,),
             now=NOW,
         )
+
+
+def test_context_refresh_cannot_replace_an_active_decision() -> None:
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(decision(),)))
+    changed = context(decisions=(decision("采用方案 A"),))
+
+    with pytest.raises(RuntimeError, match="decision_change_requires_review"):
+        service.replace_context(changed)
+
+    assert service.current_decision(
+        "project-1", "decision-1", now=NOW
+    ).decision_text == "采用方案 B"
+
+
+def test_context_rejects_future_generated_at() -> None:
+    service = ProjectMemoryService(clock=lambda: NOW)
+
+    with pytest.raises(RuntimeError, match="context_from_future"):
+        service.replace_context(
+            context(
+                generated_at=NOW + timedelta(seconds=31),
+                decisions=(decision(),),
+            )
+        )

@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
+from companion_gateway.project.auth import (
+    ProjectApiPrincipal,
+    parse_project_api_principals,
+)
+
 
 _DEVICE_WS_PATH = "/v1/devices/ws"
 _DEFAULT_MIMO_OPENAI_BASE_URL = "https://token-plan-cn.xiaomimimo.com/v1"
@@ -310,6 +315,7 @@ def _normalize_project_id(value: str | None) -> str | None:
 class Settings:
     database_path: Path
     project_id: str | None = None
+    project_api_principals: tuple[ProjectApiPrincipal, ...] = ()
     device_token_hashes: Mapping[str, str] = field(default_factory=dict)
     fake_voice_fixture_path: Path | None = None
     public_websocket_url: str | None = None
@@ -378,6 +384,14 @@ class Settings:
 
     def __post_init__(self) -> None:
         normalized_project_id = _normalize_project_id(self.project_id)
+        normalized_project_api_principals = tuple(self.project_api_principals)
+        if not all(
+            isinstance(item, ProjectApiPrincipal)
+            for item in normalized_project_api_principals
+        ):
+            raise ValueError(
+                "project_api_principals must contain ProjectApiPrincipal values"
+            )
         ota_tokens = _normalize_ota_tokens(self.ota_device_tokens)
         normalized_url = _normalize_websocket_url(
             self.public_websocket_url,
@@ -638,6 +652,11 @@ class Settings:
             )
         object.__setattr__(self, "ota_device_tokens", ota_tokens)
         object.__setattr__(self, "project_id", normalized_project_id)
+        object.__setattr__(
+            self,
+            "project_api_principals",
+            normalized_project_api_principals,
+        )
         object.__setattr__(self, "public_websocket_url", normalized_url)
         object.__setattr__(self, "device_token_hashes", normalized_hashes)
         object.__setattr__(self, "voice_runtime", normalized_runtime)
@@ -703,6 +722,9 @@ class Settings:
     def from_environment(cls) -> "Settings":
         configured_path = os.environ.get("COMPANION_DB_PATH")
         configured_project_id = os.environ.get("COMPANION_PROJECT_ID")
+        configured_project_api_principals = parse_project_api_principals(
+            os.environ.get("COMPANION_PROJECT_API_PRINCIPALS")
+        )
         configured_fixture = os.environ.get("COMPANION_FAKE_VOICE_FIXTURE_PATH")
         configured_runtime = os.environ.get("COMPANION_VOICE_RUNTIME")
         configured_endpoint = os.environ.get("COMPANION_MINICPM_O_ENDPOINT")
@@ -1148,6 +1170,7 @@ class Settings:
                 Path(configured_path) if configured_path else Path("data/companion.db")
             ),
             project_id=configured_project_id,
+            project_api_principals=configured_project_api_principals,
             device_token_hashes=token_hashes,
             fake_voice_fixture_path=(
                 Path(configured_fixture) if configured_fixture else None
