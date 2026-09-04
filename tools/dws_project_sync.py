@@ -14,7 +14,13 @@ from pathlib import Path
 from typing import Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
-from urllib.request import Request, urlopen as default_urlopen
+from urllib.request import (
+    HTTPRedirectHandler,
+    OpenerDirector,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -228,16 +234,16 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = _ArgumentParser(prog="dws_project_sync", add_help=True)
+    parser = _ArgumentParser(prog="dws_project_sync", add_help=False)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    collect = commands.add_parser("collect")
+    collect = commands.add_parser("collect", add_help=False)
     collect.add_argument("--manifest", required=True)
     collect.add_argument("--project", required=True)
     collect.add_argument("--dws-path", required=True)
     collect.add_argument("--output", required=True)
 
-    push = commands.add_parser("push")
+    push = commands.add_parser("push", add_help=False)
     push.add_argument("--manifest", required=True)
     push.add_argument("--project", required=True)
     push.add_argument("--sources-file", required=True)
@@ -543,6 +549,27 @@ def _gateway_base(value: str) -> str:
     return f"http://{parsed.hostname}:8731"
 
 
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+def _build_direct_opener() -> OpenerDirector:
+    return build_opener(ProxyHandler({}), _RejectRedirects())
+
+
+def _direct_urlopen(request: Request, *, timeout: float) -> object:
+    return _build_direct_opener().open(request, timeout=timeout)
+
+
 def _validate_response(
     raw: bytes,
     *,
@@ -556,11 +583,20 @@ def _validate_response(
         raise ValueError("response_invalid") from None
     if not isinstance(payload, dict) or set(payload) != _RESPONSE_KEYS:
         raise ValueError("response_invalid")
-    if payload["sync_id"] != envelope.sync_id:
-        raise ValueError("response_sync_mismatch")
-    if payload["outcome"] not in {"applied", "unchanged", "degraded"}:
+    response_sync_id = payload["sync_id"]
+    if not isinstance(response_sync_id, str):
         raise ValueError("response_invalid")
-    if payload["project_status"] not in {
+    if response_sync_id != envelope.sync_id:
+        raise ValueError("response_sync_mismatch")
+    outcome = payload["outcome"]
+    if not isinstance(outcome, str) or outcome not in {
+        "applied",
+        "unchanged",
+        "degraded",
+    }:
+        raise ValueError("response_invalid")
+    project_status = payload["project_status"]
+    if not isinstance(project_status, str) or project_status not in {
         "healthy",
         "degraded",
         "stale",
@@ -581,7 +617,9 @@ def _validate_response(
         raise ValueError("response_invalid")
     generation_id = payload["generation_id"]
     if generation_id is not None and (
-        not isinstance(generation_id, str) or not generation_id.strip()
+        not isinstance(generation_id, str)
+        or not generation_id.strip()
+        or len(generation_id) > 128
     ):
         raise ValueError("response_invalid")
     next_sync = payload["next_sync_before"]
@@ -748,7 +786,7 @@ def _push_command(
     response = None
     try:
         response = opener(request, timeout=30.0)
-        raw_response = response.read()
+        raw_response = response.read(65_537)
     except HTTPError:
         raise ValueError("http_error") from None
     except (TimeoutError, URLError, OSError):
@@ -788,13 +826,24 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     runner: object | None = None,
-    urlopen: Callable[..., object] = default_urlopen,
+    urlopen: Callable[..., object] = _direct_urlopen,
     environ: Mapping[str, str] | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     monotonic: Callable[[], float] = time.perf_counter,
 ) -> int:
+    actual_argv = list(sys.argv[1:] if argv is None else argv)
+    if "--help" in actual_argv or "-h" in actual_argv:
+        if actual_argv and actual_argv[0] in {"collect", "push"}:
+            output: dict[str, object] = {
+                "status": "help",
+                "command": actual_argv[0],
+            }
+        else:
+            output = {"status": "help", "commands": ["collect", "push"]}
+        _emit(output)
+        return 0
     try:
-        args = _parser().parse_args(argv)
+        args = _parser().parse_args(actual_argv)
         if args.command == "collect":
             output = _collect_command(args, runner=runner, now=now)
         else:

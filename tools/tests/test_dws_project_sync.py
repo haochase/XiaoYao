@@ -3,14 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 from urllib.error import URLError
+from urllib.request import ProxyHandler
 
 import pytest
 
 from companion_gateway.project.models import ProjectContextPackage
 from companion_gateway.project.sync_models import SourceErrorType
+import tools.dws_project_sync as sync_cli
 from tools.dws_project_sync import (
     QwenProjectContextArtifact,
     build_envelope,
@@ -216,6 +220,7 @@ class RecordingUrlOpen:
         self.request = None
         self.timeout = None
         self.response = response
+        self.read_sizes: list[int | None] = []
 
     def __call__(self, request, *, timeout: float):  # type: ignore[no-untyped-def]
         self.request = request
@@ -231,8 +236,13 @@ class RecordingUrlOpen:
             "generation_id": "generation-private",
             "next_sync_before": "2026-09-05T12:05:00+00:00",
         }
+
+        def read(size: int | None = None) -> bytes:
+            self.read_sizes.append(size)
+            return canonical(response).encode("utf-8")
+
         return SimpleNamespace(
-            read=lambda: canonical(response).encode("utf-8"),
+            read=read,
             __enter__=lambda self: self,
             __exit__=lambda *_args: None,
         )
@@ -599,3 +609,208 @@ def test_internal_error_text_is_never_exposed(tmp_path: Path, capsys) -> None:
         "status": "error",
         "error_type": "sync_failed",
     }
+
+
+def test_default_transport_disables_environment_and_system_proxies(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("http_proxy", "http://proxy.invalid:8080")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:8080")
+    monkeypatch.setattr(
+        "urllib.request.getproxies",
+        lambda: pytest.fail("system proxies must not be loaded"),
+    )
+    captured_handlers: list[object] = []
+    real_build_opener = sync_cli.build_opener
+
+    def recording_build_opener(*handlers: object):
+        captured_handlers.extend(handlers)
+        return real_build_opener(*handlers)
+
+    monkeypatch.setattr(sync_cli, "build_opener", recording_build_opener)
+
+    sync_cli._build_direct_opener()
+
+    proxy_handlers = [
+        handler for handler in captured_handlers if isinstance(handler, ProxyHandler)
+    ]
+    assert len(proxy_handlers) == 1
+    assert proxy_handlers[0].proxies == {}
+
+
+def test_default_transport_rejects_redirect_without_forwarding_bearer(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    target_authorizations: list[str | None] = []
+    redirect_requests = 0
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            target_authorizations.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+
+        do_POST = do_GET
+
+        def log_message(self, *_args: object) -> None:
+            return None
+
+    target = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            nonlocal redirect_requests
+            redirect_requests += 1
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                f"http://127.0.0.1:{target.server_port}/outside",
+            )
+            self.end_headers()
+
+        def log_message(self, *_args: object) -> None:
+            return None
+
+    redirect = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    threads = [
+        threading.Thread(target=server.serve_forever, daemon=True)
+        for server in (target, redirect)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        monkeypatch.setattr(
+            sync_cli,
+            "_gateway_base",
+            lambda _value: f"http://127.0.0.1:{redirect.server_port}",
+        )
+        assert main(
+            push_args(paths),
+            environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+        ) == 1
+    finally:
+        for server in (redirect, target):
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join(timeout=2)
+
+    assert redirect_requests == 1
+    assert target_authorizations == []
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "http_error",
+    }
+    assert json.loads(paths["state"].read_text(encoding="utf-8"))["pending"]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("outcome", []), ("project_status", {"private": "value"})],
+)
+def test_response_enum_fields_require_strings(
+    tmp_path: Path,
+    capsys,
+    field: str,
+    value: object,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    response = {
+        "sync_id": "placeholder",
+        "outcome": "applied",
+        "project_status": "healthy",
+        "accepted_sources": 1,
+        "failed_sources": 0,
+        "generation_id": None,
+        "next_sync_before": "2026-09-05T12:05:00+00:00",
+    }
+
+    class InvalidEnumResponse(RecordingUrlOpen):
+        def __call__(self, request, *, timeout):  # type: ignore[no-untyped-def]
+            request_payload = json.loads(request.data)
+            response["sync_id"] = request_payload["sync_id"]
+            response[field] = value
+            return super().__call__(request, timeout=timeout)
+
+    sent = InvalidEnumResponse(response)
+    assert main(
+        push_args(paths),
+        urlopen=sent,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "response_invalid",
+    }
+    assert json.loads(paths["state"].read_text(encoding="utf-8"))["pending"]
+
+
+def test_response_read_is_bounded_to_sixty_four_kibibytes(
+    tmp_path: Path, capsys
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    sent = RecordingUrlOpen()
+
+    assert main(
+        push_args(paths),
+        urlopen=sent,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 0
+    capsys.readouterr()
+    assert sent.read_sizes == [65_537]
+
+
+def test_oversized_response_is_rejected_after_one_bounded_read(
+    tmp_path: Path, capsys
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    read_sizes: list[int] = []
+
+    def oversized(_request, *, timeout):  # type: ignore[no-untyped-def]
+        assert timeout == 30.0
+
+        def read(size: int) -> bytes:
+            read_sizes.append(size)
+            return b"x" * size
+
+        return SimpleNamespace(read=read)
+
+    assert main(
+        push_args(paths),
+        urlopen=oversized,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "response_invalid",
+    }
+    assert read_sizes == [65_537]
+    assert json.loads(paths["state"].read_text(encoding="utf-8"))["pending"]
+
+
+@pytest.mark.parametrize("argv", [["--help"], ["collect", "--help"]])
+def test_help_outputs_exactly_one_json_object(
+    capsys, argv: list[str]
+) -> None:
+    assert main(argv) == 0
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+    assert payload["status"] == "help"
+    assert output.err == ""
+    assert output.out.count("\n") == 1
+
+
+def test_qwen_prompt_only_completes_retrieval_with_obtained_evidence() -> None:
+    prompt = (
+        Path(__file__).resolve().parents[2]
+        / "prompts"
+        / "qwenwork-dws-project-sync.md"
+    ).read_text(encoding="utf-8")
+
+    normalized = " ".join(prompt.replace("`", "").split())
+    assert "未完成的检索请求绝不能加入 completed_retrieval_request_ids" in normalized
+    assert "只有已取得对应证据" in normalized
+    assert "遗漏的请求保持 pending" in normalized

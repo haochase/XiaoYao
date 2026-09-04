@@ -9,8 +9,10 @@
    `QwenProjectContextArtifact`，写入 `<PRIVATE_CONTEXT_ARTIFACT_PATH>`。每条事实性决策、
    行动项和风险都必须引用一个状态为 `active` 的来源，并使用该来源正文中的精确摘录。
    不得引用失败、删除或撤权来源，也不得根据常识、历史对话或模型推断补写事实。
-3. 缺少证据时省略对应事实；原样保留仍需完成的
-   `completed_retrieval_request_ids`，不得捏造检索结果或完成状态。
+3. 缺少证据时省略对应事实。只有已取得对应证据，才能将请求 ID 加入
+   `completed_retrieval_request_ids`；未完成的检索请求绝不能加入
+   `completed_retrieval_request_ids`，遗漏的请求保持 pending。不得捏造检索结果或
+   完成状态。
 4. 运行 `tools/dws_project_sync.py push`，参数仅使用私有任务配置中的 manifest、项目、
    来源包、context artifact、`--state-file <PRIVATE_STATE_PATH>`，gateway 固定为
    `http://127.0.0.1:8731`。令牌只由 `COMPANION_DWS_SYNC_TOKEN` 提供。
