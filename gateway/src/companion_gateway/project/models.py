@@ -115,6 +115,7 @@ class DecisionVersion(BaseModel):
     version: int = Field(ge=1)
     replaces_version: int | None = Field(default=None, ge=1)
     change_reason: str = Field(min_length=1, max_length=2000)
+    decision_text: str | None = Field(default=None, max_length=2000)
     proposed_by: str = Field(min_length=1, max_length=256)
     approved_by: str | None = Field(default=None, max_length=256)
     approved_at: datetime | None = None
@@ -126,6 +127,11 @@ class DecisionVersion(BaseModel):
     )
     _change_reason = field_validator("change_reason")(
         lambda value: _require_non_blank(value, "change_reason")
+    )
+    _version_decision_text = field_validator("decision_text")(
+        lambda value: _require_non_blank(value, "decision_text")
+        if value is not None
+        else value
     )
     _proposed_by = field_validator("proposed_by")(
         lambda value: _require_non_blank(value, "proposed_by")
@@ -242,6 +248,7 @@ class ConflictCandidate(BaseModel):
     created_at: datetime
     reviewed_by: str | None = Field(default=None, max_length=256)
     reviewed_at: datetime | None = None
+    review_reason: str | None = Field(default=None, max_length=2000)
 
     _candidate_id = field_validator("candidate_id")(
         lambda value: _require_non_blank(value, "candidate_id")
@@ -271,6 +278,11 @@ class ConflictCandidate(BaseModel):
     )
     _reviewed_at = field_validator("reviewed_at")(
         lambda value: _require_aware(value, "reviewed_at")
+        if value is not None
+        else value
+    )
+    _review_reason = field_validator("review_reason")(
+        lambda value: _require_non_blank(value, "review_reason")
         if value is not None
         else value
     )

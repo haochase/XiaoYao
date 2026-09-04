@@ -70,6 +70,7 @@ class ProjectMemoryService:
                             decision_id=item.decision_id,
                             version=1,
                             change_reason="初始项目决策",
+                            decision_text=item.decision_text,
                             proposed_by=item.owner,
                             approved_by=item.owner,
                             approved_at=item.decided_at,
@@ -155,6 +156,10 @@ class ProjectMemoryService:
         )
         with self._lock:
             existing = self._conflicts.get(candidate_id)
+            if existing is None and self._repository is not None:
+                existing = self._repository.get_conflict(candidate_id)
+                if existing is not None:
+                    self._conflicts[candidate_id] = existing
             if existing is not None:
                 return existing, False
             candidate = ConflictCandidate(
@@ -196,51 +201,80 @@ class ProjectMemoryService:
         now: datetime | None = None,
     ) -> ConflictCandidate | tuple[ConflictCandidate, DecisionVersion]:
         timestamp = now or self._clock()
-        candidate = self.get_conflict(candidate_id)
-        if candidate.status is not ConflictStatus.PROPOSED:
-            raise ProjectMemoryError("conflict_already_reviewed")
-        context = self._require_fresh_context(candidate.project_id, timestamp)
-        if not reviewer_id.strip():
-            raise ValueError("reviewer_id must not be blank")
-        if not change_reason.strip():
-            raise ValueError("change_reason must not be blank")
-
-        if action == "reject":
-            reviewed = candidate.model_copy(
-                update={
-                    "status": ConflictStatus.REJECTED,
-                    "reviewed_by": reviewer_id,
-                    "reviewed_at": timestamp,
-                }
-            )
-            with self._lock:
-                self._conflicts[candidate_id] = reviewed
-                if self._repository is not None:
-                    self._repository.save_conflict(reviewed)
-            return reviewed
-
-        if action != "accept":
-            raise ValueError("action must be accept or reject")
-        if not new_decision_text or not new_decision_text.strip():
-            raise ValueError("new_decision_text is required")
-        if not evidence_refs:
-            raise ValueError("evidence_refs is required")
-        self._require_source_scope(context, evidence_refs)
-        active = self.current_decision(
-            candidate.project_id, candidate.decision_id, now=timestamp
-        )
-        key = (candidate.project_id, candidate.decision_id)
         with self._lock:
+            candidate = self.get_conflict(candidate_id)
+            if candidate.status is not ConflictStatus.PROPOSED:
+                raise ProjectMemoryError("conflict_already_reviewed")
+            context = self._require_fresh_context(candidate.project_id, timestamp)
+            if not reviewer_id.strip():
+                raise ValueError("reviewer_id must not be blank")
+            if not change_reason.strip():
+                raise ValueError("change_reason must not be blank")
+
+            if action == "reject":
+                reviewed = candidate.model_copy(
+                    update={
+                        "status": ConflictStatus.REJECTED,
+                        "reviewed_by": reviewer_id,
+                        "reviewed_at": timestamp,
+                        "review_reason": change_reason,
+                    }
+                )
+                result = (
+                    self._repository.commit_conflict_review(
+                        reviewed_candidate=reviewed,
+                    )
+                    if self._repository is not None
+                    else "committed"
+                )
+                self._raise_for_review_commit(result)
+                self._conflicts[candidate_id] = reviewed
+                return reviewed
+
+            if action != "accept":
+                raise ValueError("action must be accept or reject")
+            if not new_decision_text or not new_decision_text.strip():
+                raise ValueError("new_decision_text is required")
+            if not evidence_refs:
+                raise ValueError("evidence_refs is required")
+            self._require_source_scope(context, evidence_refs)
+            active = self.current_decision(
+                candidate.project_id, candidate.decision_id, now=timestamp
+            )
+            if active.decision_text != candidate.active_decision_text:
+                raise ProjectMemoryError("conflict_stale")
+            key = (candidate.project_id, candidate.decision_id)
             versions = self._versions.get(key, [])
             if not versions and self._repository is not None:
                 versions = self._repository.list_versions(*key)
-            self._versions[key] = versions
             previous_version = versions[-1].version if versions else 1
+            previous = (
+                versions[-1]
+                if versions
+                else DecisionVersion(
+                    decision_id=candidate.decision_id,
+                    version=previous_version,
+                    change_reason="初始项目决策",
+                    decision_text=active.decision_text,
+                    proposed_by=active.owner,
+                    approved_by=active.owner,
+                    approved_at=active.decided_at,
+                    status=DecisionStatus.ACTIVE,
+                    evidence_refs=active.source_refs,
+                )
+            )
+            superseded = previous.model_copy(
+                update={
+                    "decision_text": previous.decision_text or active.decision_text,
+                    "status": DecisionStatus.SUPERSEDED,
+                }
+            )
             version = DecisionVersion(
                 decision_id=candidate.decision_id,
                 version=previous_version + 1,
                 replaces_version=previous_version,
                 change_reason=change_reason,
+                decision_text=new_decision_text,
                 proposed_by="conflict-detector",
                 approved_by=reviewer_id,
                 approved_at=timestamp,
@@ -267,23 +301,44 @@ class ProjectMemoryService:
                 {
                     **context.model_dump(),
                     "active_decisions": updated_decisions,
+                    "generated_at": timestamp,
                 }
             )
-            self._contexts[candidate.project_id] = updated_context
-            if self._repository is not None:
-                self._repository.save_context(updated_context)
             reviewed = candidate.model_copy(
                 update={
                     "status": ConflictStatus.ACCEPTED,
                     "reviewed_by": reviewer_id,
                     "reviewed_at": timestamp,
+                    "review_reason": change_reason,
                 }
             )
+            result = (
+                self._repository.commit_conflict_review(
+                    reviewed_candidate=reviewed,
+                    expected_active_decision_text=candidate.active_decision_text,
+                    updated_context=updated_context,
+                    previous_version=superseded,
+                    new_version=version,
+                )
+                if self._repository is not None
+                else "committed"
+            )
+            self._raise_for_review_commit(result)
+            self._versions[key] = [*versions[:-1], superseded, version]
+            self._contexts[candidate.project_id] = updated_context
             self._conflicts[candidate_id] = reviewed
-            if self._repository is not None:
-                self._repository.save_version(candidate.project_id, version)
-                self._repository.save_conflict(reviewed)
         return reviewed, version
+
+    @staticmethod
+    def _raise_for_review_commit(result: str) -> None:
+        if result == "committed":
+            return
+        error = {
+            "not_found": "conflict_not_found",
+            "already_reviewed": "conflict_already_reviewed",
+            "stale": "conflict_stale",
+        }.get(result, "conflict_review_failed")
+        raise ProjectMemoryError(error)
 
     def _require_fresh_context(
         self, project_id: str, now: datetime | None
