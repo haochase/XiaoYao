@@ -240,6 +240,7 @@ class ConflictCandidate(BaseModel):
     candidate_id: str = Field(min_length=1, max_length=128)
     project_id: str = Field(min_length=1, max_length=128)
     decision_id: str = Field(min_length=1, max_length=128)
+    base_version: int = Field(default=1, ge=1)
     observed_text: str = Field(min_length=1, max_length=2000)
     active_decision_text: str = Field(min_length=1, max_length=2000)
     reason: str = Field(min_length=1, max_length=2000)

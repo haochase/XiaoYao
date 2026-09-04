@@ -592,6 +592,31 @@ def create_app(
         response.headers["X-Trace-Id"] = request.state.trace_id
         return response
 
+    def authorize_project_context(
+        request: Request,
+        project_id: str,
+        *,
+        require_review: bool = False,
+    ) -> ProjectApiPrincipal:
+        principal = _authenticate_project_request(
+            project_authenticator,
+            request,
+            project_id=project_id,
+            require_review=require_review,
+        )
+        try:
+            context = project_memory.get_context(project_id)
+        except ProjectContextUnavailable as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        _authorize_project_principal(
+            project_authenticator,
+            principal,
+            project_id=project_id,
+            permission_scope=context.permission_scope,
+            require_review=require_review,
+        )
+        return principal
+
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -653,11 +678,7 @@ def create_app(
         project_id: str,
         body: ProjectQueryRequest,
     ) -> dict[str, object]:
-        _authenticate_project_request(
-            project_authenticator,
-            request,
-            project_id=project_id,
-        )
+        authorize_project_context(request, project_id)
         try:
             answer = project_memory.answer(
                 project_id,
@@ -676,11 +697,7 @@ def create_app(
         project_id: str,
         body: ConflictProposalRequest,
     ) -> JSONResponse:
-        _authenticate_project_request(
-            project_authenticator,
-            request,
-            project_id=project_id,
-        )
+        authorize_project_context(request, project_id)
         try:
             candidate, created = project_memory.propose_conflict(
                 project_id,
@@ -716,6 +733,14 @@ def create_app(
                 project_authenticator,
                 principal,
                 project_id=candidate.project_id,
+                require_review=True,
+            )
+            context = project_memory.get_context(candidate.project_id)
+            _authorize_project_principal(
+                project_authenticator,
+                principal,
+                project_id=candidate.project_id,
+                permission_scope=context.permission_scope,
                 require_review=True,
             )
             result = project_memory.review_conflict(

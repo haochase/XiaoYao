@@ -15,6 +15,7 @@ NOW = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
 OWNER_TOKEN = "owner-project-token"
 OTHER_TOKEN = "other-project-token"
 VIEWER_TOKEN = "viewer-project-token"
+WRONG_SCOPE_TOKEN = "wrong-scope-project-token"
 OWNER_HEADERS = {"Authorization": f"Bearer {OWNER_TOKEN}"}
 
 
@@ -42,6 +43,13 @@ def project_settings(database_path) -> Settings:
                 project_ids=frozenset({"project-1"}),
                 permission_scopes=frozenset({"project:star-retail"}),
                 can_review=False,
+            ),
+            ProjectApiPrincipal(
+                principal_id="scope-owner",
+                token_sha256=sha256(WRONG_SCOPE_TOKEN.encode()).hexdigest(),
+                project_ids=frozenset({"project-1"}),
+                permission_scopes=frozenset({"project:other"}),
+                can_review=True,
             ),
         ),
     )
@@ -277,3 +285,49 @@ def test_project_review_uses_authenticated_principal_and_requires_review_role(
     assert forbidden.status_code == 403
     assert reviewed.status_code == 200
     assert reviewed.json()["candidate"]["reviewed_by"] == "owner-1"
+
+
+def test_project_api_rejects_same_project_principal_without_context_scope(
+    client: TestClient,
+) -> None:
+    wrong_scope_headers = {"Authorization": f"Bearer {WRONG_SCOPE_TOKEN}"}
+    client.post(
+        "/v1/projects/project-1/context", json=context(), headers=OWNER_HEADERS
+    )
+    proposal = client.post(
+        "/v1/projects/project-1/conflicts",
+        json={
+            "decision_id": "decision-1",
+            "observed_text": "改用方案 A",
+            "reason": "供应商交期发生变化",
+            "evidence_refs": [source("meeting-2")],
+        },
+        headers=OWNER_HEADERS,
+    )
+    candidate_id = proposal.json()["candidate"]["candidate_id"]
+
+    query = client.post(
+        "/v1/projects/project-1/query",
+        json={"query": "终端方案", "kind": "fact"},
+        headers=wrong_scope_headers,
+    )
+    conflict = client.post(
+        "/v1/projects/project-1/conflicts",
+        json={
+            "decision_id": "decision-1",
+            "observed_text": "改用方案 C",
+            "reason": "权限域不匹配",
+            "evidence_refs": [source("meeting-3")],
+        },
+        headers=wrong_scope_headers,
+    )
+    review = client.post(
+        f"/v1/projects/conflicts/{candidate_id}/review",
+        json={"action": "reject", "change_reason": "权限域不匹配"},
+        headers=wrong_scope_headers,
+    )
+
+    assert query.status_code == 403
+    assert conflict.status_code == 403
+    assert review.status_code == 403
+    assert query.json()["detail"] == "project_scope_denied"

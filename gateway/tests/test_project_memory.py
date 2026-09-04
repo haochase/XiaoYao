@@ -256,6 +256,47 @@ def test_stale_conflict_cannot_overwrite_a_newer_decision() -> None:
     ).decision_text == "采用方案 A"
 
 
+def test_stale_conflict_uses_base_version_even_when_text_is_unchanged() -> None:
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(decision(),)))
+    stale, _ = service.propose_conflict(
+        "project-1",
+        decision_id="decision-1",
+        observed_text="改用方案 C",
+        reason="旧候选",
+        evidence_refs=(source("meeting-2"),),
+        now=NOW,
+    )
+    same_text, _ = service.propose_conflict(
+        "project-1",
+        decision_id="decision-1",
+        observed_text="维持方案 B",
+        reason="补充了新的决策依据",
+        evidence_refs=(source("meeting-3"),),
+        now=NOW,
+    )
+    service.review_conflict(
+        same_text.candidate_id,
+        reviewer_id="owner-1",
+        action="accept",
+        new_decision_text="采用方案 B",
+        change_reason="补充了新的决策依据",
+        evidence_refs=(source("meeting-3"),),
+        now=NOW + timedelta(minutes=1),
+    )
+
+    with pytest.raises(RuntimeError, match="conflict_stale"):
+        service.review_conflict(
+            stale.candidate_id,
+            reviewer_id="owner-1",
+            action="accept",
+            new_decision_text="采用方案 C",
+            change_reason="旧候选",
+            evidence_refs=(source("meeting-2"),),
+            now=NOW + timedelta(minutes=2),
+        )
+
+
 def test_context_refresh_cannot_replace_an_active_decision() -> None:
     service = ProjectMemoryService(clock=lambda: NOW)
     service.replace_context(context(decisions=(decision(),)))

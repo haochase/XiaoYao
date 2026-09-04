@@ -6,6 +6,7 @@ from typing import Literal
 
 from companion_gateway.project.models import (
     ConflictCandidate,
+    ConflictStatus,
     DecisionVersion,
     ProjectContextPackage,
 )
@@ -60,6 +61,47 @@ class ProjectMemoryRepository:
                 (package.project_id, package.model_dump_json()),
             )
         return package
+
+    def replace_context(
+        self,
+        package: ProjectContextPackage,
+        initial_versions: tuple[DecisionVersion, ...],
+    ) -> Literal["inserted", "refreshed", "decision_conflict"]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload_json FROM project_contexts WHERE project_id = ?",
+                (package.project_id,),
+            ).fetchone()
+            if row is not None:
+                stored = ProjectContextPackage.model_validate_json(row["payload_json"])
+                if stored.active_decisions != package.active_decisions:
+                    return "decision_conflict"
+                connection.execute(
+                    "UPDATE project_contexts SET payload_json = ? WHERE project_id = ?",
+                    (package.model_dump_json(), package.project_id),
+                )
+                return "refreshed"
+
+            connection.execute(
+                "INSERT INTO project_contexts(project_id, payload_json) VALUES (?, ?)",
+                (package.project_id, package.model_dump_json()),
+            )
+            for version in initial_versions:
+                connection.execute(
+                    """
+                    INSERT INTO project_versions(
+                        project_id, decision_id, version, payload_json
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        package.project_id,
+                        version.decision_id,
+                        version.version,
+                        version.model_dump_json(),
+                    ),
+                )
+        return "inserted"
 
     def get_context(self, project_id: str) -> ProjectContextPackage | None:
         with self._connect() as connection:
@@ -125,6 +167,28 @@ class ProjectMemoryRepository:
             )
         return candidate
 
+    def create_conflict(
+        self,
+        candidate: ConflictCandidate,
+    ) -> tuple[ConflictCandidate, bool]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                INSERT INTO project_conflicts(candidate_id, payload_json)
+                VALUES (?, ?)
+                ON CONFLICT(candidate_id) DO NOTHING
+                """,
+                (candidate.candidate_id, candidate.model_dump_json()),
+            )
+            row = connection.execute(
+                "SELECT payload_json FROM project_conflicts WHERE candidate_id = ?",
+                (candidate.candidate_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("conflict_insert_failed")
+        return ConflictCandidate.model_validate_json(row["payload_json"]), cursor.rowcount == 1
+
     def get_conflict(self, candidate_id: str) -> ConflictCandidate | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -141,6 +205,7 @@ class ProjectMemoryRepository:
         self,
         *,
         reviewed_candidate: ConflictCandidate,
+        expected_base_version: int | None = None,
         expected_active_decision_text: str | None = None,
         updated_context: ProjectContextPackage | None = None,
         previous_version: DecisionVersion | None = None,
@@ -157,13 +222,14 @@ class ProjectMemoryRepository:
             stored_candidate = ConflictCandidate.model_validate_json(
                 conflict_row["payload_json"]
             )
-            if stored_candidate.status.value != "proposed":
+            if stored_candidate.status is not ConflictStatus.PROPOSED:
                 return "already_reviewed"
 
             review_updates_decision = updated_context is not None
             if review_updates_decision:
                 if (
                     expected_active_decision_text is None
+                    or expected_base_version is None
                     or previous_version is None
                     or new_version is None
                 ):
@@ -190,31 +256,56 @@ class ProjectMemoryRepository:
                     or stored_decision.decision_text != expected_active_decision_text
                 ):
                     return "stale"
+                version_row = connection.execute(
+                    """
+                    SELECT payload_json FROM project_versions
+                    WHERE project_id = ? AND decision_id = ?
+                    ORDER BY version DESC LIMIT 1
+                    """,
+                    (reviewed_candidate.project_id, reviewed_candidate.decision_id),
+                ).fetchone()
+                if version_row is None:
+                    return "not_found"
+                stored_version = DecisionVersion.model_validate_json(
+                    version_row["payload_json"]
+                )
+                if (
+                    stored_version.version != expected_base_version
+                    or previous_version.version != expected_base_version
+                    or new_version.version != expected_base_version + 1
+                ):
+                    return "stale"
+                updated = connection.execute(
+                    """
+                    UPDATE project_versions SET payload_json = ?
+                    WHERE project_id = ? AND decision_id = ? AND version = ?
+                    """,
+                    (
+                        previous_version.model_dump_json(),
+                        reviewed_candidate.project_id,
+                        previous_version.decision_id,
+                        previous_version.version,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    return "stale"
                 connection.execute(
                     """
-                    INSERT INTO project_contexts(project_id, payload_json)
-                    VALUES (?, ?)
-                    ON CONFLICT(project_id) DO UPDATE SET
-                        payload_json = excluded.payload_json
+                    INSERT INTO project_versions(
+                        project_id, decision_id, version, payload_json
+                    ) VALUES (?, ?, ?, ?)
                     """,
-                    (updated_context.project_id, updated_context.model_dump_json()),
+                    (
+                        reviewed_candidate.project_id,
+                        new_version.decision_id,
+                        new_version.version,
+                        new_version.model_dump_json(),
+                    ),
                 )
-                for version in (previous_version, new_version):
-                    connection.execute(
-                        """
-                        INSERT INTO project_versions(
-                            project_id, decision_id, version, payload_json
-                        ) VALUES (?, ?, ?, ?)
-                        ON CONFLICT(project_id, decision_id, version) DO UPDATE SET
-                            payload_json = excluded.payload_json
-                        """,
-                        (
-                            reviewed_candidate.project_id,
-                            version.decision_id,
-                            version.version,
-                            version.model_dump_json(),
-                        ),
-                    )
+                connection.execute(
+                    "UPDATE project_contexts SET payload_json = ? WHERE project_id = ?",
+                    (updated_context.model_dump_json(), updated_context.project_id),
+                )
 
             connection.execute(
                 """

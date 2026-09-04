@@ -7,6 +7,7 @@ from companion_gateway.project.models import (
     ConflictStatus,
     DecisionCard,
     DecisionStatus,
+    DecisionVersion,
     EvidenceRef,
     ProjectContextPackage,
 )
@@ -29,12 +30,12 @@ def source(source_id: str = "meeting-1") -> EvidenceRef:
     )
 
 
-def context() -> ProjectContextPackage:
+def context(decision_text: str = "采用方案 B") -> ProjectContextPackage:
     decision = DecisionCard(
         decision_id="decision-1",
         project_id="project-1",
         topic="终端方案",
-        decision_text="采用方案 B",
+        decision_text=decision_text,
         rationale="交付风险更低",
         owner="owner-1",
         decided_at=NOW,
@@ -225,6 +226,46 @@ def test_stale_service_cannot_review_an_already_accepted_conflict(tmp_path) -> N
         )
 
 
+def test_duplicate_proposal_cannot_overwrite_reviewed_terminal_state(tmp_path) -> None:
+    database_path = tmp_path / "project-memory.db"
+    first_repository = ProjectMemoryRepository(database_path)
+    first_repository.initialize()
+    first = ProjectMemoryService(repository=first_repository, clock=lambda: NOW)
+    first.replace_context(context())
+    proposed, _ = first.propose_conflict(
+        "project-1",
+        decision_id="decision-1",
+        observed_text="改用方案 A",
+        reason="供应商交期发生变化",
+        evidence_refs=(source("meeting-2"),),
+        now=NOW,
+    )
+    first.review_conflict(
+        proposed.candidate_id,
+        reviewer_id="owner-1",
+        action="reject",
+        change_reason="保留原决策",
+        now=NOW + timedelta(minutes=1),
+    )
+    second = ProjectMemoryService(
+        repository=ProjectMemoryRepository(database_path),
+        clock=lambda: NOW,
+    )
+
+    duplicate, created = second.propose_conflict(
+        "project-1",
+        decision_id="decision-1",
+        observed_text="改用方案 A",
+        reason="供应商交期发生变化",
+        evidence_refs=(source("meeting-2"),),
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert created is False
+    assert duplicate.status is ConflictStatus.REJECTED
+    assert duplicate.reviewed_by == "owner-1"
+
+
 def test_failed_atomic_review_keeps_in_memory_state_unchanged(
     tmp_path,
     monkeypatch,
@@ -246,6 +287,7 @@ def test_failed_atomic_review_keeps_in_memory_state_unchanged(
     def fail_review(**_kwargs) -> bool:
         raise RuntimeError("simulated_transaction_failure")
 
+    commit_review = repository.commit_conflict_review
     monkeypatch.setattr(repository, "commit_conflict_review", fail_review)
     with pytest.raises(RuntimeError, match="simulated_transaction_failure"):
         service.review_conflict(
@@ -262,3 +304,113 @@ def test_failed_atomic_review_keeps_in_memory_state_unchanged(
     assert service.current_decision(
         "project-1", "decision-1", now=NOW
     ).decision_text == "采用方案 B"
+
+    monkeypatch.setattr(repository, "commit_conflict_review", commit_review)
+    reviewed, version = service.review_conflict(
+        proposed.candidate_id,
+        reviewer_id="owner-1",
+        action="accept",
+        new_decision_text="采用方案 A",
+        change_reason="供应商交期发生变化",
+        evidence_refs=(source("meeting-2"),),
+        now=NOW + timedelta(minutes=2),
+    )
+    versions = repository.list_versions("project-1", "decision-1")
+    assert reviewed.status is ConflictStatus.ACCEPTED
+    assert version.version == 2
+    assert [item.version for item in versions] == [1, 2]
+    assert [item.status for item in versions] == [
+        DecisionStatus.SUPERSEDED,
+        DecisionStatus.ACTIVE,
+    ]
+
+
+def test_failed_conflict_insert_does_not_leave_cached_candidate(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    repository = ProjectMemoryRepository(tmp_path / "project-memory.db")
+    repository.initialize()
+    service = ProjectMemoryService(repository=repository, clock=lambda: NOW)
+    service.replace_context(context())
+    create_conflict = repository.create_conflict
+
+    def fail_create(_candidate):
+        raise RuntimeError("simulated_insert_failure")
+
+    monkeypatch.setattr(repository, "create_conflict", fail_create)
+    with pytest.raises(RuntimeError, match="simulated_insert_failure"):
+        service.propose_conflict(
+            "project-1",
+            decision_id="decision-1",
+            observed_text="改用方案 A",
+            reason="供应商交期发生变化",
+            evidence_refs=(source("meeting-2"),),
+            now=NOW,
+        )
+
+    monkeypatch.setattr(repository, "create_conflict", create_conflict)
+    _, created = service.propose_conflict(
+        "project-1",
+        decision_id="decision-1",
+        observed_text="改用方案 A",
+        reason="供应商交期发生变化",
+        evidence_refs=(source("meeting-2"),),
+        now=NOW,
+    )
+    assert created is True
+
+
+def test_first_context_insert_cannot_be_overwritten_by_another_service(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "project-memory.db"
+    first_repository = ProjectMemoryRepository(database_path)
+    first_repository.initialize()
+    second_repository = ProjectMemoryRepository(database_path)
+    second_repository.initialize()
+    first = ProjectMemoryService(repository=first_repository, clock=lambda: NOW)
+    second = ProjectMemoryService(repository=second_repository, clock=lambda: NOW)
+
+    first.replace_context(context("采用方案 B"))
+    with pytest.raises(ProjectMemoryError, match="decision_change_requires_review"):
+        second.replace_context(context("采用方案 A"))
+
+    stored = second_repository.get_context("project-1")
+    assert stored is not None
+    assert stored.active_decisions[0].decision_text == "采用方案 B"
+
+
+def test_incomplete_legacy_version_history_is_rejected(tmp_path) -> None:
+    database_path = tmp_path / "project-memory.db"
+    repository = ProjectMemoryRepository(database_path)
+    repository.initialize()
+    service = ProjectMemoryService(repository=repository, clock=lambda: NOW)
+    service.replace_context(context())
+    repository.save_version(
+        "project-1",
+        DecisionVersion(
+            decision_id="decision-1",
+            version=1,
+            change_reason="旧格式缺少决策正文",
+            proposed_by="owner-1",
+            approved_by="owner-1",
+            approved_at=NOW,
+            status=DecisionStatus.ACTIVE,
+            evidence_refs=(source(),),
+        ),
+    )
+    reopened = ProjectMemoryService(
+        repository=ProjectMemoryRepository(database_path),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(ProjectMemoryError, match="decision_history_incomplete"):
+        reopened.propose_conflict(
+            "project-1",
+            decision_id="decision-1",
+            observed_text="改用方案 A",
+            reason="供应商交期发生变化",
+            evidence_refs=(source("meeting-2"),),
+            now=NOW,
+        )
