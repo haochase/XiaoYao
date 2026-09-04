@@ -138,6 +138,8 @@ def test_runner_normalizes_timeout_and_failures_without_leaking_output(
     assert timeout_error.value.error_type is SourceErrorType.NETWORK_TIMEOUT
     assert timeout_error.value.retryable is True
     assert str(timeout_error.value) == "network_timeout"
+    assert timeout_error.value.__cause__ is None
+    assert timeout_error.value.__context__ is None
 
     def failed(*_args: object, **_kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(
@@ -179,6 +181,29 @@ def test_runner_exit_zero_requires_one_json_object(
     with pytest.raises(DwsReadError) as error:
         DwsCommandRunner(dws_path, profile="corp:user", run=run).run(("doc", "info"))
     assert error.value.error_type is SourceErrorType.INVALID_PAYLOAD
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_runner_rejects_non_finite_json_constants(
+    tmp_path: Path,
+    constant: str,
+) -> None:
+    dws_path = tmp_path / "dws.exe"
+    dws_path.write_text("", encoding="utf-8")
+    run = lambda *_a, **_k: SimpleNamespace(  # noqa: E731
+        returncode=0,
+        stdout=f'{{"value":{constant}}}',
+        stderr="private",
+    )
+
+    with pytest.raises(DwsReadError) as error:
+        DwsCommandRunner(dws_path, profile="corp:user", run=run).run(("doc", "info"))
+
+    assert error.value.error_type is SourceErrorType.INVALID_PAYLOAD
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
 
 
 def test_unwrap_dws_payload_has_a_fixed_three_layer_allowlist() -> None:
@@ -375,6 +400,70 @@ def test_task_adapter_only_gets_the_allowlisted_task() -> None:
     assert record.content_text == canonical(detail["result"])
 
 
+def test_adapter_rejects_non_finite_json_without_exception_chain() -> None:
+    runner = RecordingRunner([{"taskId": "task-1", "value": float("nan")}])
+
+    with pytest.raises(DwsReadError) as error:
+        read_task(
+            runner,
+            source("task", "task-1"),
+            permission_scope="project:project-1",
+            clock=lambda: NOW,
+        )
+
+    assert error.value.error_type is SourceErrorType.INVALID_PAYLOAD
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+def test_adapter_normalizes_metadata_validation_errors_and_collects_failure() -> None:
+    invalid_time = RecordingRunner(
+        [{"taskId": "task-1", "updatedAt": "private-invalid-time"}]
+    )
+    with pytest.raises(DwsReadError) as time_error:
+        read_task(
+            invalid_time,
+            source("task", "task-1"),
+            permission_scope="project:project-1",
+            clock=lambda: NOW,
+        )
+    assert time_error.value.error_type is SourceErrorType.INVALID_PAYLOAD
+    assert time_error.value.__cause__ is None
+    assert time_error.value.__context__ is None
+
+    project = DwsProjectManifest(
+        project_id="project-1",
+        project_name="Demo",
+        profile="private-profile",
+        permission_scope="project:project-1",
+        sources=(source("task", "task-1"),),
+    )
+    long_metadata = RecordingRunner(
+        [{"taskId": "task-1", "title": "密" * 513}]
+    )
+
+    bundle = collect_sources(project, long_metadata, clock=lambda: NOW)
+
+    assert bundle.records[0].status == "failed"
+    assert bundle.records[0].error_type is SourceErrorType.INVALID_PAYLOAD
+
+
+def test_long_source_id_uses_hashed_fallback_url() -> None:
+    source_id = "文" * 256
+    runner = RecordingRunner([{}])
+
+    record = read_task(
+        runner,
+        source("task", source_id),
+        permission_scope="project:project-1",
+        clock=lambda: NOW,
+    )
+
+    source_hash = hashlib.sha256(source_id.encode()).hexdigest()
+    assert record.source_url == f"dingtalk://task/{source_hash}"
+    assert source_id not in record.source_url
+
+
 def test_metadata_aliases_use_first_present_field_and_reject_null_identity() -> None:
     runner = RecordingRunner(
         [
@@ -509,6 +598,13 @@ def test_record_and_bundle_are_frozen_and_enforce_status_invariants() -> None:
         )
     with pytest.raises(ValidationError):
         DwsSourceRecord(**{**record.model_dump(), "content_hash": "b" * 64})
+    with pytest.raises(ValidationError):
+        DwsSourceBundle(
+            **{
+                **bundle.model_dump(),
+                "content_hash": "a" * 65,
+            }
+        )
 
     failed = DwsSourceRecord(
         source_type="document",

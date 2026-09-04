@@ -42,6 +42,10 @@ def _is_forbidden_flag(value: str) -> bool:
     )
 
 
+def _reject_non_finite_constant(_value: str) -> None:
+    raise ValueError("non-finite JSON constant")
+
+
 class DwsReadError(Exception):
     def __init__(
         self,
@@ -166,6 +170,7 @@ class DwsCommandRunner:
             "--format",
             "json",
         ]
+        run_error: DwsReadError | None = None
         try:
             completed = self._run(
                 command,
@@ -174,10 +179,12 @@ class DwsCommandRunner:
                 text=True,
                 timeout=self._timeout_seconds,
             )
-        except subprocess.TimeoutExpired as error:
-            raise DwsReadError(SourceErrorType.NETWORK_TIMEOUT, True) from error
-        except (OSError, subprocess.SubprocessError) as error:
-            raise DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, False) from error
+        except subprocess.TimeoutExpired:
+            run_error = DwsReadError(SourceErrorType.NETWORK_TIMEOUT, True)
+        except (OSError, subprocess.SubprocessError):
+            run_error = DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, False)
+        if run_error is not None:
+            raise run_error
 
         payload = _parse_json_object(getattr(completed, "stdout", ""))
         if getattr(completed, "returncode", 1) == 0:
@@ -196,8 +203,13 @@ def _parse_json_object(value: object) -> dict[str, object] | None:
     if not isinstance(value, (str, bytes, bytearray)):
         return None
     try:
-        payload = json.loads(value)
-    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+        payload = json.loads(value, parse_constant=_reject_non_finite_constant)
+    except (
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        RecursionError,
+        ValueError,
+    ):
         return None
     if not isinstance(payload, dict):
         return None

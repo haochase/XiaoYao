@@ -155,6 +155,8 @@ def test_manifest_requires_absolute_regular_small_utf8_json_file(
         DwsManifest.load(invalid_utf8)
     assert str(error.value) == "manifest_invalid_utf8"
     assert "private-secret" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
 
     invalid_json = tmp_path / "invalid.json"
     invalid_json.write_text('{"private":"secret"', encoding="utf-8")
@@ -162,11 +164,45 @@ def test_manifest_requires_absolute_regular_small_utf8_json_file(
         DwsManifest.load(invalid_json)
     assert str(error.value) == "manifest_invalid_json"
     assert "private" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
 
     oversized = tmp_path / "oversized.json"
     oversized.write_bytes(b" " * (1024 * 1024 + 1))
     with pytest.raises(ValueError, match="manifest_too_large"):
         DwsManifest.load(oversized)
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_manifest_rejects_non_finite_json_without_exception_chain(
+    tmp_path: Path,
+    constant: str,
+) -> None:
+    path = tmp_path / "manifest.json"
+    path.write_text(
+        '{"schema_version":1,"projects":' + constant + "}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as error:
+        DwsManifest.load(path)
+
+    assert str(error.value) == "manifest_invalid_json"
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+def test_manifest_validation_error_has_no_sensitive_exception_chain(
+    tmp_path: Path,
+) -> None:
+    path = write_manifest(tmp_path, root_extra={"token": "private-token"})
+
+    with pytest.raises(ValueError) as error:
+        DwsManifest.load(path)
+
+    assert str(error.value) == "manifest_validation_failed"
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
 
 
 def test_manifest_rejects_duplicate_projects_and_control_characters(

@@ -28,6 +28,10 @@ def _require_aware(value: datetime, field_name: str) -> datetime:
     return value
 
 
+def _reject_non_finite_constant(_value: str) -> None:
+    raise ValueError("non-finite JSON constant")
+
+
 class DwsSourceSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -119,25 +123,44 @@ class DwsManifest(BaseModel):
             raise ValueError("manifest_not_found")
         if not path.is_file():
             raise ValueError("manifest_not_regular_file")
+        read_failed = False
         try:
             if path.stat().st_size > _MAX_MANIFEST_BYTES:
                 raise ValueError("manifest_too_large")
             raw = path.read_bytes()
         except ValueError:
             raise
-        except OSError as error:
-            raise ValueError("manifest_unreadable") from error
+        except OSError:
+            read_failed = True
+        if read_failed:
+            raise ValueError("manifest_unreadable")
+
+        decode_failed = False
         try:
             text = raw.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise ValueError("manifest_invalid_utf8") from error
+        except UnicodeDecodeError:
+            decode_failed = True
+        if decode_failed:
+            raise ValueError("manifest_invalid_utf8")
+
+        json_failed = False
         try:
-            payload = json.loads(text)
-        except (json.JSONDecodeError, RecursionError) as error:
-            raise ValueError("manifest_invalid_json") from error
+            payload = json.loads(
+                text,
+                parse_constant=_reject_non_finite_constant,
+            )
+        except (json.JSONDecodeError, RecursionError, ValueError):
+            json_failed = True
+        if json_failed:
+            raise ValueError("manifest_invalid_json")
         if not isinstance(payload, dict):
             raise ValueError("manifest_root_invalid")
+
+        validation_failed = False
         try:
-            return cls.model_validate(payload)
-        except (TypeError, ValueError) as error:
-            raise ValueError("manifest_validation_failed") from error
+            manifest = cls.model_validate(payload)
+        except (TypeError, ValueError):
+            validation_failed = True
+        if validation_failed:
+            raise ValueError("manifest_validation_failed")
+        return manifest

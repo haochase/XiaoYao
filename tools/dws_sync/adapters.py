@@ -6,7 +6,6 @@ import math
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Literal, Protocol
-from urllib.parse import quote
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -153,6 +152,16 @@ class DwsSourceBundle(BaseModel):
     def validate_collected_at(cls, value: datetime) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("collected_at must be timezone-aware")
+        return value
+
+    @field_validator("content_hash")
+    @classmethod
+    def validate_content_hash(cls, value: str) -> str:
+        invalid_character = any(
+            character not in "0123456789abcdef" for character in value
+        )
+        if len(value) != 64 or invalid_character:
+            raise ValueError("content_hash must be a lowercase SHA-256 hash")
         return value
 
     @model_validator(mode="after")
@@ -416,7 +425,7 @@ def collect_sources(
                     status="revoked",
                 )
             else:
-                record = DwsSourceRecord(
+                record = _build_record(
                     source_type=spec.source_type,
                     source_id=spec.source_id,
                     permission_scope=project.permission_scope,
@@ -474,7 +483,7 @@ def _active_record(
     source_url = _optional_text(url_value)
     source_version = _optional_text(version_value)
     source_time = _optional_datetime(time_value)
-    return DwsSourceRecord(
+    return _build_record(
         source_type=spec.source_type,
         source_id=spec.source_id,
         permission_scope=permission_scope,
@@ -482,7 +491,7 @@ def _active_record(
         status="active",
         source_title=source_title or f"{spec.source_type.value}:{spec.source_id}",
         source_url=source_url
-        or f"dingtalk://{spec.source_type.value}/{quote(spec.source_id, safe='')}",
+        or f"dingtalk://{spec.source_type.value}/{_sha256(spec.source_id)}",
         source_version=source_version or content_hash,
         source_time=source_time or fetched_at,
         content_text=content_text,
@@ -498,7 +507,7 @@ def _terminal_record(
     fetched_at: datetime,
     status: Literal["deleted", "revoked"],
 ) -> DwsSourceRecord:
-    return DwsSourceRecord(
+    return _build_record(
         source_type=spec.source_type,
         source_id=spec.source_id,
         permission_scope=permission_scope,
@@ -554,16 +563,22 @@ def _optional_datetime(value: object) -> datetime | None:
         timestamp = float(value)
         if abs(timestamp) >= 10_000_000_000:
             timestamp /= 1000
+        conversion_failed = False
         try:
             return datetime.fromtimestamp(timestamp, tz=UTC)
-        except (OverflowError, OSError, ValueError) as error:
-            raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False) from error
+        except (OverflowError, OSError, ValueError):
+            conversion_failed = True
+        if conversion_failed:
+            raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
     if not isinstance(value, str):
         raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
+    parse_failed = False
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as error:
-        raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False) from error
+    except ValueError:
+        parse_failed = True
+    if parse_failed:
+        raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
     return parsed
@@ -577,16 +592,32 @@ def _read_clock(clock: Callable[[], datetime]) -> datetime:
 
 
 def _canonical_json(value: object) -> str:
+    serialization_failed = False
     try:
-        return json.dumps(
+        serialized = json.dumps(
             value,
+            allow_nan=False,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         )
-    except (TypeError, ValueError, RecursionError) as error:
-        raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False) from error
+    except (TypeError, ValueError, RecursionError):
+        serialization_failed = True
+    if serialization_failed:
+        raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
+    return serialized
 
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _build_record(**values: object) -> DwsSourceRecord:
+    validation_failed = False
+    try:
+        record = DwsSourceRecord(**values)
+    except (TypeError, ValueError):
+        validation_failed = True
+    if validation_failed:
+        raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
+    return record
