@@ -39,11 +39,13 @@ from companion_gateway.device.models import (
     AbortControl,
     DeviceHello,
     ListenControl,
+    TtsControl,
     VadControl,
     server_hello,
 )
 from companion_gateway.device.session import (
     DeviceAuthenticator,
+    DevicePhase,
     DeviceSession,
     DeviceSessionRegistry,
     InvalidDevicePhase,
@@ -55,6 +57,8 @@ from companion_gateway.device.transport import (
     DeviceTransport,
     OutboundControl,
     OutboundTask,
+    complete_delivery,
+    fail_delivery,
 )
 from companion_gateway.domain.memory import MemoryCandidate, MemoryCategory, utc_now
 from companion_gateway.domain.executor import TaskDeliveryAttempt, TaskExecutor
@@ -147,6 +151,26 @@ ProjectIdentifier = Annotated[
 ]
 async def _sleep_between_tts_frames(seconds: float) -> None:
     await asyncio.sleep(seconds)
+
+
+async def _wait_for_notification_signal(
+    signal: asyncio.Event,
+    completion,
+    *,
+    timeout_seconds: float,
+) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while not signal.is_set():
+        if completion is not None and completion.cancelled():
+            raise RuntimeError("notification_cancelled")
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise RuntimeError("notification_ack_timeout")
+        try:
+            await asyncio.wait_for(signal.wait(), timeout=min(0.05, remaining))
+        except TimeoutError:
+            continue
 
 
 class EventRequest(BaseModel):
@@ -321,16 +345,25 @@ def create_app(
                 task.task_id,
             )
             return TaskDeliveryAttempt.failed("device_offline")
+        if voice_delivery_service is None:
+            logger.info(
+                "task_delivery_failed device=%s task=%s "
+                "reason=voice_synthesis_unavailable",
+                redact_device_id(task.target_device_id),
+                task.task_id,
+            )
+            return TaskDeliveryAttempt.failed("voice_synthesis_unavailable")
+        try:
+            session.start_speaking()
+        except InvalidDevicePhase:
+            logger.info(
+                "task_delivery_deferred device=%s task=%s reason=device_busy",
+                redact_device_id(task.target_device_id),
+                task.task_id,
+            )
+            return TaskDeliveryAttempt.failed("device_busy")
         try:
             if medication_service.is_medication_task(task.task_id):
-                if voice_delivery_service is None:
-                    logger.info(
-                        "task_delivery_failed device=%s task=%s "
-                        "reason=voice_synthesis_unavailable",
-                        redact_device_id(task.target_device_id),
-                        task.task_id,
-                    )
-                    return TaskDeliveryAttempt.failed("voice_synthesis_unavailable")
                 voice_delivery_service.synthesize_notification_and_send(
                     session_id=session.session_id,
                     text=task.payload.text,
@@ -341,8 +374,6 @@ def create_app(
                     task.task_id,
                 )
             else:
-                if voice_delivery_service is None:
-                    return TaskDeliveryAttempt.failed("voice_synthesis_unavailable")
                 voice_delivery_service.synthesize_notification_and_send(
                     session_id=session.session_id,
                     text=task.payload.text,
@@ -353,6 +384,8 @@ def create_app(
                     task.task_id,
                 )
         except DeviceNotConnected:
+            if session.phase is DevicePhase.SPEAKING:
+                session.stop_speaking()
             logger.info(
                 "task_delivery_failed device=%s task=%s reason=device_offline",
                 redact_device_id(task.target_device_id),
@@ -360,6 +393,8 @@ def create_app(
             )
             return TaskDeliveryAttempt.failed("device_offline")
         except DeviceOutboundBackpressure:
+            if session.phase is DevicePhase.SPEAKING:
+                session.stop_speaking()
             logger.info(
                 "task_delivery_failed device=%s task=%s "
                 "reason=outbound_backpressure",
@@ -368,6 +403,8 @@ def create_app(
             )
             return TaskDeliveryAttempt.failed("outbound_backpressure")
         except (ModelRuntimeError, RuntimeError, ValueError):
+            if session.phase is DevicePhase.SPEAKING:
+                session.stop_speaking()
             logger.info(
                 "task_delivery_failed device=%s task=%s reason=voice_synthesis_failed",
                 redact_device_id(task.target_device_id),
@@ -1002,6 +1039,10 @@ def create_app(
         post_tts_silence_gate: ConsecutiveSilenceGate | None = None
         post_tts_frames_ignored = 0
         tts_interrupted = asyncio.Event()
+        notification_ready = asyncio.Event()
+        notification_done = asyncio.Event()
+        notification_waiting_for: str | None = None
+        notification_early_done = False
         trace_id = f"trc_{uuid4().hex}"
         logger.info("device_ws_accepted device=%s", redact_device_id(device_id))
         try:
@@ -1047,11 +1088,15 @@ def create_app(
             transport.register(session.session_id)
 
             async def forward_outbound() -> None:
+                nonlocal close_code, close_reason_length
+                nonlocal notification_early_done
+                nonlocal notification_waiting_for
                 nonlocal post_tts_frames_ignored, post_tts_silence_gate
                 frame_duration_ms = response_hello["audio_params"]["frame_duration"]
                 outbound_kind = "unknown"
                 frames_sent = 0
                 total_frames = 0
+                current_tts = None
                 try:
                     while True:
                         message = await transport.next_outbound(session.session_id)
@@ -1074,10 +1119,26 @@ def create_app(
                                 }
                             )
                             continue
+                        current_tts = message
+                        completion = message.delivery_completion
+                        if completion is not None and completion.cancelled():
+                            current_tts = None
+                            continue
                         outbound_kind = "tts"
                         frames_sent = 0
                         total_frames = len(message.opus_frames)
                         tts_interrupted.clear()
+                        if message.purpose == "notification":
+                            if session.phase is DevicePhase.IDLE:
+                                session.start_speaking()
+                            elif session.phase is not DevicePhase.SPEAKING:
+                                raise InvalidDevicePhase(
+                                    "notification delivery requires an idle device"
+                                )
+                            notification_ready.clear()
+                            notification_done.clear()
+                            notification_early_done = False
+                            notification_waiting_for = "ready"
                         await websocket.send_json(
                             {
                                 "type": "tts",
@@ -1086,6 +1147,15 @@ def create_app(
                                 "session_id": message.session_id,
                             }
                         )
+                        if message.purpose == "notification":
+                            await _wait_for_notification_signal(
+                                notification_ready,
+                                completion,
+                                timeout_seconds=(
+                                    settings.device_notification_ready_timeout_seconds
+                                ),
+                            )
+                            notification_waiting_for = "streaming"
                         started_at = time.perf_counter()
                         logger.info(
                             "device_ws_tts_stream_started device=%s session=%s "
@@ -1099,6 +1169,8 @@ def create_app(
                             frame_duration_ms / 1_000
                         )
                         for frame_index, opus_frame in enumerate(message.opus_frames):
+                            if completion is not None and completion.cancelled():
+                                raise RuntimeError("notification_cancelled")
                             if tts_interrupted.is_set():
                                 break
                             if frame_index:
@@ -1107,9 +1179,20 @@ def create_app(
                                 )
                             if tts_interrupted.is_set():
                                 break
+                            if completion is not None and completion.cancelled():
+                                raise RuntimeError("notification_cancelled")
                             await websocket.send_bytes(opus_frame)
                             frames_sent += 1
                         if tts_interrupted.is_set():
+                            if message.purpose == "notification":
+                                notification_waiting_for = None
+                                fail_delivery(
+                                    completion,
+                                    RuntimeError("notification_interrupted"),
+                                )
+                                if session.phase is DevicePhase.SPEAKING:
+                                    session.stop_speaking()
+                            current_tts = None
                             logger.info(
                                 "device_ws_tts_stream_interrupted device=%s session=%s "
                                 "frames_sent=%s total_frames=%s",
@@ -1135,6 +1218,10 @@ def create_app(
                                         settings.device_post_tts_silence_frames
                                     ),
                                 )
+                        if completion is not None and completion.cancelled():
+                            raise RuntimeError("notification_cancelled")
+                        if message.purpose == "notification":
+                            notification_waiting_for = "sending_stop"
                         await websocket.send_json(
                             {
                                 "type": "tts",
@@ -1142,6 +1229,21 @@ def create_app(
                                 "session_id": message.session_id,
                             }
                         )
+                        if message.purpose == "notification":
+                            notification_waiting_for = "done"
+                            if notification_early_done:
+                                notification_done.set()
+                            await _wait_for_notification_signal(
+                                notification_done,
+                                completion,
+                                timeout_seconds=(
+                                    settings.device_notification_ready_timeout_seconds
+                                ),
+                            )
+                            notification_waiting_for = None
+                            session.stop_speaking()
+                            complete_delivery(completion)
+                        current_tts = None
                         logger.info(
                             "device_ws_tts_stream_finished device=%s session=%s "
                             "frames=%s duration_ms=%s",
@@ -1150,7 +1252,17 @@ def create_app(
                             len(message.opus_frames),
                             round((time.perf_counter() - started_at) * 1_000),
                         )
-                except (RuntimeError, WebSocketDisconnect) as exc:
+                except asyncio.CancelledError as exc:
+                    if current_tts is not None:
+                        fail_delivery(
+                            current_tts.delivery_completion,
+                            DeviceNotConnected(session.session_id)
+                        )
+                    raise
+                except Exception as exc:
+                    notification_waiting_for = None
+                    if current_tts is not None:
+                        fail_delivery(current_tts.delivery_completion, exc)
                     logger.info(
                         "device_ws_outbound_stopped device=%s session=%s kind=%s "
                         "error_type=%s error=%r frames_sent=%s total_frames=%s",
@@ -1162,6 +1274,13 @@ def create_app(
                         frames_sent,
                         total_frames,
                     )
+                    close_code = 1011
+                    close_reason = "outbound_delivery_failed"
+                    close_reason_length = len(close_reason)
+                    transport.unregister(session.session_id)
+                    device_sessions.disconnect(session)
+                    with suppress(RuntimeError, WebSocketDisconnect):
+                        await websocket.close(code=close_code, reason=close_reason)
 
             outbound_sender = asyncio.create_task(forward_outbound())
 
@@ -1346,6 +1465,25 @@ def create_app(
                             control = AbortControl.model_validate(payload)
                             session.apply_abort(control)
                             tts_interrupted.set()
+                        elif message_type == "tts":
+                            control = TtsControl.model_validate(payload)
+                            if control.session_id != session.session_id:
+                                raise InvalidDevicePhase(
+                                    "tts.ready has the wrong session_id"
+                                )
+                            if (
+                                control.state == "done"
+                                and notification_waiting_for == "sending_stop"
+                            ):
+                                notification_early_done = True
+                            elif control.state != notification_waiting_for:
+                                raise InvalidDevicePhase(
+                                    "tts control does not match the pending notification"
+                                )
+                            if control.state == "ready":
+                                notification_ready.set()
+                            elif notification_waiting_for == "done":
+                                notification_done.set()
                         else:
                             raise UnsupportedDeviceControl(
                                 "unsupported control message"

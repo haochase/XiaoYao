@@ -351,7 +351,7 @@ def test_notification_tts_keeps_control_connection_open(
     ) as websocket:
         websocket.send_json(hello_payload())
         server_hello = websocket.receive_json()
-        app.state.device_transport.send_notification_tts_stream(
+        completion = app.state.device_transport.send_notification_tts_stream(
             server_hello["session_id"],
             (b"notification-opus",),
         )
@@ -362,10 +362,102 @@ def test_notification_tts_keeps_control_connection_open(
             "purpose": "notification",
             "session_id": server_hello["session_id"],
         }
+        assert completion.done() is False
+        websocket.send_json(
+            {
+                "type": "tts",
+                "state": "ready",
+                "session_id": server_hello["session_id"],
+            }
+        )
         assert websocket.receive_bytes() == b"notification-opus"
         assert websocket.receive_json()["state"] == "stop"
+        assert completion.done() is False
+        websocket.send_json(
+            {
+                "type": "tts",
+                "state": "done",
+                "session_id": server_hello["session_id"],
+            }
+        )
+        completion.result(timeout=1)
         time.sleep(0.05)
         assert app.state.device_sessions.get(DEVICE_ID) is not None
+
+
+def test_notification_rejects_done_before_audio_and_stop(
+    client: TestClient,
+    app_and_sink,
+) -> None:
+    app, _ = app_and_sink
+
+    with pytest.raises(WebSocketDisconnect) as disconnected:
+        with client.websocket_connect(
+            "/v1/devices/ws",
+            headers=websocket_headers(),
+        ) as websocket:
+            websocket.send_json(hello_payload())
+            server_hello = websocket.receive_json()
+            app.state.device_transport.send_notification_tts_stream(
+                server_hello["session_id"],
+                (b"notification-opus",),
+            )
+            assert websocket.receive_json()["state"] == "start"
+            websocket.send_json(
+                {
+                    "type": "tts",
+                    "state": "ready",
+                    "session_id": server_hello["session_id"],
+                }
+            )
+            websocket.send_json(
+                {
+                    "type": "tts",
+                    "state": "done",
+                    "session_id": server_hello["session_id"],
+                }
+            )
+            assert websocket.receive_json()["code"] == "invalid_device_phase"
+            websocket.receive_json()
+
+    assert disconnected.value.code == 1008
+
+
+def test_notification_abort_fails_delivery_and_clears_reserved_phase(
+    client: TestClient,
+    app_and_sink,
+) -> None:
+    app, _ = app_and_sink
+
+    with client.websocket_connect(
+        "/v1/devices/ws",
+        headers=websocket_headers(),
+    ) as websocket:
+        websocket.send_json(hello_payload())
+        server_hello = websocket.receive_json()
+        completion = app.state.device_transport.send_notification_tts_stream(
+            server_hello["session_id"],
+            (b"notification-opus",),
+        )
+        assert websocket.receive_json()["state"] == "start"
+        websocket.send_json(
+            {
+                "type": "tts",
+                "state": "ready",
+                "session_id": server_hello["session_id"],
+            }
+        )
+        websocket.send_json(
+            {
+                "type": "abort",
+                "reason": "wake_word_detected",
+                "session_id": server_hello["session_id"],
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="notification_interrupted"):
+            completion.result(timeout=1)
+        assert app.state.device_sessions.get(DEVICE_ID).phase.value == "idle"
 
 
 def test_idle_device_connection_receives_keepalive(tmp_path) -> None:
@@ -436,6 +528,7 @@ def test_tts_disconnect_log_includes_failure_details(
     assert "error=" in caplog.text
     assert "frames_sent=1" in caplog.text
     assert "total_frames=3" in caplog.text
+    assert app.state.device_sessions.get(DEVICE_ID) is None
 
 
 def test_abort_interrupts_an_active_tts_stream(

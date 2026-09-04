@@ -8,6 +8,8 @@ from companion_gateway.device.transport import (
     OutboundControl,
     OutboundTask,
     OutboundTts,
+    complete_delivery,
+    fail_delivery,
 )
 from companion_gateway.domain.models import (
     ConfirmationPolicy,
@@ -76,13 +78,16 @@ def test_device_transport_marks_notification_tts() -> None:
         transport = DeviceTransport()
         transport.register("ses-notification")
 
-        transport.send_notification_tts_stream(
+        completion = transport.send_notification_tts_stream(
             "ses-notification",
             (b"notification-opus",),
         )
 
         message = await transport.next_tts("ses-notification")
         assert message.purpose == "notification"
+        assert completion.done() is False
+        assert message.delivery_completion is completion
+        completion.set_result(None)
 
     asyncio.run(scenario())
 
@@ -105,6 +110,16 @@ def test_device_transport_delivers_control_messages_through_outbound_queue() -> 
         }
 
     asyncio.run(scenario())
+
+
+def test_delivery_completion_helpers_tolerate_concurrent_cancellation() -> None:
+    delivery = transport_module.Future()
+    delivery.cancel()
+
+    complete_delivery(delivery)
+    fail_delivery(delivery, RuntimeError("disconnected"))
+
+    assert delivery.cancelled() is True
 
 
 def test_cancelling_outbound_wait_cleans_up_both_internal_waiters(

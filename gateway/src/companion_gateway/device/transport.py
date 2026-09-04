@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import Future
+from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass
 from threading import RLock
 from typing import Literal
@@ -21,11 +21,33 @@ class DeviceOutboundBackpressure(RuntimeError):
     pass
 
 
+def complete_delivery(completion: Future[None] | None) -> None:
+    if completion is None:
+        return
+    try:
+        completion.set_result(None)
+    except InvalidStateError:
+        pass
+
+
+def fail_delivery(
+    completion: Future[None] | None,
+    error: BaseException,
+) -> None:
+    if completion is None:
+        return
+    try:
+        completion.set_exception(error)
+    except InvalidStateError:
+        pass
+
+
 @dataclass(frozen=True)
 class OutboundTts:
     session_id: str
     opus_frames: tuple[bytes, ...]
     purpose: Literal["conversation", "notification"] = "conversation"
+    delivery_completion: Future[None] | None = None
 
 
 @dataclass(frozen=True)
@@ -70,7 +92,15 @@ class DeviceTransport:
 
     def unregister(self, session_id: str) -> None:
         with self._lock:
-            self._channels.pop(session_id, None)
+            channel = self._channels.pop(session_id, None)
+        if channel is None:
+            return
+        while not channel.queue.empty():
+            message = channel.queue.get_nowait()
+            fail_delivery(
+                message.delivery_completion,
+                DeviceNotConnected(session_id),
+            )
 
     async def next_tts(self, session_id: str) -> OutboundTts:
         with self._lock:
@@ -146,12 +176,15 @@ class DeviceTransport:
         self,
         session_id: str,
         opus_frames: tuple[bytes, ...],
-    ) -> None:
-        self._send_tts_stream(
+    ) -> Future[None]:
+        completion = self._send_tts_stream(
             session_id,
             opus_frames,
             purpose="notification",
         )
+        if completion is None:
+            raise RuntimeError("notification delivery completion is unavailable")
+        return completion
 
     def _send_tts_stream(
         self,
@@ -159,7 +192,7 @@ class DeviceTransport:
         opus_frames: tuple[bytes, ...],
         *,
         purpose: Literal["conversation", "notification"],
-    ) -> None:
+    ) -> Future[None] | None:
         frames = tuple(bytes(frame) for frame in opus_frames)
         if not frames:
             raise ValueError("opus_frames must not be empty")
@@ -174,10 +207,14 @@ class DeviceTransport:
         if channel is None:
             raise DeviceNotConnected(session_id)
 
+        delivery_completion: Future[None] | None = (
+            Future() if purpose == "notification" else None
+        )
         message = OutboundTts(
             session_id=session_id,
             opus_frames=frames,
             purpose=purpose,
+            delivery_completion=delivery_completion,
         )
         try:
             current_loop = asyncio.get_running_loop()
@@ -185,7 +222,7 @@ class DeviceTransport:
             current_loop = None
         if current_loop is channel.loop:
             self._enqueue(channel, message)
-            return
+            return delivery_completion
 
         completion: Future[None] = Future()
         channel.loop.call_soon_threadsafe(
@@ -195,6 +232,7 @@ class DeviceTransport:
             completion,
         )
         completion.result(timeout=1.0)
+        return delivery_completion
 
     def send_task(self, session_id: str, task: TaskRecord) -> None:
         with self._lock:

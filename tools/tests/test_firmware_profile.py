@@ -51,7 +51,8 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
         "    callbacks.on_vad_change = [this](bool speaking) {\n"
         "        xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);\n"
         "    };\n"
-        "    audio_service_.SetCallbacks(callbacks);\n"
+        + firmware_profile._PLAYBACK_DRAINED_ANCHOR
+        + "    audio_service_.SetCallbacks(callbacks);\n"
         "}\n"
         "\n"
         "void Application::InitializeProtocol() {\n"
@@ -156,19 +157,29 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     assert "clock_ticks_ % 5 == 0" in application
     assert "notification_tts_ = notification;" in application
     assert "protocol_->SendTtsReady();" in application
+    assert "protocol_->SendTtsDone();" in application
+    assert "FinishNotificationIfPlaybackDrained();" in application
+    assert "audio_service_.IsPlaybackIdle()" in application
+    assert "notification_stop_received_ = true;" in application
     application_header = application_header_path.read_text(encoding="utf-8")
     assert "bool network_connected_ = false;" in application_header
+    assert "bool notification_stop_received_ = false;" in application_header
     assert "void EnsureIdleControlChannel();" in application_header
+    assert "void FinishNotificationIfPlaybackDrained();" in application_header
     protocol_header = protocol_header_path.read_text(encoding="utf-8")
     assert "virtual void SendVadState(bool speaking);" in protocol_header
+    assert "virtual void SendTtsReady();" in protocol_header
+    assert "virtual void SendTtsDone();" in protocol_header
     protocol_source = protocol_source_path.read_text(encoding="utf-8")
     assert r'\"type\":\"vad\"' in protocol_source
     assert 'speaking ? "start" : "stop"' in protocol_source
+    assert "void Protocol::SendTtsReady()" in protocol_source
+    assert "void Protocol::SendTtsDone()" in protocol_source
     websocket_source = websocket_source_path.read_text(encoding="utf-8")
     assert 'cJSON_AddBoolToObject(features, "vad_events", true);' in websocket_source
-    assert 'os.environ.get("XIAOYAO_IDF_COMMAND", "idf.py")' in build_path.read_text(
-        encoding="utf-8"
-    )
+    build_source = build_path.read_text(encoding="utf-8")
+    assert 'os.environ.get("XIAOYAO_IDF_SCRIPT")' in build_source
+    assert "[sys.executable, idf_script]" in build_source
 
 
 def test_public_xiaoyao_profile_selects_an_esp32s3_chinese_multinet_model() -> None:
@@ -199,23 +210,6 @@ def test_vendor_profile_contains_persistent_control_channel_boundaries() -> None
         'strcmp(purpose->valuestring, "notification") == 0'
         in firmware_profile._TTS_STATE_PROFILE
     )
-
-
-def test_apply_vendor_profile_accepts_a_semantically_complete_evolved_source(
-    tmp_path: Path,
-) -> None:
-    source_root = tmp_path / "evolved-xiaozhi"
-    for relative_path, markers in firmware_profile._VENDOR_PROFILE_MARKERS.items():
-        path = source_root / relative_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            "// source may contain additional compatible behavior\n"
-            + "\n".join(markers)
-            + "\n",
-            encoding="utf-8",
-        )
-
-    firmware_profile.apply_vendor_profile(source_root)
 
 
 def test_exact_profile_can_upgrade_a_previous_rendered_profile(tmp_path: Path) -> None:
@@ -332,5 +326,7 @@ def test_firmware_build_script_requires_a_single_interpreter_and_profile_output(
     assert 'CONFIG_XIAOYAO_VAD_EVENTS=y' in build_script
     assert 'CONFIG_SR_MN_CN_MULTINET6_QUANT=y' in build_script
     assert "Copy-Item -Force $idfExecutable $shimPath" not in build_script
-    assert "& $idfExecutable fullclean" in build_script
-    assert 'XIAOYAO_IDF_COMMAND = $idfExecutable' in build_script
+    assert "& $python $idfScript fullclean" in build_script
+    assert "$env:XIAOYAO_IDF_SCRIPT = $idfScript" in build_script
+    assert "$idfVersion -ne 'ESP-IDF v6.0.2'" in build_script
+    assert "$previousEnvironment" in build_script

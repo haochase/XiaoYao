@@ -109,16 +109,39 @@ _VAD_CALLBACK_PROFILE = (
     "        xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);\n"
     "    };\n"
 )
+_PLAYBACK_DRAINED_ANCHOR = (
+    "    callbacks.on_playback_drained = [this]() {\n"
+    "        xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);\n"
+    "    };\n"
+)
+_PLAYBACK_DRAINED_PROFILE = (
+    "    callbacks.on_playback_drained = [this]() {\n"
+    "#if CONFIG_XIAOYAO_PERSISTENT_CONTROL_CHANNEL\n"
+    "        Schedule([this]() { FinishNotificationIfPlaybackDrained(); });\n"
+    "#endif\n"
+    "        xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);\n"
+    "    };\n"
+)
 _PROTOCOL_HEADER_ANCHOR = (
     "    virtual void SendStartListening(ListeningMode mode);\n"
     "    virtual void SendStopListening();\n"
     "    virtual void SendAbortSpeaking(AbortReason reason);\n"
 )
-_PROTOCOL_HEADER_PROFILE = (
+_PROTOCOL_HEADER_VAD_PROFILE = (
     "    virtual void SendStartListening(ListeningMode mode);\n"
     "    virtual void SendStopListening();\n"
     "    virtual void SendVadState(bool speaking);\n"
     "    virtual void SendAbortSpeaking(AbortReason reason);\n"
+)
+_PROTOCOL_HEADER_READY_PROFILE = _PROTOCOL_HEADER_VAD_PROFILE.replace(
+    "    virtual void SendAbortSpeaking(AbortReason reason);\n",
+    "    virtual void SendTtsReady();\n"
+    "    virtual void SendAbortSpeaking(AbortReason reason);\n"
+)
+_PROTOCOL_HEADER_PROFILE = _PROTOCOL_HEADER_READY_PROFILE.replace(
+    "    virtual void SendAbortSpeaking(AbortReason reason);\n",
+    "    virtual void SendTtsDone();\n"
+    "    virtual void SendAbortSpeaking(AbortReason reason);\n",
 )
 _PROTOCOL_SOURCE_ANCHOR = (
     "void Protocol::SendStopListening() {\n"
@@ -128,7 +151,7 @@ _PROTOCOL_SOURCE_ANCHOR = (
     "}\n\n"
     "void Protocol::SendMcpMessage(const std::string& payload) {\n"
 )
-_PROTOCOL_SOURCE_PROFILE = (
+_PROTOCOL_SOURCE_VAD_PROFILE = (
     "void Protocol::SendStopListening() {\n"
     "    std::string message =\n"
     "        \"{\\\"session_id\\\":\\\"\" + session_id_ + \"\\\",\\\"type\\\":\\\"listen\\\",\\\"state\\\":\\\"stop\\\"}\";\n"
@@ -142,6 +165,24 @@ _PROTOCOL_SOURCE_PROFILE = (
     "    SendText(message);\n"
     "}\n\n"
     "void Protocol::SendMcpMessage(const std::string& payload) {\n"
+)
+_PROTOCOL_SOURCE_READY_PROFILE = _PROTOCOL_SOURCE_VAD_PROFILE.replace(
+    "void Protocol::SendMcpMessage(const std::string& payload) {\n",
+    "void Protocol::SendTtsReady() {\n"
+    "    std::string message = \"{\\\"session_id\\\":\\\"\" + session_id_ +\n"
+    "                          \"\\\",\\\"type\\\":\\\"tts\\\",\\\"state\\\":\\\"ready\\\"}\";\n"
+    "    SendText(message);\n"
+    "}\n\n"
+    "void Protocol::SendMcpMessage(const std::string& payload) {\n",
+)
+_PROTOCOL_SOURCE_PROFILE = _PROTOCOL_SOURCE_READY_PROFILE.replace(
+    "void Protocol::SendMcpMessage(const std::string& payload) {\n",
+    "void Protocol::SendTtsDone() {\n"
+    "    std::string message = \"{\\\"session_id\\\":\\\"\" + session_id_ +\n"
+    "                          \"\\\",\\\"type\\\":\\\"tts\\\",\\\"state\\\":\\\"done\\\"}\";\n"
+    "    SendText(message);\n"
+    "}\n\n"
+    "void Protocol::SendMcpMessage(const std::string& payload) {\n",
 )
 _WEBSOCKET_FEATURE_ANCHOR = (
     "    cJSON_AddBoolToObject(features, \"mcp\", true);\n"
@@ -225,7 +266,7 @@ _TTS_STATE_ANCHOR = (
     "                    }\n"
     "                });\n"
 )
-_TTS_STATE_PROFILE = (
+_TTS_STATE_READY_PROFILE = (
     "            if (strcmp(state->valuestring, \"start\") == 0) {\n"
     "                auto purpose = cJSON_GetObjectItem(root, \"purpose\");\n"
     "                bool notification = cJSON_IsString(purpose) &&\n"
@@ -251,24 +292,90 @@ _TTS_STATE_PROFILE = (
     "                    }\n"
     "                });\n"
 )
+_TTS_STATE_IMMEDIATE_DONE_PROFILE = _TTS_STATE_READY_PROFILE.replace(
+    "                        if (notification_tts_ ||\n"
+    "                            listening_mode_ == kListeningModeManualStop) {\n"
+    "                            notification_tts_ = false;\n"
+    "                            SetDeviceState(kDeviceStateIdle);\n",
+    "                        bool notification = notification_tts_;\n"
+    "                        if (notification ||\n"
+    "                            listening_mode_ == kListeningModeManualStop) {\n"
+    "                            notification_tts_ = false;\n"
+    "                            SetDeviceState(kDeviceStateIdle);\n"
+    "                            if (notification && protocol_) {\n"
+    "                                protocol_->SendTtsDone();\n"
+    "                            }\n",
+)
+_TTS_STATE_PROFILE = _TTS_STATE_READY_PROFILE.replace(
+    "                    notification_tts_ = notification;\n",
+    "                    notification_tts_ = notification;\n"
+    "                    notification_stop_received_ = false;\n",
+).replace(
+    "                        if (notification_tts_ ||\n"
+    "                            listening_mode_ == kListeningModeManualStop) {\n"
+    "                            notification_tts_ = false;\n"
+    "                            SetDeviceState(kDeviceStateIdle);\n"
+    "                        } else {\n"
+    "                            SetDeviceState(kDeviceStateListening);\n"
+    "                        }\n",
+    "                        if (notification_tts_) {\n"
+    "                            notification_stop_received_ = true;\n"
+    "                            FinishNotificationIfPlaybackDrained();\n"
+    "                        } else if (\n"
+    "                            listening_mode_ == kListeningModeManualStop) {\n"
+    "                            SetDeviceState(kDeviceStateIdle);\n"
+    "                        } else {\n"
+    "                            SetDeviceState(kDeviceStateListening);\n"
+    "                        }\n",
+)
 _APP_FIELDS_ANCHOR = (
     "    bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)\n"
     "    int clock_ticks_ = 0;\n"
 )
-_APP_FIELDS_PROFILE = (
+_APP_FIELDS_READY_PROFILE = (
     "    bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)\n"
     "    bool network_connected_ = false;\n"
     "    bool notification_tts_ = false;\n"
     "    int clock_ticks_ = 0;\n"
 )
+_APP_FIELDS_PROFILE = _APP_FIELDS_READY_PROFILE.replace(
+    "    bool notification_tts_ = false;\n",
+    "    bool notification_tts_ = false;\n"
+    "    bool notification_stop_received_ = false;\n",
+)
 _APP_METHODS_ANCHOR = (
     "    void ContinueOpenAudioChannel(ListeningMode mode);\n"
     "    void BeginWakeWordInvoke(const std::string& wake_word);\n"
 )
-_APP_METHODS_PROFILE = (
+_APP_METHODS_READY_PROFILE = (
     "    void ContinueOpenAudioChannel(ListeningMode mode);\n"
     "    void EnsureIdleControlChannel();\n"
     "    void BeginWakeWordInvoke(const std::string& wake_word);\n"
+)
+_APP_METHODS_PROFILE = _APP_METHODS_READY_PROFILE.replace(
+    "    void EnsureIdleControlChannel();\n",
+    "    void EnsureIdleControlChannel();\n"
+    "    void FinishNotificationIfPlaybackDrained();\n",
+)
+_FINISH_NOTIFICATION_ANCHOR = (
+    "void Application::EnsureIdleControlChannel() {\n"
+)
+_FINISH_NOTIFICATION_PROFILE = (
+    "void Application::FinishNotificationIfPlaybackDrained() {\n"
+    "#if CONFIG_XIAOYAO_PERSISTENT_CONTROL_CHANNEL\n"
+    "    if (!notification_tts_ || !notification_stop_received_ ||\n"
+    "        !audio_service_.IsPlaybackIdle()) {\n"
+    "        return;\n"
+    "    }\n"
+    "    notification_tts_ = false;\n"
+    "    notification_stop_received_ = false;\n"
+    "    SetDeviceState(kDeviceStateIdle);\n"
+    "    if (protocol_) {\n"
+    "        protocol_->SendTtsDone();\n"
+    "    }\n"
+    "#endif\n"
+    "}\n\n"
+    "void Application::EnsureIdleControlChannel() {\n"
 )
 _CONTINUE_CHANNEL_ANCHOR = "void Application::ContinueOpenAudioChannel(ListeningMode mode) {\n"
 _CONTINUE_CHANNEL_PROFILE = (
@@ -287,46 +394,17 @@ _CONTINUE_CHANNEL_PROFILE = (
     "void Application::ContinueOpenAudioChannel(ListeningMode mode) {\n"
 )
 _BUILD_IDF_ANCHOR = '    command = ["idf.py"]\n'
-_BUILD_IDF_PROFILE = (
+_BUILD_IDF_COMMAND_PROFILE = (
     '    command = [os.environ.get("XIAOYAO_IDF_COMMAND", "idf.py")]\n'
 )
-_VENDOR_PROFILE_MARKERS = {
-    Path("main/Kconfig.projbuild"): (
-        "config XIAOYAO_WEBSOCKET_ONLY",
-        "config XIAOYAO_VAD_EVENTS",
-        "config XIAOYAO_PERSISTENT_CONTROL_CHANNEL",
-    ),
-    Path("main/application.cc"): (
-        "#if CONFIG_XIAOYAO_WEBSOCKET_ONLY",
-        "#if CONFIG_USE_CUSTOM_WAKE_WORD",
-        "protocol_->SendVadState(speaking);",
-        "clock_ticks_ % 5 == 0",
-        "network_connected_ = true;",
-        "network_connected_ = false;",
-        "notification_tts_ = notification;",
-        "void Application::EnsureIdleControlChannel()",
-    ),
-    Path("main/application.h"): (
-        "bool network_connected_ = false;",
-        "bool notification_tts_ = false;",
-        "void EnsureIdleControlChannel();",
-    ),
-    Path("main/protocols/protocol.h"): (
-        "virtual void SendVadState(bool speaking);",
-    ),
-    Path("main/protocols/protocol.cc"): (
-        "void Protocol::SendVadState(bool speaking)",
-        'speaking ? "start" : "stop"',
-    ),
-    Path("main/protocols/websocket_protocol.cc"): (
-        'cJSON_AddBoolToObject(features, "vad_events", true);',
-    ),
-    Path("scripts/build.py"): (
-        'os.environ.get("XIAOYAO_IDF_COMMAND", "idf.py")',
-    ),
-}
-
-
+_BUILD_IDF_PROFILE = (
+    '    idf_script = os.environ.get("XIAOYAO_IDF_SCRIPT")\n'
+    "    command = (\n"
+    "        [sys.executable, idf_script]\n"
+    "        if idf_script\n"
+    '        else [os.environ.get("XIAOYAO_IDF_COMMAND", "idf.py")]\n'
+    "    )\n"
+)
 def _read_text_preserving_newlines(path: Path) -> str:
     with path.open("r", encoding="utf-8", newline="") as file:
         return file.read()
@@ -367,22 +445,9 @@ def _apply_exact_profile(
     _write_text_preserving_newlines(path, content.replace(expected, rendered, 1))
 
 
-def _has_complete_vendor_profile(source_root: Path) -> bool:
-    for relative_path, markers in _VENDOR_PROFILE_MARKERS.items():
-        try:
-            content = _read_text_preserving_newlines(source_root / relative_path)
-        except OSError:
-            return False
-        if any(marker not in content for marker in markers):
-            return False
-    return True
-
-
 def apply_vendor_profile(source_root: Path) -> None:
     """Apply the XiaoYao protocol profile to a known XiaoZhi source snapshot."""
     source_root = source_root.resolve()
-    if _has_complete_vendor_profile(source_root):
-        return
     _apply_exact_profile(
         source_root / "main" / "Kconfig.projbuild",
         _KCONFIG_ANCHOR,
@@ -409,6 +474,11 @@ def apply_vendor_profile(source_root: Path) -> None:
     )
     _apply_exact_profile(
         source_root / "main" / "application.cc",
+        _PLAYBACK_DRAINED_ANCHOR,
+        _PLAYBACK_DRAINED_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.cc",
         _CLOCK_TICK_ANCHOR,
         _CLOCK_TICK_PROFILE,
     )
@@ -431,6 +501,10 @@ def apply_vendor_profile(source_root: Path) -> None:
         source_root / "main" / "application.cc",
         _TTS_STATE_ANCHOR,
         _TTS_STATE_PROFILE,
+        previous_profiles=(
+            _TTS_STATE_READY_PROFILE,
+            _TTS_STATE_IMMEDIATE_DONE_PROFILE,
+        ),
     )
     _apply_exact_profile(
         source_root / "main" / "application.cc",
@@ -438,24 +512,39 @@ def apply_vendor_profile(source_root: Path) -> None:
         _CONTINUE_CHANNEL_PROFILE,
     )
     _apply_exact_profile(
+        source_root / "main" / "application.cc",
+        _FINISH_NOTIFICATION_ANCHOR,
+        _FINISH_NOTIFICATION_PROFILE,
+    )
+    _apply_exact_profile(
         source_root / "main" / "application.h",
         _APP_FIELDS_ANCHOR,
         _APP_FIELDS_PROFILE,
+        previous_profiles=(_APP_FIELDS_READY_PROFILE,),
     )
     _apply_exact_profile(
         source_root / "main" / "application.h",
         _APP_METHODS_ANCHOR,
         _APP_METHODS_PROFILE,
+        previous_profiles=(_APP_METHODS_READY_PROFILE,),
     )
     _apply_exact_profile(
         source_root / "main" / "protocols" / "protocol.h",
         _PROTOCOL_HEADER_ANCHOR,
         _PROTOCOL_HEADER_PROFILE,
+        previous_profiles=(
+            _PROTOCOL_HEADER_VAD_PROFILE,
+            _PROTOCOL_HEADER_READY_PROFILE,
+        ),
     )
     _apply_exact_profile(
         source_root / "main" / "protocols" / "protocol.cc",
         _PROTOCOL_SOURCE_ANCHOR,
         _PROTOCOL_SOURCE_PROFILE,
+        previous_profiles=(
+            _PROTOCOL_SOURCE_VAD_PROFILE,
+            _PROTOCOL_SOURCE_READY_PROFILE,
+        ),
     )
     _apply_exact_profile(
         source_root / "main" / "protocols" / "websocket_protocol.cc",
@@ -466,6 +555,7 @@ def apply_vendor_profile(source_root: Path) -> None:
         source_root / "scripts" / "build.py",
         _BUILD_IDF_ANCHOR,
         _BUILD_IDF_PROFILE,
+        previous_profiles=(_BUILD_IDF_COMMAND_PROFILE,),
     )
 
 

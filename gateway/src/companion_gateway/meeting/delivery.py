@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from companion_gateway.device.session import redact_device_id
+from companion_gateway.device.session import DevicePhase, redact_device_id
 from companion_gateway.device.transport import (
     DeviceNotConnected,
     DeviceOutboundBackpressure,
@@ -29,6 +29,16 @@ class MeetingDeliveryService:
         session = self._sessions.get(task.target_device_id)
         if session is not None and self._voice is not None:
             try:
+                session.start_speaking()
+            except (AttributeError, ValueError):
+                logger.info(
+                    "meeting_voice_delivery_deferred device=%s task=%s "
+                    "reason=device_busy",
+                    device_id,
+                    task.task_id,
+                )
+                return TaskDeliveryAttempt.failed("device_busy")
+            try:
                 self._voice.synthesize_notification_and_send(
                     session_id=session.session_id,
                     text=task.payload.text,
@@ -40,6 +50,8 @@ class MeetingDeliveryService:
                 RuntimeError,
                 ValueError,
             ) as exc:
+                if session.phase is DevicePhase.SPEAKING:
+                    session.stop_speaking()
                 logger.info(
                     "meeting_voice_delivery_failed device=%s task=%s error_type=%s",
                     device_id,

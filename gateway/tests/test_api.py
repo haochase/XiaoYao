@@ -12,7 +12,7 @@ import companion_gateway.api as api_module
 from companion_gateway.api import create_app, create_default_app
 from companion_gateway.audio.bridge import Pcm16Mono, resample_pcm16_mono
 from companion_gateway.audio.pyav_opus import PyAvOpusCodec
-from companion_gateway.device.models import DeviceHello
+from companion_gateway.device.models import DeviceHello, ListenControl
 from companion_gateway.device.session import DeviceSession
 from companion_gateway.device.transport import DeviceOutboundBackpressure
 from companion_gateway.domain.models import (
@@ -886,6 +886,50 @@ def test_enabled_task_scheduler_notifies_connected_target_device(tmp_path) -> No
         (session_hello["session_id"], "take medicine")
     ]
     assert app.state.service.get_task(task.task_id).status is TaskStatus.DELIVERED
+
+
+def test_busy_device_keeps_reminder_pending_for_retry(tmp_path) -> None:
+    device_id = "busy-reminder-device"
+    voice_delivery = RecordingReminderVoiceDelivery()
+    app = create_app(
+        Settings(database_path=tmp_path / "busy-reminder.db"),
+        voice_delivery_service=voice_delivery,
+    )
+    session = DeviceSession.create(
+        device_id=device_id,
+        client_id="busy-reminder-client",
+        hello=DeviceHello.model_validate(
+            {
+                "type": "hello",
+                "version": 1,
+                "transport": "websocket",
+                "audio_params": {
+                    "format": "opus",
+                    "sample_rate": 16_000,
+                    "channels": 1,
+                    "frame_duration": 60,
+                },
+            }
+        ),
+    )
+    session.apply_listen(ListenControl(type="listen", state="start", mode="manual"))
+    app.state.device_sessions.connect(session)
+    task, _ = app.state.task_executor.create_and_schedule(
+        TaskCreate.model_validate(
+            {
+                **task_payload(),
+                "target_device_id": device_id,
+                "confirmation_policy": "optional",
+                "idempotency_key": "reminder:busy:1",
+            }
+        ),
+        trace_id="trace-reminder-busy",
+    )
+
+    app.state.task_scheduler.tick(now=datetime(2026, 8, 6, 12, tzinfo=UTC))
+
+    assert voice_delivery.messages == []
+    assert app.state.service.get_task(task.task_id).status is TaskStatus.PENDING_DELIVERY
 
 
 def test_default_app_fixture_voice_returns_a_full_tts_stream(

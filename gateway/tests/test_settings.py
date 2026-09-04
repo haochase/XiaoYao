@@ -321,6 +321,30 @@ def test_meeting_assistant_defaults_disabled_without_a_target() -> None:
     assert settings.meeting_target_device_id is None
 
 
+def test_settings_loads_device_notification_timing(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_DEVICE_CONTROL_KEEPALIVE_SECONDS", "45")
+    monkeypatch.setenv("COMPANION_DEVICE_NOTIFICATION_READY_TIMEOUT_SECONDS", "3")
+
+    settings = Settings.from_environment()
+
+    assert settings.device_control_keepalive_seconds == 45
+    assert settings.device_notification_ready_timeout_seconds == 3
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
+def test_settings_rejects_invalid_device_notification_timing(value: float) -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        Settings(
+            database_path=Path("data/test.db"),
+            device_control_keepalive_seconds=value,
+        )
+    with pytest.raises(ValueError, match="must be positive"):
+        Settings(
+            database_path=Path("data/test.db"),
+            device_notification_ready_timeout_seconds=value,
+        )
+
+
 def test_meeting_assistant_requires_complete_dependencies() -> None:
     with pytest.raises(ValueError, match="COMPANION_MEETING_ASSISTANT_ENABLED"):
         Settings(

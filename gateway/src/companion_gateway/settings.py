@@ -375,6 +375,7 @@ class Settings:
     meeting_reminder_lead_seconds: int = 600
     meeting_context_ttl_seconds: float = 300.0
     device_control_keepalive_seconds: float = 60.0
+    device_notification_ready_timeout_seconds: float = 5.0
     device_hello_timeout_seconds: float = 10.0
     device_audio_frame_max_bytes: int = 4096
     device_auto_stop_idle_seconds: float = 1.2
@@ -565,6 +566,20 @@ class Settings:
         if self.device_auto_stop_idle_seconds <= 0:
             raise ValueError(
                 "COMPANION_DEVICE_AUTO_STOP_IDLE_SECONDS must be positive"
+            )
+        if (
+            not math.isfinite(self.device_control_keepalive_seconds)
+            or self.device_control_keepalive_seconds <= 0
+        ):
+            raise ValueError(
+                "COMPANION_DEVICE_CONTROL_KEEPALIVE_SECONDS must be positive"
+            )
+        if (
+            not math.isfinite(self.device_notification_ready_timeout_seconds)
+            or self.device_notification_ready_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "COMPANION_DEVICE_NOTIFICATION_READY_TIMEOUT_SECONDS must be positive"
             )
         if (
             self.device_auto_turn_rms_threshold is not None
@@ -917,6 +932,14 @@ class Settings:
             "COMPANION_AUDIO_QUEUE_CAPACITY",
             "256",
         )
+        configured_device_control_keepalive_seconds = os.environ.get(
+            "COMPANION_DEVICE_CONTROL_KEEPALIVE_SECONDS",
+            "60",
+        )
+        configured_device_notification_ready_timeout_seconds = os.environ.get(
+            "COMPANION_DEVICE_NOTIFICATION_READY_TIMEOUT_SECONDS",
+            "5",
+        )
         configured_device_auto_stop_idle_seconds = os.environ.get(
             "COMPANION_DEVICE_AUTO_STOP_IDLE_SECONDS",
             "1.2",
@@ -1064,6 +1087,22 @@ class Settings:
         except ValueError as exc:
             raise ValueError(
                 "COMPANION_DEVICE_AUTO_STOP_IDLE_SECONDS must be a number"
+            ) from exc
+        try:
+            device_control_keepalive_seconds = float(
+                configured_device_control_keepalive_seconds
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_DEVICE_CONTROL_KEEPALIVE_SECONDS must be a number"
+            ) from exc
+        try:
+            device_notification_ready_timeout_seconds = float(
+                configured_device_notification_ready_timeout_seconds
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_DEVICE_NOTIFICATION_READY_TIMEOUT_SECONDS must be a number"
             ) from exc
         try:
             device_auto_turn_rms_threshold = (
@@ -1244,6 +1283,10 @@ class Settings:
             meeting_lookahead_hours=meeting_lookahead_hours,
             meeting_reminder_lead_seconds=meeting_reminder_lead_seconds,
             meeting_context_ttl_seconds=meeting_context_ttl_seconds,
+            device_control_keepalive_seconds=device_control_keepalive_seconds,
+            device_notification_ready_timeout_seconds=(
+                device_notification_ready_timeout_seconds
+            ),
             device_auto_stop_idle_seconds=device_auto_stop_idle_seconds,
             device_vad_turn_rms_threshold=device_vad_turn_rms_threshold,
             device_auto_turn_rms_threshold=device_auto_turn_rms_threshold,

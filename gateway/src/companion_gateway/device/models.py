@@ -54,7 +54,15 @@ class VadControl(BaseModel):
     session_id: str | None = None
 
 
-DeviceControl = ListenControl | AbortControl | VadControl
+class TtsControl(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["tts"]
+    state: Literal["ready", "done"]
+    session_id: str
+
+
+DeviceControl = ListenControl | AbortControl | VadControl | TtsControl
 
 
 def server_hello(session_id: str) -> dict[str, object]:

@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import struct
 import wave
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Thread
 
 import pytest
 
@@ -73,6 +75,7 @@ class RecordingTransport:
     def __init__(self) -> None:
         self.messages: list[tuple[str, tuple[bytes, ...]]] = []
         self.notification_messages: list[tuple[str, tuple[bytes, ...]]] = []
+        self.notification_completion: Future[None] | None = None
 
     def send_tts_stream(
         self,
@@ -85,8 +88,12 @@ class RecordingTransport:
         self,
         session_id: str,
         opus_frames: tuple[bytes, ...],
-    ) -> None:
+    ) -> Future[None]:
         self.notification_messages.append((session_id, opus_frames))
+        completion = self.notification_completion or Future()
+        if self.notification_completion is None:
+            completion.set_result(None)
+        return completion
 
 
 class TaskRuntime(FakeModelRuntime):
@@ -673,6 +680,75 @@ def test_device_voice_delivery_marks_notification_text() -> None:
     assert transport.notification_messages == [
         ("ses-notification", (b"opus-reply",))
     ]
+
+
+def test_device_voice_delivery_waits_for_notification_completion() -> None:
+    response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
+    transport = RecordingTransport()
+    transport.notification_completion = Future()
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=VoiceTurnService(
+            audio_bridge=AudioBridge(
+                codec=EchoOpusCodec(
+                    pcm_frame(sample_rate=16_000, sample_count=960)
+                ),
+                model_sample_rate=16_000,
+                queue_capacity=1,
+            ),
+            model_runtime=FakeModelRuntime(
+                response_text="reply",
+                response_pcm=response_pcm,
+            ),
+        ),
+        device_transport=transport,
+    )
+    worker = Thread(
+        target=delivery.synthesize_notification_and_send,
+        kwargs={"session_id": "ses-notification", "text": "take medicine"},
+    )
+
+    worker.start()
+    worker.join(timeout=0.05)
+    assert worker.is_alive() is True
+    transport.notification_completion.set_result(None)
+    worker.join(timeout=1)
+
+    assert worker.is_alive() is False
+
+
+def test_device_voice_delivery_cancels_timed_out_notification() -> None:
+    class ImmediateTimeoutFuture(Future[None]):
+        def result(self, timeout=None):
+            raise FutureTimeoutError()
+
+    response_pcm = pcm_frame(sample_rate=16_000, sample_count=960, start=100)
+    transport = RecordingTransport()
+    completion: Future[None] = ImmediateTimeoutFuture()
+    transport.notification_completion = completion
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=VoiceTurnService(
+            audio_bridge=AudioBridge(
+                codec=EchoOpusCodec(
+                    pcm_frame(sample_rate=16_000, sample_count=960)
+                ),
+                model_sample_rate=16_000,
+                queue_capacity=1,
+            ),
+            model_runtime=FakeModelRuntime(
+                response_text="reply",
+                response_pcm=response_pcm,
+            ),
+        ),
+        device_transport=transport,
+    )
+
+    with pytest.raises(RuntimeError, match="notification_delivery_timeout"):
+        delivery.synthesize_notification_and_send(
+            session_id="ses-timeout",
+            text="take medicine",
+        )
+
+    assert completion.cancelled() is True
 
 
 def test_device_voice_delivery_runs_tts_canary_without_sending() -> None:

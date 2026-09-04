@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
@@ -7,6 +9,7 @@ from secrets import compare_digest
 from threading import RLock
 from typing import Literal
 from uuid import uuid4
+from functools import wraps
 
 from companion_gateway.device.models import (
     AbortControl,
@@ -17,6 +20,15 @@ from companion_gateway.device.models import (
 
 
 Clock = Callable[[], datetime]
+
+
+def _with_state_lock(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._state_lock:
+            return method(self, *args, **kwargs)
+
+    return locked
 
 
 def _utc_now() -> datetime:
@@ -75,6 +87,12 @@ class DeviceSession:
     wake_word_detected: bool = False
     listening_started: bool = False
     auto_turn_finished: bool = False
+    _state_lock: RLock = field(
+        default_factory=RLock,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     @classmethod
     def create(
@@ -95,9 +113,11 @@ class DeviceSession:
             last_seen_at=now,
         )
 
+    @_with_state_lock
     def touch(self, *, clock: Clock = _utc_now) -> None:
         self.last_seen_at = clock()
 
+    @_with_state_lock
     def apply_listen(self, control: ListenControl) -> None:
         if control.session_id not in (None, self.session_id):
             raise InvalidDevicePhase("listen message has the wrong session_id")
@@ -131,6 +151,7 @@ class DeviceSession:
         if control.mode is not None:
             self.listening_mode = control.mode
 
+    @_with_state_lock
     def should_ignore_wake_word_audio(self) -> bool:
         return (
             self.phase is DevicePhase.IDLE
@@ -138,9 +159,11 @@ class DeviceSession:
             and not self.listening_started
         )
 
+    @_with_state_lock
     def should_ignore_auto_turn_tail_audio(self) -> bool:
         return self.phase is DevicePhase.IDLE and self.auto_turn_finished
 
+    @_with_state_lock
     def finish_auto_listening(self) -> bool:
         if self.phase is not DevicePhase.LISTENING or self.listening_mode != "auto":
             return False
@@ -148,6 +171,7 @@ class DeviceSession:
         self.auto_turn_finished = True
         return True
 
+    @_with_state_lock
     def apply_vad(self, control: VadControl) -> None:
         if not self.hello.features.vad_events:
             raise InvalidDevicePhase("VAD events were not advertised")
@@ -164,6 +188,7 @@ class DeviceSession:
                 f"cannot report VAD while {self.phase.value}"
             )
 
+    @_with_state_lock
     def accept_audio_frame(self) -> None:
         if self.phase is not DevicePhase.LISTENING:
             raise InvalidDevicePhase(
@@ -171,6 +196,7 @@ class DeviceSession:
             )
         self.audio_frames_received += 1
 
+    @_with_state_lock
     def apply_abort(self, control: AbortControl) -> None:
         if control.session_id not in (None, self.session_id):
             raise InvalidDevicePhase("abort message has the wrong session_id")
@@ -178,6 +204,7 @@ class DeviceSession:
             raise InvalidDevicePhase("cannot abort a closed session")
         self.phase = DevicePhase.IDLE
 
+    @_with_state_lock
     def start_speaking(self) -> None:
         if self.phase is not DevicePhase.IDLE:
             raise InvalidDevicePhase(
@@ -185,6 +212,7 @@ class DeviceSession:
             )
         self.phase = DevicePhase.SPEAKING
 
+    @_with_state_lock
     def stop_speaking(self) -> None:
         if self.phase is not DevicePhase.SPEAKING:
             raise InvalidDevicePhase(
@@ -192,6 +220,7 @@ class DeviceSession:
             )
         self.phase = DevicePhase.IDLE
 
+    @_with_state_lock
     def close(self) -> None:
         self.phase = DevicePhase.CLOSED
 

@@ -7,6 +7,7 @@ from companion_gateway.device.transport import (
     DeviceNotConnected,
     DeviceOutboundBackpressure,
 )
+from companion_gateway.device.session import DevicePhase
 from companion_gateway.domain.medication import FeishuSendResult
 from companion_gateway.domain.models import (
     ConfirmationPolicy,
@@ -23,14 +24,33 @@ REMINDER_TEXT = "10分钟后产品周会"
 
 
 class RecordingSession:
-    def __init__(self, session_id: str) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        phase: DevicePhase = DevicePhase.IDLE,
+    ) -> None:
         self.session_id = session_id
+        self.phase = phase
+
+    def start_speaking(self) -> None:
+        if self.phase is not DevicePhase.IDLE:
+            raise ValueError("device is busy")
+        self.phase = DevicePhase.SPEAKING
+
+    def stop_speaking(self) -> None:
+        if self.phase is not DevicePhase.SPEAKING:
+            raise ValueError("device is not speaking")
+        self.phase = DevicePhase.IDLE
 
 
 class RecordingSessions:
-    def __init__(self, session_id: str | None) -> None:
+    def __init__(
+        self,
+        session_id: str | None,
+        phase: DevicePhase = DevicePhase.IDLE,
+    ) -> None:
         self._session = (
-            RecordingSession(session_id) if session_id is not None else None
+            RecordingSession(session_id, phase) if session_id is not None else None
         )
 
     def get(self, _device_id: str) -> RecordingSession | None:
@@ -135,6 +155,26 @@ def test_missing_voice_delivery_uses_feishu_fallback() -> None:
 
     assert delivery.deliver(meeting_task()).delivered is True
     assert notifier.calls[0]["text"] == REMINDER_TEXT
+
+
+def test_busy_device_keeps_meeting_reminder_pending_for_retry() -> None:
+    voice = RecordingVoiceDelivery()
+    notifier = RecordingNotifier()
+    delivery = MeetingDeliveryService(
+        sessions=RecordingSessions(
+            session_id="ses-listening",
+            phase=DevicePhase.LISTENING,
+        ),
+        voice=voice,
+        notifier=notifier,
+    )
+
+    result = delivery.deliver(meeting_task())
+
+    assert result.delivered is False
+    assert result.failure_reason == "device_busy"
+    assert voice.calls == []
+    assert notifier.calls == []
 
 
 @pytest.mark.parametrize(

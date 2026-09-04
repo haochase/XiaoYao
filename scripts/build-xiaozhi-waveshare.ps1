@@ -63,6 +63,10 @@ $driveRoot = "$driveName\"
 $mappingCreated = $false
 $localProfileCreated = $false
 $previousLocation = Get-Location
+$previousEnvironment = @{}
+Get-ChildItem Env: | ForEach-Object {
+    $previousEnvironment[$_.Name] = $_.Value
+}
 
 function Get-SubstTarget {
     param([string]$Name)
@@ -155,8 +159,16 @@ try {
     Set-StrictMode -Version Latest
     $env:IDF_PATH = $driveRoot
 
-    $idfExecutable = (Get-Command 'idf.py.exe' -CommandType Application).Source
-    $env:XIAOYAO_IDF_COMMAND = $idfExecutable
+    $python = Join-Path $env:IDF_PYTHON_ENV_PATH 'Scripts\python.exe'
+    $idfScript = Join-Path $idfRepository 'tools\idf.py'
+    if (-not (Test-Path $idfScript)) {
+        throw "Specified ESP-IDF repository does not contain idf.py: $idfScript"
+    }
+    $idfVersion = (& $python $idfScript --version | Select-Object -Last 1).Trim()
+    if ($LASTEXITCODE -ne 0 -or $idfVersion -ne 'ESP-IDF v6.0.2') {
+        throw "Unexpected ESP-IDF repository version: $idfVersion"
+    }
+    $env:XIAOYAO_IDF_SCRIPT = $idfScript
 
     $buildNinja = Join-Path $xiaozhiRoot 'build\build.ninja'
     $shortIdfMarker = "$IdfDriveLetter`:/components"
@@ -165,13 +177,12 @@ try {
     )
     if ($Clean -or $staleLongPathBuild) {
         Set-Location $xiaozhiRoot
-        & $idfExecutable fullclean
+        & $python $idfScript fullclean
         if ($LASTEXITCODE -ne 0) {
             throw "idf.py fullclean failed with exit code $LASTEXITCODE"
         }
     }
 
-    $python = Join-Path $env:IDF_PYTHON_ENV_PATH 'Scripts\python.exe'
     & $python $profileRenderer `
         --template $profileTemplate `
         --ota-url $OtaUrl `
@@ -223,5 +234,17 @@ try {
     }
     if ($mappingCreated) {
         subst.exe $driveName /D
+    }
+    Get-ChildItem Env: | ForEach-Object {
+        if (-not $previousEnvironment.ContainsKey($_.Name)) {
+            [Environment]::SetEnvironmentVariable($_.Name, $null, 'Process')
+        }
+    }
+    foreach ($entry in $previousEnvironment.GetEnumerator()) {
+        [Environment]::SetEnvironmentVariable(
+            $entry.Key,
+            $entry.Value,
+            'Process'
+        )
     }
 }
