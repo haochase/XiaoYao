@@ -320,6 +320,12 @@ class Settings:
     database_path: Path
     device_project_ids: Mapping[str, str] = field(default_factory=dict)
     project_api_principals: tuple[ProjectApiPrincipal, ...] = ()
+    project_sync_host: str = "127.0.0.1"
+    project_sync_port: int = 8731
+    project_sync_max_body_bytes: int = 2_097_152
+    project_sync_clock_skew_seconds: float = 300.0
+    project_retrieval_ttl_seconds: int = 1_800
+    project_source_freshness_seconds: int = 1_800
     device_token_hashes: Mapping[str, str] = field(default_factory=dict)
     fake_voice_fixture_path: Path | None = None
     public_websocket_url: str | None = None
@@ -399,6 +405,51 @@ class Settings:
         ):
             raise ValueError(
                 "project_api_principals must contain ProjectApiPrincipal values"
+            )
+        if self.project_sync_host != "127.0.0.1":
+            raise ValueError(
+                "COMPANION_PROJECT_SYNC_HOST must be exactly 127.0.0.1"
+            )
+        if (
+            not isinstance(self.project_sync_port, int)
+            or isinstance(self.project_sync_port, bool)
+            or self.project_sync_port != 8731
+        ):
+            raise ValueError("COMPANION_PROJECT_SYNC_PORT must be exactly 8731")
+        if (
+            not isinstance(self.project_sync_max_body_bytes, int)
+            or isinstance(self.project_sync_max_body_bytes, bool)
+            or not 1_024 <= self.project_sync_max_body_bytes <= 2_097_152
+        ):
+            raise ValueError(
+                "COMPANION_PROJECT_SYNC_MAX_BODY_BYTES must be between 1024 and "
+                "2097152"
+            )
+        if (
+            not isinstance(self.project_sync_clock_skew_seconds, (int, float))
+            or isinstance(self.project_sync_clock_skew_seconds, bool)
+            or not math.isfinite(self.project_sync_clock_skew_seconds)
+            or not 0 <= self.project_sync_clock_skew_seconds <= 300
+        ):
+            raise ValueError(
+                "COMPANION_PROJECT_SYNC_CLOCK_SKEW_SECONDS must be between 0 and 300"
+            )
+        if (
+            not isinstance(self.project_retrieval_ttl_seconds, int)
+            or isinstance(self.project_retrieval_ttl_seconds, bool)
+            or not 60 <= self.project_retrieval_ttl_seconds <= 86_400
+        ):
+            raise ValueError(
+                "COMPANION_PROJECT_RETRIEVAL_TTL_SECONDS must be between 60 and 86400"
+            )
+        if (
+            not isinstance(self.project_source_freshness_seconds, int)
+            or isinstance(self.project_source_freshness_seconds, bool)
+            or not 60 <= self.project_source_freshness_seconds <= 86_400
+        ):
+            raise ValueError(
+                "COMPANION_PROJECT_SOURCE_FRESHNESS_SECONDS must be between 60 and "
+                "86400"
             )
         ota_tokens = _normalize_ota_tokens(self.ota_device_tokens)
         normalized_url = _normalize_websocket_url(
@@ -753,6 +804,30 @@ class Settings:
         configured_project_api_principals = parse_project_api_principals(
             os.environ.get("COMPANION_PROJECT_API_PRINCIPALS")
         )
+        configured_project_sync_host = os.environ.get(
+            "COMPANION_PROJECT_SYNC_HOST",
+            "127.0.0.1",
+        )
+        configured_project_sync_port = os.environ.get(
+            "COMPANION_PROJECT_SYNC_PORT",
+            "8731",
+        )
+        configured_project_sync_max_body_bytes = os.environ.get(
+            "COMPANION_PROJECT_SYNC_MAX_BODY_BYTES",
+            "2097152",
+        )
+        configured_project_sync_clock_skew_seconds = os.environ.get(
+            "COMPANION_PROJECT_SYNC_CLOCK_SKEW_SECONDS",
+            "300",
+        )
+        configured_project_retrieval_ttl_seconds = os.environ.get(
+            "COMPANION_PROJECT_RETRIEVAL_TTL_SECONDS",
+            "1800",
+        )
+        configured_project_source_freshness_seconds = os.environ.get(
+            "COMPANION_PROJECT_SOURCE_FRESHNESS_SECONDS",
+            "1800",
+        )
         configured_fixture = os.environ.get("COMPANION_FAKE_VOICE_FIXTURE_PATH")
         configured_runtime = os.environ.get("COMPANION_VOICE_RUNTIME")
         configured_endpoint = os.environ.get("COMPANION_MINICPM_O_ENDPOINT")
@@ -985,6 +1060,42 @@ class Settings:
         except ValueError as exc:
             raise ValueError(
                 "COMPANION_MINICPM_O_TIMEOUT_SECONDS must be a number"
+            ) from exc
+        try:
+            project_sync_port = int(configured_project_sync_port)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_PROJECT_SYNC_PORT must be an integer"
+            ) from exc
+        try:
+            project_sync_max_body_bytes = int(configured_project_sync_max_body_bytes)
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_PROJECT_SYNC_MAX_BODY_BYTES must be an integer"
+            ) from exc
+        try:
+            project_sync_clock_skew_seconds = float(
+                configured_project_sync_clock_skew_seconds
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_PROJECT_SYNC_CLOCK_SKEW_SECONDS must be a number"
+            ) from exc
+        try:
+            project_retrieval_ttl_seconds = int(
+                configured_project_retrieval_ttl_seconds
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_PROJECT_RETRIEVAL_TTL_SECONDS must be an integer"
+            ) from exc
+        try:
+            project_source_freshness_seconds = int(
+                configured_project_source_freshness_seconds
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "COMPANION_PROJECT_SOURCE_FRESHNESS_SECONDS must be an integer"
             ) from exc
         try:
             minicpm_o_max_retries = int(configured_minicpm_max_retries)
@@ -1223,6 +1334,12 @@ class Settings:
             ),
             device_project_ids=configured_device_project_ids,
             project_api_principals=configured_project_api_principals,
+            project_sync_host=configured_project_sync_host,
+            project_sync_port=project_sync_port,
+            project_sync_max_body_bytes=project_sync_max_body_bytes,
+            project_sync_clock_skew_seconds=project_sync_clock_skew_seconds,
+            project_retrieval_ttl_seconds=project_retrieval_ttl_seconds,
+            project_source_freshness_seconds=project_source_freshness_seconds,
             device_token_hashes=token_hashes,
             fake_voice_fixture_path=(
                 Path(configured_fixture) if configured_fixture else None

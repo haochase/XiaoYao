@@ -829,3 +829,150 @@ def test_settings_reject_invalid_device_token_hashes(
 
     with pytest.raises(ValueError, match="COMPANION_DEVICE_TOKEN_HASHES"):
         Settings.from_environment()
+
+
+def test_project_sync_settings_use_safe_loopback_defaults() -> None:
+    settings = Settings(database_path=Path("data/test.db"))
+
+    assert settings.project_sync_host == "127.0.0.1"
+    assert settings.project_sync_port == 8731
+    assert settings.project_sync_max_body_bytes == 2_097_152
+    assert settings.project_sync_clock_skew_seconds == 300
+    assert settings.project_retrieval_ttl_seconds == 1_800
+    assert settings.project_source_freshness_seconds == 1_800
+
+
+def test_settings_loads_project_sync_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_PROJECT_SYNC_HOST", "127.0.0.1")
+    monkeypatch.setenv("COMPANION_PROJECT_SYNC_PORT", "8731")
+    monkeypatch.setenv("COMPANION_PROJECT_SYNC_MAX_BODY_BYTES", "1024")
+    monkeypatch.setenv("COMPANION_PROJECT_SYNC_CLOCK_SKEW_SECONDS", "0")
+    monkeypatch.setenv("COMPANION_PROJECT_RETRIEVAL_TTL_SECONDS", "60")
+    monkeypatch.setenv("COMPANION_PROJECT_SOURCE_FRESHNESS_SECONDS", "86400")
+
+    settings = Settings.from_environment()
+
+    assert settings.project_sync_max_body_bytes == 1_024
+    assert settings.project_sync_clock_skew_seconds == 0
+    assert settings.project_retrieval_ttl_seconds == 60
+    assert settings.project_source_freshness_seconds == 86_400
+
+
+@pytest.mark.parametrize("value", ["localhost", "0.0.0.0", "127.0.0.2"])
+def test_settings_rejects_non_loopback_project_sync_host(
+    monkeypatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("COMPANION_PROJECT_SYNC_HOST", value)
+
+    with pytest.raises(ValueError, match="COMPANION_PROJECT_SYNC_HOST"):
+        Settings.from_environment()
+
+
+@pytest.mark.parametrize("value", ["8730", "8732", "not-a-port"])
+def test_settings_rejects_non_fixed_project_sync_port(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("COMPANION_PROJECT_SYNC_PORT", value)
+
+    with pytest.raises(ValueError, match="COMPANION_PROJECT_SYNC_PORT"):
+        Settings.from_environment()
+
+
+@pytest.mark.parametrize("value", ["1024", "2097152"])
+def test_settings_accepts_project_sync_body_size_bounds(
+    monkeypatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("COMPANION_PROJECT_SYNC_MAX_BODY_BYTES", value)
+
+    assert Settings.from_environment().project_sync_max_body_bytes == int(value)
+
+
+@pytest.mark.parametrize("value", ["1023", "2097153", "not-an-integer"])
+def test_settings_rejects_invalid_project_sync_body_size(
+    monkeypatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("COMPANION_PROJECT_SYNC_MAX_BODY_BYTES", value)
+
+    with pytest.raises(ValueError, match="COMPANION_PROJECT_SYNC_MAX_BODY_BYTES"):
+        Settings.from_environment()
+
+
+@pytest.mark.parametrize("value", ["0", "300"])
+def test_settings_accepts_project_sync_clock_skew_bounds(
+    monkeypatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("COMPANION_PROJECT_SYNC_CLOCK_SKEW_SECONDS", value)
+
+    assert Settings.from_environment().project_sync_clock_skew_seconds == float(value)
+
+
+@pytest.mark.parametrize("value", ["-0.1", "300.1", "nan", "inf", "not-a-number"])
+def test_settings_rejects_invalid_project_sync_clock_skew(
+    monkeypatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("COMPANION_PROJECT_SYNC_CLOCK_SKEW_SECONDS", value)
+
+    with pytest.raises(ValueError, match="COMPANION_PROJECT_SYNC_CLOCK_SKEW_SECONDS"):
+        Settings.from_environment()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("COMPANION_PROJECT_RETRIEVAL_TTL_SECONDS", "59"),
+        ("COMPANION_PROJECT_RETRIEVAL_TTL_SECONDS", "86401"),
+        ("COMPANION_PROJECT_RETRIEVAL_TTL_SECONDS", "not-an-integer"),
+        ("COMPANION_PROJECT_SOURCE_FRESHNESS_SECONDS", "59"),
+        ("COMPANION_PROJECT_SOURCE_FRESHNESS_SECONDS", "86401"),
+        ("COMPANION_PROJECT_SOURCE_FRESHNESS_SECONDS", "not-an-integer"),
+    ],
+)
+def test_settings_rejects_invalid_project_sync_ttls(
+    monkeypatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        Settings.from_environment()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("project_sync_host", "localhost"),
+        ("project_sync_port", 8730),
+        ("project_sync_max_body_bytes", 2_097_153),
+        ("project_sync_clock_skew_seconds", float("inf")),
+        ("project_retrieval_ttl_seconds", 59),
+        ("project_source_freshness_seconds", 86_401),
+    ],
+)
+def test_direct_settings_reject_invalid_project_sync_values(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError):
+        Settings(database_path=Path("data/test.db"), **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("project_sync_port", 8731.0),
+        ("project_sync_max_body_bytes", 1_024.5),
+        ("project_sync_clock_skew_seconds", True),
+        ("project_retrieval_ttl_seconds", 60.5),
+        ("project_source_freshness_seconds", 60.0),
+    ],
+)
+def test_direct_settings_reject_non_contract_project_sync_types(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError):
+        Settings(database_path=Path("data/test.db"), **{field: value})

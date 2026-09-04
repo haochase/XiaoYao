@@ -17,6 +17,23 @@ from companion_gateway.project.service import (
     ProjectMemoryService,
 )
 from companion_gateway.project.repository import ProjectMemoryRepository
+from companion_gateway.project.sync_models import (
+    EvidenceChunk,
+    ProjectSyncHealth,
+    ProjectSyncOutcome,
+    ProjectSyncStatus,
+    RetrievalRequest,
+    RetrievalRequestStatus,
+    SourceErrorType,
+    SourceSnapshot,
+    SourceState,
+    SourceSyncStatus,
+    SourceTombstone,
+    SyncAudit,
+    SyncEnvelope,
+    SyncResult,
+    SyncSourceType,
+)
 
 __all__ = [
     "AnswerKind",
@@ -25,6 +42,7 @@ __all__ = [
     "DecisionCard",
     "DecisionStatus",
     "DecisionVersion",
+    "EvidenceChunk",
     "EvidenceRef",
     "ProjectAnswer",
     "ProjectContextPackage",
@@ -32,4 +50,18 @@ __all__ = [
     "ProjectMemoryError",
     "ProjectMemoryService",
     "ProjectMemoryRepository",
+    "ProjectSyncHealth",
+    "ProjectSyncOutcome",
+    "ProjectSyncStatus",
+    "RetrievalRequest",
+    "RetrievalRequestStatus",
+    "SourceErrorType",
+    "SourceSnapshot",
+    "SourceState",
+    "SourceSyncStatus",
+    "SourceTombstone",
+    "SyncAudit",
+    "SyncEnvelope",
+    "SyncResult",
+    "SyncSourceType",
 ]
