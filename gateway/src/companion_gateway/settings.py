@@ -295,9 +295,21 @@ def _normalize_meeting_target_device_id(value: str | None) -> str | None:
     return value
 
 
+def _normalize_project_id(value: str | None) -> str | None:
+    if value is None or value == "":
+        return None
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) is None:
+        raise ValueError(
+            "COMPANION_PROJECT_ID must contain only letters, digits, dots, "
+            "underscores, or hyphens and start with a letter or digit"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     database_path: Path
+    project_id: str | None = None
     device_token_hashes: Mapping[str, str] = field(default_factory=dict)
     fake_voice_fixture_path: Path | None = None
     public_websocket_url: str | None = None
@@ -365,6 +377,7 @@ class Settings:
     audio_queue_capacity: int = 256
 
     def __post_init__(self) -> None:
+        normalized_project_id = _normalize_project_id(self.project_id)
         ota_tokens = _normalize_ota_tokens(self.ota_device_tokens)
         normalized_url = _normalize_websocket_url(
             self.public_websocket_url,
@@ -624,6 +637,7 @@ class Settings:
                 "COMPANION_TASK_SCHEDULER_ENABLED=true"
             )
         object.__setattr__(self, "ota_device_tokens", ota_tokens)
+        object.__setattr__(self, "project_id", normalized_project_id)
         object.__setattr__(self, "public_websocket_url", normalized_url)
         object.__setattr__(self, "device_token_hashes", normalized_hashes)
         object.__setattr__(self, "voice_runtime", normalized_runtime)
@@ -688,6 +702,7 @@ class Settings:
     @classmethod
     def from_environment(cls) -> "Settings":
         configured_path = os.environ.get("COMPANION_DB_PATH")
+        configured_project_id = os.environ.get("COMPANION_PROJECT_ID")
         configured_fixture = os.environ.get("COMPANION_FAKE_VOICE_FIXTURE_PATH")
         configured_runtime = os.environ.get("COMPANION_VOICE_RUNTIME")
         configured_endpoint = os.environ.get("COMPANION_MINICPM_O_ENDPOINT")
@@ -1132,6 +1147,7 @@ class Settings:
             database_path=(
                 Path(configured_path) if configured_path else Path("data/companion.db")
             ),
+            project_id=configured_project_id,
             device_token_hashes=token_hashes,
             fake_voice_fixture_path=(
                 Path(configured_fixture) if configured_fixture else None

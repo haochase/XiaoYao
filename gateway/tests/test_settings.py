@@ -257,6 +257,25 @@ def test_settings_loads_meeting_assistant_configuration(monkeypatch) -> None:
     assert settings.meeting_context_ttl_seconds == 300
 
 
+def test_settings_loads_project_id_for_device_project_binding(monkeypatch) -> None:
+    monkeypatch.setenv("COMPANION_PROJECT_ID", "project-star-retail")
+
+    settings = Settings.from_environment()
+
+    assert settings.project_id == "project-star-retail"
+
+
+@pytest.mark.parametrize("value", [" project-1", "project 1", ""])
+def test_settings_rejects_invalid_project_id(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("COMPANION_PROJECT_ID", value)
+
+    if value == "":
+        assert Settings.from_environment().project_id is None
+    else:
+        with pytest.raises(ValueError, match="COMPANION_PROJECT_ID"):
+            Settings.from_environment()
+
+
 def test_meeting_assistant_defaults_disabled_without_a_target() -> None:
     settings = Settings(database_path=Path("data/test.db"))
 

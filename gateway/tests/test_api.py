@@ -39,6 +39,8 @@ class RecordingReminderVoiceDelivery:
         self.messages: list[tuple[str, str]] = []
         self.task_service = None
         self.meeting_context = None
+        self.project_memory = None
+        self.project_id = None
 
     def synthesize_and_send(self, *, session_id: str, text: str) -> None:
         self.messages.append((session_id, text))
@@ -57,6 +59,12 @@ class RecordingReminderVoiceDelivery:
 
     def set_meeting_context(self, meeting_context) -> None:
         self.meeting_context = meeting_context
+
+    def set_project_memory(self, project_memory) -> None:
+        self.project_memory = project_memory
+
+    def set_project_id(self, project_id) -> None:
+        self.project_id = project_id
 
 
 def task_payload() -> dict[str, object]:
@@ -666,6 +674,17 @@ def test_default_app_enables_fixture_voice_only_when_configured(
     app = create_default_app()
 
     assert app.state.voice_delivery_service is not None
+
+
+def test_create_app_injects_project_memory_and_id_into_voice_delivery(tmp_path) -> None:
+    voice = RecordingReminderVoiceDelivery()
+    app = create_app(
+        Settings(database_path=tmp_path / "project-binding.db", project_id="project-1"),
+        voice_delivery_service=voice,
+    )
+
+    assert voice.project_memory is app.state.project_memory_service
+    assert voice.project_id == "project-1"
 
 
 def test_default_app_loads_gateway_dotenv_file(tmp_path, monkeypatch) -> None:

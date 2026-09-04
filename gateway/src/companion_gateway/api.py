@@ -496,6 +496,16 @@ def create_app(
         voice_delivery_service.set_memory_service(memory_service)
         if meeting_context is not None:
             voice_delivery_service.set_meeting_context(meeting_context)
+        set_project_memory = getattr(
+            voice_delivery_service,
+            "set_project_memory",
+            None,
+        )
+        if set_project_memory is not None:
+            set_project_memory(project_memory)
+        set_project_id = getattr(voice_delivery_service, "set_project_id", None)
+        if settings.project_id is not None and set_project_id is not None:
+            set_project_id(settings.project_id)
     if settings.task_scheduler_enabled:
         app.add_event_handler("startup", task_scheduler.start)
         app.add_event_handler("startup", medication_scheduler.start)
