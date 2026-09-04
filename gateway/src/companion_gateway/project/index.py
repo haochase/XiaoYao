@@ -20,7 +20,10 @@ from companion_gateway.project.sync_models import (
 )
 
 
-_HEADING_PATTERN = re.compile(r"^[ \t]{0,3}(#{1,6})[ \t]+(.+?)\s*$")
+_HEADING_PATTERN = re.compile(
+    r"^[ \t]{0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$"
+)
+_ATX_CLOSING_SEQUENCE_PATTERN = re.compile(r"[ \t]+#+[ \t]*$")
 _FENCE_PATTERN = re.compile(r"^[ \t]*(`{3,}|~{3,})")
 _LIST_ITEM_PATTERN = re.compile(r"^[ \t]*(?:[-+*]|\d+[.)])[ \t]+")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -65,6 +68,12 @@ def _normalize(value: str) -> str:
 
 def _bigrams(value: str) -> frozenset[str]:
     return frozenset(value[index : index + 2] for index in range(len(value) - 1))
+
+
+def _atx_heading_title(value: str | None) -> str:
+    if value is None:
+        return ""
+    return _ATX_CLOSING_SEQUENCE_PATTERN.sub("", value).strip()
 
 
 @dataclass(frozen=True)
@@ -529,16 +538,17 @@ def _markdown_blocks(markdown: str) -> tuple[_MarkdownBlock, ...]:
             fence is not None
             and fence.group(1)[0] == active_fence[0]
             and len(fence.group(1)) >= active_fence[1]
+            and not content[fence.end() :].strip(" \t")
         ):
             active_fence = None
         if heading is not None:
             emit_block()
             section_index += 1
             level = len(heading.group(1))
-            title = heading.group(2).strip().rstrip("#").rstrip()
+            title = _atx_heading_title(heading.group(2))
+            if level <= len(heading_path):
+                del heading_path[level - 1 :]
             if title:
-                if level <= len(heading_path):
-                    del heading_path[level - 1 :]
                 heading_path.append(title)
             offset += len(line)
             continue

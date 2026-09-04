@@ -233,6 +233,19 @@ def test_chunking_keeps_heading_like_code_fence_lines_as_evidence() -> None:
     ]
 
 
+def test_chunking_does_not_close_a_fence_with_a_non_whitespace_suffix() -> None:
+    chunks = chunk_text(
+        "doc-1",
+        "v1",
+        "```text\n```not-close\n# still-code\n```\n\n# 后续标题\n正文",
+    )
+
+    assert [(item.heading_path, item.text) for item in chunks] == [
+        ((), "```text\n```not-close\n# still-code\n```"),
+        (("后续标题",), "正文"),
+    ]
+
+
 def test_chunking_splits_list_like_code_fence_lines_with_overlap() -> None:
     chunks = chunk_text(
         "doc-1",
@@ -256,6 +269,31 @@ def test_chunking_recognizes_indented_atx_headings() -> None:
     assert [(item.heading_path, item.text) for item in chunks] == [
         (("总览",), "首段"),
         (("总览", "风险"), "风险内容"),
+    ]
+
+
+def test_chunking_preserves_non_closing_hashes_in_an_atx_heading() -> None:
+    chunks = chunk_text("doc-1", "v1", "# C#\n正文")
+
+    assert [(item.heading_path, item.text) for item in chunks] == [
+        (("C#",), "正文")
+    ]
+
+
+def test_chunking_strips_space_prefixed_atx_closing_hashes() -> None:
+    chunks = chunk_text("doc-1", "v1", "# 标题 ###\n正文")
+
+    assert [(item.heading_path, item.text) for item in chunks] == [
+        (("标题",), "正文")
+    ]
+
+
+def test_chunking_treats_a_bare_atx_marker_as_an_empty_boundary() -> None:
+    chunks = chunk_text("doc-1", "v1", "# 前一节\n第一段\n\n#\n第二段")
+
+    assert [(item.heading_path, item.text) for item in chunks] == [
+        (("前一节",), "第一段"),
+        ((), "第二段"),
     ]
 
 
