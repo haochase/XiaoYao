@@ -7,6 +7,8 @@ param(
 
     [string]$XiaozhiSourcePath,
 
+    [string]$IdfRepositoryPath,
+
     [switch]$Clean
 )
 
@@ -45,9 +47,14 @@ if ([string]::IsNullOrWhiteSpace($XiaozhiSourcePath)) {
 } else {
     $xiaozhiRoot = [System.IO.Path]::GetFullPath($XiaozhiSourcePath)
 }
-$idfRepository = Join-Path $vendorRoot 'esp-idf\v6.0.2\esp-idf'
-$activationScript = Join-Path $vendorRoot `
-    'esp-idf\activate_idf_v6.0.2.ps1\Microsoft.v6.0.2.PowerShell_profile.ps1'
+if ([string]::IsNullOrWhiteSpace($IdfRepositoryPath)) {
+    $idfRepository = Join-Path $vendorRoot 'esp-idf\v6.0.2\esp-idf'
+    $activationScript = Join-Path $vendorRoot `
+        'esp-idf\activate_idf_v6.0.2.ps1\Microsoft.v6.0.2.PowerShell_profile.ps1'
+} else {
+    $idfRepository = [System.IO.Path]::GetFullPath($IdfRepositoryPath)
+    $activationScript = Join-Path $idfRepository 'export.ps1'
+}
 $profileTemplate = Join-Path $workspaceRoot 'firmware\xiaoyao.config.json'
 $localProfile = Join-Path $xiaozhiRoot `
     'main\boards\waveshare\esp32-s3-audio-board\xiaoyao.local.config.json'
@@ -117,7 +124,7 @@ if ($null -ne $existingTarget) {
 
 try {
     if (-not (Test-Path $activationScript)) {
-        throw 'Run scripts/setup-esp-idf.ps1 before building firmware'
+        throw "ESP-IDF activation script is missing: $activationScript"
     }
     if (-not (Test-Path (Join-Path $xiaozhiRoot 'scripts\build.py'))) {
         throw "xiaozhi source snapshot is missing: $xiaozhiRoot"

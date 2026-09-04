@@ -58,6 +58,15 @@ explicitly:
 .\scripts\build-xiaozhi-waveshare.ps1 -OtaUrl 'https://example.com/ota'
 ```
 
+If ESP-IDF is already available outside the managed vendor directory, pass its
+repository path explicitly:
+
+```powershell
+.\scripts\build-xiaozhi-waveshare.ps1 `
+  -OtaUrl 'https://example.com/ota' `
+  -IdfRepositoryPath 'E:\path\to\esp-idf-v6.0.2'
+```
+
 To use a source snapshot outside the default vendor location, provide
 `-XiaozhiSourcePath`. The helper applies the XiaoYao patch idempotently, removes
 the temporary profile in `finally`, and prints SHA-256 hashes for the generated
