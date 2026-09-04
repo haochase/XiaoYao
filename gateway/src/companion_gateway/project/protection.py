@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
-import sys
 from collections.abc import Callable
 from ctypes import wintypes
 from functools import lru_cache
@@ -44,11 +43,15 @@ class _TokenUser(ctypes.Structure):
 
 class _WindowsApis:
     def __init__(self) -> None:
+        library_load_failed = False
         try:
             crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
         except (AttributeError, OSError):
+            library_load_failed = True
+
+        if library_load_failed:
             _raise_protection_error()
 
         data_blob_pointer = ctypes.POINTER(_DataBlob)
@@ -120,7 +123,12 @@ def _windows_apis() -> _WindowsApis:
 
 
 def _raise_protection_error() -> None:
-    raise ProtectionError("dpapi_operation_failed") from None
+    error = ProtectionError("dpapi_operation_failed")
+    try:
+        raise error
+    except ProtectionError:
+        error.__context__ = None
+        raise error from None
 
 
 def _call_windows_api(
@@ -130,15 +138,19 @@ def _call_windows_api(
     try:
         return operation(*arguments)
     except OSError:
-        _raise_protection_error()
+        pass
+    _raise_protection_error()
 
 
-def _run_cleanup(operation: Callable[[], None]) -> None:
-    primary_exception = sys.exc_info()[0] is not None
+def _run_cleanup(
+    operation: Callable[[], None],
+    *,
+    primary_failure: bool,
+) -> None:
     try:
         operation()
     except ProtectionError:
-        if not primary_exception:
+        if not primary_failure:
             raise
 
 
@@ -186,6 +198,7 @@ class WindowsDpapiProtector:
         plaintext_blob, _plaintext_buffer = _data_blob(plaintext)
         entropy_blob, _entropy_buffer = _data_blob(_entropy(project_id))
         protected_blob = _DataBlob()
+        primary_failure = False
         try:
             protected = _call_windows_api(
                 apis.crypt_protect_data,
@@ -200,14 +213,21 @@ class WindowsDpapiProtector:
             if not protected:
                 _raise_protection_error()
             return _blob_bytes(protected_blob)
+        except BaseException:
+            primary_failure = True
+            raise
         finally:
-            _run_cleanup(lambda: _free_blob(apis, protected_blob))
+            _run_cleanup(
+                lambda: _free_blob(apis, protected_blob),
+                primary_failure=primary_failure,
+            )
 
     def unprotect(self, project_id: str, protected: bytes) -> bytes:
         apis = _windows_apis()
         protected_blob, _protected_buffer = _data_blob(protected)
         entropy_blob, _entropy_buffer = _data_blob(_entropy(project_id))
         plaintext_blob = _DataBlob()
+        primary_failure = False
         try:
             plaintext = _call_windows_api(
                 apis.crypt_unprotect_data,
@@ -222,13 +242,20 @@ class WindowsDpapiProtector:
             if not plaintext:
                 _raise_protection_error()
             return _blob_bytes(plaintext_blob)
+        except BaseException:
+            primary_failure = True
+            raise
         finally:
-            _run_cleanup(lambda: _free_blob(apis, plaintext_blob))
+            _run_cleanup(
+                lambda: _free_blob(apis, plaintext_blob),
+                primary_failure=primary_failure,
+            )
 
 
 def protection_identity_digest() -> str:
     apis = _windows_apis()
     token = wintypes.HANDLE()
+    primary_failure = False
     try:
         opened = _call_windows_api(
             apis.open_process_token,
@@ -275,12 +302,25 @@ def protection_identity_digest() -> str:
         )
         if not converted:
             _raise_protection_error()
+        sid_primary_failure = False
         try:
             if sid.value is None:
                 _raise_protection_error()
             return hashlib.sha256(sid.value.encode("utf-8")).hexdigest()
+        except BaseException:
+            sid_primary_failure = True
+            raise
         finally:
-            _run_cleanup(lambda: _local_free(apis, sid))
+            _run_cleanup(
+                lambda: _local_free(apis, sid),
+                primary_failure=sid_primary_failure,
+            )
+    except BaseException:
+        primary_failure = True
+        raise
     finally:
         if token:
-            _run_cleanup(lambda: _close_handle(apis, token))
+            _run_cleanup(
+                lambda: _close_handle(apis, token),
+                primary_failure=primary_failure,
+            )

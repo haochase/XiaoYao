@@ -19,6 +19,7 @@ def assert_sanitized_failure(operation: Callable[[], object]) -> None:
 
     assert type(error.value) is ProtectionError
     assert str(error.value) == "dpapi_operation_failed"
+    assert error.value.__context__ is None
 
 
 class _ProtectedBlobApi:
@@ -59,6 +60,7 @@ class _FailedProtectCleanupApi(_ProtectedBlobApi):
 class _SidApi:
     def __init__(self, *, failure: str | None = None) -> None:
         self._failure = failure
+        self._sid_buffer = ctypes.create_unicode_buffer("S-1-5-21-test")
 
     def get_current_process(self) -> int:
         return 1
@@ -109,8 +111,8 @@ class _SidApi:
         output = ctypes.cast(
             sid_pointer,
             ctypes.POINTER(wintypes.LPWSTR),
-        ).contents
-        output.value = "S-1-5-21-test"
+        )
+        output[0] = ctypes.cast(self._sid_buffer, wintypes.LPWSTR)
         return True
 
     def local_free(self, _pointer: object) -> None:
@@ -196,6 +198,24 @@ def test_cleanup_failure_does_not_mask_a_dpapi_failure(monkeypatch) -> None:
     assert type(error.value) is ProtectionError
     assert str(error.value) == "dpapi_operation_failed"
     assert error.value.__context__ is None
+
+
+def test_cleanup_failure_is_not_suppressed_by_an_outer_exception(monkeypatch) -> None:
+    monkeypatch.setattr(
+        protection,
+        "_windows_apis",
+        lambda: _ProtectedBlobApi(fail_local_free=True),
+    )
+
+    try:
+        raise RuntimeError("outer failure")
+    except RuntimeError:
+        assert_sanitized_failure(
+            lambda: WindowsDpapiProtector().protect(
+                "project-1",
+                b"private evidence",
+            )
+        )
 
 
 @pytest.mark.parametrize("failure", ["local_free", "close_handle"])
