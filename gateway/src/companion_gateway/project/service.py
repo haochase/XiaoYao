@@ -414,10 +414,17 @@ class ProjectMemoryService:
 
     @classmethod
     def _matches(cls, decision: DecisionCard, query: str) -> bool:
-        return any(
-            query in cls._normalize(value)
-            for value in (decision.decision_id, decision.topic, decision.decision_text)
-        )
+        for value in (
+            decision.decision_id,
+            decision.topic,
+            decision.decision_text,
+        ):
+            normalized_value = cls._normalize(value)
+            if query in normalized_value or (
+                len(normalized_value) >= 2 and normalized_value in query
+            ):
+                return True
+        return False
 
     @staticmethod
     def _require_source_scope(

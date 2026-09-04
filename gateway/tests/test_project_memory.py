@@ -76,6 +76,21 @@ def test_fact_answer_uses_fresh_context_and_returns_sources() -> None:
     assert answer.source_refs[0].source_id == "meeting-1"
 
 
+def test_fact_answer_matches_project_topic_inside_a_natural_question() -> None:
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(decision(),)))
+
+    answer = service.answer(
+        "project-1",
+        "终端方案是什么",
+        kind=AnswerKind.FACT,
+        now=NOW,
+    )
+
+    assert answer.text == "采用方案 B"
+    assert answer.source_refs == (source(),)
+
+
 def test_answer_rejects_expired_context_instead_of_using_stale_facts() -> None:
     service = ProjectMemoryService(clock=lambda: NOW)
     service.replace_context(context(decisions=(decision(),)))
