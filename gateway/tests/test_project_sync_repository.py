@@ -1,6 +1,8 @@
 import hashlib
 import json
 import sqlite3
+import threading
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -36,6 +38,7 @@ NOW = datetime(2026, 9, 5, 8, 0, tzinfo=UTC)
 HASH_A = "a" * 64
 HASH_B = "b" * 64
 HASH_C = "c" * 64
+HASH_D = "d" * 64
 
 
 def source_id_hash(source_id: str) -> str:
@@ -308,6 +311,42 @@ def test_same_cursor_and_hash_is_idempotent(tmp_path: Path) -> None:
     assert retried.generation_id == first.generation_id
 
 
+@pytest.mark.parametrize(
+    "package",
+    [
+        context(
+            active_decisions=(
+                context().active_decisions[0].model_copy(
+                    update={"decision_text": "同游标篡改决策"}
+                ),
+            )
+        ),
+        context(
+            permission_scope="project:other",
+            source_refs=(),
+            active_decisions=(),
+        ),
+    ],
+)
+def test_same_cursor_and_hash_still_checks_context_conflicts(
+    tmp_path: Path,
+    package: ProjectContextPackage,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1))
+    snapshots = None
+    expected = "decision_change_requires_review"
+    if package.permission_scope == "project:other":
+        snapshots = (active_snapshot(permission_scope="project:other"),)
+        expected = "permission_conflict"
+
+    with pytest.raises(SyncConflict, match=expected):
+        repository.commit(
+            sync_commit(cursor=1, package=package, snapshots=snapshots)
+        )
+
+
 def test_greater_cursor_with_same_hash_refreshes_without_new_generation(
     tmp_path: Path,
 ) -> None:
@@ -482,6 +521,215 @@ def test_first_failed_source_is_stored_without_protected_content(
     assert stored.protected_chunks == ()
 
 
+def test_stale_source_cannot_reuse_empty_failed_state(tmp_path: Path) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    failed_state = source_state(
+        source_version=None,
+        content_hash=None,
+        status="failed",
+        last_success_at=None,
+        last_error_type=SourceErrorType.NETWORK_TIMEOUT,
+    )
+    failed_snapshot = active_snapshot(
+        source_version="unavailable",
+        source_time=None,
+        status="failed",
+        chunks=(),
+        content_hash=None,
+        error_type=SourceErrorType.NETWORK_TIMEOUT,
+        retryable=True,
+    )
+    repository.commit(
+        sync_commit(
+            cursor=1,
+            snapshots=(failed_snapshot,),
+            states=(failed_state,),
+            protected_sources=(),
+            protected_chunks=(),
+        )
+    )
+    stale_state = source_state(
+        status="stale",
+        last_success_at=None,
+        last_error_type=SourceErrorType.NETWORK_TIMEOUT,
+    )
+    stale_snapshot = active_snapshot(
+        status="stale",
+        chunks=(),
+        error_type=SourceErrorType.NETWORK_TIMEOUT,
+        retryable=True,
+    )
+
+    with pytest.raises(SyncConflict, match="source_reuse_conflict"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                snapshots=(stale_snapshot,),
+                states=(stale_state,),
+                protected_sources=(),
+                protected_chunks=(),
+            )
+        )
+
+
+def test_failed_source_reuse_rejects_time_rollback(tmp_path: Path) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1))
+    failed_state = source_state(
+        status="failed",
+        content_hash=None,
+        last_attempt_at=NOW - timedelta(seconds=1),
+        last_success_at=None,
+        last_error_type=SourceErrorType.NETWORK_TIMEOUT,
+    )
+    failed_snapshot = active_snapshot(
+        status="failed",
+        chunks=(),
+        content_hash=None,
+        error_type=SourceErrorType.NETWORK_TIMEOUT,
+        retryable=True,
+    )
+
+    with pytest.raises(SyncConflict, match="source_reuse_conflict"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                snapshots=(failed_snapshot,),
+                states=(failed_state,),
+                protected_sources=(),
+                protected_chunks=(),
+            )
+        )
+
+
+def test_stale_source_reuse_rejects_permission_hash_change(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1))
+    stale_state = source_state(
+        permission_hash=HASH_D,
+        status="stale",
+        last_error_type=SourceErrorType.PERMISSION_DENIED,
+    )
+    stale_snapshot = active_snapshot(
+        permission_hash=HASH_D,
+        status="stale",
+        chunks=(),
+        error_type=SourceErrorType.PERMISSION_DENIED,
+        retryable=False,
+    )
+
+    with pytest.raises(SyncConflict, match="source_reuse_conflict"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                snapshots=(stale_snapshot,),
+                states=(stale_state,),
+                protected_sources=(),
+                protected_chunks=(),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "corruption_sql",
+    [
+        "UPDATE project_source_states SET protected_title = X''",
+        "UPDATE project_evidence_chunks SET protected_text = X''",
+    ],
+)
+def test_failed_source_reuse_rejects_incomplete_protected_payload(
+    tmp_path: Path,
+    corruption_sql: str,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1))
+    with sqlite3.connect(tmp_path / "project-memory.db") as connection:
+        connection.execute(corruption_sql)
+    failed_state = source_state(
+        status="failed",
+        content_hash=None,
+        last_success_at=None,
+        last_error_type=SourceErrorType.NETWORK_TIMEOUT,
+    )
+    failed_snapshot = active_snapshot(
+        status="failed",
+        chunks=(),
+        content_hash=None,
+        error_type=SourceErrorType.NETWORK_TIMEOUT,
+        retryable=True,
+    )
+
+    with pytest.raises(SyncConflict, match="source_reuse_conflict"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                snapshots=(failed_snapshot,),
+                states=(failed_state,),
+                protected_sources=(),
+                protected_chunks=(),
+            )
+        )
+
+
+def test_failed_task_reuse_rejects_missing_protected_source(tmp_path: Path) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    task_snapshot = active_snapshot(source_type="task", chunks=())
+    task_state = source_state(source_type="task")
+    repository.commit(
+        sync_commit(
+            cursor=1,
+            snapshots=(task_snapshot,),
+            states=(task_state,),
+            protected_sources=(
+                protected_source(source_type=SyncSourceType.TASK),
+            ),
+            protected_chunks=(),
+        )
+    )
+    with sqlite3.connect(tmp_path / "project-memory.db") as connection:
+        connection.execute(
+            "UPDATE project_source_states SET protected_source_id = NULL"
+        )
+    failed_state = source_state(
+        source_type="task",
+        status="failed",
+        content_hash=None,
+        last_success_at=None,
+        last_error_type=SourceErrorType.NETWORK_TIMEOUT,
+    )
+    failed_snapshot = active_snapshot(
+        source_type="task",
+        status="failed",
+        chunks=(),
+        content_hash=None,
+        error_type=SourceErrorType.NETWORK_TIMEOUT,
+        retryable=True,
+    )
+
+    with pytest.raises(SyncConflict, match="source_reuse_conflict"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                snapshots=(failed_snapshot,),
+                states=(failed_state,),
+                protected_sources=(),
+                protected_chunks=(),
+            )
+        )
+
+
 def retrieval_request(**updates: object) -> RetrievalRequest:
     values: dict[str, object] = {
         "request_id": "request-1",
@@ -627,6 +875,103 @@ def test_failure_before_activation_rolls_back_new_generation(
     assert stored.content_hash == HASH_A
 
 
+def test_load_active_generation_reads_one_sqlite_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "project-memory.db"
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1))
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone() == ("wal",)
+
+    reader_started = threading.Event()
+    writer_finished = threading.Event()
+    writer_errors: list[BaseException] = []
+    load_active_row = repository._load_active_row
+
+    def pause_after_generation_read(
+        connection: sqlite3.Connection,
+        project_id: str,
+    ) -> sqlite3.Row | None:
+        row = load_active_row(connection, project_id)
+        reader_started.set()
+        assert writer_finished.wait(timeout=5)
+        return row
+
+    def promote_next_generation() -> None:
+        try:
+            assert reader_started.wait(timeout=5)
+            repository_at(tmp_path).commit(
+                sync_commit(cursor=2, content_hash=HASH_B)
+            )
+        except BaseException as error:
+            writer_errors.append(error)
+        finally:
+            writer_finished.set()
+
+    monkeypatch.setattr(repository, "_load_active_row", pause_after_generation_read)
+    writer = threading.Thread(target=promote_next_generation)
+    writer.start()
+    loaded = repository.load_active_generation("project-1")
+    writer.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert writer_errors == []
+    assert loaded is not None
+    assert loaded.generation_id == "generation-1"
+    assert loaded.source_states == (source_state(),)
+    assert loaded.protected_chunks == (protected_chunk(),)
+    current = repository_at(tmp_path).load_active_generation("project-1")
+    assert current is not None
+    assert current.generation_id == "generation-2"
+
+
+@pytest.mark.parametrize(
+    "audit_updates",
+    [
+        {"source_counts_by_status": {SourceSyncStatus.FAILED: 1}},
+        {"chunk_count": 0},
+        {"outcome": "degraded"},
+    ],
+)
+def test_audit_mismatch_rolls_back_commit(
+    tmp_path: Path,
+    audit_updates: dict[str, object],
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    candidate = sync_commit(cursor=1)
+    candidate = replace(
+        candidate,
+        audit=candidate.audit.model_copy(update=audit_updates),
+    )
+
+    with pytest.raises(SyncConflict, match="audit_mismatch"):
+        repository.commit(candidate)
+
+    assert repository.load_active_generation("project-1") is None
+    with sqlite3.connect(tmp_path / "project-memory.db") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_sync_audits"
+        ).fetchone() == (0,)
+
+
+def test_unchanged_audit_outcome_must_match_actual_result(tmp_path: Path) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1))
+
+    with pytest.raises(SyncConflict, match="audit_mismatch"):
+        repository.commit(sync_commit(cursor=2))
+
+    stored = repository.load_active_generation("project-1")
+    assert stored is not None
+    assert stored.source_cursor == 1
+    assert repository.get_retrieval_request("project-1", "request-1") is None
+
+
 def test_sync_tables_do_not_store_private_source_fields_in_plaintext(
     tmp_path: Path,
 ) -> None:
@@ -639,6 +984,7 @@ def test_sync_tables_do_not_store_private_source_fields_in_plaintext(
         "real-source-id",
         "真实项目标题",
         "https://example.invalid/private-document",
+        "私密章节",
         "绝不能明文落盘的正文",
     ):
         assert secret.encode() not in stored_bytes

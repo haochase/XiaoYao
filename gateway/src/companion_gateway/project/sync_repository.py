@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -201,16 +202,32 @@ class ProjectSyncRepository:
                 active_hash = str(active["content_hash"])
                 if envelope.source_cursor < active_cursor:
                     raise SyncConflict("stale_cursor")
+                self._check_context_conflicts(stored_context, envelope.context)
                 if envelope.source_cursor == active_cursor:
                     if envelope.content_hash != active_hash:
                         raise SyncConflict("cursor_content_conflict")
-                    return self._stored_result(connection, candidate, active)
-                self._check_context_conflicts(stored_context, envelope.context)
+                    stored_result = self._stored_result(
+                        connection,
+                        candidate,
+                        active,
+                    )
+                    self._validate_audit(candidate, stored_result.outcome)
+                    return stored_result
                 if envelope.content_hash == active_hash:
+                    self._validate_audit(candidate, "unchanged")
                     return self._commit_unchanged(connection, candidate, active)
 
             if active is None:
                 self._check_context_conflicts(stored_context, envelope.context)
+            outcome: Literal["applied", "degraded"] = (
+                "degraded"
+                if any(
+                    item.status in {SourceSyncStatus.FAILED, SourceSyncStatus.STALE}
+                    for item in candidate.source_states
+                )
+                else "applied"
+            )
+            self._validate_audit(candidate, outcome)
             prior_generation_id = (
                 str(active["generation_id"]) if active is not None else None
             )
@@ -247,14 +264,6 @@ class ProjectSyncRepository:
                     payload_json = excluded.payload_json
                 """,
                 (envelope.project_id, envelope.context.model_dump_json()),
-            )
-            outcome: Literal["applied", "degraded"] = (
-                "degraded"
-                if any(
-                    item.status in {SourceSyncStatus.FAILED, SourceSyncStatus.STALE}
-                    for item in candidate.source_states
-                )
-                else "applied"
             )
             connection.execute(
                 """
@@ -310,6 +319,7 @@ class ProjectSyncRepository:
         project_id: str,
     ) -> StoredProjectGeneration | None:
         with self._connect() as connection:
+            connection.execute("BEGIN")
             generation = self._load_active_row(connection, project_id)
             if generation is None:
                 return None
@@ -619,6 +629,19 @@ class ProjectSyncRepository:
             ):
                 raise ValueError("protected_chunk_mismatch")
 
+    @staticmethod
+    def _validate_audit(
+        candidate: SyncCommit,
+        outcome: Literal["applied", "unchanged", "degraded"],
+    ) -> None:
+        expected_counts = dict(Counter(item.status for item in candidate.source_states))
+        if (
+            candidate.audit.source_counts_by_status != expected_counts
+            or candidate.audit.chunk_count != len(candidate.protected_chunks)
+            or candidate.audit.outcome != outcome
+        ):
+            raise SyncConflict("audit_mismatch")
+
     def _stored_result(
         self,
         connection: sqlite3.Connection,
@@ -758,16 +781,44 @@ class ProjectSyncRepository:
                 continue
             if state.status in {SourceSyncStatus.FAILED, SourceSyncStatus.STALE}:
                 prior_state = prior_states.get(key)
-                if prior_state is not None:
-                    state = state.model_copy(
-                        update={
-                            "source_version": prior_state.source_version,
-                            "content_hash": prior_state.content_hash,
-                            "last_success_at": prior_state.last_success_at,
-                        }
-                    )
-                source = prior_sources.get(key) or supplied_sources.get(key)
-                source_chunks = prior_chunks.get(key) or supplied_chunks.get(key, [])
+                prior_source = prior_sources.get(key)
+                source_chunks = prior_chunks.get(key, [])
+                if prior_state is not None and prior_state.status in {
+                    SourceSyncStatus.ACTIVE,
+                    SourceSyncStatus.STALE,
+                }:
+                    if not self._can_reuse_source(
+                        state,
+                        prior_state,
+                        prior_source,
+                        source_chunks,
+                    ):
+                        raise SyncConflict("source_reuse_conflict")
+                    assert prior_state is not None
+                    assert prior_source is not None
+                    try:
+                        state = SourceState(
+                            project_id=state.project_id,
+                            source_type=state.source_type,
+                            source_id_hash=state.source_id_hash,
+                            source_version=prior_state.source_version,
+                            content_hash=prior_state.content_hash,
+                            permission_hash=state.permission_hash,
+                            status=state.status,
+                            last_attempt_at=state.last_attempt_at,
+                            last_success_at=prior_state.last_success_at,
+                            last_error_type=state.last_error_type,
+                        )
+                    except ValueError:
+                        raise SyncConflict("source_reuse_conflict") from None
+                    source = prior_source
+                elif prior_source is not None or source_chunks:
+                    raise SyncConflict("source_reuse_conflict")
+                elif state.status is SourceSyncStatus.STALE:
+                    raise SyncConflict("source_reuse_conflict")
+                else:
+                    source = supplied_sources.get(key)
+                    source_chunks = supplied_chunks.get(key, [])
             else:
                 source = supplied_sources.get(key)
                 source_chunks = supplied_chunks.get(key, [])
@@ -783,6 +834,59 @@ class ProjectSyncRepository:
             sources.append(source)
             chunks.extend(source_chunks)
         return tuple(states), tuple(sources), tuple(chunks)
+
+    @staticmethod
+    def _can_reuse_source(
+        candidate: SourceState,
+        prior_state: SourceState | None,
+        prior_source: ProtectedSourceRecord | None,
+        prior_chunks: list[ProtectedChunkRecord],
+    ) -> bool:
+        if prior_state is None or prior_source is None:
+            return False
+        if prior_state.status not in {
+            SourceSyncStatus.ACTIVE,
+            SourceSyncStatus.STALE,
+        }:
+            return False
+        if (
+            prior_state.source_version is None
+            or prior_state.content_hash is None
+            or prior_state.last_success_at is None
+            or candidate.permission_hash != prior_state.permission_hash
+            or prior_source.source_version != prior_state.source_version
+            or prior_source.content_hash != prior_state.content_hash
+            or prior_source.permission_hash != prior_state.permission_hash
+            or prior_source.source_time is None
+            or not prior_source.protected_source_id
+            or not prior_source.protected_title
+            or not prior_source.protected_url
+        ):
+            return False
+        if (
+            candidate.status is SourceSyncStatus.STALE
+            and (
+                candidate.source_version != prior_state.source_version
+                or candidate.content_hash != prior_state.content_hash
+            )
+        ):
+            return False
+        if candidate.source_type in {
+            SyncSourceType.DOCUMENT,
+            SyncSourceType.MEETING_NOTE,
+        } and not prior_chunks:
+            return False
+        if any(
+            chunk.source_type is not candidate.source_type
+            or chunk.source_id_hash != candidate.source_id_hash
+            or chunk.source_version != prior_state.source_version
+            or chunk.end_offset <= chunk.start_offset
+            or not chunk.protected_heading_path
+            or not chunk.protected_text
+            for chunk in prior_chunks
+        ):
+            return False
+        return True
 
     @staticmethod
     def _insert_source_states(
