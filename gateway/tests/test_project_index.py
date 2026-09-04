@@ -297,6 +297,15 @@ def test_chunking_treats_a_bare_atx_marker_as_an_empty_boundary() -> None:
     ]
 
 
+def test_chunking_treats_hash_only_atx_content_as_an_empty_boundary() -> None:
+    chunks = chunk_text("doc-1", "v1", "# 前一节\n第一段\n\n# ###\n第二段")
+
+    assert [(item.heading_path, item.text) for item in chunks] == [
+        (("前一节",), "第一段"),
+        ((), "第二段"),
+    ]
+
+
 def test_chunking_splits_a_loose_list_with_overlap() -> None:
     chunks = chunk_text(
         "doc-1",

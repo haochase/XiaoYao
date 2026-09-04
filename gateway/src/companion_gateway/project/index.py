@@ -24,6 +24,7 @@ _HEADING_PATTERN = re.compile(
     r"^[ \t]{0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$"
 )
 _ATX_CLOSING_SEQUENCE_PATTERN = re.compile(r"[ \t]+#+[ \t]*$")
+_ATX_HASH_ONLY_PATTERN = re.compile(r"[ \t]*#+[ \t]*$")
 _FENCE_PATTERN = re.compile(r"^[ \t]*(`{3,}|~{3,})")
 _LIST_ITEM_PATTERN = re.compile(r"^[ \t]*(?:[-+*]|\d+[.)])[ \t]+")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -71,7 +72,7 @@ def _bigrams(value: str) -> frozenset[str]:
 
 
 def _atx_heading_title(value: str | None) -> str:
-    if value is None:
+    if value is None or _ATX_HASH_ONLY_PATTERN.fullmatch(value) is not None:
         return ""
     return _ATX_CLOSING_SEQUENCE_PATTERN.sub("", value).strip()
 
