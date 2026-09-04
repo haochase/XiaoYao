@@ -609,7 +609,14 @@ def _canonical_json(value: object) -> str:
 
 
 def _sha256(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    encoding_failed = False
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        encoding_failed = True
+    if encoding_failed:
+        raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _build_record(**values: object) -> DwsSourceRecord:

@@ -416,6 +416,40 @@ def test_adapter_rejects_non_finite_json_without_exception_chain() -> None:
     assert error.value.__context__ is None
 
 
+def test_adapter_rejects_unpaired_surrogate_without_exception_chain() -> None:
+    runner = RecordingRunner([{"taskId": "task-1", "value": "\ud800"}])
+
+    with pytest.raises(DwsReadError) as error:
+        read_task(
+            runner,
+            source("task", "task-1"),
+            permission_scope="project:project-1",
+            clock=lambda: NOW,
+        )
+
+    assert error.value.error_type is SourceErrorType.INVALID_PAYLOAD
+    assert error.value.retryable is False
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+def test_collect_sources_isolates_unpaired_surrogate_as_failed_record() -> None:
+    project = DwsProjectManifest(
+        project_id="project-1",
+        project_name="Demo",
+        profile="private-profile",
+        permission_scope="project:project-1",
+        sources=(source("task", "task-1"),),
+    )
+    runner = RecordingRunner([{"taskId": "task-1", "value": "\ud800"}])
+
+    bundle = collect_sources(project, runner, clock=lambda: NOW)
+
+    assert bundle.records[0].status == "failed"
+    assert bundle.records[0].error_type is SourceErrorType.INVALID_PAYLOAD
+    assert bundle.records[0].retryable is False
+
+
 def test_adapter_normalizes_metadata_validation_errors_and_collects_failure() -> None:
     invalid_time = RecordingRunner(
         [{"taskId": "task-1", "updatedAt": "private-invalid-time"}]
