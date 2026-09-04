@@ -17,6 +17,13 @@ from companion_gateway.project.service import (
     ProjectMemoryService,
 )
 from companion_gateway.project.repository import ProjectMemoryRepository
+from companion_gateway.project.sync_service import (
+    ProjectSourceUnavailable,
+    ProjectSyncError,
+    ProjectSyncService,
+    ProjectSyncValidationError,
+    compute_envelope_content_hash,
+)
 from companion_gateway.project.sync_models import (
     EvidenceChunk,
     ProjectSyncHealth,
@@ -52,7 +59,11 @@ __all__ = [
     "ProjectMemoryRepository",
     "ProjectSyncHealth",
     "ProjectSyncOutcome",
+    "ProjectSyncError",
+    "ProjectSyncService",
     "ProjectSyncStatus",
+    "ProjectSyncValidationError",
+    "ProjectSourceUnavailable",
     "RetrievalRequest",
     "RetrievalRequestStatus",
     "SourceErrorType",
@@ -64,4 +75,5 @@ __all__ = [
     "SyncEnvelope",
     "SyncResult",
     "SyncSourceType",
+    "compute_envelope_content_hash",
 ]
