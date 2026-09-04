@@ -1,0 +1,204 @@
+from __future__ import annotations
+
+import json
+import math
+from collections.abc import Callable, Mapping
+from pathlib import Path
+import subprocess
+from typing import Any
+
+from companion_gateway.project.sync_models import SourceErrorType
+
+
+_FORBIDDEN_FLAGS = {
+    "--client-id",
+    "--client-secret",
+    "--format",
+    "--profile",
+    "--token",
+    "--yes",
+}
+_SHELL_COMPONENTS = {
+    "&",
+    "&&",
+    "(",
+    ")",
+    ";",
+    "<",
+    "<<",
+    ">",
+    ">>",
+    "|",
+    "||",
+    "2>",
+    "2>&1",
+}
+
+
+def _is_forbidden_flag(value: str) -> bool:
+    return any(
+        value == flag or value.startswith(f"{flag}=")
+        for flag in _FORBIDDEN_FLAGS
+    )
+
+
+class DwsReadError(Exception):
+    def __init__(
+        self,
+        error_type: SourceErrorType | str,
+        retryable: bool,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        try:
+            normalized = SourceErrorType(error_type)
+        except ValueError:
+            normalized = SourceErrorType.UNKNOWN
+        if retry_after_seconds is not None:
+            if (
+                not retryable
+                or not math.isfinite(retry_after_seconds)
+                or retry_after_seconds < 0
+            ):
+                retry_after_seconds = None
+        self.error_type = normalized
+        self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(normalized.value)
+
+
+def normalized_read_error(
+    response: Mapping[str, object],
+    *,
+    fallback: SourceErrorType = SourceErrorType.INVALID_PAYLOAD,
+    fallback_retryable: bool = False,
+) -> DwsReadError:
+    error_value = response.get("error")
+    error = error_value if isinstance(error_value, Mapping) else response
+    candidates = (
+        error.get("error_type"),
+        error.get("errorType"),
+        error.get("reason"),
+        error.get("type"),
+        error.get("code"),
+        response.get("code"),
+    )
+    error_type = fallback
+    for candidate in candidates:
+        mapped = _map_error_type(candidate)
+        if mapped is not None:
+            error_type = mapped
+            break
+
+    retry_value = error.get("retryable", response.get("retryable"))
+    retryable = retry_value if isinstance(retry_value, bool) else fallback_retryable
+    retry_after = error.get(
+        "retry_after_seconds",
+        response.get("retry_after_seconds"),
+    )
+    if isinstance(retry_after, bool) or not isinstance(retry_after, (int, float)):
+        retry_after_seconds = None
+    else:
+        retry_after_seconds = float(retry_after)
+    return DwsReadError(error_type, retryable, retry_after_seconds)
+
+
+def _map_error_type(value: object) -> SourceErrorType | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower().replace("-", "_")
+    try:
+        return SourceErrorType(normalized)
+    except ValueError:
+        pass
+    aliases = (
+        (
+            ("permission", "nopermission", "forbidden"),
+            SourceErrorType.PERMISSION_DENIED,
+        ),
+        (("not_found", "notfound", "deleted"), SourceErrorType.NODE_NOT_FOUND),
+        (("auth", "unauthorized", "token"), SourceErrorType.AUTHENTICATION_FAILED),
+        (("rate", "too_many"), SourceErrorType.RATE_LIMITED),
+        (("timeout", "timed_out"), SourceErrorType.NETWORK_TIMEOUT),
+        (("invalid", "malformed"), SourceErrorType.INVALID_PAYLOAD),
+        (("unavailable", "service_error"), SourceErrorType.PROVIDER_UNAVAILABLE),
+    )
+    for fragments, error_type in aliases:
+        if any(fragment in normalized for fragment in fragments):
+            return error_type
+    return None
+
+
+class DwsCommandRunner:
+    def __init__(
+        self,
+        dws_path: Path,
+        *,
+        profile: str,
+        timeout_seconds: float = 30.0,
+        run: Callable[..., Any] = subprocess.run,
+    ) -> None:
+        if not dws_path.is_absolute():
+            raise ValueError("dws_path_not_absolute")
+        if not dws_path.exists() or not dws_path.is_file():
+            raise ValueError("dws_path_not_regular_file")
+        if not profile.strip():
+            raise ValueError("dws_profile_invalid")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("dws_timeout_invalid")
+        self._dws_path = dws_path
+        self._profile = profile
+        self._timeout_seconds = timeout_seconds
+        self._run = run
+
+    def run(self, args: tuple[str, ...]) -> dict[str, object]:
+        if (
+            not args
+            or any(not isinstance(item, str) or not item for item in args)
+            or any(_is_forbidden_flag(item) for item in args)
+            or any(item in _SHELL_COMPONENTS for item in args)
+        ):
+            raise ValueError("dws_args_invalid")
+        command = [
+            str(self._dws_path),
+            "--profile",
+            self._profile,
+            *args,
+            "--format",
+            "json",
+        ]
+        try:
+            completed = self._run(
+                command,
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=self._timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise DwsReadError(SourceErrorType.NETWORK_TIMEOUT, True) from error
+        except (OSError, subprocess.SubprocessError) as error:
+            raise DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, False) from error
+
+        payload = _parse_json_object(getattr(completed, "stdout", ""))
+        if getattr(completed, "returncode", 1) == 0:
+            if payload is None:
+                raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
+            return payload
+        if payload is not None:
+            raise normalized_read_error(
+                payload,
+                fallback=SourceErrorType.PROVIDER_UNAVAILABLE,
+            )
+        raise DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, False)
+
+
+def _parse_json_object(value: object) -> dict[str, object] | None:
+    if not isinstance(value, (str, bytes, bytearray)):
+        return None
+    try:
+        payload = json.loads(value)
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
