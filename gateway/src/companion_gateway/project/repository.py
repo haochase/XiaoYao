@@ -27,8 +27,12 @@ class ProjectMemoryRepository:
     def initialize(self) -> None:
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
-            connection.executescript(
-                """
+            self._initialize_tables(connection)
+
+    @staticmethod
+    def _initialize_tables(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
                 CREATE TABLE IF NOT EXISTS project_contexts (
                     project_id TEXT PRIMARY KEY,
                     payload_json TEXT NOT NULL
@@ -46,8 +50,8 @@ class ProjectMemoryRepository:
                     candidate_id TEXT PRIMARY KEY,
                     payload_json TEXT NOT NULL
                 );
-                """
-            )
+            """
+        )
 
     def save_context(self, package: ProjectContextPackage) -> ProjectContextPackage:
         with self._connect() as connection:
