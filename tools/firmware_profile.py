@@ -234,6 +234,9 @@ _TTS_STATE_PROFILE = (
     "                    aborted_ = false;\n"
     "                    notification_tts_ = notification;\n"
     "                    SetDeviceState(kDeviceStateSpeaking);\n"
+    "                    if (notification && protocol_) {\n"
+    "                        protocol_->SendTtsReady();\n"
+    "                    }\n"
     "                });\n"
     "            } else if (strcmp(state->valuestring, \"stop\") == 0) {\n"
     "                Schedule([this]() {\n"
@@ -287,6 +290,41 @@ _BUILD_IDF_ANCHOR = '    command = ["idf.py"]\n'
 _BUILD_IDF_PROFILE = (
     '    command = [os.environ.get("XIAOYAO_IDF_COMMAND", "idf.py")]\n'
 )
+_VENDOR_PROFILE_MARKERS = {
+    Path("main/Kconfig.projbuild"): (
+        "config XIAOYAO_WEBSOCKET_ONLY",
+        "config XIAOYAO_VAD_EVENTS",
+        "config XIAOYAO_PERSISTENT_CONTROL_CHANNEL",
+    ),
+    Path("main/application.cc"): (
+        "#if CONFIG_XIAOYAO_WEBSOCKET_ONLY",
+        "#if CONFIG_USE_CUSTOM_WAKE_WORD",
+        "protocol_->SendVadState(speaking);",
+        "clock_ticks_ % 5 == 0",
+        "network_connected_ = true;",
+        "network_connected_ = false;",
+        "notification_tts_ = notification;",
+        "void Application::EnsureIdleControlChannel()",
+    ),
+    Path("main/application.h"): (
+        "bool network_connected_ = false;",
+        "bool notification_tts_ = false;",
+        "void EnsureIdleControlChannel();",
+    ),
+    Path("main/protocols/protocol.h"): (
+        "virtual void SendVadState(bool speaking);",
+    ),
+    Path("main/protocols/protocol.cc"): (
+        "void Protocol::SendVadState(bool speaking)",
+        'speaking ? "start" : "stop"',
+    ),
+    Path("main/protocols/websocket_protocol.cc"): (
+        'cJSON_AddBoolToObject(features, "vad_events", true);',
+    ),
+    Path("scripts/build.py"): (
+        'os.environ.get("XIAOYAO_IDF_COMMAND", "idf.py")',
+    ),
+}
 
 
 def _read_text_preserving_newlines(path: Path) -> str:
@@ -329,9 +367,22 @@ def _apply_exact_profile(
     _write_text_preserving_newlines(path, content.replace(expected, rendered, 1))
 
 
+def _has_complete_vendor_profile(source_root: Path) -> bool:
+    for relative_path, markers in _VENDOR_PROFILE_MARKERS.items():
+        try:
+            content = _read_text_preserving_newlines(source_root / relative_path)
+        except OSError:
+            return False
+        if any(marker not in content for marker in markers):
+            return False
+    return True
+
+
 def apply_vendor_profile(source_root: Path) -> None:
     """Apply the XiaoYao protocol profile to a known XiaoZhi source snapshot."""
     source_root = source_root.resolve()
+    if _has_complete_vendor_profile(source_root):
+        return
     _apply_exact_profile(
         source_root / "main" / "Kconfig.projbuild",
         _KCONFIG_ANCHOR,

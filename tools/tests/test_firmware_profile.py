@@ -155,6 +155,7 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     assert "EnsureIdleControlChannel();" in application
     assert "clock_ticks_ % 5 == 0" in application
     assert "notification_tts_ = notification;" in application
+    assert "protocol_->SendTtsReady();" in application
     application_header = application_header_path.read_text(encoding="utf-8")
     assert "bool network_connected_ = false;" in application_header
     assert "void EnsureIdleControlChannel();" in application_header
@@ -198,6 +199,23 @@ def test_vendor_profile_contains_persistent_control_channel_boundaries() -> None
         'strcmp(purpose->valuestring, "notification") == 0'
         in firmware_profile._TTS_STATE_PROFILE
     )
+
+
+def test_apply_vendor_profile_accepts_a_semantically_complete_evolved_source(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "evolved-xiaozhi"
+    for relative_path, markers in firmware_profile._VENDOR_PROFILE_MARKERS.items():
+        path = source_root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "// source may contain additional compatible behavior\n"
+            + "\n".join(markers)
+            + "\n",
+            encoding="utf-8",
+        )
+
+    firmware_profile.apply_vendor_profile(source_root)
 
 
 def test_exact_profile_can_upgrade_a_previous_rendered_profile(tmp_path: Path) -> None:

@@ -143,6 +143,13 @@ try {
         throw "Temporary XiaoYao profile already exists: $localProfile"
     }
 
+    if (-not [string]::IsNullOrWhiteSpace($env:IDF_PYTHON_ENV_PATH)) {
+        $idfPythonScripts = Join-Path $env:IDF_PYTHON_ENV_PATH 'Scripts'
+        if (Test-Path $idfPythonScripts) {
+            $env:PATH = "$idfPythonScripts;$env:PATH"
+        }
+    }
+
     Set-StrictMode -Off
     . $activationScript
     Set-StrictMode -Version Latest
