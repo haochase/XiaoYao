@@ -47,6 +47,9 @@ from companion_gateway.project.sync_repository import (
 )
 
 
+CLOCK_ROLLBACK_THRESHOLD_SECONDS = 300.0
+
+
 class ProjectSyncError(RuntimeError):
     pass
 
@@ -449,7 +452,7 @@ class ProjectSyncService:
             if self._last_wall is not None and self._last_monotonic is not None:
                 wall_elapsed = (wall_now - self._last_wall).total_seconds()
                 monotonic_elapsed = sample - self._last_monotonic
-                if wall_elapsed < -self._clock_skew_seconds:
+                if wall_elapsed < -CLOCK_ROLLBACK_THRESHOLD_SECONDS:
                     self._clock_untrusted = True
                     self._immediate_sync_required = True
                     reason = "clock_rollback"
@@ -941,6 +944,7 @@ class ProjectSyncService:
 
 
 __all__ = [
+    "CLOCK_ROLLBACK_THRESHOLD_SECONDS",
     "ClockCheckResult",
     "ProjectSourceUnavailable",
     "ProjectSyncError",

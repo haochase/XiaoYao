@@ -249,6 +249,7 @@ def sync_service(
     protector: ReversibleProtector | None = None,
     registry: ProjectSnapshotRegistry | None = None,
     source_freshness_seconds: int = 1_800,
+    clock_skew_seconds: float = 300.0,
     monotonic=lambda: 100.0,  # noqa: B008
 ) -> tuple[
     ProjectSyncService,
@@ -268,6 +269,7 @@ def sync_service(
             actual_protector,
             actual_registry,
             source_freshness_seconds=source_freshness_seconds,
+            clock_skew_seconds=clock_skew_seconds,
             monotonic=monotonic,
         ),
         actual_repository,
@@ -488,6 +490,29 @@ def test_resume_detection_requests_one_immediate_sync(tmp_path: Path) -> None:
     assert not resumed.clock_untrusted
     assert service.consume_immediate_sync_request()
     assert not service.consume_immediate_sync_request()
+
+
+def test_clock_rollback_threshold_is_independent_of_envelope_skew(
+    tmp_path: Path,
+) -> None:
+    service, _, _, _ = sync_service(tmp_path, clock_skew_seconds=0)
+    service.recheck_clock(wall_now=NOW, monotonic_now=100)
+
+    small_rollback = service.recheck_clock(
+        wall_now=NOW - timedelta(seconds=1),
+        monotonic_now=101,
+    )
+    large_rollback = service.recheck_clock(
+        wall_now=NOW - timedelta(seconds=302),
+        monotonic_now=102,
+    )
+
+    assert small_rollback.reason == "normal"
+    assert not small_rollback.clock_untrusted
+    assert not small_rollback.immediate_sync_required
+    assert large_rollback.reason == "clock_rollback"
+    assert large_rollback.clock_untrusted
+    assert large_rollback.immediate_sync_required
 
 
 def test_clock_rollback_fails_closed_until_successful_sync(tmp_path: Path) -> None:
