@@ -2,6 +2,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+from collections import Counter
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,6 +40,8 @@ HASH_A = "a" * 64
 HASH_B = "b" * 64
 HASH_C = "c" * 64
 HASH_D = "d" * 64
+HASH_E = "e" * 64
+HASH_F = "f" * 64
 
 
 def source_id_hash(source_id: str) -> str:
@@ -170,6 +173,63 @@ def protected_chunk(**updates: object) -> ProtectedChunkRecord:
     return ProtectedChunkRecord(**values)
 
 
+def active_document_records(
+    *,
+    source_id: str,
+    source_version: str,
+    source_content_hash: str,
+    chunk_id: str,
+    chunk_content_hash: str,
+    observed_at: datetime,
+) -> tuple[
+    SourceSnapshot,
+    SourceState,
+    ProtectedSourceRecord,
+    ProtectedChunkRecord,
+]:
+    item = chunk(
+        chunk_id=chunk_id,
+        source_id=source_id,
+        source_version=source_version,
+        content_hash=chunk_content_hash,
+    )
+    snapshot = active_snapshot(
+        source_id=source_id,
+        source_title="另一个真实标题",
+        source_url="https://example.invalid/another-private-document",
+        source_version=source_version,
+        source_time=observed_at,
+        fetched_at=observed_at,
+        chunks=(item,),
+        content_hash=source_content_hash,
+    )
+    state = source_state(
+        source_id_hash=source_id_hash(source_id),
+        source_version=source_version,
+        content_hash=source_content_hash,
+        last_attempt_at=observed_at,
+        last_success_at=observed_at,
+    )
+    source_record = protected_source(
+        source_id_hash=source_id_hash(source_id),
+        protected_source_id=f"cipher-id-{source_version}".encode(),
+        protected_title=f"cipher-title-{source_version}".encode(),
+        protected_url=f"cipher-url-{source_version}".encode(),
+        source_version=source_version,
+        source_time=observed_at,
+        content_hash=source_content_hash,
+    )
+    chunk_record = protected_chunk(
+        chunk_id=chunk_id,
+        source_id_hash=source_id_hash(source_id),
+        source_version=source_version,
+        protected_heading_path=f"cipher-heading-{source_version}".encode(),
+        protected_text=f"cipher-text-{source_version}".encode(),
+        content_hash=chunk_content_hash,
+    )
+    return snapshot, state, source_record, chunk_record
+
+
 def sync_commit(
     *,
     cursor: int,
@@ -209,7 +269,7 @@ def sync_commit(
         started_at=envelope.generated_at,
         finished_at=envelope.generated_at + timedelta(seconds=1),
         outcome=chosen_outcome,
-        source_counts_by_status={item.status: 1 for item in chosen_states},
+        source_counts_by_status=dict(Counter(item.status for item in chosen_states)),
         chunk_count=sum(len(item.chunks) for item in chosen_snapshots),
         duration_ms=1_000,
         error_type=None,
@@ -481,6 +541,199 @@ def test_failed_and_stale_sources_keep_old_chunks_and_last_success(
     assert stored.source_states[0].status.value == status
 
 
+@pytest.mark.parametrize(
+    "final_status",
+    [SourceSyncStatus.FAILED, SourceSyncStatus.STALE],
+)
+def test_complete_failed_generation_can_reuse_content_again(
+    tmp_path: Path,
+    final_status: SourceSyncStatus,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    other_v1 = active_document_records(
+        source_id="other-source-id",
+        source_version="v1",
+        source_content_hash=HASH_D,
+        chunk_id="1" * 64,
+        chunk_content_hash="2" * 64,
+        observed_at=NOW,
+    )
+    repository.commit(
+        sync_commit(
+            cursor=1,
+            snapshots=(active_snapshot(), other_v1[0]),
+            states=(source_state(), other_v1[1]),
+            protected_sources=(protected_source(), other_v1[2]),
+            protected_chunks=(protected_chunk(), other_v1[3]),
+        )
+    )
+    failed_at = NOW + timedelta(minutes=1)
+    failed_snapshot = active_snapshot(
+        fetched_at=failed_at,
+        status="failed",
+        chunks=(),
+        content_hash=None,
+        error_type=SourceErrorType.NETWORK_TIMEOUT,
+        retryable=True,
+    )
+    failed_state = source_state(
+        status="failed",
+        content_hash=None,
+        last_attempt_at=failed_at,
+        last_success_at=None,
+        last_error_type=SourceErrorType.NETWORK_TIMEOUT,
+    )
+    other_v2 = active_document_records(
+        source_id="other-source-id",
+        source_version="v2",
+        source_content_hash=HASH_E,
+        chunk_id="3" * 64,
+        chunk_content_hash="4" * 64,
+        observed_at=failed_at,
+    )
+    repository.commit(
+        sync_commit(
+            cursor=2,
+            content_hash=HASH_D,
+            snapshots=(failed_snapshot, other_v2[0]),
+            states=(failed_state, other_v2[1]),
+            protected_sources=(other_v2[2],),
+            protected_chunks=(other_v2[3],),
+        )
+    )
+
+    final_at = NOW + timedelta(minutes=2)
+    final_state_updates: dict[str, object] = {
+        "status": final_status,
+        "last_attempt_at": final_at,
+        "last_success_at": None,
+        "last_error_type": SourceErrorType.NETWORK_TIMEOUT,
+    }
+    final_snapshot_updates: dict[str, object] = {
+        "fetched_at": final_at,
+        "status": final_status,
+        "chunks": (),
+        "error_type": SourceErrorType.NETWORK_TIMEOUT,
+        "retryable": True,
+    }
+    if final_status is SourceSyncStatus.FAILED:
+        final_state_updates["content_hash"] = None
+        final_snapshot_updates["content_hash"] = None
+    final_state = source_state(**final_state_updates)
+    final_snapshot = active_snapshot(**final_snapshot_updates)
+    other_v3 = active_document_records(
+        source_id="other-source-id",
+        source_version="v3",
+        source_content_hash=HASH_F,
+        chunk_id="5" * 64,
+        chunk_content_hash="6" * 64,
+        observed_at=final_at,
+    )
+
+    result = repository.commit(
+        sync_commit(
+            cursor=3,
+            content_hash=HASH_E,
+            snapshots=(final_snapshot, other_v3[0]),
+            states=(final_state, other_v3[1]),
+            protected_sources=(other_v3[2],),
+            protected_chunks=(other_v3[3],),
+        )
+    )
+
+    stored = repository.load_active_generation("project-1")
+    assert stored is not None
+    inherited = next(
+        item
+        for item in stored.source_states
+        if item.source_id_hash == source_id_hash("real-source-id")
+    )
+    assert result.outcome == "degraded"
+    assert inherited.status is final_status
+    assert inherited.source_version == "v1"
+    assert inherited.content_hash == HASH_B
+    assert inherited.last_success_at == NOW
+    assert protected_source() in stored.protected_sources
+    assert protected_chunk() in stored.protected_chunks
+
+
+@pytest.mark.parametrize("status", [SourceSyncStatus.FAILED, SourceSyncStatus.STALE])
+def test_snapshot_and_state_permission_hashes_must_match(
+    tmp_path: Path,
+    status: SourceSyncStatus,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    state_updates: dict[str, object] = {
+        "status": status,
+        "last_error_type": SourceErrorType.PERMISSION_DENIED,
+    }
+    snapshot_updates: dict[str, object] = {
+        "permission_hash": HASH_D,
+        "status": status,
+        "chunks": (),
+        "error_type": SourceErrorType.PERMISSION_DENIED,
+        "retryable": False,
+    }
+    if status is SourceSyncStatus.FAILED:
+        state_updates.update({"content_hash": None, "last_success_at": None})
+        snapshot_updates["content_hash"] = None
+
+    with pytest.raises(SyncConflict, match="source_snapshot_conflict"):
+        repository.commit(
+            sync_commit(
+                cursor=1,
+                snapshots=(active_snapshot(**snapshot_updates),),
+                states=(source_state(**state_updates),),
+                protected_sources=(),
+                protected_chunks=(),
+            )
+        )
+
+    assert repository.load_active_generation("project-1") is None
+
+
+@pytest.mark.parametrize(
+    "state_updates",
+    [
+        {"source_version": "v2"},
+        {"content_hash": HASH_C},
+    ],
+)
+def test_stale_snapshot_version_and_hash_must_match_state(
+    tmp_path: Path,
+    state_updates: dict[str, object],
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    state_updates.update(
+        {
+            "status": SourceSyncStatus.STALE,
+            "last_error_type": SourceErrorType.NETWORK_TIMEOUT,
+        }
+    )
+    stale_snapshot = active_snapshot(
+        status="stale",
+        chunks=(),
+        error_type=SourceErrorType.NETWORK_TIMEOUT,
+        retryable=True,
+    )
+
+    with pytest.raises(SyncConflict, match="source_snapshot_conflict"):
+        repository.commit(
+            sync_commit(
+                cursor=1,
+                snapshots=(stale_snapshot,),
+                states=(source_state(**state_updates),),
+                protected_sources=(),
+                protected_chunks=(),
+            )
+        )
+
+    assert repository.load_active_generation("project-1") is None
+
+
 def test_first_failed_source_is_stored_without_protected_content(
     tmp_path: Path,
 ) -> None:
@@ -521,7 +774,14 @@ def test_first_failed_source_is_stored_without_protected_content(
     assert stored.protected_chunks == ()
 
 
-def test_stale_source_cannot_reuse_empty_failed_state(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "next_status",
+    [SourceSyncStatus.FAILED, SourceSyncStatus.STALE],
+)
+def test_failed_or_stale_source_cannot_reuse_empty_failed_state(
+    tmp_path: Path,
+    next_status: SourceSyncStatus,
+) -> None:
     repository = repository_at(tmp_path)
     repository.initialize()
     failed_state = source_state(
@@ -549,25 +809,30 @@ def test_stale_source_cannot_reuse_empty_failed_state(tmp_path: Path) -> None:
             protected_chunks=(),
         )
     )
-    stale_state = source_state(
-        status="stale",
-        last_success_at=None,
-        last_error_type=SourceErrorType.NETWORK_TIMEOUT,
-    )
-    stale_snapshot = active_snapshot(
-        status="stale",
-        chunks=(),
-        error_type=SourceErrorType.NETWORK_TIMEOUT,
-        retryable=True,
-    )
+    next_state_updates: dict[str, object] = {
+        "status": next_status,
+        "last_success_at": None,
+        "last_error_type": SourceErrorType.NETWORK_TIMEOUT,
+    }
+    next_snapshot_updates: dict[str, object] = {
+        "status": next_status,
+        "chunks": (),
+        "error_type": SourceErrorType.NETWORK_TIMEOUT,
+        "retryable": True,
+    }
+    if next_status is SourceSyncStatus.FAILED:
+        next_state_updates["content_hash"] = None
+        next_snapshot_updates["content_hash"] = None
+    next_state = source_state(**next_state_updates)
+    next_snapshot = active_snapshot(**next_snapshot_updates)
 
     with pytest.raises(SyncConflict, match="source_reuse_conflict"):
         repository.commit(
             sync_commit(
                 cursor=2,
                 content_hash=HASH_B,
-                snapshots=(stale_snapshot,),
-                states=(stale_state,),
+                snapshots=(next_snapshot,),
+                states=(next_state,),
                 protected_sources=(),
                 protected_chunks=(),
             )

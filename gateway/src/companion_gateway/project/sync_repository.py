@@ -545,6 +545,16 @@ class ProjectSyncRepository:
             envelope_record = snapshots_by_key.get(key) or tombstones_by_key.get(key)
             if envelope_record is None or state.status is not envelope_record.status:
                 raise ValueError("source_state_envelope_mismatch")
+            snapshot = snapshots_by_key.get(key)
+            if snapshot is None:
+                continue
+            if state.permission_hash != snapshot.permission_hash:
+                raise SyncConflict("source_snapshot_conflict")
+            if state.status is SourceSyncStatus.STALE and (
+                state.source_version != snapshot.source_version
+                or state.content_hash != snapshot.content_hash
+            ):
+                raise SyncConflict("source_snapshot_conflict")
         source_keys = [
             (item.source_type, item.source_id_hash)
             for item in candidate.protected_sources
@@ -785,6 +795,7 @@ class ProjectSyncRepository:
                 source_chunks = prior_chunks.get(key, [])
                 if prior_state is not None and prior_state.status in {
                     SourceSyncStatus.ACTIVE,
+                    SourceSyncStatus.FAILED,
                     SourceSyncStatus.STALE,
                 }:
                     if not self._can_reuse_source(
@@ -846,6 +857,7 @@ class ProjectSyncRepository:
             return False
         if prior_state.status not in {
             SourceSyncStatus.ACTIVE,
+            SourceSyncStatus.FAILED,
             SourceSyncStatus.STALE,
         }:
             return False
