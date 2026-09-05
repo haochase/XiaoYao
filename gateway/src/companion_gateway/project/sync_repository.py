@@ -87,6 +87,7 @@ class StoredProjectGeneration:
 @dataclass(frozen=True)
 class SharedClockState:
     trusted_wall_at: datetime | None
+    last_observed_wall_at: datetime | None
     clock_untrusted: bool
     needs_sync: bool
     reason: Literal["normal", "resume_detected", "clock_rollback"]
@@ -137,6 +138,7 @@ class ProjectSyncRepository:
                 CREATE TABLE IF NOT EXISTS project_sync_clock_state (
                     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
                     trusted_wall_at TEXT,
+                    last_observed_wall_at TEXT,
                     clock_untrusted INTEGER NOT NULL,
                     needs_sync INTEGER NOT NULL,
                     reason TEXT NOT NULL
@@ -215,10 +217,16 @@ class ProjectSyncRepository:
                 ON project_retrieval_requests(project_id, status, created_at);
 
                 INSERT OR IGNORE INTO project_sync_clock_state(
-                    singleton_id, trusted_wall_at, clock_untrusted,
-                    needs_sync, reason
-                ) VALUES (1, NULL, 0, 0, 'normal');
+                    singleton_id, trusted_wall_at, last_observed_wall_at,
+                    clock_untrusted, needs_sync, reason
+                ) VALUES (1, NULL, NULL, 0, 0, 'normal');
                 """
+            )
+            self._ensure_column(
+                connection,
+                "project_sync_clock_state",
+                "last_observed_wall_at",
+                "TEXT",
             )
             self._ensure_column(
                 connection,
@@ -349,7 +357,8 @@ class ProjectSyncRepository:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT trusted_wall_at, clock_untrusted, needs_sync, reason
+                SELECT trusted_wall_at, last_observed_wall_at,
+                       clock_untrusted, needs_sync, reason
                 FROM project_sync_clock_state
                 WHERE singleton_id = 1
                 """
@@ -357,6 +366,65 @@ class ProjectSyncRepository:
         if row is None:
             raise RuntimeError("clock_state_missing")
         return _clock_state_from_row(row)
+
+    def observe_wall_clock(
+        self,
+        wall_now: datetime,
+        *,
+        rollback_threshold_seconds: float,
+    ) -> SharedClockState:
+        if wall_now.tzinfo is None or wall_now.utcoffset() is None:
+            raise ValueError("wall_now_must_be_aware")
+        if rollback_threshold_seconds < 0:
+            raise ValueError("clock_rollback_threshold_invalid")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT trusted_wall_at, last_observed_wall_at,
+                       clock_untrusted, needs_sync, reason
+                FROM project_sync_clock_state
+                WHERE singleton_id = 1
+                """
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("clock_state_missing")
+            current = _clock_state_from_row(row)
+            baseline = (
+                current.last_observed_wall_at or current.trusted_wall_at
+            )
+            rollback = (
+                baseline is not None
+                and (baseline - wall_now).total_seconds()
+                > rollback_threshold_seconds
+            )
+            observed = current.last_observed_wall_at
+            if observed is None or wall_now > observed:
+                observed = wall_now
+            clock_untrusted = current.clock_untrusted or rollback
+            needs_sync = current.needs_sync or rollback
+            reason = "clock_rollback" if clock_untrusted else current.reason
+            connection.execute(
+                """
+                UPDATE project_sync_clock_state
+                SET last_observed_wall_at = ?, clock_untrusted = ?,
+                    needs_sync = ?, reason = ?
+                WHERE singleton_id = 1
+                """,
+                (
+                    _datetime_text(observed),
+                    int(clock_untrusted),
+                    int(needs_sync),
+                    reason,
+                ),
+            )
+        return SharedClockState(
+            trusted_wall_at=current.trusted_wall_at,
+            last_observed_wall_at=observed,
+            clock_untrusted=clock_untrusted,
+            needs_sync=needs_sync,
+            reason=reason,
+        )
 
     def mark_clock_state(
         self,
@@ -373,7 +441,8 @@ class ProjectSyncRepository:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT trusted_wall_at, clock_untrusted, needs_sync, reason
+                SELECT trusted_wall_at, last_observed_wall_at,
+                       clock_untrusted, needs_sync, reason
                 FROM project_sync_clock_state
                 WHERE singleton_id = 1
                 """
@@ -402,6 +471,7 @@ class ProjectSyncRepository:
             )
         return SharedClockState(
             trusted_wall_at=current.trusted_wall_at,
+            last_observed_wall_at=current.last_observed_wall_at,
             clock_untrusted=updated_untrusted,
             needs_sync=updated_needs_sync,
             reason=updated_reason,
@@ -1042,11 +1112,12 @@ class ProjectSyncRepository:
         connection.execute(
             """
             UPDATE project_sync_clock_state
-            SET trusted_wall_at = ?, clock_untrusted = 0,
+            SET trusted_wall_at = ?, last_observed_wall_at = ?,
+                clock_untrusted = 0,
                 needs_sync = 0, reason = 'normal'
             WHERE singleton_id = 1
             """,
-            (_datetime_text(finished_at),),
+            (_datetime_text(finished_at), _datetime_text(finished_at)),
         )
 
     def _build_effective_records(
@@ -1440,6 +1511,9 @@ def _clock_state_from_row(row: sqlite3.Row) -> SharedClockState:
         raise RuntimeError("clock_state_invalid")
     return SharedClockState(
         trusted_wall_at=_optional_parse_datetime(row["trusted_wall_at"]),
+        last_observed_wall_at=_optional_parse_datetime(
+            row["last_observed_wall_at"]
+        ),
         clock_untrusted=bool(row["clock_untrusted"]),
         needs_sync=bool(row["needs_sync"]),
         reason=reason,

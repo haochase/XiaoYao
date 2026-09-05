@@ -54,17 +54,15 @@ class ProjectClockGuard:
     ) -> ClockCheckResult:
         _require_aware(wall_now)
         sample = self._read_monotonic(monotonic_now)
-        shared = self._repository.load_clock_state()
-        detected_untrusted = (
-            shared.trusted_wall_at is not None
-            and (
-                shared.trusted_wall_at - wall_now
-            ).total_seconds() > CLOCK_ROLLBACK_THRESHOLD_SECONDS
+        shared = self._repository.observe_wall_clock(
+            wall_now,
+            rollback_threshold_seconds=CLOCK_ROLLBACK_THRESHOLD_SECONDS,
         )
-        detected_sync = detected_untrusted
+        detected_untrusted = False
+        detected_sync = False
         detected_reason: Literal[
             "normal", "resume_detected", "clock_rollback"
-        ] = "clock_rollback" if detected_untrusted else "normal"
+        ] = "normal"
 
         with self._lock:
             if self._last_wall is not None and self._last_monotonic is not None:
@@ -90,8 +88,6 @@ class ProjectClockGuard:
                     else "resume_detected"
                 ),
             )
-        else:
-            shared = self._repository.load_clock_state()
         with self._lock:
             self._local_sync_request = (
                 self._local_sync_request or shared.needs_sync

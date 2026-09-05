@@ -191,10 +191,15 @@ def envelope(cursor: int, at: datetime, *, revoked: bool = False) -> SyncEnvelop
     )
 
 
-def settings(database_path: Path) -> Settings:
+def settings(
+    database_path: Path,
+    *,
+    source_freshness_seconds: int = 1_800,
+) -> Settings:
     return Settings(
         database_path=database_path,
         project_api_principals=(principal(),),
+        project_source_freshness_seconds=source_freshness_seconds,
     )
 
 
@@ -562,6 +567,60 @@ def test_new_device_process_uses_persisted_wall_clock_baseline(
     state = repository.load_clock_state()
     assert blocked.status_code == 404
     assert blocked.json()["detail"] == "source_stale"
+    assert state.clock_untrusted
+    assert state.needs_sync
+
+
+def test_new_process_detects_rollback_from_persisted_query_high_watermark(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "query-clock-high-watermark.db"
+    repository = ProjectSyncRepository(database_path)
+    repository.initialize()
+    repository.configure_protection(
+        digest("test-user"),
+        ReversibleProtector.protector_version,
+    )
+    writer = ProjectSyncService(
+        repository,
+        ReversibleProtector(),
+        ProjectSnapshotRegistry(),
+    )
+    writer.apply(envelope(1, NOW), principal=principal(), now=NOW)
+    configure_device_dependencies(monkeypatch)
+    configured = settings(
+        database_path,
+        source_freshness_seconds=86_400,
+    )
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    later_app = create_app(
+        configured,
+        project_clock=lambda: NOW + timedelta(minutes=20),
+        project_monotonic=lambda: 100.0,
+    )
+    with TestClient(later_app) as client:
+        assert client.post(
+            f"/v1/projects/{PROJECT_ID}/query",
+            json={"query": "terminal plan", "kind": "decision_check"},
+            headers=headers,
+        ).status_code == 200
+
+    restarted_app = create_app(
+        configured,
+        project_clock=lambda: NOW + timedelta(minutes=10),
+        project_monotonic=lambda: 1.0,
+    )
+    with TestClient(restarted_app) as client:
+        blocked = client.post(
+            f"/v1/projects/{PROJECT_ID}/query",
+            json={"query": "terminal plan", "kind": "decision_check"},
+            headers=headers,
+        )
+
+    assert blocked.status_code == 404
+    assert blocked.json()["detail"] == "source_stale"
+    state = repository.load_clock_state()
     assert state.clock_untrusted
     assert state.needs_sync
 
