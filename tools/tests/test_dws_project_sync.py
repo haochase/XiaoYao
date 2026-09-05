@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import re
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
+from threading import BrokenBarrierError
 from types import SimpleNamespace
 from urllib.error import URLError
 from urllib.request import ProxyHandler
@@ -21,6 +23,7 @@ from companion_gateway.project.models import (
 )
 from companion_gateway.project.sync_models import SourceErrorType
 import tools.dws_project_sync as sync_cli
+import tools.dws_sync.state_lock as state_lock
 from tools.dws_project_sync import (
     QwenProjectContextArtifact,
     build_envelope,
@@ -289,6 +292,92 @@ class RecordingUrlOpen:
             __enter__=lambda self: self,
             __exit__=lambda *_args: None,
         )
+
+
+def _concurrent_push_worker(
+    args: list[str],
+    load_barrier: object,
+    observations: object,
+) -> None:
+    original_load_state = sync_cli._load_state
+
+    def synchronized_load_state(
+        path: Path, project_id: str
+    ):  # type: ignore[no-untyped-def]
+        state = original_load_state(path, project_id)
+        observations.put(  # type: ignore[attr-defined]
+            ("loaded", state.last_cursor, state.pending is None)
+        )
+        try:
+            load_barrier.wait(timeout=0.5)  # type: ignore[attr-defined]
+        except BrokenBarrierError:
+            pass
+        return state
+
+    def urlopen(request, *, timeout: float):  # type: ignore[no-untyped-def]
+        assert timeout == 30.0
+        request_payload = json.loads(request.data)
+        observations.put(  # type: ignore[attr-defined]
+            ("sent", request_payload["source_cursor"], request_payload["sync_id"])
+        )
+        response = {
+            "sync_id": request_payload["sync_id"],
+            "outcome": "applied",
+            "project_status": "healthy",
+            "accepted_sources": 1,
+            "failed_sources": 0,
+            "generation_id": "generation-private",
+            "next_sync_before": "2026-09-05T12:05:00+00:00",
+        }
+        return SimpleNamespace(
+            read=lambda _size: canonical(response).encode("utf-8"),
+            close=lambda: None,
+        )
+
+    sync_cli._load_state = synchronized_load_state
+    result = main(
+        args,
+        urlopen=urlopen,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    )
+    observations.put(("result", result))  # type: ignore[attr-defined]
+
+
+def _blocking_push_worker(
+    args: list[str],
+    entered_http: object,
+    release_http: object,
+    observations: object,
+) -> None:
+    def urlopen(request, *, timeout: float):  # type: ignore[no-untyped-def]
+        assert timeout == 30.0
+        request_payload = json.loads(request.data)
+        observations.put(  # type: ignore[attr-defined]
+            ("sent", request_payload["source_cursor"], request_payload["sync_id"])
+        )
+        entered_http.set()  # type: ignore[attr-defined]
+        if not release_http.wait(timeout=5):  # type: ignore[attr-defined]
+            raise TimeoutError
+        response = {
+            "sync_id": request_payload["sync_id"],
+            "outcome": "applied",
+            "project_status": "healthy",
+            "accepted_sources": 1,
+            "failed_sources": 0,
+            "generation_id": "generation-private",
+            "next_sync_before": "2026-09-05T12:05:00+00:00",
+        }
+        return SimpleNamespace(
+            read=lambda _size: canonical(response).encode("utf-8"),
+            close=lambda: None,
+        )
+
+    result = main(
+        args,
+        urlopen=urlopen,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    )
+    observations.put(("result", result))  # type: ignore[attr-defined]
 
 
 class PendingUrlOpen:
@@ -767,6 +856,193 @@ def test_push_uses_named_bearer_and_promotes_pending_state(
     assert "sync_id" not in output
     assert "generation_id" not in output
     assert "private-token" not in canonical(output)
+
+    lock_files = list(paths["state"].parent.glob(".dws-sync-state-*.lock"))
+    assert len(lock_files) == 1
+    assert lock_files[0].parent == paths["state"].parent
+    assert "project-1" not in lock_files[0].name
+
+
+def test_concurrent_pushes_serialize_state_lifecycle_across_processes(
+    tmp_path: Path,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    process_context = multiprocessing.get_context("spawn")
+    load_barrier = process_context.Barrier(2)
+    observations = process_context.Queue()
+    processes = [
+        process_context.Process(
+            target=_concurrent_push_worker,
+            args=(push_args(paths), load_barrier, observations),
+        )
+        for _ in range(2)
+    ]
+
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=10)
+            assert process.exitcode == 0
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2)
+
+    observed = [observations.get(timeout=2) for _ in range(6)]
+    loaded = sorted(item[1:] for item in observed if item[0] == "loaded")
+    sent = sorted(item[1:] for item in observed if item[0] == "sent")
+    results = [item[1] for item in observed if item[0] == "result"]
+    state = json.loads(paths["state"].read_text(encoding="utf-8"))
+
+    assert loaded == [(0, True), (1, True)]
+    assert [item[0] for item in sent] == [1, 2]
+    assert len({item[1] for item in sent}) == 2
+    assert results == [0, 0]
+    assert state["last_cursor"] == 2
+    assert state["pending"] is None
+
+
+def test_push_lock_is_held_through_http_and_timeout_is_public(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    process_context = multiprocessing.get_context("spawn")
+    entered_http = process_context.Event()
+    release_http = process_context.Event()
+    observations = process_context.Queue()
+    holder = process_context.Process(
+        target=_blocking_push_worker,
+        args=(push_args(paths), entered_http, release_http, observations),
+    )
+    contender_sent = False
+
+    def contender_urlopen(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal contender_sent
+        contender_sent = True
+        return RecordingUrlOpen()(*_args, **_kwargs)
+
+    try:
+        holder.start()
+        assert entered_http.wait(timeout=5)
+        monkeypatch.setattr(sync_cli, "SYNC_LOCK_TIMEOUT_SECONDS", 0.1)
+
+        assert main(
+            push_args(paths),
+            urlopen=contender_urlopen,
+            environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+        ) == 1
+        assert json.loads(capsys.readouterr().out) == {
+            "status": "error",
+            "error_type": "sync_lock_timeout",
+        }
+        assert contender_sent is False
+    finally:
+        release_http.set()
+        holder.join(timeout=10)
+        if holder.is_alive():
+            holder.terminate()
+            holder.join(timeout=2)
+
+    assert holder.exitcode == 0
+    holder_observations = [observations.get(timeout=2) for _ in range(2)]
+    assert [item[0] for item in holder_observations] == ["sent", "result"]
+
+
+def test_state_lock_wait_is_capped_at_thirty_seconds(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    clock = iter((0.0, 30.0))
+    sleeps: list[float] = []
+
+    def unavailable(_stream: object) -> None:
+        raise OSError
+
+    monkeypatch.setattr(state_lock, "_try_lock", unavailable)
+    with pytest.raises(ValueError, match="^sync_lock_timeout$"):
+        with state_lock.acquire_state_lock(
+            tmp_path / "state.json",
+            "project-1",
+            timeout=300.0,
+            monotonic=lambda: next(clock),
+            sleep=sleeps.append,
+        ):
+            pytest.fail("unavailable lock must not be yielded")
+
+    assert sleeps == []
+
+
+def test_different_state_files_do_not_block_each_other(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    independent_paths = {**paths, "state": tmp_path / "independent-state.json"}
+    process_context = multiprocessing.get_context("spawn")
+    entered_http = process_context.Event()
+    release_http = process_context.Event()
+    observations = process_context.Queue()
+    holder = process_context.Process(
+        target=_blocking_push_worker,
+        args=(push_args(paths), entered_http, release_http, observations),
+    )
+
+    try:
+        holder.start()
+        assert entered_http.wait(timeout=5)
+        monkeypatch.setattr(sync_cli, "SYNC_LOCK_TIMEOUT_SECONDS", 0.1)
+
+        assert main(
+            push_args(independent_paths),
+            urlopen=RecordingUrlOpen(),
+            environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+        ) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "synced"
+    finally:
+        release_http.set()
+        holder.join(timeout=10)
+        if holder.is_alive():
+            holder.terminate()
+            holder.join(timeout=2)
+
+    assert holder.exitcode == 0
+    assert json.loads(independent_paths["state"].read_text(encoding="utf-8"))[
+        "last_cursor"
+    ] == 1
+
+
+def test_keyboard_interrupt_releases_push_lock(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+
+    def interrupt(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise KeyboardInterrupt
+
+    assert main(
+        push_args(paths),
+        urlopen=interrupt,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "interrupted",
+    }
+
+    monkeypatch.setattr(sync_cli, "SYNC_LOCK_TIMEOUT_SECONDS", 0.1)
+    assert main(
+        push_args(paths),
+        urlopen=RecordingUrlOpen(),
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "synced"
 
 
 def test_push_requires_only_fixed_token_environment(tmp_path: Path, capsys) -> None:

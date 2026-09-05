@@ -53,6 +53,7 @@ try:
         DwsSourceRecord,
         collect_sources,
     )
+    from tools.dws_sync.state_lock import acquire_state_lock
 except ModuleNotFoundError as exc:
     if exc.name != "tools":
         raise
@@ -66,11 +67,13 @@ except ModuleNotFoundError as exc:
         DwsSourceRecord,
         collect_sources,
     )
+    from dws_sync.state_lock import acquire_state_lock  # type: ignore[no-redef]
 
 
 MAX_PAYLOAD_BYTES = 2_097_152
 MAX_PRIVATE_INPUT_BYTES = 2_097_152
 MAX_STATE_BYTES = 65_536
+SYNC_LOCK_TIMEOUT_SECONDS = 30.0
 TOKEN_ENVIRONMENT_VARIABLE = "COMPANION_DWS_SYNC_TOKEN"
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -136,6 +139,7 @@ _PUBLIC_ERROR_TYPES = {
     "state_file_parent_invalid",
     "state_file_too_large",
     "state_project_mismatch",
+    "sync_lock_timeout",
     "sync_failed",
     "token_invalid",
     "token_missing",
@@ -963,93 +967,100 @@ def _push_command(
         raise ValueError("token_missing")
     if "\r" in token or "\n" in token:
         raise ValueError("token_invalid")
-    state = _load_state(state_path, project.project_id)
-    cursor = (
-        state.pending.source_cursor
-        if state.pending is not None
-        else state.last_cursor + 1
-    )
-    envelope = _build_envelope(
-        project,
-        source_bundle,
-        artifact.context,
-        completed_retrieval_request_ids=artifact.completed_retrieval_request_ids,
-        source_cursor=cursor,
-        now=now(),
-    )
-    if state.pending is not None:
-        if state.pending.content_hash != envelope.content_hash:
-            raise ValueError("pending_sync_conflict")
-        if state.pending.sync_id != envelope.sync_id:
-            raise ValueError("state_file_invalid")
-    encoded = _canonical_bytes(envelope.model_dump(mode="json"))
-    if len(encoded) > MAX_PAYLOAD_BYTES:
-        raise ValueError("payload_too_large")
-
-    pending = PendingSync(
-        source_cursor=envelope.source_cursor,
-        content_hash=envelope.content_hash,
-        sync_id=envelope.sync_id,
-    )
-    if state.pending is None:
-        _atomic_write(
-            state_path,
-            _canonical_bytes(
-                state.model_copy(update={"pending": pending}).model_dump()
-            ),
+    with acquire_state_lock(
+        state_path,
+        project.project_id,
+        timeout=SYNC_LOCK_TIMEOUT_SECONDS,
+    ):
+        state = _load_state(state_path, project.project_id)
+        cursor = (
+            state.pending.source_cursor
+            if state.pending is not None
+            else state.last_cursor + 1
         )
+        envelope = _build_envelope(
+            project,
+            source_bundle,
+            artifact.context,
+            completed_retrieval_request_ids=(
+                artifact.completed_retrieval_request_ids
+            ),
+            source_cursor=cursor,
+            now=now(),
+        )
+        if state.pending is not None:
+            if state.pending.content_hash != envelope.content_hash:
+                raise ValueError("pending_sync_conflict")
+            if state.pending.sync_id != envelope.sync_id:
+                raise ValueError("state_file_invalid")
+        encoded = _canonical_bytes(envelope.model_dump(mode="json"))
+        if len(encoded) > MAX_PAYLOAD_BYTES:
+            raise ValueError("payload_too_large")
 
-    request = Request(
-        (
-            f"{gateway}/v1/projects/"
-            f"{quote(project.project_id, safe='')}/sync"
-        ),
-        data=encoded,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Content-Length": str(len(encoded)),
-        },
-        method="POST",
-    )
-    started = monotonic()
-    response = None
-    try:
-        response = opener(request, timeout=30.0)
-        raw_response = response.read(65_537)
-    except HTTPError:
-        raise ValueError("http_error") from None
-    except (TimeoutError, URLError, OSError):
-        raise ValueError("network_error") from None
-    except Exception:
-        raise ValueError("network_error") from None
-    finally:
-        close = getattr(response, "close", None)
-        if callable(close):
-            close()
-    response_payload = _validate_response(raw_response, envelope=envelope)
-    duration_ms = max(0, int((monotonic() - started) * 1000))
-    promoted = SyncCliState(
-        schema_version=1,
-        project_id=project.project_id,
-        last_cursor=envelope.source_cursor,
-        last_content_hash=envelope.content_hash,
-        last_sync_id=envelope.sync_id,
-        pending=None,
-    )
-    _atomic_write(state_path, _canonical_bytes(promoted.model_dump()))
-    return {
-        "status": "synced",
-        "project_id": project.project_id,
-        "source_count": len(source_bundle.records),
-        "payload_bytes": len(encoded),
-        "content_hash": envelope.content_hash,
-        "outcome": response_payload["outcome"],
-        "project_status": response_payload["project_status"],
-        "accepted_sources": response_payload["accepted_sources"],
-        "failed_sources": response_payload["failed_sources"],
-        "duration_ms": duration_ms,
-    }
+        pending = PendingSync(
+            source_cursor=envelope.source_cursor,
+            content_hash=envelope.content_hash,
+            sync_id=envelope.sync_id,
+        )
+        if state.pending is None:
+            _atomic_write(
+                state_path,
+                _canonical_bytes(
+                    state.model_copy(update={"pending": pending}).model_dump()
+                ),
+            )
+
+        request = Request(
+            (
+                f"{gateway}/v1/projects/"
+                f"{quote(project.project_id, safe='')}/sync"
+            ),
+            data=encoded,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(encoded)),
+            },
+            method="POST",
+        )
+        started = monotonic()
+        response = None
+        try:
+            response = opener(request, timeout=30.0)
+            raw_response = response.read(65_537)
+        except HTTPError:
+            raise ValueError("http_error") from None
+        except (TimeoutError, URLError, OSError):
+            raise ValueError("network_error") from None
+        except Exception:
+            raise ValueError("network_error") from None
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+        response_payload = _validate_response(raw_response, envelope=envelope)
+        duration_ms = max(0, int((monotonic() - started) * 1000))
+        promoted = SyncCliState(
+            schema_version=1,
+            project_id=project.project_id,
+            last_cursor=envelope.source_cursor,
+            last_content_hash=envelope.content_hash,
+            last_sync_id=envelope.sync_id,
+            pending=None,
+        )
+        _atomic_write(state_path, _canonical_bytes(promoted.model_dump()))
+        return {
+            "status": "synced",
+            "project_id": project.project_id,
+            "source_count": len(source_bundle.records),
+            "payload_bytes": len(encoded),
+            "content_hash": envelope.content_hash,
+            "outcome": response_payload["outcome"],
+            "project_status": response_payload["project_status"],
+            "accepted_sources": response_payload["accepted_sources"],
+            "failed_sources": response_payload["failed_sources"],
+            "duration_ms": duration_ms,
+        }
 
 
 def main(
