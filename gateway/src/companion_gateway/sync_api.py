@@ -20,7 +20,10 @@ from companion_gateway.project.auth import (
 )
 from companion_gateway.project.index import ProjectSnapshotRegistry
 from companion_gateway.project.models import EvidenceRef
-from companion_gateway.project.protection import WindowsDpapiProtector
+from companion_gateway.project.protection import (
+    WindowsDpapiProtector,
+    protection_identity_digest,
+)
 from companion_gateway.project.sync_models import (
     RetrievalRequest,
     RetrievalRequestStatus,
@@ -301,14 +304,22 @@ def create_sync_app(
     if repository is None:
         repository = ProjectSyncRepository(settings.database_path)
         repository.initialize()
-    service = sync_service or ProjectSyncService(
-        repository,
-        WindowsDpapiProtector(),
-        ProjectSnapshotRegistry(),
-        sync_interval_seconds=_SYNC_INTERVAL_SECONDS,
-        source_freshness_seconds=settings.project_source_freshness_seconds,
-        clock_skew_seconds=settings.project_sync_clock_skew_seconds,
-    )
+    service = sync_service
+    if service is None:
+        protector = WindowsDpapiProtector()
+        repository.configure_protection(
+            protection_identity_digest(),
+            protector.protector_version,
+        )
+        service = ProjectSyncService(
+            repository,
+            protector,
+            ProjectSnapshotRegistry(),
+            sync_interval_seconds=_SYNC_INTERVAL_SECONDS,
+            source_freshness_seconds=settings.project_source_freshness_seconds,
+            clock_skew_seconds=settings.project_sync_clock_skew_seconds,
+        )
+        service.restore_active_projects()
     authenticator = ProjectApiAuthenticator(settings.project_api_principals)
     app = FastAPI(title="XiaoYao Project Sync Gateway", version="0.1.0")
     app.add_middleware(
@@ -477,14 +488,20 @@ def create_default_sync_app() -> FastAPI:
     settings = Settings.from_environment()
     repository = ProjectSyncRepository(settings.database_path)
     repository.initialize()
+    protector = WindowsDpapiProtector()
+    repository.configure_protection(
+        protection_identity_digest(),
+        protector.protector_version,
+    )
     service = ProjectSyncService(
         repository,
-        WindowsDpapiProtector(),
+        protector,
         ProjectSnapshotRegistry(),
         sync_interval_seconds=_SYNC_INTERVAL_SECONDS,
         source_freshness_seconds=settings.project_source_freshness_seconds,
         clock_skew_seconds=settings.project_sync_clock_skew_seconds,
     )
+    service.restore_active_projects()
     return create_sync_app(
         settings,
         repository=repository,

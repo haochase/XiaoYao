@@ -535,6 +535,28 @@ def test_failed_source_retains_last_success_and_decrypted_payload(
     ) is None
 
 
+def test_restart_restores_all_active_snapshots_before_status(
+    tmp_path: Path,
+) -> None:
+    service, repository, protector, _ = sync_service(tmp_path)
+    service.apply(envelope(), principal=PRINCIPAL, now=NOW)
+    restored_registry = ProjectSnapshotRegistry()
+    restored, _, _, _ = sync_service(
+        tmp_path,
+        repository=repository,
+        protector=protector,
+        registry=restored_registry,
+    )
+
+    assert restored.restore_active_projects() == (PROJECT_ID,)
+    snapshot = restored_registry.get(PROJECT_ID)
+    assert snapshot is not None
+    assert snapshot.context == context()
+    assert restored.status(PROJECT_ID, now=NOW).health is (
+        ProjectSyncHealth.HEALTHY
+    )
+
+
 def test_status_projects_expired_active_source_without_mutating_snapshot(
     tmp_path: Path,
 ) -> None:

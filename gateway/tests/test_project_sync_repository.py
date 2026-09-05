@@ -296,6 +296,41 @@ def repository_at(tmp_path: Path) -> ProjectSyncRepository:
     return ProjectSyncRepository(tmp_path / "project-memory.db")
 
 
+def test_protection_descriptor_persists_and_rejects_identity_or_version_change(
+    tmp_path: Path,
+) -> None:
+    identity = "a" * 64
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.configure_protection(identity, "test-protector-v1")
+
+    reopened = repository_at(tmp_path)
+    reopened.initialize()
+    reopened.configure_protection(identity, "test-protector-v1")
+    assert reopened.protection_descriptor() == (
+        identity,
+        "test-protector-v1",
+    )
+
+    with pytest.raises(SyncConflict, match="protection_identity_mismatch"):
+        reopened.configure_protection("b" * 64, "test-protector-v1")
+    with pytest.raises(SyncConflict, match="protection_version_mismatch"):
+        reopened.configure_protection(identity, "test-protector-v2")
+
+
+def test_active_ciphertext_without_protection_descriptor_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1))
+
+    reopened = repository_at(tmp_path)
+    reopened.initialize()
+    with pytest.raises(SyncConflict, match="protection_metadata_missing"):
+        reopened.configure_protection("a" * 64, "test-protector-v1")
+
+
 def test_commit_promotes_one_generation_atomically(tmp_path: Path) -> None:
     repository = repository_at(tmp_path)
     repository.initialize()

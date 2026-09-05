@@ -329,6 +329,55 @@ class ProjectSyncService:
             ),
         )
 
+    def restore_active_projects(self) -> tuple[str, ...]:
+        restored: list[tuple[str, ProjectRuntimeSnapshot]] = []
+        for project_id in self._repository.list_active_project_ids():
+            active = self._repository.load_active_generation(project_id)
+            if active is None:
+                raise ProjectSyncValidationError("active_generation_missing")
+            sources, chunks = self._decrypt_generation(active, None)
+            sources = tuple(
+                sorted(
+                    sources,
+                    key=lambda item: (
+                        item.source_type.value,
+                        item.source_id_hash,
+                    ),
+                )
+            )
+            chunks = tuple(
+                sorted(
+                    chunks,
+                    key=lambda item: (
+                        item.source_id,
+                        item.source_version,
+                        item.ordinal,
+                        item.chunk_id,
+                    ),
+                )
+            )
+            restored.append(
+                (
+                    project_id,
+                    ProjectRuntimeSnapshot(
+                        project_id=project_id,
+                        generation_id=active.generation_id,
+                        context=active.context,
+                        source_states=active.source_states,
+                        sources=sources,
+                        chunks=chunks,
+                        evidence_index=ProjectEvidenceIndex(
+                            active.context,
+                            sources,
+                            chunks,
+                        ),
+                    ),
+                )
+            )
+        for project_id, snapshot in restored:
+            self._registry.swap(project_id, snapshot)
+        return tuple(project_id for project_id, _ in restored)
+
     def status(self, project_id: str, *, now: datetime) -> ProjectSyncStatus:
         _require_aware(now, "now_must_be_aware")
         snapshot = self._registry.get(project_id)

@@ -11,6 +11,7 @@ from typing import Protocol, TypeVar
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 TOKEN_QUERY = 0x0008
 TOKEN_USER = 1
+WINDOWS_DPAPI_PROTECTOR_VERSION = "windows-dpapi-current-user-v1"
 
 
 _Result = TypeVar("_Result")
@@ -193,6 +194,8 @@ def _close_handle(apis: _WindowsApis, handle: wintypes.HANDLE) -> None:
 
 
 class WindowsDpapiProtector:
+    protector_version = WINDOWS_DPAPI_PROTECTOR_VERSION
+
     def protect(self, project_id: str, plaintext: bytes) -> bytes:
         apis = _windows_apis()
         plaintext_blob, _plaintext_buffer = _data_blob(plaintext)

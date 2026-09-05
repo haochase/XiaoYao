@@ -87,6 +87,7 @@ class StoredProjectGeneration:
 class ProjectSyncRepository:
     def __init__(self, database_path: str | Path) -> None:
         self._database_path = Path(database_path)
+        self._configured_protection: tuple[str, str] | None = None
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._database_path, timeout=5)
@@ -117,6 +118,12 @@ class ProjectSyncRepository:
                 CREATE TABLE IF NOT EXISTS project_active_generations (
                     project_id TEXT PRIMARY KEY,
                     generation_id TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS project_protection_metadata (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    identity_digest TEXT NOT NULL,
+                    protector_version TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS project_source_states (
@@ -190,11 +197,90 @@ class ProjectSyncRepository:
                 """
             )
 
+    def configure_protection(
+        self,
+        identity_digest: str,
+        protector_version: str,
+    ) -> None:
+        if (
+            len(identity_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in identity_digest
+            )
+        ):
+            raise ValueError("protection_identity_invalid")
+        if (
+            not protector_version.strip()
+            or len(protector_version) > 128
+            or any(character.isspace() for character in protector_version)
+        ):
+            raise ValueError("protection_version_invalid")
+        descriptor = (identity_digest, protector_version)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT identity_digest, protector_version
+                FROM project_protection_metadata
+                WHERE singleton_id = 1
+                """
+            ).fetchone()
+            if row is None:
+                active = connection.execute(
+                    "SELECT 1 FROM project_active_generations LIMIT 1"
+                ).fetchone()
+                if active is not None:
+                    raise SyncConflict("protection_metadata_missing")
+                connection.execute(
+                    """
+                    INSERT INTO project_protection_metadata(
+                        singleton_id, identity_digest, protector_version
+                    ) VALUES (1, ?, ?)
+                    """,
+                    descriptor,
+                )
+            else:
+                stored = (
+                    str(row["identity_digest"]),
+                    str(row["protector_version"]),
+                )
+                if stored[0] != identity_digest:
+                    raise SyncConflict("protection_identity_mismatch")
+                if stored[1] != protector_version:
+                    raise SyncConflict("protection_version_mismatch")
+        self._configured_protection = descriptor
+
+    def protection_descriptor(self) -> tuple[str, str] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT identity_digest, protector_version
+                FROM project_protection_metadata
+                WHERE singleton_id = 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["identity_digest"]), str(row["protector_version"])
+
+    def list_active_project_ids(self) -> tuple[str, ...]:
+        with self._connect() as connection:
+            self._assert_protection_access(connection)
+            rows = connection.execute(
+                """
+                SELECT project_id FROM project_active_generations
+                ORDER BY project_id
+                """
+            ).fetchall()
+        return tuple(str(row["project_id"]) for row in rows)
+
     def commit(self, candidate: SyncCommit) -> SyncCommitResult:
         self._validate_candidate(candidate)
         envelope = candidate.envelope
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._assert_protection_access(connection)
             active = self._load_active_row(connection, envelope.project_id)
             stored_context = self._load_context(connection, envelope.project_id)
             if active is not None:
@@ -320,6 +406,7 @@ class ProjectSyncRepository:
     ) -> StoredProjectGeneration | None:
         with self._connect() as connection:
             connection.execute("BEGIN")
+            self._assert_protection_access(connection)
             generation = self._load_active_row(connection, project_id)
             if generation is None:
                 return None
@@ -358,6 +445,27 @@ class ProjectSyncRepository:
                 _protected_chunk_from_row(row) for row in chunk_rows
             ),
         )
+
+    def _assert_protection_access(self, connection: sqlite3.Connection) -> None:
+        row = connection.execute(
+            """
+            SELECT identity_digest, protector_version
+            FROM project_protection_metadata
+            WHERE singleton_id = 1
+            """
+        ).fetchone()
+        if row is None:
+            return
+        if self._configured_protection is None:
+            raise SyncConflict("protection_identity_required")
+        stored = (
+            str(row["identity_digest"]),
+            str(row["protector_version"]),
+        )
+        if stored[0] != self._configured_protection[0]:
+            raise SyncConflict("protection_identity_mismatch")
+        if stored[1] != self._configured_protection[1]:
+            raise SyncConflict("protection_version_mismatch")
 
     def save_retrieval_request(self, request: RetrievalRequest) -> RetrievalRequest:
         with self._connect() as connection:

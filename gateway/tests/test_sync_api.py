@@ -248,7 +248,18 @@ def test_default_sync_app_initializes_dependencies_before_creating_app(
         def initialize(self) -> None:
             events.append("repository.initialized")
 
+        def configure_protection(
+            self,
+            identity_digest: str,
+            protector_version: str,
+        ) -> None:
+            assert identity_digest == digest("windows-user")
+            assert protector_version == "windows-dpapi-current-user-v1"
+            events.append("repository.protection_configured")
+
     class RecordingProtector:
+        protector_version = "windows-dpapi-current-user-v1"
+
         def __init__(self) -> None:
             events.append("protector.created")
 
@@ -281,6 +292,10 @@ def test_default_sync_app_initializes_dependencies_before_creating_app(
             )
             events.append("service.created")
 
+        def restore_active_projects(self) -> tuple[str, ...]:
+            events.append("service.restored")
+            return ()
+
     def create_recorded_app(
         config,
         *,
@@ -312,6 +327,12 @@ def test_default_sync_app_initializes_dependencies_before_creating_app(
     )
     monkeypatch.setattr(sync_api_module, "ProjectSyncRepository", RecordingRepository)
     monkeypatch.setattr(sync_api_module, "WindowsDpapiProtector", RecordingProtector)
+    monkeypatch.setattr(
+        sync_api_module,
+        "protection_identity_digest",
+        lambda: digest("windows-user"),
+        raising=False,
+    )
     monkeypatch.setattr(sync_api_module, "ProjectSnapshotRegistry", RecordingRegistry)
     monkeypatch.setattr(sync_api_module, "ProjectSyncService", RecordingService)
     monkeypatch.setattr(sync_api_module, "create_sync_app", create_recorded_app)
@@ -322,8 +343,10 @@ def test_default_sync_app_initializes_dependencies_before_creating_app(
         "repository.created",
         "repository.initialized",
         "protector.created",
+        "repository.protection_configured",
         "registry.created",
         "service.created",
+        "service.restored",
         "app.created",
     ]
 
