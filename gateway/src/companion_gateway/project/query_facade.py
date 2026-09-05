@@ -13,6 +13,9 @@ from companion_gateway.project.index import (
 from companion_gateway.project.clock_guard import ProjectClockGuard
 from companion_gateway.project.models import EvidenceRef
 from companion_gateway.project.protection import ContentProtector
+from companion_gateway.project.protection_state import (
+    initialize_repository_protection,
+)
 from companion_gateway.project.snapshot_loader import (
     ProjectSnapshotHydrator,
     SnapshotHydrationError,
@@ -53,6 +56,7 @@ class RepositoryBackedProjectQueryFacade:
         if not isinstance(version, str) or not version:
             raise ValueError("protector_version_missing")
         self._repository = repository
+        self._protector = protector
         self._protector_version = version
         self._identity_digest = identity_digest
         self._source_freshness_seconds = source_freshness_seconds
@@ -164,9 +168,10 @@ class RepositoryBackedProjectQueryFacade:
     def _configure_protection(self) -> None:
         if self._protection_configured:
             return
-        self._repository.configure_protection(
-            self._identity_digest(),
-            self._protector_version,
+        initialize_repository_protection(
+            self._repository,
+            self._protector,
+            identity_digest=self._identity_digest(),
         )
         self._protection_configured = True
 

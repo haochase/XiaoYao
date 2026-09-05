@@ -311,20 +311,7 @@ class ProjectSyncRepository:
         identity_digest: str,
         protector_version: str,
     ) -> None:
-        if (
-            len(identity_digest) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in identity_digest
-            )
-        ):
-            raise ValueError("protection_identity_invalid")
-        if (
-            not protector_version.strip()
-            or len(protector_version) > 128
-            or any(character.isspace() for character in protector_version)
-        ):
-            raise ValueError("protection_version_invalid")
+        self._validate_protection_descriptor(identity_digest, protector_version)
         descriptor = (identity_digest, protector_version)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -359,6 +346,97 @@ class ProjectSyncRepository:
                 if stored[1] != protector_version:
                     raise SyncConflict("protection_version_mismatch")
         self._configured_protection = descriptor
+
+    def adopt_verified_protection(
+        self,
+        identity_digest: str,
+        protector_version: str,
+        verified_generations: tuple[StoredProjectGeneration, ...],
+    ) -> None:
+        self._validate_protection_descriptor(identity_digest, protector_version)
+        descriptor = (identity_digest, protector_version)
+        expected = tuple(
+            sorted(
+                (
+                    item.project_id,
+                    item.generation_id,
+                    item.source_cursor,
+                    item.content_hash,
+                )
+                for item in verified_generations
+            )
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT identity_digest, protector_version
+                FROM project_protection_metadata
+                WHERE singleton_id = 1
+                """
+            ).fetchone()
+            if row is not None:
+                stored = (
+                    str(row["identity_digest"]),
+                    str(row["protector_version"]),
+                )
+                if stored[0] != identity_digest:
+                    raise SyncConflict("protection_identity_mismatch")
+                if stored[1] != protector_version:
+                    raise SyncConflict("protection_version_mismatch")
+            else:
+                actual = tuple(
+                    (
+                        str(item["project_id"]),
+                        str(item["generation_id"]),
+                        int(item["source_cursor"]),
+                        str(item["content_hash"]),
+                    )
+                    for item in connection.execute(
+                        """
+                        SELECT generation.project_id,
+                               generation.generation_id,
+                               generation.source_cursor,
+                               generation.content_hash
+                        FROM project_active_generations AS active
+                        JOIN project_sync_generations AS generation
+                          ON generation.project_id = active.project_id
+                         AND generation.generation_id = active.generation_id
+                        ORDER BY generation.project_id
+                        """
+                    )
+                )
+                if actual != expected:
+                    raise SyncConflict("protection_adoption_conflict")
+                connection.execute(
+                    """
+                    INSERT INTO project_protection_metadata(
+                        singleton_id, identity_digest, protector_version
+                    ) VALUES (1, ?, ?)
+                    """,
+                    descriptor,
+                )
+        self._configured_protection = descriptor
+
+    @staticmethod
+    def _validate_protection_descriptor(
+        identity_digest: str,
+        protector_version: str,
+    ) -> None:
+        if (
+            len(identity_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in identity_digest
+            )
+        ):
+            raise ValueError("protection_identity_invalid")
+        if (
+            not protector_version.strip()
+            or len(protector_version) > 128
+            or any(character.isspace() for character in protector_version)
+        ):
+            raise ValueError("protection_version_invalid")
 
     def protection_descriptor(self) -> tuple[str, str] | None:
         with self._connect() as connection:

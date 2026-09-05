@@ -18,6 +18,10 @@ from companion_gateway.project.models import (
     SourcedFact,
 )
 from companion_gateway.project.repository import ProjectMemoryRepository
+from companion_gateway.project.protection_state import (
+    ProtectionStateError,
+    initialize_repository_protection,
+)
 from companion_gateway.project.sync_models import (
     EvidenceChunk,
     ProjectSyncHealth,
@@ -77,6 +81,8 @@ PRINCIPAL = ProjectApiPrincipal(
 
 
 class ReversibleProtector:
+    protector_version = "test-reversible-v1"
+
     def __init__(self) -> None:
         self.protected_plaintexts: list[bytes] = []
         self.fail_protect = False
@@ -645,6 +651,46 @@ def test_restart_restores_all_active_snapshots_before_status(
     assert restored.status(PROJECT_ID, now=NOW).health is (
         ProjectSyncHealth.HEALTHY
     )
+
+
+def test_legacy_active_ciphertext_adopts_identity_after_full_decryption(
+    tmp_path: Path,
+) -> None:
+    service, repository, protector, _ = sync_service(tmp_path)
+    service.apply(envelope(), principal=PRINCIPAL, now=NOW)
+    identity = digest("legacy-windows-user")
+
+    initialize_repository_protection(
+        repository,
+        protector,
+        identity_digest=identity,
+    )
+
+    assert repository.protection_descriptor() == (
+        identity,
+        protector.protector_version,
+    )
+    assert repository.load_active_generation(PROJECT_ID) is not None
+
+
+def test_legacy_active_ciphertext_rejects_identity_when_decryption_fails(
+    tmp_path: Path,
+) -> None:
+    service, repository, protector, _ = sync_service(tmp_path)
+    service.apply(envelope(), principal=PRINCIPAL, now=NOW)
+    protector.fail_unprotect = True
+
+    with pytest.raises(
+        ProtectionStateError,
+        match="protection_identity_unverified",
+    ):
+        initialize_repository_protection(
+            repository,
+            protector,
+            identity_digest=digest("wrong-windows-user"),
+        )
+
+    assert repository.protection_descriptor() is None
 
 
 def test_status_projects_expired_active_source_without_mutating_snapshot(

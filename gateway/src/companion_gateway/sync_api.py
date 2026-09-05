@@ -24,6 +24,9 @@ from companion_gateway.project.protection import (
     WindowsDpapiProtector,
     protection_identity_digest,
 )
+from companion_gateway.project.protection_state import (
+    initialize_repository_protection,
+)
 from companion_gateway.project.sync_models import (
     RetrievalRequest,
     RetrievalRequestStatus,
@@ -311,9 +314,10 @@ def create_sync_app(
     service = sync_service
     if service is None:
         protector = WindowsDpapiProtector()
-        repository.configure_protection(
-            protection_identity_digest(),
-            protector.protector_version,
+        initialize_repository_protection(
+            repository,
+            protector,
+            identity_digest=protection_identity_digest(),
         )
         service = ProjectSyncService(
             repository,
@@ -479,9 +483,10 @@ def create_default_sync_app() -> FastAPI:
     repository = ProjectSyncRepository(settings.database_path)
     repository.initialize()
     protector = WindowsDpapiProtector()
-    repository.configure_protection(
-        protection_identity_digest(),
-        protector.protector_version,
+    initialize_repository_protection(
+        repository,
+        protector,
+        identity_digest=protection_identity_digest(),
     )
     service = ProjectSyncService(
         repository,
