@@ -12,7 +12,11 @@ from companion_gateway.project.auth import (
     ProjectAuthorizationError,
 )
 from companion_gateway.project.index import ProjectSnapshotRegistry
-from companion_gateway.project.models import EvidenceRef, ProjectContextPackage
+from companion_gateway.project.models import (
+    EvidenceRef,
+    ProjectContextPackage,
+    SourcedFact,
+)
 from companion_gateway.project.repository import ProjectMemoryRepository
 from companion_gateway.project.sync_models import (
     EvidenceChunk,
@@ -341,6 +345,92 @@ def test_apply_rejects_invalid_hash_clock_skew_and_scope(tmp_path: Path) -> None
     )
     with pytest.raises(ProjectAuthorizationError, match="project_scope_denied"):
         service.apply(valid, principal=wrong_scope, now=NOW)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("open_actions", ("legacy action",)),
+        ("current_risks", ("legacy risk",)),
+        ("next_meeting", "legacy meeting"),
+    ],
+)
+def test_sync_rejects_nonempty_legacy_facts(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    service, repository, _, _ = sync_service(tmp_path)
+    candidate = envelope()
+    legacy_context = candidate.context.model_copy(update={field: value})
+    candidate = candidate.model_copy(update={"context": legacy_context})
+    candidate = candidate.model_copy(
+        update={"content_hash": compute_envelope_content_hash(candidate)}
+    )
+
+    with pytest.raises(
+        ProjectSyncValidationError,
+        match="context_fact_unreferenced",
+    ):
+        service.apply(candidate, principal=PRINCIPAL, now=NOW)
+
+    assert repository.load_active_generation(PROJECT_ID) is None
+
+
+def test_sync_rejects_sourced_fact_with_unmatched_excerpt(tmp_path: Path) -> None:
+    service, repository, _, _ = sync_service(tmp_path)
+    candidate = envelope()
+    fabricated = DOCUMENT_REF.model_copy(
+        update={"excerpt": "Fact absent from active evidence"}
+    )
+    sourced_context = candidate.context.model_copy(
+        update={
+            "sourced_actions": (
+                SourcedFact(
+                    text="Fabricated action",
+                    source_refs=(fabricated,),
+                ),
+            )
+        }
+    )
+    candidate = candidate.model_copy(update={"context": sourced_context})
+    candidate = candidate.model_copy(
+        update={"content_hash": compute_envelope_content_hash(candidate)}
+    )
+
+    with pytest.raises(
+        ProjectSyncValidationError,
+        match="source_excerpt_mismatch",
+    ):
+        service.apply(candidate, principal=PRINCIPAL, now=NOW)
+
+    assert repository.load_active_generation(PROJECT_ID) is None
+
+
+def test_sync_accepts_sourced_fact_with_active_exact_excerpt(tmp_path: Path) -> None:
+    service, repository, _, _ = sync_service(tmp_path)
+    candidate = envelope()
+    sourced_context = candidate.context.model_copy(
+        update={
+            "sourced_actions": (
+                SourcedFact(
+                    text="Confirm the rollout decision",
+                    source_refs=(DOCUMENT_REF,),
+                ),
+            )
+        }
+    )
+    candidate = candidate.model_copy(update={"context": sourced_context})
+    candidate = candidate.model_copy(
+        update={"content_hash": compute_envelope_content_hash(candidate)}
+    )
+
+    result = service.apply(candidate, principal=PRINCIPAL, now=NOW)
+
+    assert result.outcome == "applied"
+    stored = repository.load_active_generation(PROJECT_ID)
+    assert stored is not None
+    assert stored.context.sourced_actions == sourced_context.sourced_actions
 
 
 def test_apply_rejects_chunk_id_that_does_not_match_content(tmp_path: Path) -> None:

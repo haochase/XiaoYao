@@ -55,8 +55,11 @@ _SAFE_SYNC_VALIDATION_ERRORS = frozenset(
     {
         "clock_skew_exceeded",
         "content_hash_mismatch",
+        "context_fact_unreferenced",
         "invalid_envelope",
         "now_must_be_aware",
+        "source_excerpt_mismatch",
+        "source_ref_mismatch",
     }
 )
 _SAFE_SOURCE_ERRORS = frozenset(
