@@ -75,6 +75,11 @@ class DwsReadError(Exception):
         super().__init__(normalized.value)
 
 
+class HostHandoffRequired(ValueError):
+    def __init__(self) -> None:
+        super().__init__("host_handoff_required")
+
+
 def normalized_read_error(
     response: Mapping[str, object],
     *,
@@ -198,6 +203,8 @@ class DwsCommandRunner:
             process,
             timeout_seconds=self._timeout_seconds,
         )
+        if stdout.lstrip().startswith(b"[dws-bash:pending-post-tool-use]:"):
+            raise HostHandoffRequired()
         payload = _parse_json_object(stdout)
         if returncode == 0:
             if payload is None:

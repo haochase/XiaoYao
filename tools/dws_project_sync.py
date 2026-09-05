@@ -101,6 +101,7 @@ _PUBLIC_ERROR_TYPES = {
     "dws_path_not_regular_file",
     "gateway_invalid",
     "http_error",
+    "host_handoff_required",
     "invalid_payload",
     "manifest_invalid_json",
     "manifest_invalid_utf8",
