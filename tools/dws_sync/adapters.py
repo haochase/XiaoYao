@@ -336,10 +336,10 @@ def read_document(
             sleep=sleep,
         )
     )
-    _validate_identity(info, spec.source_id)
-    content_type = info.get("contentType")
-    extension = info.get("extension", info.get("type"))
-    if content_type != "ALIDOC" or extension != "adoc":
+    _identity_present, _identity_matches, metadata_matches = (
+        document_metadata_contract(info, spec.source_id)
+    )
+    if not metadata_matches:
         raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
     read = _require_mapping(
         _run_unwrapped(
@@ -696,6 +696,20 @@ def _validate_identity(payload: Mapping[str, object], expected: str) -> None:
     identity = _metadata_value(payload, _IDENTITY_ALIASES)
     if identity is not _MISSING and identity != expected:
         raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
+
+
+def document_metadata_contract(
+    payload: Mapping[str, object], expected_source_id: str
+) -> tuple[bool, bool, bool]:
+    identity = _metadata_value(payload, _IDENTITY_ALIASES)
+    identity_present = identity is not _MISSING
+    identity_matches = not identity_present or identity == expected_source_id
+    metadata_matches = (
+        identity_matches
+        and payload.get("contentType") == "ALIDOC"
+        and payload.get("extension", payload.get("type")) == "adoc"
+    )
+    return identity_present, identity_matches, metadata_matches
 
 
 def _metadata_value(
