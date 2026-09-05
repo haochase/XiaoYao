@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 import companion_gateway.api as device_api
@@ -26,8 +28,12 @@ from companion_gateway.project.sync_models import (
     SyncEnvelope,
     SyncSourceType,
 )
+from companion_gateway.project.query_facade import (
+    RepositoryBackedProjectQueryFacade,
+)
 from companion_gateway.project.sync_repository import ProjectSyncRepository
 from companion_gateway.project.sync_service import (
+    ProjectSourceUnavailable,
     ProjectSyncService,
     compute_envelope_content_hash,
 )
@@ -172,7 +178,11 @@ def envelope(cursor: int, at: datetime, *, revoked: bool = False) -> SyncEnvelop
         source_cursor=cursor,
         content_hash="0" * 64,
         producer="qwenwork-dws",
-        context=context(at),
+        context=(
+            context(at).model_copy(update={"source_refs": (), "active_decisions": ()})
+            if revoked
+            else context(at)
+        ),
         sources=() if revoked else (active_source(at),),
         tombstones=(
             SourceTombstone(
@@ -275,9 +285,10 @@ def test_independent_device_app_refreshes_shared_sqlite_and_fails_closed(
     sync_service.apply(envelope(1, NOW), principal=principal(), now=NOW)
     configure_device_dependencies(monkeypatch)
 
+    current_time = {"value": NOW + timedelta(minutes=1)}
     device_app = create_app(
         settings(database_path),
-        project_clock=lambda: NOW + timedelta(minutes=1),
+        project_clock=lambda: current_time["value"],
     )
     headers = {"Authorization": f"Bearer {TOKEN}"}
     with TestClient(device_app) as client:
@@ -294,6 +305,7 @@ def test_independent_device_app_refreshes_shared_sqlite_and_fails_closed(
             principal=principal(),
             now=revoked_at,
         )
+        current_time["value"] = revoked_at
         blocked = client.post(
             f"/v1/projects/{PROJECT_ID}/query",
             json={"query": "terminal plan", "kind": "decision_check"},
@@ -301,7 +313,11 @@ def test_independent_device_app_refreshes_shared_sqlite_and_fails_closed(
         )
 
     assert blocked.status_code == 404
-    assert blocked.json()["detail"] == "source_unavailable"
+    assert blocked.json()["detail"] == "source_stale"
+    active = repository.load_active_generation(PROJECT_ID)
+    assert active is not None
+    assert active.context.active_decisions == ()
+    assert active.protected_chunks == ()
 
 
 def test_device_query_refreshes_new_generation_evidence_from_shared_sqlite(
@@ -457,9 +473,11 @@ def test_device_query_never_falls_back_when_active_ciphertext_cannot_decrypt(
     assert "private-decryption-detail" not in response.text
 
 
-def test_device_clock_rollback_is_shared_until_successful_sync(
+@pytest.mark.parametrize("clock_event", ["rollback", "resume"])
+def test_device_clock_recovery_is_shared_until_successful_sync(
     tmp_path: Path,
     monkeypatch,
+    clock_event: str,
 ) -> None:
     database_path = tmp_path / "shared-clock.db"
     repository = ProjectSyncRepository(database_path)
@@ -493,7 +511,9 @@ def test_device_clock_rollback_is_shared_until_successful_sync(
         )
         assert baseline.status_code == 200
 
-        wall["value"] = NOW + timedelta(seconds=100)
+        wall["value"] = NOW + timedelta(
+            seconds=100 if clock_event == "rollback" else 1101
+        )
         monotonic["value"] = 101.0
         blocked = client.post(
             f"/v1/projects/{PROJECT_ID}/query",
@@ -503,10 +523,12 @@ def test_device_clock_rollback_is_shared_until_successful_sync(
         shared = repository.load_clock_state()
         assert blocked.status_code == 404
         assert blocked.json()["detail"] == "source_stale"
-        assert shared.clock_untrusted
+        assert shared.clock_untrusted is (clock_event == "rollback")
         assert shared.needs_sync
         assert writer.status(PROJECT_ID, now=wall["value"]).health is (
             ProjectSyncHealth.CLOCK_UNTRUSTED
+            if clock_event == "rollback"
+            else ProjectSyncHealth.STALE
         )
 
         recovered_at = wall["value"] + timedelta(seconds=1)
@@ -526,6 +548,60 @@ def test_device_clock_rollback_is_shared_until_successful_sync(
     assert recovered.status_code == 200
     assert not repository.load_clock_state().clock_untrusted
     assert not repository.load_clock_state().needs_sync
+
+
+@pytest.mark.parametrize("first_observer", ["query", "sync"])
+def test_other_project_sync_does_not_release_clock_recovery(
+    tmp_path: Path,
+    first_observer: str,
+) -> None:
+    repository = ProjectSyncRepository(tmp_path / "project-recovery.db")
+    repository.initialize()
+    protector = ReversibleProtector()
+    writer = ProjectSyncService(
+        repository, protector, ProjectSnapshotRegistry(), monotonic=lambda: 50.0
+    )
+    writer.apply(envelope(1, NOW), principal=principal(), now=NOW)
+    second_id = "project-2"
+    second_context = context(NOW).model_copy(
+        update={"project_id": second_id, "active_decisions": ()}
+    )
+    second = envelope(1, NOW).model_copy(
+        update={
+            "project_id": second_id,
+            "context": second_context,
+            "sync_id": "second-sync-1",
+        }
+    )
+    second = second.model_copy(
+        update={"content_hash": compute_envelope_content_hash(second)}
+    )
+    second_principal = replace(principal(), project_ids=frozenset({second_id}))
+    writer.apply(second, principal=second_principal, now=NOW)
+    wall = {"value": NOW}
+    reader = RepositoryBackedProjectQueryFacade(
+        repository,
+        protector,
+        identity_digest=lambda: digest("test-user"),
+        source_freshness_seconds=1800,
+        clock=lambda: wall["value"],
+        monotonic=lambda: 100.0,
+    )
+    reader.get(second_id)
+    wall["value"] = NOW + timedelta(seconds=601)
+    if first_observer == "query":
+        reader.get(second_id)
+        assert repository.project_requires_clock_resync(second_id)
+    writer.apply(
+        envelope(2, wall["value"]), principal=principal(), now=wall["value"]
+    )
+    assert not repository.load_clock_state().needs_sync
+    reader.require_sources_fresh(PROJECT_ID, (source_ref(),), now=wall["value"])
+    with pytest.raises(ProjectSourceUnavailable, match="source_stale"):
+        reader.require_sources_fresh(second_id, (source_ref(),), now=wall["value"])
+    assert writer.status(second_id, now=wall["value"]).health is (
+        ProjectSyncHealth.STALE
+    )
 
 
 def test_new_device_process_uses_persisted_wall_clock_baseline(
@@ -667,7 +743,8 @@ def test_device_resume_sets_shared_needs_sync_without_persisting_monotonic(
 
     state = repository.load_clock_state()
     assert first.status_code == 200
-    assert resumed.status_code == 200
+    assert resumed.status_code == 404
+    assert resumed.json()["detail"] == "source_stale"
     assert state.needs_sync
     assert not state.clock_untrusted
     assert not hasattr(state, "monotonic")

@@ -68,11 +68,21 @@ class ProjectClockGuard:
             if self._last_wall is not None and self._last_monotonic is not None:
                 wall_elapsed = (wall_now - self._last_wall).total_seconds()
                 monotonic_elapsed = sample - self._last_monotonic
+                recently_synced = (
+                    shared.trusted_wall_at is not None
+                    and shared.trusted_wall_at > self._last_wall
+                    and 0 <= (wall_now - shared.trusted_wall_at).total_seconds()
+                    <= 2 * self._sync_interval_seconds
+                )
                 if wall_elapsed < -CLOCK_ROLLBACK_THRESHOLD_SECONDS:
                     detected_untrusted = True
                     detected_sync = True
                     detected_reason = "clock_rollback"
-                elif monotonic_elapsed > 2 * self._sync_interval_seconds:
+                elif (
+                    not recently_synced
+                    and max(wall_elapsed, monotonic_elapsed)
+                    > 2 * self._sync_interval_seconds
+                ):
                     detected_sync = True
                     detected_reason = "resume_detected"
             self._last_wall = wall_now

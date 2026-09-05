@@ -141,6 +141,8 @@ class RepositoryBackedProjectQueryFacade:
             raise ProjectSourceUnavailable("source_unavailable")
         if self._repository.load_clock_state().clock_untrusted:
             raise ProjectSourceUnavailable("clock_untrusted")
+        if self._repository.project_requires_clock_resync(project_id):
+            raise ProjectSourceUnavailable("source_stale")
         states = {
             (item.source_type, item.source_id_hash): item
             for item in snapshot.source_states
@@ -168,9 +170,8 @@ class RepositoryBackedProjectQueryFacade:
                 or state.last_success_at is None
             ):
                 raise ProjectSourceUnavailable("source_unavailable")
-            if (now - state.last_success_at).total_seconds() > (
-                self._source_freshness_seconds
-            ):
+            age = (now - state.last_success_at).total_seconds()
+            if not 0 <= age <= self._source_freshness_seconds:
                 raise ProjectSourceUnavailable("source_stale")
 
     def save_retrieval_request(
@@ -181,6 +182,8 @@ class RepositoryBackedProjectQueryFacade:
     ) -> RetrievalRequest:
         if self._repository.load_clock_state().clock_untrusted:
             raise ProjectSourceUnavailable("clock_untrusted")
+        if self._repository.project_requires_clock_resync(request.project_id):
+            raise ProjectSourceUnavailable("source_stale")
         try:
             return self._repository.save_retrieval_request(
                 request,
