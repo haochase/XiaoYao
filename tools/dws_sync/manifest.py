@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -119,21 +121,52 @@ class DwsManifest(BaseModel):
     def load(cls, path: Path) -> "DwsManifest":
         if not path.is_absolute():
             raise ValueError("manifest_path_not_absolute")
-        if not path.exists():
-            raise ValueError("manifest_not_found")
-        if not path.is_file():
-            raise ValueError("manifest_not_regular_file")
-        read_failed = False
+
+        path_error: str | None = None
+        path_mode: int | None = None
         try:
-            if path.stat().st_size > _MAX_MANIFEST_BYTES:
-                raise ValueError("manifest_too_large")
-            raw = path.read_bytes()
-        except ValueError:
-            raise
+            path_mode = path.lstat().st_mode
+        except FileNotFoundError:
+            path_error = "manifest_not_found"
         except OSError:
-            read_failed = True
-        if read_failed:
-            raise ValueError("manifest_unreadable")
+            path_error = "manifest_unreadable"
+        if path_error is not None:
+            raise ValueError(path_error)
+        assert path_mode is not None
+        if stat.S_ISFIFO(path_mode):
+            raise ValueError("manifest_not_regular_file")
+
+        read_error: str | None = None
+        descriptor_error: str | None = None
+        raw: bytes | None = None
+        try:
+            with path.open("rb") as stream:
+                opened_stat = os.fstat(stream.fileno())
+                if not stat.S_ISREG(opened_stat.st_mode):
+                    descriptor_error = "manifest_not_regular_file"
+                elif opened_stat.st_size > _MAX_MANIFEST_BYTES:
+                    descriptor_error = "manifest_too_large"
+                else:
+                    raw = stream.read(_MAX_MANIFEST_BYTES + 1)
+        except FileNotFoundError:
+            read_error = "manifest_not_found"
+        except IsADirectoryError:
+            read_error = "manifest_not_regular_file"
+        except PermissionError:
+            read_error = (
+                "manifest_not_regular_file"
+                if stat.S_ISDIR(path_mode)
+                else "manifest_unreadable"
+            )
+        except OSError:
+            read_error = "manifest_unreadable"
+        if read_error is not None:
+            raise ValueError(read_error)
+        if descriptor_error is not None:
+            raise ValueError(descriptor_error)
+        assert raw is not None
+        if len(raw) > _MAX_MANIFEST_BYTES:
+            raise ValueError("manifest_too_large")
 
         decode_failed = False
         try:

@@ -1,13 +1,58 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
 from companion_gateway.project.sync_models import SyncSourceType
-from tools.dws_sync.manifest import DwsManifest, DwsSourceSpec
+from tools.dws_sync.manifest import (
+    _MAX_MANIFEST_BYTES,
+    DwsManifest,
+    DwsSourceSpec,
+)
+
+
+class FakeManifestStream:
+    def __init__(self, raw: bytes, events: list[object]) -> None:
+        self._raw = raw
+        self._events = events
+
+    def __enter__(self) -> "FakeManifestStream":
+        self._events.append("enter")
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self._events.append("exit")
+
+    def fileno(self) -> int:
+        self._events.append("fileno")
+        return 73
+
+    def read(self, size: int = -1) -> bytes:
+        self._events.append(("read", size))
+        return self._raw
+
+
+class TrackingOpenedStat:
+    def __init__(self, size: int, events: list[object]) -> None:
+        self._size = size
+        self._events = events
+
+    @property
+    def st_mode(self) -> int:
+        self._events.append("st_mode")
+        return stat.S_IFREG
+
+    @property
+    def st_size(self) -> int:
+        self._events.append("st_size")
+        return self._size
 
 
 def write_manifest(
@@ -35,6 +80,188 @@ def write_manifest(
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
+
+
+def test_manifest_uses_one_opened_descriptor_and_one_bounded_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = write_manifest(tmp_path)
+    raw = path.read_bytes()
+    events: list[object] = []
+    real_exists = Path.exists
+    real_is_file = Path.is_file
+    real_open = Path.open
+    real_read_bytes = Path.read_bytes
+    real_stat = Path.stat
+
+    def guard_path_query(real_query: Any) -> Any:
+        def guarded_query(
+            queried_path: Path,
+            *args: object,
+            **kwargs: object,
+        ) -> Any:
+            if queried_path == path:
+                raise AssertionError("path query introduces a TOCTOU window")
+            return real_query(queried_path, *args, **kwargs)
+
+        return guarded_query
+
+    def guarded_stat(
+        queried_path: Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        if queried_path == path and follow_symlinks:
+            raise AssertionError("path query introduces a TOCTOU window")
+        return real_stat(queried_path, follow_symlinks=follow_symlinks)
+
+    def open_once(
+        opened_path: Path,
+        mode: str = "r",
+        *_args: object,
+        **_kwargs: object,
+    ) -> Any:
+        if opened_path != path:
+            return real_open(opened_path, mode, *_args, **_kwargs)
+        events.append(("open", opened_path, mode))
+        if events.count(("open", opened_path, mode)) > 1:
+            raise AssertionError("manifest opened more than once")
+        return FakeManifestStream(raw, events)
+
+    def opened_fstat(file_descriptor: int) -> TrackingOpenedStat:
+        events.append(("fstat", file_descriptor))
+        return TrackingOpenedStat(len(raw), events)
+
+    monkeypatch.setattr(Path, "exists", guard_path_query(real_exists))
+    monkeypatch.setattr(Path, "is_file", guard_path_query(real_is_file))
+    monkeypatch.setattr(Path, "stat", guarded_stat)
+    monkeypatch.setattr(Path, "read_bytes", guard_path_query(real_read_bytes))
+    monkeypatch.setattr(Path, "open", open_once)
+    monkeypatch.setattr(os, "fstat", opened_fstat)
+
+    manifest = DwsManifest.load(path)
+
+    assert manifest.projects[0].project_id == "project-1"
+    assert events == [
+        ("open", path, "rb"),
+        "enter",
+        "fileno",
+        ("fstat", 73),
+        "st_mode",
+        "st_size",
+        ("read", _MAX_MANIFEST_BYTES + 1),
+        "exit",
+    ]
+
+
+def test_manifest_rejects_actual_bounded_read_larger_than_fstat_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = write_manifest(tmp_path)
+    events: list[object] = []
+    stream = FakeManifestStream(b" " * (_MAX_MANIFEST_BYTES + 1), events)
+
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: stream)
+    monkeypatch.setattr(
+        os,
+        "fstat",
+        lambda _descriptor: SimpleNamespace(st_mode=stat.S_IFREG, st_size=1),
+    )
+
+    with pytest.raises(ValueError) as error:
+        DwsManifest.load(path)
+
+    assert str(error.value) == "manifest_too_large"
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+    assert events.count(("read", _MAX_MANIFEST_BYTES + 1)) == 1
+
+
+def test_manifest_rejects_non_regular_opened_descriptor_without_reading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = write_manifest(tmp_path)
+    events: list[object] = []
+    stream = FakeManifestStream(b"must-not-be-read", events)
+
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: stream)
+    monkeypatch.setattr(
+        os,
+        "fstat",
+        lambda _descriptor: SimpleNamespace(st_mode=stat.S_IFDIR, st_size=0),
+    )
+
+    with pytest.raises(ValueError) as error:
+        DwsManifest.load(path)
+
+    assert str(error.value) == "manifest_not_regular_file"
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+    assert not any(
+        isinstance(event, tuple) and event[0] == "read" for event in events
+    )
+
+
+def test_manifest_treats_opened_descriptor_as_authoritative(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = write_manifest(tmp_path)
+    raw = path.read_bytes()
+    events: list[object] = []
+    stream = FakeManifestStream(raw, events)
+
+    monkeypatch.setattr(
+        Path,
+        "lstat",
+        lambda _path: SimpleNamespace(st_mode=stat.S_IFLNK),
+    )
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: stream)
+    monkeypatch.setattr(
+        os,
+        "fstat",
+        lambda _descriptor: SimpleNamespace(
+            st_mode=stat.S_IFREG,
+            st_size=len(raw),
+        ),
+    )
+
+    manifest = DwsManifest.load(path)
+
+    assert manifest.projects[0].project_id == "project-1"
+    assert events.count(("read", _MAX_MANIFEST_BYTES + 1)) == 1
+
+
+def test_manifest_path_errors_keep_stable_labels_without_exception_chains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for path, expected in (
+        (tmp_path / "missing.json", "manifest_not_found"),
+        (tmp_path, "manifest_not_regular_file"),
+    ):
+        with pytest.raises(ValueError) as error:
+            DwsManifest.load(path)
+        assert str(error.value) == expected
+        assert error.value.__cause__ is None
+        assert error.value.__context__ is None
+
+    denied = write_manifest(tmp_path)
+
+    def deny_open(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "open", deny_open)
+
+    with pytest.raises(ValueError) as error:
+        DwsManifest.load(denied)
+
+    assert str(error.value) == "manifest_unreadable"
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
 
 
 def test_manifest_loads_only_declared_project_source_fields(tmp_path: Path) -> None:
