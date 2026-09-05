@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -34,7 +35,7 @@ from companion_gateway.project.sync_service import (
     ProjectSyncService,
     ProjectSyncValidationError,
 )
-from companion_gateway.settings import Settings
+from companion_gateway.settings import Settings, load_environment_file
 
 
 _PROXY_HEADERS = frozenset(
@@ -71,6 +72,8 @@ _SAFE_CONFLICT_ERRORS = frozenset(
         "stale_cursor",
     }
 )
+LOCAL_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+_SYNC_INTERVAL_SECONDS = 300.0
 
 
 class RetrievalRequestCreate(BaseModel):
@@ -290,16 +293,18 @@ def create_sync_app(
     settings: Settings,
     *,
     sync_service=None,
+    repository: ProjectSyncRepository | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     now = clock or (lambda: datetime.now(UTC))
-    repository = ProjectSyncRepository(settings.database_path)
-    repository.initialize()
+    if repository is None:
+        repository = ProjectSyncRepository(settings.database_path)
+        repository.initialize()
     service = sync_service or ProjectSyncService(
         repository,
         WindowsDpapiProtector(),
         ProjectSnapshotRegistry(),
-        sync_interval_seconds=300,
+        sync_interval_seconds=_SYNC_INTERVAL_SECONDS,
         source_freshness_seconds=settings.project_source_freshness_seconds,
         clock_skew_seconds=settings.project_sync_clock_skew_seconds,
     )
@@ -464,3 +469,23 @@ def create_sync_app(
         return {"request": jsonable_encoder(retrieval)}
 
     return app
+
+
+def create_default_sync_app() -> FastAPI:
+    load_environment_file(LOCAL_ENV_PATH)
+    settings = Settings.from_environment()
+    repository = ProjectSyncRepository(settings.database_path)
+    repository.initialize()
+    service = ProjectSyncService(
+        repository,
+        WindowsDpapiProtector(),
+        ProjectSnapshotRegistry(),
+        sync_interval_seconds=_SYNC_INTERVAL_SECONDS,
+        source_freshness_seconds=settings.project_source_freshness_seconds,
+        clock_skew_seconds=settings.project_sync_clock_skew_seconds,
+    )
+    return create_sync_app(
+        settings,
+        repository=repository,
+        sync_service=service,
+    )

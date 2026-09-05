@@ -186,6 +186,14 @@ def test_python_gateway_runner_check_uses_project_paths_without_starting_server(
     assert result["source_available"] is True
 
 
+def test_python_gateway_runner_uses_the_shared_path_preparation_helper() -> None:
+    source = read_script("run_xiaoyao_gateway.py")
+
+    assert "from gateway_runner_common import _prepare_import_paths" in source
+    assert "def _prepare_import_paths" not in source
+    assert "sync_api" not in source
+
+
 def test_gateway_runner_propagates_uvicorn_exit_code(tmp_path: Path) -> None:
     fake_python = tmp_path / "fake-python.cmd"
     fake_python.write_text(
@@ -208,6 +216,36 @@ def test_gateway_runner_propagates_uvicorn_exit_code(tmp_path: Path) -> None:
             str(fake_python),
             "-Port",
             "8723",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 37
+
+
+def test_sync_runner_propagates_python_exit_code(tmp_path: Path) -> None:
+    fake_python = tmp_path / "fake-python.cmd"
+    fake_python.write_text(
+        "@echo off\r\n"
+        'if /I "%~nx1"=="run_xiaoyao_sync.py" exit /b 37\r\n'
+        "exit /b 99\r\n",
+        encoding="ascii",
+    )
+
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-File",
+            str(SCRIPTS / "run-xiaoyao-sync.ps1"),
+            "-GatewayRoot",
+            str(ROOT / "gateway"),
+            "-PythonPath",
+            str(fake_python),
+            "-Port",
+            "8731",
         ],
         check=False,
         capture_output=True,

@@ -230,6 +230,141 @@ def test_sync_api_health_and_ready_are_loopback_only(client: TestClient) -> None
     assert rejected.json()["detail"] == "sync_host_forbidden"
 
 
+def test_default_sync_app_initializes_dependencies_before_creating_app(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    configured_settings = settings(tmp_path / "default-sync-api.db")
+    environment_path = tmp_path / ".env"
+    expected_app = object()
+    events: list[object] = []
+
+    class RecordingRepository:
+        def __init__(self, database_path) -> None:
+            assert database_path == configured_settings.database_path
+            events.append("repository.created")
+
+        def initialize(self) -> None:
+            events.append("repository.initialized")
+
+    class RecordingProtector:
+        def __init__(self) -> None:
+            events.append("protector.created")
+
+    class RecordingRegistry:
+        def __init__(self) -> None:
+            events.append("registry.created")
+
+    class RecordingService:
+        def __init__(
+            self,
+            repository,
+            protector,
+            registry,
+            *,
+            sync_interval_seconds,
+            source_freshness_seconds,
+            clock_skew_seconds,
+        ) -> None:
+            assert repository.__class__ is RecordingRepository
+            assert protector.__class__ is RecordingProtector
+            assert registry.__class__ is RecordingRegistry
+            assert sync_interval_seconds == sync_api_module._SYNC_INTERVAL_SECONDS
+            assert (
+                source_freshness_seconds
+                == configured_settings.project_source_freshness_seconds
+            )
+            assert (
+                clock_skew_seconds
+                == configured_settings.project_sync_clock_skew_seconds
+            )
+            events.append("service.created")
+
+    def create_recorded_app(
+        config,
+        *,
+        repository,
+        sync_service,
+    ):  # type: ignore[no-untyped-def]
+        assert config is configured_settings
+        assert repository.__class__ is RecordingRepository
+        assert sync_service.__class__ is RecordingService
+        events.append("app.created")
+        return expected_app
+
+    monkeypatch.setattr(
+        sync_api_module,
+        "LOCAL_ENV_PATH",
+        environment_path,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sync_api_module,
+        "load_environment_file",
+        lambda path: events.append(("environment.loaded", path)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sync_api_module.Settings,
+        "from_environment",
+        classmethod(lambda cls: configured_settings),
+    )
+    monkeypatch.setattr(sync_api_module, "ProjectSyncRepository", RecordingRepository)
+    monkeypatch.setattr(sync_api_module, "WindowsDpapiProtector", RecordingProtector)
+    monkeypatch.setattr(sync_api_module, "ProjectSnapshotRegistry", RecordingRegistry)
+    monkeypatch.setattr(sync_api_module, "ProjectSyncService", RecordingService)
+    monkeypatch.setattr(sync_api_module, "create_sync_app", create_recorded_app)
+
+    assert sync_api_module.create_default_sync_app() is expected_app
+    assert events == [
+        ("environment.loaded", environment_path),
+        "repository.created",
+        "repository.initialized",
+        "protector.created",
+        "registry.created",
+        "service.created",
+        "app.created",
+    ]
+
+
+def test_sync_interval_is_a_fixed_module_contract() -> None:
+    assert sync_api_module._SYNC_INTERVAL_SECONDS == 300.0
+
+
+def test_default_sync_app_stops_when_repository_initialization_fails(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    configured_settings = settings(tmp_path / "default-sync-api.db")
+
+    class FailingRepository:
+        def __init__(self, database_path) -> None:
+            assert database_path == configured_settings.database_path
+
+        def initialize(self) -> None:
+            raise RuntimeError("sync_database_unavailable")
+
+    def unexpected_app(*args, **kwargs):  # type: ignore[no-untyped-def]
+        pytest.fail("create_sync_app must not run after initialization fails")
+
+    monkeypatch.setattr(
+        sync_api_module,
+        "load_environment_file",
+        lambda path: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sync_api_module.Settings,
+        "from_environment",
+        classmethod(lambda cls: configured_settings),
+    )
+    monkeypatch.setattr(sync_api_module, "ProjectSyncRepository", FailingRepository)
+    monkeypatch.setattr(sync_api_module, "create_sync_app", unexpected_app)
+
+    with pytest.raises(RuntimeError, match="sync_database_unavailable"):
+        sync_api_module.create_default_sync_app()
+
+
 @pytest.mark.parametrize(
     "header",
     ["Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Original-URL"],
