@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import multiprocessing
@@ -296,6 +297,7 @@ class RecordingUrlOpen:
 
 def _concurrent_push_worker(
     args: list[str],
+    start_barrier: object,
     load_barrier: object,
     observations: object,
 ) -> None:
@@ -309,7 +311,7 @@ def _concurrent_push_worker(
             ("loaded", state.last_cursor, state.pending is None)
         )
         try:
-            load_barrier.wait(timeout=0.5)  # type: ignore[attr-defined]
+            load_barrier.wait(timeout=5)  # type: ignore[attr-defined]
         except BrokenBarrierError:
             pass
         return state
@@ -334,6 +336,7 @@ def _concurrent_push_worker(
             close=lambda: None,
         )
 
+    start_barrier.wait(timeout=5)  # type: ignore[attr-defined]
     sync_cli._load_state = synchronized_load_state
     result = main(
         args,
@@ -868,12 +871,13 @@ def test_concurrent_pushes_serialize_state_lifecycle_across_processes(
 ) -> None:
     paths = write_push_inputs(tmp_path)
     process_context = multiprocessing.get_context("spawn")
+    start_barrier = process_context.Barrier(3)
     load_barrier = process_context.Barrier(2)
     observations = process_context.Queue()
     processes = [
         process_context.Process(
             target=_concurrent_push_worker,
-            args=(push_args(paths), load_barrier, observations),
+            args=(push_args(paths), start_barrier, load_barrier, observations),
         )
         for _ in range(2)
     ]
@@ -881,6 +885,7 @@ def test_concurrent_pushes_serialize_state_lifecycle_across_processes(
     try:
         for process in processes:
             process.start()
+        start_barrier.wait(timeout=5)
         for process in processes:
             process.join(timeout=10)
             assert process.exitcode == 0
@@ -960,7 +965,7 @@ def test_state_lock_wait_is_capped_at_thirty_seconds(
     sleeps: list[float] = []
 
     def unavailable(_stream: object) -> None:
-        raise OSError
+        raise PermissionError(errno.EACCES, "locked")
 
     monkeypatch.setattr(state_lock, "_try_lock", unavailable)
     with pytest.raises(ValueError, match="^sync_lock_timeout$"):
@@ -974,6 +979,62 @@ def test_state_lock_wait_is_capped_at_thirty_seconds(
             pytest.fail("unavailable lock must not be yielded")
 
     assert sleeps == []
+
+
+def test_state_lock_does_not_retry_non_contention_os_errors(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def io_failure(_stream: object) -> None:
+        raise OSError(errno.EIO, "private detail")
+
+    monkeypatch.setattr(state_lock, "_try_lock", io_failure)
+    with pytest.raises(ValueError, match="^private_file_write_failed$"):
+        with state_lock.acquire_state_lock(
+            tmp_path / "state.json",
+            "project-1",
+            sleep=lambda _delay: pytest.fail("I/O errors must not be retried"),
+        ):
+            pytest.fail("failed lock must not be yielded")
+
+
+def test_state_lock_does_not_retry_after_deadline(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    attempts = 0
+    clock = iter((0.0, 29.99, 30.01))
+
+    def available_too_late(_stream: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError(errno.EACCES, "locked")
+
+    monkeypatch.setattr(state_lock, "_try_lock", available_too_late)
+    with pytest.raises(ValueError, match="^sync_lock_timeout$"):
+        with state_lock.acquire_state_lock(
+            tmp_path / "state.json",
+            "project-1",
+            monotonic=lambda: next(clock),
+            sleep=lambda _delay: None,
+        ):
+            pytest.fail("lock acquired after deadline must not be yielded")
+
+    assert attempts == 1
+
+
+def test_state_lock_identity_depends_only_on_resolved_state_path(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+
+    assert state_lock._state_lock_path(
+        state_path, "project-1"
+    ) == state_lock._state_lock_path(state_path, "project-2")
+    assert state_lock._state_lock_path(
+        state_path, "project-1"
+    ) != state_lock._state_lock_path(tmp_path / "other-state.json", "project-1")
 
 
 def test_different_state_files_do_not_block_each_other(
