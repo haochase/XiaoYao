@@ -509,6 +509,78 @@ def test_same_cursor_and_hash_is_idempotent(tmp_path: Path) -> None:
     assert retried.generation_id == first.generation_id
 
 
+def test_higher_cursor_rejects_source_version_and_time_rollback(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    current = active_document_records(
+        source_id="real-source-id",
+        source_version="v2",
+        source_content_hash=HASH_D,
+        chunk_id=HASH_E,
+        chunk_content_hash=HASH_F,
+        observed_at=NOW + timedelta(minutes=1),
+    )
+    repository.commit(
+        sync_commit(
+            cursor=1,
+            snapshots=(current[0],),
+            states=(current[1],),
+            protected_sources=(current[2],),
+            protected_chunks=(current[3],),
+        )
+    )
+    stale = active_document_records(
+        source_id="real-source-id",
+        source_version="v1",
+        source_content_hash=HASH_B,
+        chunk_id=HASH_C,
+        chunk_content_hash=HASH_B,
+        observed_at=NOW,
+    )
+
+    with pytest.raises(SyncConflict, match="source_version_rollback"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                snapshots=(stale[0],),
+                states=(stale[1],),
+                protected_sources=(stale[2],),
+                protected_chunks=(stale[3],),
+            )
+        )
+
+
+def test_higher_cursor_rejects_same_source_version_with_new_content(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
+    conflicting = active_document_records(
+        source_id="real-source-id",
+        source_version="v1",
+        source_content_hash=HASH_D,
+        chunk_id=HASH_E,
+        chunk_content_hash=HASH_F,
+        observed_at=NOW + timedelta(minutes=1),
+    )
+
+    with pytest.raises(SyncConflict, match="source_version_conflict"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                snapshots=(conflicting[0],),
+                states=(conflicting[1],),
+                protected_sources=(conflicting[2],),
+                protected_chunks=(conflicting[3],),
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "package",
     [

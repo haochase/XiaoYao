@@ -169,6 +169,16 @@ class ProjectSyncRepository:
                     )
                 );
 
+                CREATE TABLE IF NOT EXISTS project_source_heads (
+                    project_id TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    source_id_hash TEXT NOT NULL,
+                    source_version TEXT NOT NULL,
+                    source_time TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    PRIMARY KEY (project_id, source_type, source_id_hash)
+                );
+
                 CREATE TABLE IF NOT EXISTS project_evidence_chunks (
                     project_id TEXT NOT NULL,
                     generation_id TEXT NOT NULL,
@@ -224,6 +234,25 @@ class ProjectSyncRepository:
                     singleton_id, trusted_wall_at, clock_untrusted,
                     needs_sync, reason
                 ) VALUES (1, NULL, 0, 0, 'normal');
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO project_source_heads(
+                    project_id, source_type, source_id_hash, source_version,
+                    source_time, content_hash
+                )
+                SELECT state.project_id, state.source_type,
+                       state.source_id_hash, state.source_version,
+                       state.source_time, state.content_hash
+                FROM project_source_states AS state
+                JOIN project_active_generations AS active
+                  ON active.project_id = state.project_id
+                 AND active.generation_id = state.generation_id
+                WHERE state.status = 'active'
+                  AND state.source_version IS NOT NULL
+                  AND state.source_time IS NOT NULL
+                  AND state.content_hash IS NOT NULL
                 """
             )
             self._ensure_column(
@@ -615,6 +644,7 @@ class ProjectSyncRepository:
                 active_hash = str(active["content_hash"])
                 if envelope.source_cursor < active_cursor:
                     raise SyncConflict("stale_cursor")
+                self._validate_source_heads(connection, candidate)
                 self._check_context_conflicts(stored_context, envelope.context)
                 if envelope.source_cursor == active_cursor:
                     if envelope.content_hash != active_hash:
@@ -632,6 +662,7 @@ class ProjectSyncRepository:
 
             if active is None:
                 self._check_context_conflicts(stored_context, envelope.context)
+                self._validate_source_heads(connection, candidate)
             outcome: Literal["applied", "degraded"] = (
                 "degraded"
                 if any(
@@ -664,6 +695,7 @@ class ProjectSyncRepository:
                 candidate.generation_id,
                 effective_chunks,
             )
+            self._upsert_source_heads(connection, candidate)
             completed = self._complete_retrieval_requests(
                 connection,
                 candidate,
@@ -1062,6 +1094,76 @@ class ProjectSyncRepository:
             raise SyncConflict("permission_conflict")
         if stored.active_decisions != candidate.active_decisions:
             raise SyncConflict("decision_change_requires_review")
+
+    @staticmethod
+    def _validate_source_heads(
+        connection: sqlite3.Connection,
+        candidate: SyncCommit,
+    ) -> None:
+        for source in candidate.envelope.sources:
+            if source.status is not SourceSyncStatus.ACTIVE:
+                continue
+            assert source.source_version is not None
+            assert source.source_time is not None
+            assert source.content_hash is not None
+            source_hash = hashlib.sha256(
+                source.source_id.encode("utf-8")
+            ).hexdigest()
+            row = connection.execute(
+                """
+                SELECT source_version, source_time, content_hash
+                FROM project_source_heads
+                WHERE project_id = ? AND source_type = ?
+                  AND source_id_hash = ?
+                """,
+                (
+                    candidate.envelope.project_id,
+                    source.source_type.value,
+                    source_hash,
+                ),
+            ).fetchone()
+            if row is None:
+                continue
+            previous_time = _parse_datetime(str(row["source_time"]))
+            if source.source_time < previous_time:
+                raise SyncConflict("source_version_rollback")
+            if source.source_version == row["source_version"] and (
+                source.content_hash != row["content_hash"]
+                or source.source_time != previous_time
+            ):
+                raise SyncConflict("source_version_conflict")
+
+    @staticmethod
+    def _upsert_source_heads(
+        connection: sqlite3.Connection,
+        candidate: SyncCommit,
+    ) -> None:
+        for source in candidate.envelope.sources:
+            if source.status is not SourceSyncStatus.ACTIVE:
+                continue
+            assert source.source_version is not None
+            assert source.source_time is not None
+            assert source.content_hash is not None
+            connection.execute(
+                """
+                INSERT INTO project_source_heads(
+                    project_id, source_type, source_id_hash, source_version,
+                    source_time, content_hash
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, source_type, source_id_hash)
+                DO UPDATE SET source_version = excluded.source_version,
+                              source_time = excluded.source_time,
+                              content_hash = excluded.content_hash
+                """,
+                (
+                    candidate.envelope.project_id,
+                    source.source_type.value,
+                    hashlib.sha256(source.source_id.encode("utf-8")).hexdigest(),
+                    source.source_version,
+                    _datetime_text(source.source_time),
+                    source.content_hash,
+                ),
+            )
 
     @staticmethod
     def _validate_candidate(candidate: SyncCommit) -> None:
