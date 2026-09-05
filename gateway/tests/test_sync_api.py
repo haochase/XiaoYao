@@ -32,6 +32,7 @@ from companion_gateway.project.sync_service import (
 )
 from companion_gateway.settings import Settings
 from companion_gateway.sync_api import create_sync_app
+from tools.dws_project_sync import _validate_response
 
 
 NOW = datetime(2026, 9, 5, 8, 0, tzinfo=UTC)
@@ -367,7 +368,13 @@ def test_default_sync_app_stops_when_repository_initialization_fails(
 
 @pytest.mark.parametrize(
     "header",
-    ["Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Original-URL"],
+    [
+        "Forwarded",
+        "X-Forwarded-For",
+        "X-Forwarded-Host",
+        "X-Forwarded-Proto",
+        "X-Original-URL",
+    ],
 )
 def test_sync_api_rejects_forwarded_headers(
     client: TestClient,
@@ -473,7 +480,8 @@ def test_sync_api_applies_authenticated_matching_envelope(
         headers=AUTH,
     )
     assert response.status_code == 200
-    assert response.json()["result"]["sync_id"] == "sync-1"
+    assert response.json()["sync_id"] == "sync-1"
+    assert _validate_response(response.content, envelope=envelope()) == response.json()
     assert sync_service.applied == [envelope()]
 
 

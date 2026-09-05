@@ -51,6 +51,7 @@ def main() -> int:
         factory=True,
         host=args.host,
         port=args.port,
+        proxy_headers=False,
     )
     return 0
 

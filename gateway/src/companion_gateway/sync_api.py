@@ -43,6 +43,7 @@ _PROXY_HEADERS = frozenset(
         b"forwarded",
         b"x-forwarded-for",
         b"x-forwarded-host",
+        b"x-forwarded-proto",
         b"x-original-url",
     }
 )
@@ -345,7 +346,7 @@ def create_sync_app(
             result = service.apply(package, principal=principal, now=now())
         except Exception as exc:
             raise _sync_error(exc) from exc
-        return {"result": jsonable_encoder(result)}
+        return jsonable_encoder(result)
 
     @app.get("/v1/projects/{project_id}/sync/status")
     def sync_status(project_id: str, request: Request) -> dict[str, object]:

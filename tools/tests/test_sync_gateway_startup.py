@@ -18,6 +18,7 @@ def test_sync_runner_defaults_to_loopback_and_dedicated_port() -> None:
     assert 'default="127.0.0.1"' in source
     assert "default=8731" in source
     assert "companion_gateway.sync_api:create_default_sync_app" in source
+    assert "proxy_headers=False" in source
 
 
 def test_device_runner_does_not_reference_sync_api() -> None:
