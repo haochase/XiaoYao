@@ -4,6 +4,7 @@
 .venv/
 .vendor/
 .worktrees/
+.private/
 .superpowers/
 __pycache__/
 *.py[cod]

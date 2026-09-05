@@ -43,6 +43,12 @@ Run the synchronization CLI from the repository root as a module:
 python -m tools.dws_project_sync --help
 ```
 
+Scheduled QwenWork runs use the fixed ignored task configuration at
+`.private/qwenwork-dws-project-sync.json`. Its schema-version-1 fields are
+`manifest`, `project`, `dws`, `source_bundle`, `context_artifact`, and `state`;
+real values remain outside Git. The context conversion Skill has the fixed name
+`hui-anchor-dws-project-context-v1`.
+
 See [the gateway DWS runbook](gateway/README.md#private-dws-project-synchronization)
 for the sanitized manifest schema, required environment-variable names, exact
 `collect` and `push` commands, and the five-minute QwenWork schedule. A failed

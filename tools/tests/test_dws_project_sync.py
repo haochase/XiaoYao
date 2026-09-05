@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1032,3 +1033,107 @@ def test_qwen_prompt_uses_only_module_cli_entrypoints() -> None:
     assert "python -m tools.dws_project_sync push" in prompt
     assert "tools/dws_project_sync.py collect" not in prompt
     assert "tools/dws_project_sync.py push" not in prompt
+
+
+def test_qwen_prompt_defines_fixed_strict_private_task_config() -> None:
+    root = Path(__file__).resolve().parents[2]
+    prompt = (root / "prompts" / "qwenwork-dws-project-sync.md").read_text(
+        encoding="utf-8"
+    )
+    schema_match = re.search(
+        r"<!-- task-config-schema -->\s*```json\s*(\{.*?\})\s*```",
+        prompt,
+        re.DOTALL,
+    )
+
+    assert schema_match is not None
+    schema = json.loads(schema_match.group(1))
+    fields = {
+        "schema_version",
+        "manifest",
+        "project",
+        "dws",
+        "source_bundle",
+        "context_artifact",
+        "state",
+    }
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == fields
+    assert set(schema["properties"]) == fields
+    assert schema["properties"]["schema_version"] == {"const": 1}
+    assert schema["properties"]["project"]["pattern"] == (
+        "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    )
+    assert ".private/qwenwork-dws-project-sync.json" in prompt
+    forbidden_placeholder = "<" + "PRIVATE_"
+    assert forbidden_placeholder not in prompt
+    lstat_at = prompt.index("Path.lstat")
+    read_at = prompt.index("read(65537)")
+    parse_at = prompt.index("JSON 解析")
+    assert "普通文件" in prompt[lstat_at:read_at]
+    assert "symlink" in prompt[lstat_at:read_at]
+    assert "reparse" in prompt[lstat_at:read_at]
+    assert lstat_at < read_at < parse_at
+
+
+def test_qwen_prompt_rejects_private_path_aliases() -> None:
+    prompt = (
+        Path(__file__).resolve().parents[2]
+        / "prompts"
+        / "qwenwork-dws-project-sync.md"
+    ).read_text(encoding="utf-8")
+
+    assert "Path.resolve(strict=False)" in prompt
+    assert "os.path.normcase" in prompt
+    assert "os.path.samefile" in prompt
+    assert "五个配置路径与固定任务配置路径必须两两不同" in prompt
+    assert "reparse" in prompt
+
+
+def test_qwen_prompt_names_skill_and_closes_artifact_io_contract() -> None:
+    prompt = (
+        Path(__file__).resolve().parents[2]
+        / "prompts"
+        / "qwenwork-dws-project-sync.md"
+    ).read_text(encoding="utf-8")
+
+    assert "hui-anchor-dws-project-context-v1" in prompt
+    assert "DwsSourceBundle" in prompt
+    assert "QwenProjectContextArtifact" in prompt
+    assert "唯一输入" in prompt
+    assert "唯一输出" in prompt
+    assert "同目录临时文件" in prompt
+    assert "flush" in prompt
+    assert "fsync" in prompt
+    assert "os.replace" in prompt
+    assert "不得读取其他文件" in prompt
+    assert "不得输出其他内容" in prompt
+    assert '"open_actions": []' in prompt
+    assert '"current_risks": []' in prompt
+    assert '"next_meeting": null' in prompt
+    assert "必须预先安装" in prompt
+    assert "不可用时立即停止" in prompt
+    assert "不得搜索、安装或替换 Skill" in prompt
+
+    validate_at = prompt.index("QwenProjectContextArtifact.model_validate")
+    size_at = prompt.index("2097152")
+    temporary_at = prompt.index("创建同目录临时文件")
+    replace_at = prompt.index("os.replace")
+    assert validate_at < temporary_at
+    assert size_at < temporary_at
+    assert temporary_at < replace_at
+
+
+def test_private_task_config_is_ignored_and_documented_publicly() -> None:
+    root = Path(__file__).resolve().parents[2]
+    ignore_lines = (root / ".gitignore").read_text(encoding="utf-8").splitlines()
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    gateway_readme = (root / "gateway" / "README.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert ".private/" in ignore_lines
+    for document in (readme, gateway_readme):
+        assert ".private/qwenwork-dws-project-sync.json" in document
+        assert "hui-anchor-dws-project-context-v1" in document

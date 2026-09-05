@@ -80,6 +80,14 @@ The DWS synchronization listener is a separate, opt-in process. It is fixed to
 the ESP32-facing port `8723`. Keep the private manifest, generated source bundle,
 QwenWork context artifact, cursor state, and every credential outside Git.
 
+The scheduled task reads only the fixed ignored repository-local configuration
+`.private/qwenwork-dws-project-sync.json`. It is a strict schema-version-1 object
+with exactly these private value fields: `manifest`, `project`, `dws`,
+`source_bundle`, `context_artifact`, and `state`. The committed prompt contains
+the field schema but no real values. QwenWork must invoke the fixed
+`hui-anchor-dws-project-context-v1` Skill to convert `DwsSourceBundle` into
+`QwenProjectContextArtifact`.
+
 The synchronization listener and the QwenWork task must run as the same fixed
 Windows user. Evidence is protected with CurrentUser DPAPI, so another user or
 a service without that user's loaded profile cannot decrypt it. A protection
