@@ -815,6 +815,176 @@ def test_gateway_does_not_retry_redirect_or_authentication_error(
     assert attempts == 1
 
 
+def test_gateway_exposes_allowlisted_http_error_detail_and_closes_body(
+    tmp_path: Path, capsys
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    body = io.BytesIO(b'{"detail":"clock_skew_exceeded"}')
+    closed = False
+
+    def rejected(request, *, timeout):  # type: ignore[no-untyped-def]
+        error = HTTPError(request.full_url, 400, "private", {}, body)
+        original_close = error.close
+
+        def close() -> None:
+            nonlocal closed
+            closed = True
+            original_close()
+
+        error.close = close
+        raise error
+
+    assert main(
+        push_args(paths),
+        urlopen=rejected,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+        sleep=lambda _delay: None,
+    ) == 1
+    assert json.loads(capsys.readouterr().out)["error_type"] == (
+        "clock_skew_exceeded"
+    )
+    assert closed is True
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"detail":"private database row 42"}',
+        b'{"detail":"clock_skew_exceeded","private":"secret"}',
+        (
+            b'{"detail":"private database row 42",'
+            b'"detail":"clock_skew_exceeded"}'
+        ),
+        b'{"detail":',
+        b"x" * 65_537,
+        b" " * (65_537 - len(b'{"detail":"clock_skew_exceeded"}'))
+        + b'{"detail":"clock_skew_exceeded"}',
+    ],
+    ids=(
+        "unknown",
+        "extra-key",
+        "duplicate-key",
+        "invalid-json",
+        "oversized",
+        "oversized-valid-json",
+    ),
+)
+def test_gateway_hides_unsafe_http_error_bodies(
+    tmp_path: Path, capsys, body: bytes
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    private_detail = "private database row 42"
+    response_body = io.BytesIO(body)
+    closed = False
+
+    def rejected(request, *, timeout):  # type: ignore[no-untyped-def]
+        error = HTTPError(request.full_url, 409, "private", {}, response_body)
+        original_close = error.close
+
+        def close() -> None:
+            nonlocal closed
+            closed = True
+            original_close()
+
+        error.close = close
+        raise error
+
+    assert main(
+        push_args(paths),
+        urlopen=rejected,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+        sleep=lambda _delay: None,
+    ) == 1
+    public = capsys.readouterr().out
+    assert json.loads(public)["error_type"] == "http_error"
+    assert private_detail not in public
+    assert closed is True
+
+
+def test_gateway_http_error_fallback_read_uses_remaining_timeout() -> None:
+    timeouts: list[float] = []
+    read_sizes: list[int] = []
+    raw = b'{"detail":"clock_skew_exceeded"}'
+
+    def read(size: int) -> bytes:
+        read_sizes.append(size)
+        return raw
+
+    body = SimpleNamespace(
+        read=read,
+        settimeout=lambda timeout: timeouts.append(timeout),
+        close=lambda: None,
+    )
+    error = HTTPError("http://127.0.0.1:8731", 400, "private", {}, body)
+    ticks = iter((10.0, 10.5))
+
+    assert sync_cli._safe_gateway_error_type(
+        error,
+        deadline=15.0,
+        monotonic=lambda: next(ticks),
+    ) == "clock_skew_exceeded"
+    assert timeouts == [5.0]
+    assert read_sizes == [65_537]
+
+
+def test_gateway_http_error_fallback_does_not_read_after_deadline() -> None:
+    read_sizes: list[int] = []
+    body = SimpleNamespace(
+        read=lambda size: read_sizes.append(size) or b"{}",
+        settimeout=lambda _timeout: pytest.fail("deadline must fail first"),
+        close=lambda: None,
+    )
+    error = HTTPError("http://127.0.0.1:8731", 400, "private", {}, body)
+
+    assert sync_cli._safe_gateway_error_type(
+        error,
+        deadline=10.0,
+        monotonic=lambda: 10.0,
+    ) == "http_error"
+    assert read_sizes == []
+
+
+def test_gateway_retries_retryable_http_error_without_exposing_body(
+    tmp_path: Path, capsys
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    attempts = 0
+    closed = 0
+    private_detail = "private retry detail"
+
+    def rejected(request, *, timeout):  # type: ignore[no-untyped-def]
+        nonlocal attempts
+        attempts += 1
+        error = HTTPError(
+            request.full_url,
+            503,
+            "private",
+            {},
+            io.BytesIO(canonical({"detail": private_detail}).encode("utf-8")),
+        )
+        original_close = error.close
+
+        def close() -> None:
+            nonlocal closed
+            closed += 1
+            original_close()
+
+        error.close = close
+        raise error
+
+    assert main(
+        push_args(paths),
+        urlopen=rejected,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+        sleep=lambda _delay: None,
+    ) == 1
+    public = capsys.readouterr().out
+    assert json.loads(public)["error_type"] == "http_error"
+    assert private_detail not in public
+    assert attempts == 3
+    assert closed == 3
+
+
 def test_gateway_invalid_response_is_not_retried_and_is_closed(
     tmp_path: Path, capsys
 ) -> None:
@@ -1394,13 +1564,33 @@ def test_build_envelope_maps_statuses_and_uses_authoritative_hash() -> None:
     )
 
     assert envelope.content_hash == compute_envelope_content_hash(envelope)
-    assert envelope.generated_at == context().generated_at
+    assert envelope.generated_at == NOW
+    assert envelope.context.generated_at == context().generated_at
     assert [item.status.value for item in envelope.sources] == ["active", "failed"]
     assert len(envelope.sources[0].chunks) == 1
     source_id_hash = digest("task-private")
     assert envelope.sources[1].source_title == f"task:{source_id_hash[:12]}"
     assert envelope.sources[1].source_url == f"dingtalk://task/{source_id_hash}"
     assert [item.status.value for item in envelope.tombstones] == ["deleted"]
+
+
+def test_build_envelope_uses_push_clock_without_changing_semantic_identity() -> None:
+    push_now = NOW + timedelta(seconds=301)
+    source_bundle = bundle()
+    project_context = context()
+
+    first = build_envelope(
+        project(), source_bundle, project_context, now=push_now
+    )
+    later = build_envelope(
+        project(), source_bundle, project_context, now=push_now + timedelta(seconds=30)
+    )
+
+    assert first.generated_at == push_now
+    assert first.context.generated_at == NOW
+    assert first.sources[0].fetched_at == NOW
+    assert later.content_hash == first.content_hash
+    assert later.sync_id == first.sync_id
 
 
 @pytest.mark.parametrize(

@@ -97,6 +97,40 @@ _RESPONSE_KEYS = {
     "generation_id",
     "next_sync_before",
 }
+_SAFE_GATEWAY_ERROR_TYPES = frozenset(
+    {
+        "clock_skew_exceeded",
+        "completion_claims_conflict",
+        "content_hash_mismatch",
+        "context_conflict",
+        "context_fact_unreferenced",
+        "cursor_content_conflict",
+        "invalid_envelope",
+        "now_must_be_aware",
+        "project_access_denied",
+        "project_api_authentication_failed",
+        "project_api_authentication_required",
+        "project_api_disabled",
+        "project_review_denied",
+        "project_scope_denied",
+        "retrieval_claim_expired",
+        "retrieval_claim_invalid",
+        "retrieval_claim_required",
+        "retrieval_evidence_missing",
+        "retrieval_request_conflict",
+        "source_excerpt_mismatch",
+        "source_ref_mismatch",
+        "stale_cursor",
+        "sync_body_too_large",
+        "sync_conflict",
+        "sync_host_forbidden",
+        "sync_internal_error",
+        "sync_invalid_content_length",
+        "sync_invalid_request",
+        "sync_project_mismatch",
+        "sync_proxy_headers_forbidden",
+    }
+)
 _PUBLIC_ERROR_TYPES = {
     "arguments_invalid",
     "authentication_failed",
@@ -161,7 +195,7 @@ _PUBLIC_ERROR_TYPES = {
     "run_stage_invalid",
     "run_token_invalid",
     "unknown",
-}
+} | _SAFE_GATEWAY_ERROR_TYPES
 
 
 def _safe_id(value: str, field_name: str) -> str:
@@ -686,7 +720,7 @@ def _build_envelope(
         schema_version=1,
         sync_id="sync_" + "0" * 32,
         project_id=project.project_id,
-        generated_at=context.generated_at,
+        generated_at=now,
         source_cursor=source_cursor,
         content_hash="0" * 64,
         producer="qwenwork-dws",
@@ -885,6 +919,10 @@ def _read_gateway_response(
         read = getattr(response, "read", None)
         if not callable(read):
             raise ValueError("response_invalid")
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise ValueError("network_timeout")
+        _set_response_timeout(response, remaining)
         raw = read(65_537)
         if not isinstance(raw, bytes):
             raise ValueError("response_invalid")
@@ -911,6 +949,42 @@ def _read_gateway_response(
     return b"".join(chunks)
 
 
+def _safe_gateway_error_type(
+    error: HTTPError,
+    *,
+    deadline: float,
+    monotonic: Callable[[], float],
+) -> str:
+    try:
+        raw = _read_gateway_response(
+            error,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+    except (OSError, TimeoutError, ValueError):
+        return "http_error"
+    if len(raw) > MAX_STATE_BYTES:
+        return "http_error"
+    try:
+        payload = json.loads(
+            raw.decode("utf-8"),
+            parse_constant=_reject_non_finite,
+            object_pairs_hook=tuple,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
+        return "http_error"
+    if (
+        not isinstance(payload, tuple)
+        or len(payload) != 1
+        or payload[0][0] != "detail"
+    ):
+        return "http_error"
+    detail = payload[0][1]
+    if not isinstance(detail, str) or detail not in _SAFE_GATEWAY_ERROR_TYPES:
+        return "http_error"
+    return detail
+
+
 def _gateway_request(
     request: Request,
     *,
@@ -935,7 +1009,15 @@ def _gateway_request(
         except HTTPError as exc:
             response = exc
             retryable = exc.code in _RETRYABLE_HTTP_STATUSES
-            if not retryable or attempt == 2:
+            if not retryable:
+                raise ValueError(
+                    _safe_gateway_error_type(
+                        exc,
+                        deadline=deadline,
+                        monotonic=monotonic,
+                    )
+                ) from None
+            if attempt == 2:
                 raise ValueError("http_error") from None
         except (TimeoutError, URLError, OSError):
             retryable = True
