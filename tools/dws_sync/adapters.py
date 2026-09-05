@@ -221,24 +221,48 @@ class DwsSourceBundle(BaseModel):
 
 
 def unwrap_dws_payload(response: Mapping[str, object]) -> object:
+    payload, _page_token = _unwrap_dws_payload(response)
+    return payload
+
+
+def _unwrap_dws_paged_payload(
+    response: Mapping[str, object],
+) -> tuple[object, object]:
+    payload, wrapper_token = _unwrap_dws_payload(response)
+    if isinstance(payload, Mapping):
+        wrapper_token = _merge_page_token(
+            wrapper_token,
+            payload.get("nextToken", _MISSING),
+        )
+    return payload, wrapper_token
+
+
+def _unwrap_dws_payload(
+    response: Mapping[str, object],
+) -> tuple[object, object]:
     if not isinstance(response, Mapping):
         raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
     if "success" in response and response["success"] is not True:
         raise normalized_read_error(response)
 
     payload: object = response
+    wrapper_token: object = _MISSING
     for _depth in range(3):
         if not isinstance(payload, Mapping):
             if isinstance(payload, list):
-                return payload
+                return payload, wrapper_token
             raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
         if "success" in payload and payload["success"] is not True:
             raise normalized_read_error(payload)
         present = [key for key in _PAYLOAD_KEYS if key in payload]
         if not present:
-            return payload
+            return payload, wrapper_token
         if len(present) != 1 or not set(payload).issubset(_WRAPPER_KEYS):
             raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
+        wrapper_token = _merge_page_token(
+            wrapper_token,
+            payload.get("nextToken", _MISSING),
+        )
         payload = payload[present[0]]
         if not isinstance(payload, (Mapping, list)):
             raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
@@ -247,7 +271,23 @@ def unwrap_dws_payload(response: Mapping[str, object]) -> object:
         raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
     if not isinstance(payload, (Mapping, list)):
         raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
-    return payload
+    return payload, wrapper_token
+
+
+def _merge_page_token(current: object, candidate: object) -> object:
+    if candidate is _MISSING:
+        return current
+    if current is _MISSING or current == candidate:
+        return candidate
+    raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
+
+
+def _next_page_token(value: object) -> str | None:
+    if value is _MISSING or value in (None, ""):
+        return None
+    if isinstance(value, str):
+        return value
+    raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
 
 
 def read_document(
@@ -311,7 +351,8 @@ def read_meeting_note(
         args = ("minutes", "get", "transcription", "--id", spec.source_id)
         if next_token is not None:
             args += ("--next-token", next_token)
-        page = _require_mapping(unwrap_dws_payload(runner.run(args)))
+        raw_page, wrapper_token = _unwrap_dws_paged_payload(runner.run(args))
+        page = _require_mapping(raw_page)
         present = [key for key in _TRANSCRIPTION_KEYS if key in page]
         if len(present) != 1 or not set(page).issubset(
             {present[0], "nextToken"}
@@ -320,13 +361,7 @@ def read_meeting_note(
         items = page[present[0]]
         if not isinstance(items, list):
             raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
-        token_value = page.get("nextToken")
-        if token_value in (None, ""):
-            next_token = None
-        elif isinstance(token_value, str):
-            next_token = token_value
-        else:
-            raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
+        next_token = _next_page_token(wrapper_token)
         if not items and next_token is not None:
             raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
         transcription.extend(items)
@@ -406,9 +441,8 @@ def read_calendar_event(
         args = base_args
         if next_token is not None:
             args += ("--next-token", next_token)
-        page_events, next_token = _calendar_page(
-            unwrap_dws_payload(runner.run(args))
-        )
+        page_payload, wrapper_token = _unwrap_dws_paged_payload(runner.run(args))
+        page_events, next_token = _calendar_page(page_payload, wrapper_token)
         if not page_events and next_token is not None:
             raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
         matches.extend(
@@ -514,6 +548,7 @@ def collect_sources(
 
 def _calendar_page(
     payload: object,
+    wrapper_token: object = _MISSING,
 ) -> tuple[list[Mapping[str, object]], str | None]:
     if isinstance(payload, Mapping):
         if (
@@ -523,16 +558,10 @@ def _calendar_page(
         ):
             raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
         raw_events = payload["events"]
-        token_value = payload.get("nextToken")
-        if token_value in (None, ""):
-            next_token = None
-        elif isinstance(token_value, str):
-            next_token = token_value
-        else:
-            raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
+        next_token = _next_page_token(wrapper_token)
     elif isinstance(payload, list):
         raw_events = payload
-        next_token = None
+        next_token = _next_page_token(wrapper_token)
     else:
         raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
     if any(not isinstance(event, Mapping) for event in raw_events):

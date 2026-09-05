@@ -517,6 +517,65 @@ def test_meeting_adapter_reads_all_parts_and_pages_until_token_is_empty() -> Non
     }
 
 
+def test_meeting_adapter_preserves_sibling_wrapper_page_tokens() -> None:
+    info = {"taskUuid": "abc123", "title": "评审会"}
+    summary = {"markdown": "结论"}
+    runner = RecordingRunner(
+        [
+            info,
+            summary,
+            {
+                "data": {"paragraphs": [{"text": "甲"}]},
+                "nextToken": "token-2",
+            },
+            {
+                "result": {"paragraphs": [{"text": "乙"}]},
+                "nextToken": "",
+            },
+            {"todos": []},
+        ]
+    )
+
+    record = read_meeting_note(
+        runner,
+        source("meeting_note", "abc123"),
+        permission_scope="project:project-1",
+        clock=lambda: NOW,
+    )
+
+    assert runner.calls[3][-2:] == ("--next-token", "token-2")
+    assert json.loads(record.content_text or "")["transcription"] == [
+        {"text": "甲"},
+        {"text": "乙"},
+    ]
+
+
+def test_meeting_adapter_rejects_conflicting_wrapper_page_tokens() -> None:
+    runner = RecordingRunner(
+        [
+            {"taskUuid": "abc123"},
+            {"markdown": "summary"},
+            {
+                "data": {
+                    "paragraphs": [{"text": "甲"}],
+                    "nextToken": "inner-token",
+                },
+                "nextToken": "outer-token",
+            },
+        ]
+    )
+
+    with pytest.raises(DwsReadError) as error:
+        read_meeting_note(
+            runner,
+            source("meeting_note", "abc123"),
+            permission_scope="project:project-1",
+            clock=lambda: NOW,
+        )
+
+    assert error.value.error_type is SourceErrorType.INVALID_PAYLOAD
+
+
 def test_meeting_adapter_rejects_empty_token_page_and_repeated_token() -> None:
     prefix = [{"taskUuid": "abc123"}, {"markdown": "summary"}]
     empty = RecordingRunner(prefix + [{"items": [], "nextToken": "again"}])
@@ -781,6 +840,68 @@ def test_calendar_reads_all_pages_before_getting_allowlisted_event() -> None:
         "--id",
         "event-2",
     )
+
+
+def test_calendar_preserves_sibling_wrapper_token_without_false_tombstone() -> None:
+    spec = source(
+        "calendar",
+        "event-2",
+        window_start="2026-09-05T08:00:00+08:00",
+        window_end="2026-09-05T18:00:00+08:00",
+    )
+    runner = RecordingRunner(
+        [
+            {
+                "body": {"events": [{"eventId": "event-1"}]},
+                "nextToken": "page-2",
+            },
+            {
+                "data": {"events": [{"eventId": "event-2"}]},
+                "nextToken": "",
+            },
+            {"eventId": "event-2", "summary": "复盘"},
+        ]
+    )
+
+    record = read_calendar_event(
+        runner,
+        spec,
+        permission_scope="project:project-1",
+        clock=lambda: NOW,
+    )
+
+    assert record.status == "active"
+    assert runner.calls[1][-2:] == ("--next-token", "page-2")
+
+
+def test_calendar_rejects_conflicting_wrapper_and_inner_page_tokens() -> None:
+    spec = source(
+        "calendar",
+        "event-2",
+        window_start="2026-09-05T08:00:00+08:00",
+        window_end="2026-09-05T18:00:00+08:00",
+    )
+    runner = RecordingRunner(
+        [
+            {
+                "result": {
+                    "events": [{"eventId": "event-1"}],
+                    "nextToken": "inner-token",
+                },
+                "nextToken": "outer-token",
+            }
+        ]
+    )
+
+    with pytest.raises(DwsReadError) as error:
+        read_calendar_event(
+            runner,
+            spec,
+            permission_scope="project:project-1",
+            clock=lambda: NOW,
+        )
+
+    assert error.value.error_type is SourceErrorType.INVALID_PAYLOAD
 
 
 @pytest.mark.parametrize(
