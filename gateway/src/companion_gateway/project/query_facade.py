@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from threading import RLock
@@ -9,6 +10,7 @@ from companion_gateway.project.index import (
     ProjectRuntimeSnapshot,
     ProjectSnapshotRegistry,
 )
+from companion_gateway.project.clock_guard import ProjectClockGuard
 from companion_gateway.project.models import EvidenceRef
 from companion_gateway.project.protection import ContentProtector
 from companion_gateway.project.snapshot_loader import (
@@ -35,7 +37,9 @@ class RepositoryBackedProjectQueryFacade:
         *,
         identity_digest: Callable[[], str],
         source_freshness_seconds: int,
+        sync_interval_seconds: float = 300.0,
         clock: Callable[[], datetime] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if not callable(identity_digest):
             raise TypeError("identity_digest must be callable")
@@ -53,6 +57,11 @@ class RepositoryBackedProjectQueryFacade:
         self._identity_digest = identity_digest
         self._source_freshness_seconds = source_freshness_seconds
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._clock_guard = ProjectClockGuard(
+            repository,
+            sync_interval_seconds=sync_interval_seconds,
+            monotonic=monotonic,
+        )
         self._registry = ProjectSnapshotRegistry()
         self._hydrator = ProjectSnapshotHydrator(protector)
         self._cache_keys: dict[str, tuple[str, int]] = {}
@@ -65,6 +74,7 @@ class RepositoryBackedProjectQueryFacade:
     ) -> ProjectRuntimeSnapshot | None:
         with self._lock:
             try:
+                self._clock_guard.check(wall_now=self._clock())
                 if (
                     self._repository.protection_descriptor() is not None
                     or self._repository.has_active_generation(project_id)
@@ -107,6 +117,8 @@ class RepositoryBackedProjectQueryFacade:
         snapshot = self.refresh(project_id)
         if snapshot is None:
             return
+        if self._repository.load_clock_state().clock_untrusted:
+            raise ProjectSourceUnavailable("clock_untrusted")
         states = {
             (item.source_type, item.source_id_hash): item
             for item in snapshot.source_states
@@ -145,6 +157,8 @@ class RepositoryBackedProjectQueryFacade:
     ) -> RetrievalRequest:
         if self.refresh(request.project_id) is None:
             raise ProjectSourceUnavailable("project_not_synced")
+        if self._repository.load_clock_state().clock_untrusted:
+            raise ProjectSourceUnavailable("clock_untrusted")
         return self._repository.save_retrieval_request(request)
 
     def _configure_protection(self) -> None:

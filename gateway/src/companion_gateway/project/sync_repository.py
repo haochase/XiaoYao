@@ -84,6 +84,14 @@ class StoredProjectGeneration:
     protected_chunks: tuple[ProtectedChunkRecord, ...]
 
 
+@dataclass(frozen=True)
+class SharedClockState:
+    trusted_wall_at: datetime | None
+    clock_untrusted: bool
+    needs_sync: bool
+    reason: Literal["normal", "resume_detected", "clock_rollback"]
+
+
 class ProjectSyncRepository:
     def __init__(self, database_path: str | Path) -> None:
         self._database_path = Path(database_path)
@@ -124,6 +132,14 @@ class ProjectSyncRepository:
                     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
                     identity_digest TEXT NOT NULL,
                     protector_version TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS project_sync_clock_state (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    trusted_wall_at TEXT,
+                    clock_untrusted INTEGER NOT NULL,
+                    needs_sync INTEGER NOT NULL,
+                    reason TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS project_source_states (
@@ -194,6 +210,11 @@ class ProjectSyncRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_project_retrieval_status_created
                 ON project_retrieval_requests(project_id, status, created_at);
+
+                INSERT OR IGNORE INTO project_sync_clock_state(
+                    singleton_id, trusted_wall_at, clock_untrusted,
+                    needs_sync, reason
+                ) VALUES (1, NULL, 0, 0, 'normal');
                 """
             )
 
@@ -274,6 +295,68 @@ class ProjectSyncRepository:
                 (project_id,),
             ).fetchone()
         return row is not None
+
+    def load_clock_state(self) -> SharedClockState:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT trusted_wall_at, clock_untrusted, needs_sync, reason
+                FROM project_sync_clock_state
+                WHERE singleton_id = 1
+                """
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("clock_state_missing")
+        return _clock_state_from_row(row)
+
+    def mark_clock_state(
+        self,
+        *,
+        clock_untrusted: bool,
+        needs_sync: bool,
+        reason: Literal["resume_detected", "clock_rollback"],
+    ) -> SharedClockState:
+        if not clock_untrusted and not needs_sync:
+            raise ValueError("clock_state_change_empty")
+        if clock_untrusted and reason != "clock_rollback":
+            raise ValueError("clock_state_reason_invalid")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT trusted_wall_at, clock_untrusted, needs_sync, reason
+                FROM project_sync_clock_state
+                WHERE singleton_id = 1
+                """
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("clock_state_missing")
+            current = _clock_state_from_row(row)
+            updated_untrusted = current.clock_untrusted or clock_untrusted
+            updated_needs_sync = current.needs_sync or needs_sync
+            updated_reason = (
+                "clock_rollback"
+                if updated_untrusted
+                else "resume_detected"
+            )
+            connection.execute(
+                """
+                UPDATE project_sync_clock_state
+                SET clock_untrusted = ?, needs_sync = ?, reason = ?
+                WHERE singleton_id = 1
+                """,
+                (
+                    int(updated_untrusted),
+                    int(updated_needs_sync),
+                    updated_reason,
+                ),
+            )
+        return SharedClockState(
+            trusted_wall_at=current.trusted_wall_at,
+            clock_untrusted=updated_untrusted,
+            needs_sync=updated_needs_sync,
+            reason=updated_reason,
+        )
 
     def list_active_project_ids(self) -> tuple[str, ...]:
         with self._connect() as connection:
@@ -390,6 +473,7 @@ class ProjectSyncRepository:
                 (envelope.project_id, candidate.generation_id),
             )
             self._insert_audit(connection, candidate.audit, outcome)
+            self._record_successful_sync(connection, candidate.audit.finished_at)
             connection.execute(
                 """
                 DELETE FROM project_evidence_chunks
@@ -861,11 +945,27 @@ class ProjectSyncRepository:
             ),
         )
         self._insert_audit(connection, candidate.audit, "unchanged")
+        self._record_successful_sync(connection, candidate.audit.finished_at)
         return SyncCommitResult(
             outcome="unchanged",
             generation_id=generation_id,
             source_cursor=candidate.envelope.source_cursor,
             completed_retrieval_request_ids=completed,
+        )
+
+    @staticmethod
+    def _record_successful_sync(
+        connection: sqlite3.Connection,
+        finished_at: datetime,
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE project_sync_clock_state
+            SET trusted_wall_at = ?, clock_untrusted = 0,
+                needs_sync = 0, reason = 'normal'
+            WHERE singleton_id = 1
+            """,
+            (_datetime_text(finished_at),),
         )
 
     def _build_effective_records(
@@ -1254,6 +1354,18 @@ def _parse_datetime(value: str) -> datetime:
 
 def _optional_parse_datetime(value: str | None) -> datetime | None:
     return _parse_datetime(value) if value is not None else None
+
+
+def _clock_state_from_row(row: sqlite3.Row) -> SharedClockState:
+    reason = str(row["reason"])
+    if reason not in {"normal", "resume_detected", "clock_rollback"}:
+        raise RuntimeError("clock_state_invalid")
+    return SharedClockState(
+        trusted_wall_at=_optional_parse_datetime(row["trusted_wall_at"]),
+        clock_untrusted=bool(row["clock_untrusted"]),
+        needs_sync=bool(row["needs_sync"]),
+        reason=reason,
+    )
 
 
 def _state_from_row(row: sqlite3.Row) -> SourceState:

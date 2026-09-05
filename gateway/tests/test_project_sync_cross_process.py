@@ -18,6 +18,7 @@ from companion_gateway.project.models import (
 )
 from companion_gateway.project.sync_models import (
     EvidenceChunk,
+    ProjectSyncHealth,
     RetrievalRequestStatus,
     SourceSnapshot,
     SourceSyncStatus,
@@ -449,3 +450,165 @@ def test_device_query_never_falls_back_when_active_ciphertext_cannot_decrypt(
     assert response.status_code == 404
     assert response.json()["detail"] == "source_unavailable"
     assert "private-decryption-detail" not in response.text
+
+
+def test_device_clock_rollback_is_shared_until_successful_sync(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "shared-clock.db"
+    repository = ProjectSyncRepository(database_path)
+    repository.initialize()
+    repository.configure_protection(
+        digest("test-user"),
+        ReversibleProtector.protector_version,
+    )
+    writer = ProjectSyncService(
+        repository,
+        ReversibleProtector(),
+        ProjectSnapshotRegistry(),
+        monotonic=lambda: 50.0,
+    )
+    writer.apply(envelope(1, NOW), principal=principal(), now=NOW)
+    configure_device_dependencies(monkeypatch)
+    wall = {"value": NOW + timedelta(seconds=500)}
+    monotonic = {"value": 100.0}
+    device_app = create_app(
+        settings(database_path),
+        project_clock=lambda: wall["value"],
+        project_monotonic=lambda: monotonic["value"],
+    )
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+
+    with TestClient(device_app) as client:
+        baseline = client.post(
+            f"/v1/projects/{PROJECT_ID}/query",
+            json={"query": "terminal plan", "kind": "decision_check"},
+            headers=headers,
+        )
+        assert baseline.status_code == 200
+
+        wall["value"] = NOW + timedelta(seconds=100)
+        monotonic["value"] = 101.0
+        blocked = client.post(
+            f"/v1/projects/{PROJECT_ID}/query",
+            json={"query": "terminal plan", "kind": "decision_check"},
+            headers=headers,
+        )
+        shared = repository.load_clock_state()
+        assert blocked.status_code == 404
+        assert blocked.json()["detail"] == "source_stale"
+        assert shared.clock_untrusted
+        assert shared.needs_sync
+        assert writer.status(PROJECT_ID, now=wall["value"]).health is (
+            ProjectSyncHealth.CLOCK_UNTRUSTED
+        )
+
+        recovered_at = wall["value"] + timedelta(seconds=1)
+        writer.apply(
+            envelope(2, recovered_at),
+            principal=principal(),
+            now=recovered_at,
+        )
+        wall["value"] = recovered_at
+        monotonic["value"] = 102.0
+        recovered = client.post(
+            f"/v1/projects/{PROJECT_ID}/query",
+            json={"query": "terminal plan", "kind": "decision_check"},
+            headers=headers,
+        )
+
+    assert recovered.status_code == 200
+    assert not repository.load_clock_state().clock_untrusted
+    assert not repository.load_clock_state().needs_sync
+
+
+def test_new_device_process_uses_persisted_wall_clock_baseline(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "persisted-clock.db"
+    repository = ProjectSyncRepository(database_path)
+    repository.initialize()
+    repository.configure_protection(
+        digest("test-user"),
+        ReversibleProtector.protector_version,
+    )
+    writer = ProjectSyncService(
+        repository,
+        ReversibleProtector(),
+        ProjectSnapshotRegistry(),
+    )
+    trusted_at = NOW + timedelta(minutes=10)
+    writer.apply(
+        envelope(1, trusted_at),
+        principal=principal(),
+        now=trusted_at,
+    )
+    configure_device_dependencies(monkeypatch)
+    device_app = create_app(
+        settings(database_path),
+        project_clock=lambda: trusted_at - timedelta(seconds=301),
+        project_monotonic=lambda: 1.0,
+    )
+
+    with TestClient(device_app) as client:
+        blocked = client.post(
+            f"/v1/projects/{PROJECT_ID}/query",
+            json={"query": "terminal plan", "kind": "decision_check"},
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+    state = repository.load_clock_state()
+    assert blocked.status_code == 404
+    assert blocked.json()["detail"] == "source_stale"
+    assert state.clock_untrusted
+    assert state.needs_sync
+
+
+def test_device_resume_sets_shared_needs_sync_without_persisting_monotonic(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "shared-resume.db"
+    repository = ProjectSyncRepository(database_path)
+    repository.initialize()
+    repository.configure_protection(
+        digest("test-user"),
+        ReversibleProtector.protector_version,
+    )
+    writer = ProjectSyncService(
+        repository,
+        ReversibleProtector(),
+        ProjectSnapshotRegistry(),
+    )
+    writer.apply(envelope(1, NOW), principal=principal(), now=NOW)
+    configure_device_dependencies(monkeypatch)
+    wall = {"value": NOW + timedelta(seconds=60)}
+    monotonic = {"value": 100.0}
+    device_app = create_app(
+        settings(database_path),
+        project_clock=lambda: wall["value"],
+        project_monotonic=lambda: monotonic["value"],
+    )
+
+    with TestClient(device_app) as client:
+        first = client.post(
+            f"/v1/projects/{PROJECT_ID}/query",
+            json={"query": "terminal plan", "kind": "decision_check"},
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        wall["value"] += timedelta(seconds=601)
+        monotonic["value"] += 601
+        resumed = client.post(
+            f"/v1/projects/{PROJECT_ID}/query",
+            json={"query": "terminal plan", "kind": "decision_check"},
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+    state = repository.load_clock_state()
+    assert first.status_code == 200
+    assert resumed.status_code == 200
+    assert state.needs_sync
+    assert not state.clock_untrusted
+    assert not hasattr(state, "monotonic")

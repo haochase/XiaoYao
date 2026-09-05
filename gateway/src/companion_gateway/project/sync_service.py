@@ -7,14 +7,17 @@ import math
 import time
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from threading import RLock
-from typing import Literal
 
 from companion_gateway.project.auth import (
     ProjectApiAuthenticator,
     ProjectApiPrincipal,
+)
+from companion_gateway.project.clock_guard import (
+    CLOCK_ROLLBACK_THRESHOLD_SECONDS,
+    ClockCheckResult,
+    ProjectClockGuard,
 )
 from companion_gateway.project.index import (
     EvidenceSource,
@@ -51,9 +54,6 @@ from companion_gateway.project.sync_repository import (
 )
 
 
-CLOCK_ROLLBACK_THRESHOLD_SECONDS = 300.0
-
-
 class ProjectSyncError(RuntimeError):
     pass
 
@@ -64,13 +64,6 @@ class ProjectSyncValidationError(ProjectSyncError):
 
 class ProjectSourceUnavailable(ProjectSyncError):
     pass
-
-
-@dataclass(frozen=True)
-class ClockCheckResult:
-    immediate_sync_required: bool
-    clock_untrusted: bool
-    reason: Literal["normal", "resume_detected", "clock_rollback"]
 
 
 def compute_envelope_content_hash(envelope: SyncEnvelope) -> str:
@@ -231,11 +224,11 @@ class ProjectSyncService:
         self._clock_skew_seconds = float(clock_skew_seconds)
         self._monotonic = monotonic
         self._apply_lock = RLock()
-        self._clock_lock = RLock()
-        self._last_wall: datetime | None = None
-        self._last_monotonic: float | None = None
-        self._clock_untrusted = False
-        self._immediate_sync_required = False
+        self._clock_guard = ProjectClockGuard(
+            repository,
+            sync_interval_seconds=sync_interval_seconds,
+            monotonic=monotonic,
+        )
 
     def apply(
         self,
@@ -378,11 +371,10 @@ class ProjectSyncService:
 
     def status(self, project_id: str, *, now: datetime) -> ProjectSyncStatus:
         _require_aware(now, "now_must_be_aware")
+        clock_check = self.recheck_clock(wall_now=now)
         snapshot = self._refresh_active_snapshot(project_id)
         if snapshot is None:
             raise ProjectSourceUnavailable("project_not_synced")
-        with self._clock_lock:
-            clock_untrusted = self._clock_untrusted
 
         projected = tuple(
             self._project_state(item, now) for item in snapshot.source_states
@@ -404,7 +396,7 @@ class ProjectSyncService:
             if state.status
             not in {SourceSyncStatus.DELETED, SourceSyncStatus.REVOKED}
         )
-        if clock_untrusted:
+        if clock_check.clock_untrusted:
             health = ProjectSyncHealth.CLOCK_UNTRUSTED
         elif not fresh_decision_source:
             health = ProjectSyncHealth.STALE
@@ -444,12 +436,12 @@ class ProjectSyncService:
         now: datetime,
     ) -> None:
         _require_aware(now, "now_must_be_aware")
+        clock_check = self.recheck_clock(wall_now=now)
         snapshot = self._refresh_active_snapshot(project_id)
         if snapshot is None:
             raise ProjectSourceUnavailable("project_not_synced")
-        with self._clock_lock:
-            if self._clock_untrusted:
-                raise ProjectSourceUnavailable("clock_untrusted")
+        if clock_check.clock_untrusted:
+            raise ProjectSourceUnavailable("clock_untrusted")
         states = {
             (item.source_type, item.source_id_hash): item
             for item in snapshot.source_states
@@ -486,39 +478,16 @@ class ProjectSyncService:
         wall_now: datetime,
         monotonic_now: float | None = None,
     ) -> ClockCheckResult:
-        _require_aware(wall_now, "wall_now_must_be_aware")
-        sample = (
-            self._read_monotonic()
-            if monotonic_now is None
-            else self._validate_monotonic(monotonic_now)
-        )
-        with self._clock_lock:
-            reason: Literal["normal", "resume_detected", "clock_rollback"] = (
-                "normal"
+        try:
+            return self._clock_guard.check(
+                wall_now=wall_now,
+                monotonic_now=monotonic_now,
             )
-            if self._last_wall is not None and self._last_monotonic is not None:
-                wall_elapsed = (wall_now - self._last_wall).total_seconds()
-                monotonic_elapsed = sample - self._last_monotonic
-                if wall_elapsed < -CLOCK_ROLLBACK_THRESHOLD_SECONDS:
-                    self._clock_untrusted = True
-                    self._immediate_sync_required = True
-                    reason = "clock_rollback"
-                elif monotonic_elapsed > 2 * self._sync_interval_seconds:
-                    self._immediate_sync_required = True
-                    reason = "resume_detected"
-            self._last_wall = wall_now
-            self._last_monotonic = sample
-            return ClockCheckResult(
-                immediate_sync_required=self._immediate_sync_required,
-                clock_untrusted=self._clock_untrusted,
-                reason=reason,
-            )
+        except ValueError as exc:
+            raise ProjectSyncValidationError(str(exc)) from None
 
     def consume_immediate_sync_request(self) -> bool:
-        with self._clock_lock:
-            pending = self._immediate_sync_required
-            self._immediate_sync_required = False
-            return pending
+        return self._clock_guard.consume_local_sync_request()
 
     def _source_states(
         self,
@@ -871,11 +840,10 @@ class ProjectSyncService:
         return float(value)
 
     def _reset_clock(self, wall_now: datetime, monotonic_now: float) -> None:
-        with self._clock_lock:
-            self._last_wall = wall_now
-            self._last_monotonic = monotonic_now
-            self._clock_untrusted = False
-            self._immediate_sync_required = False
+        self._clock_guard.reset_local(
+            wall_now=wall_now,
+            monotonic_now=monotonic_now,
+        )
 
 
 __all__ = [

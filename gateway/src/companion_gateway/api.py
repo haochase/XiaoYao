@@ -321,6 +321,7 @@ def create_app(
     meeting_clock: Callable[[], datetime] = utc_now,
     project_memory_service: ProjectMemoryService | None = None,
     project_clock: Callable[[], datetime] = utc_now,
+    project_monotonic: Callable[[], float] = time.monotonic,
     feishu_chat_listener=None,
     memory_clock: Callable[[], datetime] = utc_now,
     vision_clock: Callable[[], datetime] = utc_now,
@@ -576,6 +577,7 @@ def create_app(
                 settings.project_source_freshness_seconds
             ),
             clock=project_clock,
+            monotonic=project_monotonic,
         )
         project_memory = ProjectMemoryService(
             clock=project_clock,
