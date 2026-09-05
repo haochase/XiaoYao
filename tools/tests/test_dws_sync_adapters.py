@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 import subprocess
@@ -22,6 +23,7 @@ from tools.dws_sync.adapters import (
     unwrap_dws_payload,
 )
 from tools.dws_sync.manifest import DwsProjectManifest, DwsSourceSpec
+from tools.dws_sync.launch import resolve_dws_launch
 from tools.dws_sync.runner import (
     MAX_DWS_STDOUT_BYTES,
     DwsCommandRunner,
@@ -165,29 +167,169 @@ def test_runner_injects_fixed_profile_json_format_and_safe_subprocess(
     assert runner.run(("todo", "task", "get", "--task-id", "task-1")) == {
         "ok": True
     }
-    assert popen.calls == [
-        (
-            [
-                str(dws_path),
-                "--profile",
-                "corp:user",
-                "todo",
-                "task",
-                "get",
-                "--task-id",
-                "task-1",
-                "--format",
-                "json",
-            ],
-            {
-                "shell": False,
-                "stdout": subprocess.PIPE,
-                "stderr": subprocess.DEVNULL,
-            },
-        )
+    command, options = popen.calls[0]
+    assert command == [
+        str(dws_path),
+        "--profile",
+        "corp:user",
+        "todo",
+        "task",
+        "get",
+        "--task-id",
+        "task-1",
+        "--format",
+        "json",
     ]
+    assert options["shell"] is False
+    assert options["stdout"] is subprocess.PIPE
+    assert options["stderr"] is subprocess.DEVNULL
+    assert "COMPANION_DWS_SYNC_TOKEN" not in options["env"]
     assert process.stdout.read_sizes == [MAX_DWS_STDOUT_BYTES + 1]
     assert len(process.wait_calls) == 1
+
+
+OFFICIAL_DWS_WRAPPER = """#!/bin/sh
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export QWORK_SHIM_ROUTE="dws"
+case "$PROCESSOR_ARCHITECTURE" in
+  ARM64) exec "$SCRIPT_DIR/ext/cli-common-shim-windows-arm64.exe" "$@" ;;
+  *)     exec "$SCRIPT_DIR/ext/cli-common-shim-windows-amd64.exe" "$@" ;;
+esac
+"""
+
+
+def official_wrapper_tree(tmp_path: Path) -> tuple[Path, Path]:
+    official_bin = tmp_path / ".qwenworkcn" / "bin"
+    official_bin.mkdir(parents=True)
+    wrapper = official_bin / "dws"
+    wrapper.write_text(OFFICIAL_DWS_WRAPPER, encoding="utf-8")
+    (official_bin / "ext").mkdir()
+    return official_bin, wrapper
+
+
+def test_runner_launches_official_windows_wrapper_through_native_shim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    official_bin = tmp_path / ".qwenworkcn" / "bin"
+    official_bin.mkdir(parents=True)
+    wrapper = official_bin / "dws"
+    wrapper.write_text(OFFICIAL_DWS_WRAPPER, encoding="utf-8")
+    shim = official_bin / "ext" / "cli-common-shim-windows-amd64.exe"
+    shim.parent.mkdir()
+    shim.write_bytes(b"native")
+    monkeypatch.setenv("QODERWORK_SOURCE_CHAT_ID", "existing-session")
+    monkeypatch.setenv("QWORK_SHIM_ROUTE", "other-route")
+    monkeypatch.setenv("COMPANION_DWS_SYNC_TOKEN", "gateway-only-secret")
+    process = FakeProcess(b'{"ok":true}')
+    popen = RecordingPopen(process)
+
+    runner = DwsCommandRunner(
+        wrapper,
+        profile="corp:user",
+        popen=popen,
+        _official_bin=official_bin,
+        _processor_architecture="AMD64",
+    )
+
+    assert runner.run(("doc", "info")) == {"ok": True}
+    command, options = popen.calls[0]
+    assert command[0] == str(shim)
+    assert options["env"]["QWORK_SHIM_ROUTE"] == "dws"
+    assert options["env"]["QODERWORK_SOURCE_CHAT_ID"] == "existing-session"
+    assert "COMPANION_DWS_SYNC_TOKEN" not in options["env"]
+    assert os.environ["QWORK_SHIM_ROUTE"] == "other-route"
+    assert os.environ["COMPANION_DWS_SYNC_TOKEN"] == "gateway-only-secret"
+
+
+def test_runner_rejects_official_wrapper_when_arch_shim_is_missing(
+    tmp_path: Path,
+) -> None:
+    official_bin = tmp_path / ".qwenworkcn" / "bin"
+    official_bin.mkdir(parents=True)
+    wrapper = official_bin / "dws"
+    wrapper.write_text(OFFICIAL_DWS_WRAPPER, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="dws_official_shim_invalid"):
+        DwsCommandRunner(
+            wrapper,
+            profile="corp:user",
+            _official_bin=official_bin,
+            _processor_architecture="AMD64",
+        )
+
+
+def test_official_wrapper_architecture_comes_from_copied_child_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    official_bin, wrapper = official_wrapper_tree(tmp_path)
+    arm64_shim = official_bin / "ext" / "cli-common-shim-windows-arm64.exe"
+    arm64_shim.write_bytes(b"native")
+    monkeypatch.setenv("PROCESSOR_ARCHITECTURE", "AMD64")
+
+    launch_path, child_env = resolve_dws_launch(
+        wrapper,
+        environ={"PROCESSOR_ARCHITECTURE": "ARM64"},
+        official_bin=official_bin,
+    )
+
+    assert launch_path == arm64_shim
+    assert child_env["PROCESSOR_ARCHITECTURE"] == "ARM64"
+
+
+def test_official_wrapper_rejects_unsupported_child_architecture(
+    tmp_path: Path,
+) -> None:
+    official_bin, wrapper = official_wrapper_tree(tmp_path)
+
+    with pytest.raises(
+        ValueError,
+        match="dws_processor_architecture_unsupported",
+    ):
+        resolve_dws_launch(
+            wrapper,
+            environ={"PROCESSOR_ARCHITECTURE": "x86"},
+            official_bin=official_bin,
+        )
+
+
+def test_official_wrapper_rejects_tampered_shape(tmp_path: Path) -> None:
+    official_bin, wrapper = official_wrapper_tree(tmp_path)
+    wrapper.write_text(
+        OFFICIAL_DWS_WRAPPER.replace('QWORK_SHIM_ROUTE="dws"', 'echo "dws"'),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="dws_official_wrapper_invalid"):
+        resolve_dws_launch(
+            wrapper,
+            environ={"PROCESSOR_ARCHITECTURE": "AMD64"},
+            official_bin=official_bin,
+        )
+
+
+def test_arbitrary_script_is_not_accepted_as_direct_dws_binary(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "custom-dws"
+    script.write_text("#!/bin/sh\necho unsafe\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="dws_path_not_supported"):
+        resolve_dws_launch(script, environ={"PROCESSOR_ARCHITECTURE": "AMD64"})
+
+
+def test_runner_rejects_reparse_or_symlink_launch_paths(tmp_path: Path) -> None:
+    target = tmp_path / "dws.exe"
+    target.write_bytes(b"native")
+    link = tmp_path / "linked-dws.exe"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    with pytest.raises(ValueError, match="dws_path_not_regular_file"):
+        DwsCommandRunner(link, profile="corp:user")
 
 
 @pytest.mark.parametrize(

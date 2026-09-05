@@ -1869,6 +1869,11 @@ def test_qwen_prompt_defines_fixed_strict_private_task_config() -> None:
     assert schema["properties"]["project"]["pattern"] == (
         "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
     )
+    assert schema["properties"]["dws"]["pattern"] == "^[CcEe]:\\\\"
+    for field in ("manifest", "source_bundle", "context_artifact", "state"):
+        assert schema["properties"][field]["pattern"] == "^[Ee]:\\\\"
+    assert "官方 wrapper" in prompt
+    assert "任意命令文本" in prompt
     assert ".private/qwenwork-dws-project-sync.json" in prompt
     forbidden_placeholder = "<" + "PRIVATE_"
     assert forbidden_placeholder not in prompt

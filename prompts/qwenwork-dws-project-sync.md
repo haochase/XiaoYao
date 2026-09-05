@@ -10,8 +10,8 @@ Windows reparse point、目录、named pipe 和其他特殊文件，且 lstat �
 bytes。随后只打开一次二进制只读流并调用一次 `read(65537)`；返回超过 65536 bytes 时立即
 停止。只有通过这些门禁后才执行 UTF-8 解码和 JSON 解析，并按以下 JSON Schema 严格验证。
 配置必须是 JSON object，`schema_version` 必须为 `1`，七个字段必须全部存在且不得有额外
-字段。五个路径字段必须是 E 盘绝对路径；配置不得包含 profile、token、gateway、任意
-argv 或业务正文。
+字段。`dws` 必须是 C 或 E 盘绝对本地文件路径；其他四个路径字段必须是 E 盘绝对路径；
+配置不得包含 profile、token、gateway、任意 argv、任意命令文本或业务正文。
 
 <!-- task-config-schema -->
 ```json
@@ -35,7 +35,7 @@ argv 或业务正文。
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
     },
-    "dws": {"type": "string", "pattern": "^[Ee]:\\\\"},
+    "dws": {"type": "string", "pattern": "^[CcEe]:\\\\"},
     "source_bundle": {"type": "string", "pattern": "^[Ee]:\\\\"},
     "context_artifact": {"type": "string", "pattern": "^[Ee]:\\\\"},
     "state": {"type": "string", "pattern": "^[Ee]:\\\\"}
@@ -43,12 +43,17 @@ argv 或业务正文。
 }
 ```
 
-配置缺失、不可读、schema 不匹配、路径不绝对或路径不在 E 盘时立即停止，不得尝试默认值。
+配置缺失、不可读、schema 不匹配、路径不绝对、`dws` 不在 C/E 盘或其他路径不在 E 盘时
+立即停止，不得尝试默认值。
 schema 验证后，必须用 `Path.resolve(strict=False)` 和 `os.path.normcase` 规范化路径。
 五个配置路径与固定任务配置路径必须两两不同；对已存在的任意路径对再用 `os.path.samefile`
 确认不是同一文件。任何 symlink、hardlink 或 Windows reparse 目标无法确认、指向同一文件
 或可能让输出覆盖输入时立即停止。`manifest` 和 `dws` 必须是现有普通文件，三个输出路径的
 父目录必须是现有目录。
+
+`dws` 若指向官方 wrapper，必须通过固定安装位置、精确 wrapper 结构、当前受支持 Windows
+架构及同目录现有普通非 reparse 原生 shim 的启动校验；不得复制或修改安装文件。不得把任意
+脚本作为 DWS 启动入口。
 
 `hui-anchor-dws-project-context-v1` 是必须预先安装的外部 Skill 依赖。在执行 collect 前，
 只通过 Skill 注册表检查该精确名称；不可用时立即停止。不得搜索、安装或替换 Skill，也

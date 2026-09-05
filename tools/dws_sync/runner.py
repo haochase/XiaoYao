@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 from companion_gateway.project.sync_models import SourceErrorType
+from tools.dws_sync.launch import resolve_dws_launch
 
 
 MAX_DWS_STDOUT_BYTES = 2_097_152
@@ -144,16 +145,20 @@ class DwsCommandRunner:
         profile: str,
         timeout_seconds: float = 30.0,
         popen: Callable[..., Any] = subprocess.Popen,
+        _official_bin: Path | None = None,
+        _processor_architecture: str | None = None,
     ) -> None:
-        if not dws_path.is_absolute():
-            raise ValueError("dws_path_not_absolute")
-        if not dws_path.exists() or not dws_path.is_file():
-            raise ValueError("dws_path_not_regular_file")
+        launch_path, launch_env = resolve_dws_launch(
+            dws_path,
+            official_bin=_official_bin,
+            processor_architecture=_processor_architecture,
+        )
         if not profile.strip():
             raise ValueError("dws_profile_invalid")
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("dws_timeout_invalid")
-        self._dws_path = dws_path
+        self._dws_path = launch_path
+        self._launch_env = launch_env
         self._profile = profile
         self._timeout_seconds = timeout_seconds
         self._popen = popen
@@ -176,12 +181,14 @@ class DwsCommandRunner:
         ]
         run_error: DwsReadError | None = None
         try:
-            process = self._popen(
-                command,
-                shell=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
+            popen_options = {
+                "shell": False,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.DEVNULL,
+            }
+            if self._launch_env is not None:
+                popen_options["env"] = self._launch_env
+            process = self._popen(command, **popen_options)
         except (OSError, subprocess.SubprocessError):
             run_error = DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, False)
         if run_error is not None:
