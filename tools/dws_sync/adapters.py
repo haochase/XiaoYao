@@ -159,7 +159,18 @@ class DwsRetrievalRequest(BaseModel):
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
     )
     query_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    request_epoch: int = Field(ge=1)
+    attempt_count: int = Field(ge=1)
+    lease_expires_at: datetime
+    lease_token: str = Field(pattern=r"^[A-Za-z0-9_-]{32,128}$")
     sources: tuple[DwsRetrievalSource, ...] = Field(min_length=1, max_length=30)
+
+    @field_validator("lease_expires_at")
+    @classmethod
+    def validate_lease_expiry(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("lease_expires_at must be timezone-aware")
+        return value
 
     @model_validator(mode="after")
     def validate_sources(self) -> "DwsRetrievalRequest":

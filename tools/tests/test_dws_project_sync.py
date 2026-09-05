@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import io
 import json
 import multiprocessing
 import re
@@ -11,8 +12,8 @@ from pathlib import Path
 import threading
 from threading import BrokenBarrierError
 from types import SimpleNamespace
-from urllib.error import URLError
-from urllib.request import ProxyHandler
+from urllib.error import HTTPError, URLError
+from urllib.request import ProxyHandler, Request
 
 import pytest
 from pydantic import ValidationError
@@ -40,6 +41,13 @@ from tools.dws_sync import (
 
 NOW = datetime(2026, 9, 5, 12, 0, tzinfo=UTC)
 SCOPE = "project:project-1"
+
+
+@pytest.fixture(autouse=True)
+def isolated_lifecycle_root(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "dws-sync-locks"
+    monkeypatch.setattr(state_lock, "PRIVATE_LOCK_ROOT", root)
+    monkeypatch.setattr(sync_cli, "LIFECYCLE_ROOT", root)
 
 
 def canonical(payload: object) -> str:
@@ -233,6 +241,21 @@ def pending_args(paths: dict[str, Path]) -> list[str]:
     ]
 
 
+def collect_args(paths: dict[str, Path], *extra: str) -> list[str]:
+    return [
+        "collect",
+        "--manifest",
+        str(paths["manifest"]),
+        "--project",
+        "project-1",
+        "--dws-path",
+        str(paths["manifest"]),
+        "--output",
+        str(paths["sources"]),
+        *extra,
+    ]
+
+
 class FakeDws:
     def run(self, args: tuple[str, ...]) -> dict[str, object]:
         if args[:2] == ("doc", "info"):
@@ -241,6 +264,8 @@ class FakeDws:
                 "contentType": "ALIDOC",
                 "extension": "adoc",
                 "title": "决策文档",
+                "shareUrl": "dingtalk://document/doc-1",
+                "version": "v1",
                 "updatedAt": NOW.isoformat(),
             }
         if args[:2] == ("doc", "read"):
@@ -301,6 +326,11 @@ def _concurrent_push_worker(
     load_barrier: object,
     observations: object,
 ) -> None:
+    lock_root = (
+        Path(args[args.index("--state-file") + 1]).parent / "dws-sync-locks"
+    )
+    sync_cli.LIFECYCLE_ROOT = lock_root
+    state_lock.PRIVATE_LOCK_ROOT = lock_root
     original_load_state = sync_cli._load_state
 
     def synchronized_load_state(
@@ -352,6 +382,11 @@ def _blocking_push_worker(
     release_http: object,
     observations: object,
 ) -> None:
+    lock_root = (
+        Path(args[args.index("--state-file") + 1]).parent / "dws-sync-locks"
+    )
+    sync_cli.LIFECYCLE_ROOT = lock_root
+    state_lock.PRIVATE_LOCK_ROOT = lock_root
     def urlopen(request, *, timeout: float):  # type: ignore[no-untyped-def]
         assert timeout == 30.0
         request_payload = json.loads(request.data)
@@ -414,6 +449,8 @@ class PendingUrlOpen:
                     "expires_at": (NOW + timedelta(minutes=30)).isoformat(),
                     "lease_expires_at": (NOW + timedelta(minutes=5)).isoformat(),
                     "attempt_count": 1,
+                    "request_epoch": 2,
+                    "lease_token": "t" * 43,
                     "completed_at": None,
                 }
             ]
@@ -448,6 +485,10 @@ def test_pending_fetch_maps_gateway_hashes_into_private_source_bundle(
     assert request == {
         "request_id": "retrieval-1",
         "query_hash": digest("missing detail"),
+        "request_epoch": 2,
+        "attempt_count": 1,
+        "lease_expires_at": "2026-09-05T12:05:00Z",
+        "lease_token": "t" * 43,
         "sources": [{"source_id": "doc-1", "source_type": "document"}],
     }
     assert output == {
@@ -498,12 +539,23 @@ def test_push_completes_only_requests_present_in_source_bundle(
     )
     write_json(paths["context"], claimed.model_dump(mode="json"))
 
+    sent = RecordingUrlOpen()
     assert main(
-        push_args(paths, "--dry-run"),
-        urlopen=lambda *_a, **_k: pytest.fail("dry-run must not use network"),
-        environ={},
+        push_args(paths),
+        urlopen=sent,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
     ) == 0
     capsys.readouterr()
+    payload = json.loads(sent.request.data)
+    assert payload["completed_retrieval_request_ids"] == []
+    assert payload["completed_retrieval_claims"] == [
+        {
+            "request_id": "retrieval-1",
+            "request_epoch": 2,
+            "attempt_count": 1,
+            "lease_token": "t" * 43,
+        }
+    ]
 
     unclaimed = claimed.model_copy(
         update={"completed_retrieval_request_ids": ("retrieval-other",)}
@@ -518,6 +570,232 @@ def test_push_completes_only_requests_present_in_source_bundle(
         "status": "error",
         "error_type": "retrieval_request_invalid",
     }
+
+
+def test_production_lifecycle_fences_every_mutating_stage(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    monkeypatch.setattr(sync_cli, "LIFECYCLE_ROOT", tmp_path / "locks")
+
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    begun = json.loads(capsys.readouterr().out)
+    token = begun["run_token"]
+    assert begun["status"] == "started"
+
+    assert main(
+        collect_args(paths, "--run-token", token),
+        runner=FakeDws(),
+        now=lambda: NOW,
+    ) == 0
+    capsys.readouterr()
+    pending = pending_args(paths) + ["--run-token", token]
+    assert main(
+        pending,
+        urlopen=PendingUrlOpen(digest("doc-1")),
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+        now=lambda: NOW,
+    ) == 0
+    capsys.readouterr()
+
+    artifact = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context(),
+        completed_retrieval_request_ids=("retrieval-1",),
+    )
+    artifact_args = [
+        "artifact",
+        "--project",
+        "project-1",
+        "--context-file",
+        str(paths["context"]),
+        "--run-token",
+        token,
+    ]
+    assert main(
+        artifact_args,
+        input_stream=io.BytesIO(
+            canonical(artifact.model_dump(mode="json")).encode("utf-8")
+        ),
+        now=lambda: NOW,
+    ) == 0
+    capsys.readouterr()
+    assert main(
+        push_args(paths, "--run-token", token),
+        urlopen=RecordingUrlOpen(),
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+        now=lambda: NOW,
+    ) == 0
+    capsys.readouterr()
+    assert main(
+        ["end", "--project", "project-1", "--run-token", token],
+        now=lambda: NOW,
+    ) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "completed",
+        "project_id": "project-1",
+        "run_token": None,
+    }
+
+
+def test_expired_run_cannot_replace_artifact(tmp_path: Path, capsys, monkeypatch) -> None:
+    paths = write_push_inputs(tmp_path)
+    original = paths["context"].read_bytes()
+    monkeypatch.setattr(sync_cli, "LIFECYCLE_ROOT", tmp_path / "locks")
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    old_token = json.loads(capsys.readouterr().out)["run_token"]
+    assert main(
+        ["begin", "--project", "project-1"],
+        now=lambda: NOW + timedelta(hours=1),
+    ) == 0
+    capsys.readouterr()
+
+    assert main(
+        [
+            "artifact",
+            "--project",
+            "project-1",
+            "--context-file",
+            str(paths["context"]),
+            "--run-token",
+            old_token,
+        ],
+        input_stream=io.BytesIO(original),
+        now=lambda: NOW + timedelta(hours=1),
+    ) == 1
+    assert json.loads(capsys.readouterr().out)["error_type"] == "run_token_invalid"
+    assert paths["context"].read_bytes() == original
+
+
+def test_active_lifecycle_blocks_all_no_token_commands_before_side_effects(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original_sources = paths["sources"].read_bytes()
+    monkeypatch.setattr(sync_cli, "LIFECYCLE_ROOT", tmp_path / "locks")
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    capsys.readouterr()
+
+    class ForbiddenRunner:
+        def run(self, _args):  # type: ignore[no-untyped-def]
+            pytest.fail("active lifecycle must block DWS reads")
+
+    assert main(
+        collect_args(paths), runner=ForbiddenRunner(), now=lambda: NOW
+    ) == 1
+    assert json.loads(capsys.readouterr().out)["error_type"] == "lifecycle_active"
+    assert paths["sources"].read_bytes() == original_sources
+
+    assert main(
+        pending_args(paths),
+        urlopen=lambda *_a, **_k: pytest.fail(
+            "active lifecycle must block retrieval claim"
+        ),
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+        now=lambda: NOW,
+    ) == 1
+    assert json.loads(capsys.readouterr().out)["error_type"] == "lifecycle_active"
+    assert paths["sources"].read_bytes() == original_sources
+
+    assert main(
+        push_args(paths),
+        urlopen=lambda *_a, **_k: pytest.fail("active lifecycle must block push"),
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+        now=lambda: NOW,
+    ) == 1
+    assert json.loads(capsys.readouterr().out)["error_type"] == "lifecycle_active"
+    assert not paths["state"].exists()
+
+
+def test_gateway_retries_transient_transport_with_same_request_and_closes(
+    tmp_path: Path, capsys
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    requests: list[object] = []
+    closed: list[bool] = []
+
+    def transient_then_success(request, *, timeout):  # type: ignore[no-untyped-def]
+        requests.append(request)
+        if len(requests) < 3:
+            raise URLError("private")
+        response = RecordingUrlOpen()(request, timeout=timeout)
+        response.close = lambda: closed.append(True)
+        return response
+
+    assert main(
+        push_args(paths),
+        urlopen=transient_then_success,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+        sleep=lambda _delay: None,
+    ) == 0
+    capsys.readouterr()
+    assert len(requests) == 3
+    assert requests[0] is requests[1] is requests[2]
+    assert closed == [True]
+
+
+@pytest.mark.parametrize("status", [302, 401])
+def test_gateway_does_not_retry_redirect_or_authentication_error(
+    tmp_path: Path, capsys, status: int
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    attempts = 0
+
+    def rejected(request, *, timeout):  # type: ignore[no-untyped-def]
+        nonlocal attempts
+        attempts += 1
+        raise HTTPError(request.full_url, status, "private", {}, None)
+
+    assert main(
+        push_args(paths),
+        urlopen=rejected,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+        sleep=lambda _delay: None,
+    ) == 1
+    assert json.loads(capsys.readouterr().out)["error_type"] == "http_error"
+    assert attempts == 1
+
+
+def test_gateway_invalid_response_is_not_retried_and_is_closed(
+    tmp_path: Path, capsys
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    attempts = 0
+    closed = 0
+
+    def invalid(_request, *, timeout):  # type: ignore[no-untyped-def]
+        nonlocal attempts
+        attempts += 1
+
+        def close() -> None:
+            nonlocal closed
+            closed += 1
+
+        return SimpleNamespace(read=lambda _size: b"{}", close=close)
+
+    assert main(
+        push_args(paths),
+        urlopen=invalid,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+        sleep=lambda _delay: None,
+    ) == 1
+    assert json.loads(capsys.readouterr().out)["error_type"] == "response_invalid"
+    assert attempts == 1
+    assert closed == 1
+
+
+def test_gateway_rejects_response_that_finishes_after_total_deadline() -> None:
+    response = SimpleNamespace(read=lambda _size: b"{}", close=lambda: None)
+    clock = iter((0.0, 31.0))
+
+    with pytest.raises(ValueError, match="^network_timeout$"):
+        sync_cli._gateway_request(
+            Request("http://127.0.0.1:8731/test"),
+            opener=lambda _request, *, timeout: response,
+            parse=lambda raw: raw,
+            monotonic=lambda: next(clock),
+            sleep=lambda _delay: None,
+        )
 
 
 def test_collect_never_prints_business_content(tmp_path: Path, capsys) -> None:
@@ -870,10 +1148,10 @@ def test_push_uses_named_bearer_and_promotes_pending_state(
     assert "generation_id" not in output
     assert "private-token" not in canonical(output)
 
-    lock_files = list(paths["state"].parent.glob(".dws-sync-state-*.lock"))
-    assert len(lock_files) == 1
-    assert lock_files[0].parent == paths["state"].parent
-    assert "project-1" not in lock_files[0].name
+    lock_path = state_lock._state_lock_path(paths["state"], "project-1")
+    assert lock_path.exists()
+    assert lock_path.parent == state_lock.PRIVATE_LOCK_ROOT
+    assert "project-1" not in lock_path.name
 
 
 def test_concurrent_pushes_serialize_state_lifecycle_across_processes(
@@ -1034,20 +1312,20 @@ def test_state_lock_does_not_retry_after_deadline(
     assert attempts == 1
 
 
-def test_state_lock_identity_depends_only_on_resolved_state_path(
+def test_state_lock_identity_depends_only_on_project_key(
     tmp_path: Path,
 ) -> None:
     state_path = tmp_path / "state.json"
 
     assert state_lock._state_lock_path(
         state_path, "project-1"
-    ) == state_lock._state_lock_path(state_path, "project-2")
+    ) == state_lock._state_lock_path(tmp_path / "other-state.json", "project-1")
     assert state_lock._state_lock_path(
         state_path, "project-1"
-    ) != state_lock._state_lock_path(tmp_path / "other-state.json", "project-1")
+    ) != state_lock._state_lock_path(state_path, "project-2")
 
 
-def test_different_state_files_do_not_block_each_other(
+def test_same_project_different_state_files_share_one_lock(
     tmp_path: Path,
     capsys,
     monkeypatch,
@@ -1072,8 +1350,10 @@ def test_different_state_files_do_not_block_each_other(
             push_args(independent_paths),
             urlopen=RecordingUrlOpen(),
             environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
-        ) == 0
-        assert json.loads(capsys.readouterr().out)["status"] == "synced"
+        ) == 1
+        assert json.loads(capsys.readouterr().out)["error_type"] == (
+            "sync_lock_timeout"
+        )
     finally:
         release_http.set()
         holder.join(timeout=10)
@@ -1082,9 +1362,7 @@ def test_different_state_files_do_not_block_each_other(
             holder.join(timeout=2)
 
     assert holder.exitcode == 0
-    assert json.loads(independent_paths["state"].read_text(encoding="utf-8"))[
-        "last_cursor"
-    ] == 1
+    assert not independent_paths["state"].exists()
 
 
 def test_keyboard_interrupt_releases_push_lock(
@@ -1513,11 +1791,39 @@ def test_qwen_prompt_only_completes_retrieval_with_obtained_evidence() -> None:
     assert "request_id" in normalized
     assert "query_hash" in normalized
     assert "sources" in normalized
+    assert "request_epoch" in normalized
+    assert "attempt_count" in normalized
+    assert "lease_token" in normalized
     collect_at = normalized.index("python -m tools.dws_project_sync collect")
     pending_at = normalized.index("python -m tools.dws_project_sync pending")
     skill_at = normalized.index("hui-anchor-dws-project-context-v1", pending_at)
     push_at = normalized.index("python -m tools.dws_project_sync push")
     assert collect_at < pending_at < skill_at < push_at
+
+
+def test_qwen_prompt_fences_full_lifecycle_and_always_releases() -> None:
+    prompt = (
+        Path(__file__).resolve().parents[2]
+        / "prompts"
+        / "qwenwork-dws-project-sync.md"
+    ).read_text(encoding="utf-8")
+    normalized = " ".join(prompt.replace("`", "").split())
+
+    for command in ("begin", "collect", "pending", "artifact", "push", "end"):
+        assert f"python -m tools.dws_project_sync {command}" in normalized
+    assert "python -m tools.dws_project_sync abort" in normalized
+    assert "--run-token" in normalized
+    assert "finally" in normalized
+    assert "coalesced" in normalized
+    assert "不得直接写 context_artifact" in normalized
+    assert "completed_retrieval_claims" in normalized
+
+    begin_at = normalized.index("python -m tools.dws_project_sync begin")
+    collect_at = normalized.index("python -m tools.dws_project_sync collect")
+    artifact_at = normalized.index("python -m tools.dws_project_sync artifact")
+    push_at = normalized.index("python -m tools.dws_project_sync push")
+    end_at = normalized.index("python -m tools.dws_project_sync end")
+    assert begin_at < collect_at < artifact_at < push_at < end_at
 
 
 def test_qwen_prompt_uses_only_module_cli_entrypoints() -> None:
@@ -1614,10 +1920,11 @@ def test_qwen_prompt_names_skill_and_closes_artifact_io_contract() -> None:
     assert "不可用时立即停止" in prompt
     assert "不得搜索、安装或替换 Skill" in prompt
 
-    validate_at = prompt.index("QwenProjectContextArtifact.model_validate")
-    size_at = prompt.index("2097152")
-    temporary_at = prompt.index("创建同目录临时文件")
-    replace_at = prompt.index("os.replace")
+    normalized = " ".join(prompt.split())
+    validate_at = normalized.index("QwenProjectContextArtifact.model_validate")
+    size_at = normalized.index("2097152")
+    temporary_at = normalized.index("创建同目录临时文件")
+    replace_at = normalized.index("os.replace")
     assert validate_at < temporary_at
     assert size_at < temporary_at
     assert temporary_at < replace_at

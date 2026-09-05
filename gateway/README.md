@@ -199,6 +199,15 @@ artifact and reports only status, counts, payload size, and a content hash; it
 does not call the gateway. Remove `--dry-run` only after explicit approval for
 a real synchronization.
 
+These individual module commands remain compatible with approved manual runs
+when that project has no active lifecycle lease. A production task must use the
+complete `begin -> collect -> pending -> artifact -> push -> end` lifecycle,
+pass the same run token to every mutating command, and call `abort` from its
+`finally` path on any failure. The project-keyed lease and lock are stored under
+the repository's ignored `.private/dws-sync-locks` directory; alternate state
+paths cannot bypass them, and concurrent triggers coalesce into at most one
+immediate follow-up run.
+
 Create the QwenWork schedule only after one approved manual run. Use the full
 contents of `prompts/qwenwork-dws-project-sync.md`, run it every five minutes in
 this repository root, keep it disabled until its first manual run succeeds, and

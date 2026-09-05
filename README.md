@@ -43,6 +43,15 @@ Run the synchronization CLI from the repository root as a module:
 python -m tools.dws_project_sync --help
 ```
 
+Individual `collect`, `pending`, and `push` commands remain available for an
+approved manual run when no project lifecycle is active. Production QwenWork
+tasks must call `begin`, pass its run token through `collect`, `pending`,
+`artifact`, and `push`, then call `end`; their `finally` path must call `abort`.
+The project-keyed lease lives under the repository's ignored
+`.private/dws-sync-locks` directory, so alternate state-file paths cannot run
+the same project concurrently. Concurrent schedule triggers are coalesced into
+one follow-up run.
+
 Scheduled QwenWork runs use the fixed ignored task configuration at
 `.private/qwenwork-dws-project-sync.json`. Its schema-version-1 fields are
 `manifest`, `project`, `dws`, `source_bundle`, `context_artifact`, and `state`;

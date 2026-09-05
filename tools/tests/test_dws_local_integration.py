@@ -27,6 +27,7 @@ from tools.dws_sync import (
     DwsSourceBundle,
     DwsSourceRecord,
 )
+from tools.dws_sync import lifecycle
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -253,65 +254,133 @@ def _free_loopback_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def _push(paths: dict[str, Path], environment: dict[str, str]) -> dict[str, object]:
+def _run_sync_cli(
+    arguments: list[str],
+    environment: dict[str, str],
+    *,
+    timeout: int = 40,
+) -> dict[str, object]:
     completed = subprocess.run(
         [
             str(PYTHON),
-            "-m",
-            "tools.dws_project_sync",
-            "push",
-            "--manifest",
-            str(paths["manifest"]),
-            "--project",
-            PROJECT_ID,
-            "--sources-file",
-            str(paths["sources"]),
-            "--context-file",
-            str(paths["context"]),
-            "--state-file",
-            str(paths["state"]),
-            "--gateway",
-            "http://127.0.0.1:8731",
+            "-c",
+            (
+                "from pathlib import Path; import sys; "
+                "sys.path.insert(0, str(Path.cwd() / 'gateway' / 'src')); "
+                "import tools.dws_project_sync as cli; "
+                "import tools.dws_sync.state_lock as lock; "
+                "root=Path(sys.argv[1]); cli.LIFECYCLE_ROOT=root; "
+                "lock.PRIVATE_LOCK_ROOT=root; raise SystemExit(cli.main(sys.argv[2:]))"
+            ),
+            str(Path(environment["TEMP"]) / "dws-sync-locks"),
+            *arguments,
         ],
         cwd=ROOT,
         env=environment,
         check=False,
         capture_output=True,
-        timeout=40,
+        timeout=timeout,
     )
     assert completed.returncode == 0, completed.stdout.decode("utf-8")
     assert completed.stderr == b""
     return json.loads(completed.stdout)
+
+
+def _begin(environment: dict[str, str]) -> str:
+    result = _run_sync_cli(
+        ["begin", "--project", PROJECT_ID], environment
+    )
+    assert result["status"] == "started"
+    token = result["run_token"]
+    assert isinstance(token, str)
+    return token
+
+
+def _lifecycle_root(environment: dict[str, str]) -> Path:
+    return Path(environment["TEMP"]) / "dws-sync-locks"
+
+
+def _push(paths: dict[str, Path], environment: dict[str, str]) -> dict[str, object]:
+    token = _begin(environment)
+    for expected, target in (
+        ("begun", "collected"),
+        ("collected", "pending"),
+        ("pending", "artifact"),
+    ):
+        lifecycle.advance_run(
+            PROJECT_ID,
+            token,
+            expected=expected,
+            target=target,
+            root=_lifecycle_root(environment),
+        )
+    try:
+        result = _run_sync_cli(
+            [
+                "push",
+                "--manifest",
+                str(paths["manifest"]),
+                "--project",
+                PROJECT_ID,
+                "--sources-file",
+                str(paths["sources"]),
+                "--context-file",
+                str(paths["context"]),
+                "--state-file",
+                str(paths["state"]),
+                "--gateway",
+                "http://127.0.0.1:8731",
+                "--run-token",
+                token,
+            ],
+            environment,
+        )
+        ended = _run_sync_cli(
+            ["end", "--project", PROJECT_ID, "--run-token", token],
+            environment,
+        )
+        assert ended["status"] == "completed"
+        return result
+    except BaseException:
+        lifecycle.abort_run(
+            PROJECT_ID, token, root=_lifecycle_root(environment)
+        )
+        raise
 
 
 def _pending(
     paths: dict[str, Path],
     environment: dict[str, str],
 ) -> dict[str, object]:
-    completed = subprocess.run(
-        [
-            str(PYTHON),
-            "-m",
-            "tools.dws_project_sync",
-            "pending",
-            "--manifest",
-            str(paths["manifest"]),
-            "--project",
-            PROJECT_ID,
-            "--sources-file",
-            str(paths["sources"]),
-            "--gateway",
-            "http://127.0.0.1:8731",
-        ],
-        cwd=ROOT,
-        env=environment,
-        check=False,
-        capture_output=True,
-        timeout=40,
+    token = _begin(environment)
+    lifecycle.advance_run(
+        PROJECT_ID,
+        token,
+        expected="begun",
+        target="collected",
+        root=_lifecycle_root(environment),
     )
-    assert completed.returncode == 0, completed.stdout.decode("utf-8")
-    assert completed.stderr == b""
-    return json.loads(completed.stdout)
+    try:
+        return _run_sync_cli(
+            [
+                "pending",
+                "--manifest",
+                str(paths["manifest"]),
+                "--project",
+                PROJECT_ID,
+                "--sources-file",
+                str(paths["sources"]),
+                "--gateway",
+                "http://127.0.0.1:8731",
+                "--run-token",
+                token,
+            ],
+            environment,
+        )
+    finally:
+        lifecycle.abort_run(
+            PROJECT_ID, token, root=_lifecycle_root(environment)
+        )
 
 
 def _start_listener(

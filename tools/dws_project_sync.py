@@ -34,7 +34,8 @@ from pydantic import (
 from companion_gateway.project.index import chunk_text
 from companion_gateway.project.models import EvidenceRef, ProjectContextPackage
 from companion_gateway.project.sync_models import (
-    RetrievalRequest,
+    ClaimedRetrievalRequest,
+    RetrievalCompletionClaim,
     RetrievalRequestStatus,
     SourceSnapshot,
     SourceTombstone,
@@ -53,7 +54,7 @@ try:
         DwsSourceRecord,
         collect_sources,
     )
-    from tools.dws_sync.state_lock import acquire_state_lock
+    from tools.dws_sync import lifecycle
 except ModuleNotFoundError as exc:
     if exc.name != "tools":
         raise
@@ -67,13 +68,14 @@ except ModuleNotFoundError as exc:
         DwsSourceRecord,
         collect_sources,
     )
-    from dws_sync.state_lock import acquire_state_lock  # type: ignore[no-redef]
+    from dws_sync import lifecycle  # type: ignore[no-redef]
 
 
 MAX_PAYLOAD_BYTES = 2_097_152
 MAX_PRIVATE_INPUT_BYTES = 2_097_152
 MAX_STATE_BYTES = 65_536
 SYNC_LOCK_TIMEOUT_SECONDS = 30.0
+LIFECYCLE_ROOT = lifecycle.state_lock.PRIVATE_LOCK_ROOT
 TOKEN_ENVIRONMENT_VARIABLE = "COMPANION_DWS_SYNC_TOKEN"
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -143,6 +145,10 @@ _PUBLIC_ERROR_TYPES = {
     "sync_failed",
     "token_invalid",
     "token_missing",
+    "lifecycle_state_invalid",
+    "lifecycle_active",
+    "run_stage_invalid",
+    "run_token_invalid",
     "unknown",
 }
 
@@ -203,6 +209,7 @@ class PendingSync(BaseModel):
     source_cursor: int = Field(ge=1)
     content_hash: str
     sync_id: str
+    completion_claims_hash: str = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
 
     @field_validator("content_hash")
     @classmethod
@@ -215,6 +222,13 @@ class PendingSync(BaseModel):
     @classmethod
     def validate_sync_id(cls, value: str) -> str:
         return _safe_id(value, "sync_id")
+
+    @field_validator("completion_claims_hash")
+    @classmethod
+    def validate_claims_hash(cls, value: str) -> str:
+        if _SHA256.fullmatch(value) is None:
+            raise ValueError("completion_claims_hash_invalid")
+        return value
 
 
 class SyncCliState(BaseModel):
@@ -275,12 +289,19 @@ def _parser() -> argparse.ArgumentParser:
     collect.add_argument("--project", required=True)
     collect.add_argument("--dws-path", required=True)
     collect.add_argument("--output", required=True)
+    collect.add_argument("--run-token")
 
     pending = commands.add_parser("pending", add_help=False)
     pending.add_argument("--manifest", required=True)
     pending.add_argument("--project", required=True)
     pending.add_argument("--sources-file", required=True)
     pending.add_argument("--gateway", required=True)
+    pending.add_argument("--run-token")
+
+    artifact = commands.add_parser("artifact", add_help=False)
+    artifact.add_argument("--project", required=True)
+    artifact.add_argument("--context-file", required=True)
+    artifact.add_argument("--run-token", required=True)
 
     push = commands.add_parser("push", add_help=False)
     push.add_argument("--manifest", required=True)
@@ -290,6 +311,14 @@ def _parser() -> argparse.ArgumentParser:
     push.add_argument("--state-file", required=True)
     push.add_argument("--gateway", required=True)
     push.add_argument("--dry-run", action="store_true")
+    push.add_argument("--run-token")
+
+    begin = commands.add_parser("begin", add_help=False)
+    begin.add_argument("--project", required=True)
+    for command in ("end", "abort"):
+        terminal = commands.add_parser(command, add_help=False)
+        terminal.add_argument("--project", required=True)
+        terminal.add_argument("--run-token", required=True)
     return parser
 
 
@@ -513,6 +542,17 @@ def _sync_id(project_id: str, cursor: int, content_hash: str) -> str:
     return "sync_" + _sha256(material)[:32]
 
 
+def _completion_claims_hash(claims: tuple[RetrievalCompletionClaim, ...]) -> str:
+    return hashlib.sha256(
+        _canonical_bytes(
+            sorted(
+                (claim.model_dump(mode="json") for claim in claims),
+                key=lambda item: item["request_id"],
+            )
+        )
+    ).hexdigest()
+
+
 def _build_envelope(
     project: DwsProjectManifest,
     source_bundle: DwsSourceBundle,
@@ -533,6 +573,18 @@ def _build_envelope(
         available_request_ids
     ):
         raise ValueError("retrieval_request_invalid")
+    requests_by_id = {
+        item.request_id: item for item in source_bundle.retrieval_requests
+    }
+    completed_claims = tuple(
+        RetrievalCompletionClaim(
+            request_id=request_id,
+            request_epoch=requests_by_id[request_id].request_epoch,
+            attempt_count=requests_by_id[request_id].attempt_count,
+            lease_token=requests_by_id[request_id].lease_token,
+        )
+        for request_id in completed_retrieval_request_ids
+    )
     sources = tuple(
         _source_snapshot(record)
         for record in source_bundle.records
@@ -560,7 +612,8 @@ def _build_envelope(
         context=context,
         sources=sources,
         tombstones=tombstones,
-        completed_retrieval_request_ids=completed_retrieval_request_ids,
+        completed_retrieval_request_ids=(),
+        completed_retrieval_claims=completed_claims,
     )
     content_hash = compute_envelope_content_hash(draft)
     return draft.model_copy(
@@ -721,6 +774,108 @@ def _validate_response(
     return payload
 
 
+_RETRYABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
+
+
+def _set_response_timeout(response: object, timeout: float) -> None:
+    candidates = [response]
+    for _depth in range(4):
+        next_candidates: list[object] = []
+        for candidate in candidates:
+            settimeout = getattr(candidate, "settimeout", None)
+            if callable(settimeout):
+                settimeout(timeout)
+                return
+            for attribute in ("fp", "raw", "_sock"):
+                child = getattr(candidate, attribute, None)
+                if child is not None:
+                    next_candidates.append(child)
+        candidates = next_candidates
+
+
+def _read_gateway_response(
+    response: object,
+    *,
+    deadline: float,
+    monotonic: Callable[[], float],
+) -> bytes:
+    read1 = getattr(response, "read1", None)
+    if not callable(read1):
+        read = getattr(response, "read", None)
+        if not callable(read):
+            raise ValueError("response_invalid")
+        raw = read(65_537)
+        if not isinstance(raw, bytes):
+            raise ValueError("response_invalid")
+        if monotonic() > deadline:
+            raise ValueError("network_timeout")
+        return raw
+
+    chunks: list[bytes] = []
+    total = 0
+    while total <= 65_536:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise ValueError("network_timeout")
+        _set_response_timeout(response, remaining)
+        chunk = read1(min(8192, 65_537 - total))
+        if not isinstance(chunk, bytes):
+            raise ValueError("response_invalid")
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    if monotonic() > deadline:
+        raise ValueError("network_timeout")
+    return b"".join(chunks)
+
+
+def _gateway_request(
+    request: Request,
+    *,
+    opener: Callable[..., object],
+    parse: Callable[[bytes], object],
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> object:
+    deadline = monotonic() + 30.0
+    for attempt in range(3):
+        remaining = 30.0 if attempt == 0 else deadline - monotonic()
+        if remaining <= 0:
+            raise ValueError("network_timeout")
+        response = None
+        retryable = False
+        try:
+            response = opener(request, timeout=remaining)
+            raw = _read_gateway_response(
+                response, deadline=deadline, monotonic=monotonic
+            )
+            return parse(raw)
+        except HTTPError as exc:
+            response = exc
+            retryable = exc.code in _RETRYABLE_HTTP_STATUSES
+            if not retryable or attempt == 2:
+                raise ValueError("http_error") from None
+        except (TimeoutError, URLError, OSError):
+            retryable = True
+            if attempt == 2:
+                raise ValueError("network_error") from None
+        except ValueError:
+            raise
+        except Exception:
+            raise ValueError("network_error") from None
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+        if retryable:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise ValueError("network_timeout")
+            sleep(min(0.1 * (2**attempt), remaining))
+    raise AssertionError("unreachable")
+
+
 def _emit(payload: Mapping[str, object]) -> None:
     sys.stdout.buffer.write(_canonical_bytes(dict(payload)) + b"\n")
     sys.stdout.buffer.flush()
@@ -737,6 +892,18 @@ def _collect_command(
     dws_path = Path(args.dws_path)
     manifest = DwsManifest.load(manifest_path)
     project = _selected_project(manifest, args.project)
+    if args.run_token:
+        lifecycle.assert_stage(
+            project.project_id,
+            args.run_token,
+            expected="begun",
+            root=LIFECYCLE_ROOT,
+            now=now,
+        )
+    else:
+        lifecycle.assert_manual_allowed(
+            project.project_id, root=LIFECYCLE_ROOT, now=now
+        )
     actual_runner = runner
     if actual_runner is None:
         actual_runner = DwsCommandRunner(dws_path, profile=project.profile)
@@ -744,7 +911,22 @@ def _collect_command(
     encoded = _canonical_bytes(source_bundle.model_dump(mode="json"))
     if len(encoded) > MAX_PRIVATE_INPUT_BYTES:
         raise ValueError("sources_file_too_large")
-    _atomic_write(output_path, encoded)
+    guard = (
+        lifecycle.stage_guard(
+            project.project_id,
+            args.run_token,
+            expected="begun",
+            target="collected",
+            root=LIFECYCLE_ROOT,
+            now=now,
+        )
+        if args.run_token
+        else lifecycle.manual_guard(
+            project.project_id, root=LIFECYCLE_ROOT, now=now
+        )
+    )
+    with guard:
+        _atomic_write(output_path, encoded)
     return {
         "status": "collected",
         "project_id": project.project_id,
@@ -760,7 +942,9 @@ def _collect_command(
     }
 
 
-def _pending_response(raw: bytes, project_id: str) -> tuple[RetrievalRequest, ...]:
+def _pending_response(
+    raw: bytes, project_id: str
+) -> tuple[ClaimedRetrievalRequest, ...]:
     if len(raw) > 65_536:
         raise ValueError("response_invalid")
     try:
@@ -772,10 +956,10 @@ def _pending_response(raw: bytes, project_id: str) -> tuple[RetrievalRequest, ..
     raw_requests = payload["requests"]
     if not isinstance(raw_requests, list) or len(raw_requests) > 100:
         raise ValueError("response_invalid")
-    requests: list[RetrievalRequest] = []
+    requests: list[ClaimedRetrievalRequest] = []
     try:
         for value in raw_requests:
-            request = RetrievalRequest.model_validate(value)
+            request = ClaimedRetrievalRequest.model_validate(value)
             if (
                 request.project_id != project_id
                 or request.status is not RetrievalRequestStatus.IN_PROGRESS
@@ -790,11 +974,14 @@ def _pending_response(raw: bytes, project_id: str) -> tuple[RetrievalRequest, ..
     return tuple(requests)
 
 
-def _pending_command(
+def _pending_command_inner(
     args: argparse.Namespace,
     *,
     opener: Callable[..., object],
     environ: Mapping[str, str],
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+    now: Callable[[], datetime],
 ) -> dict[str, object]:
     gateway = _gateway_base(args.gateway)
     manifest_path = _absolute_private_path(args.manifest, "manifest")
@@ -826,21 +1013,14 @@ def _pending_command(
         headers={"Authorization": f"Bearer {token}"},
         method="GET",
     )
-    response = None
-    try:
-        response = opener(request, timeout=30.0)
-        raw_response = response.read(65_537)
-    except HTTPError:
-        raise ValueError("http_error") from None
-    except (TimeoutError, URLError, OSError):
-        raise ValueError("network_error") from None
-    except Exception:
-        raise ValueError("network_error") from None
-    finally:
-        close = getattr(response, "close", None)
-        if callable(close):
-            close()
-    pending = _pending_response(raw_response, project.project_id)
+    pending = _gateway_request(
+        request,
+        opener=opener,
+        parse=lambda raw: _pending_response(raw, project.project_id),
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+    assert isinstance(pending, tuple)
     sources_by_hash: dict[str, DwsRetrievalSource] = {}
     for source in project.sources:
         source_hash = _sha256(source.source_id)
@@ -861,6 +1041,10 @@ def _pending_command(
                 DwsRetrievalRequest(
                     request_id=item.request_id,
                     query_hash=item.query_hash,
+                    request_epoch=item.request_epoch,
+                    attempt_count=item.attempt_count,
+                    lease_expires_at=item.lease_expires_at,
+                    lease_token=item.lease_token,
                     sources=request_sources,
                 )
             )
@@ -892,6 +1076,82 @@ def _pending_command(
         "request_count": len(mapped),
         "source_count": len(requested_sources),
         "content_hash": updated.content_hash,
+    }
+
+
+def _pending_command(
+    args: argparse.Namespace,
+    *,
+    opener: Callable[..., object],
+    environ: Mapping[str, str],
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+    now: Callable[[], datetime],
+) -> dict[str, object]:
+    manifest = DwsManifest.load(
+        _absolute_private_path(args.manifest, "manifest")
+    )
+    project = _selected_project(manifest, args.project)
+    guard = (
+        lifecycle.stage_guard(
+            project.project_id,
+            args.run_token,
+            expected="collected",
+            target="pending",
+            root=LIFECYCLE_ROOT,
+            now=now,
+        )
+        if args.run_token
+        else lifecycle.manual_guard(
+            project.project_id, root=LIFECYCLE_ROOT, now=now
+        )
+    )
+    with guard:
+        return _pending_command_inner(
+            args,
+            opener=opener,
+            environ=environ,
+            monotonic=monotonic,
+            sleep=sleep,
+            now=now,
+        )
+
+
+def _artifact_command(
+    args: argparse.Namespace,
+    *,
+    input_stream: object,
+    now: Callable[[], datetime],
+) -> dict[str, object]:
+    project_id = _safe_id(args.project, "project_id")
+    context_path = _absolute_private_path(args.context_file, "context_file")
+    read = getattr(input_stream, "read", None)
+    if not callable(read):
+        raise ValueError("context_file_invalid")
+    raw = read(MAX_PRIVATE_INPUT_BYTES + 1)
+    if not isinstance(raw, bytes) or len(raw) > MAX_PRIVATE_INPUT_BYTES:
+        raise ValueError("context_file_too_large")
+    try:
+        payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_non_finite)
+        artifact = QwenProjectContextArtifact.model_validate(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError):
+        raise ValueError("context_file_invalid") from None
+    if artifact.context.project_id != project_id:
+        raise ValueError("context_mismatch")
+    encoded = _canonical_bytes(artifact.model_dump(mode="json"))
+    with lifecycle.stage_guard(
+        project_id,
+        args.run_token,
+        expected="pending",
+        target="artifact",
+        root=LIFECYCLE_ROOT,
+        now=now,
+    ):
+        _atomic_write(context_path, encoded)
+    return {
+        "status": "artifact_written",
+        "project_id": project_id,
+        "output_bytes": len(encoded),
     }
 
 
@@ -936,11 +1196,20 @@ def _push_command(
     environ: Mapping[str, str],
     now: Callable[[], datetime],
     monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
 ) -> dict[str, object]:
     gateway = _gateway_base(args.gateway)
     project, source_bundle, artifact, state_path = _read_push_inputs(args)
 
     if args.dry_run:
+        if args.run_token:
+            lifecycle.assert_stage(
+                project.project_id,
+                args.run_token,
+                expected="artifact",
+                root=LIFECYCLE_ROOT,
+                now=now,
+            )
         envelope = _build_envelope(
             project,
             source_bundle,
@@ -967,11 +1236,24 @@ def _push_command(
         raise ValueError("token_missing")
     if "\r" in token or "\n" in token:
         raise ValueError("token_invalid")
-    with acquire_state_lock(
-        state_path,
-        project.project_id,
-        timeout=SYNC_LOCK_TIMEOUT_SECONDS,
-    ):
+    guard = (
+        lifecycle.stage_guard(
+            project.project_id,
+            args.run_token,
+            expected="artifact",
+            target="pushed",
+            root=LIFECYCLE_ROOT,
+            now=now,
+        )
+        if args.run_token
+        else lifecycle.manual_guard(
+            project.project_id,
+            root=LIFECYCLE_ROOT,
+            now=now,
+            timeout=SYNC_LOCK_TIMEOUT_SECONDS,
+        )
+    )
+    with guard:
         state = _load_state(state_path, project.project_id)
         cursor = (
             state.pending.source_cursor
@@ -991,6 +1273,10 @@ def _push_command(
         if state.pending is not None:
             if state.pending.content_hash != envelope.content_hash:
                 raise ValueError("pending_sync_conflict")
+            if state.pending.completion_claims_hash != _completion_claims_hash(
+                envelope.completed_retrieval_claims
+            ):
+                raise ValueError("pending_sync_conflict")
             if state.pending.sync_id != envelope.sync_id:
                 raise ValueError("state_file_invalid")
         encoded = _canonical_bytes(envelope.model_dump(mode="json"))
@@ -1001,6 +1287,9 @@ def _push_command(
             source_cursor=envelope.source_cursor,
             content_hash=envelope.content_hash,
             sync_id=envelope.sync_id,
+            completion_claims_hash=_completion_claims_hash(
+                envelope.completed_retrieval_claims
+            ),
         )
         if state.pending is None:
             _atomic_write(
@@ -1024,21 +1313,14 @@ def _push_command(
             method="POST",
         )
         started = monotonic()
-        response = None
-        try:
-            response = opener(request, timeout=30.0)
-            raw_response = response.read(65_537)
-        except HTTPError:
-            raise ValueError("http_error") from None
-        except (TimeoutError, URLError, OSError):
-            raise ValueError("network_error") from None
-        except Exception:
-            raise ValueError("network_error") from None
-        finally:
-            close = getattr(response, "close", None)
-            if callable(close):
-                close()
-        response_payload = _validate_response(raw_response, envelope=envelope)
+        response_payload = _gateway_request(
+            request,
+            opener=opener,
+            parse=lambda raw: _validate_response(raw, envelope=envelope),
+            monotonic=monotonic,
+            sleep=sleep,
+        )
+        assert isinstance(response_payload, dict)
         duration_ms = max(0, int((monotonic() - started) * 1000))
         promoted = SyncCliState(
             schema_version=1,
@@ -1071,10 +1353,20 @@ def main(
     environ: Mapping[str, str] | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     monotonic: Callable[[], float] = time.perf_counter,
+    sleep: Callable[[float], None] = time.sleep,
+    input_stream: object | None = None,
 ) -> int:
     actual_argv = list(sys.argv[1:] if argv is None else argv)
     if "--help" in actual_argv or "-h" in actual_argv:
-        if actual_argv and actual_argv[0] in {"collect", "pending", "push"}:
+        if actual_argv and actual_argv[0] in {
+            "abort",
+            "artifact",
+            "begin",
+            "collect",
+            "end",
+            "pending",
+            "push",
+        }:
             output: dict[str, object] = {
                 "status": "help",
                 "command": actual_argv[0],
@@ -1082,20 +1374,68 @@ def main(
         else:
             output = {
                 "status": "help",
-                "commands": ["collect", "pending", "push"],
+                "commands": [
+                    "begin",
+                    "collect",
+                    "pending",
+                    "artifact",
+                    "push",
+                    "end",
+                    "abort",
+                ],
             }
         _emit(output)
         return 0
     try:
         args = _parser().parse_args(actual_argv)
-        if args.command == "collect":
+        if args.command == "begin":
+            started = lifecycle.begin_run(
+                args.project, root=LIFECYCLE_ROOT, now=now
+            )
+            output = {
+                "status": started.status,
+                "project_id": args.project,
+                "run_token": started.run_token,
+            }
+        elif args.command == "collect":
             output = _collect_command(args, runner=runner, now=now)
         elif args.command == "pending":
             output = _pending_command(
                 args,
                 opener=urlopen,
                 environ=os.environ if environ is None else environ,
+                monotonic=monotonic,
+                sleep=sleep,
+                now=now,
             )
+        elif args.command == "artifact":
+            output = _artifact_command(
+                args,
+                input_stream=(
+                    sys.stdin.buffer if input_stream is None else input_stream
+                ),
+                now=now,
+            )
+        elif args.command == "end":
+            ended = lifecycle.end_run(
+                args.project,
+                args.run_token,
+                root=LIFECYCLE_ROOT,
+                now=now,
+            )
+            output = {
+                "status": ended.status,
+                "project_id": args.project,
+                "run_token": ended.run_token,
+            }
+        elif args.command == "abort":
+            lifecycle.abort_run(
+                args.project,
+                args.run_token,
+                root=LIFECYCLE_ROOT,
+                now=now,
+            )
+            output = {"status": "aborted", "project_id": args.project}
         else:
             output = _push_command(
                 args,
@@ -1103,6 +1443,7 @@ def main(
                 environ=os.environ if environ is None else environ,
                 now=now,
                 monotonic=monotonic,
+                sleep=sleep,
             )
     except (KeyboardInterrupt, SystemExit):
         output = {"status": "error", "error_type": "interrupted"}

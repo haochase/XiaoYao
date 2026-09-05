@@ -17,12 +17,17 @@ else:
 
 MAX_LOCK_WAIT_SECONDS = 30.0
 _LOCK_RETRY_SECONDS = 0.05
+PRIVATE_LOCK_ROOT = Path(__file__).resolve().parents[2] / ".private" / "dws-sync-locks"
 
 
-def _state_lock_path(state_path: Path, _project_id: str) -> Path:
-    normalized_state = os.path.normcase(str(state_path.resolve(strict=False)))
-    lock_key = hashlib.sha256(normalized_state.encode("utf-8")).hexdigest()[:16]
-    return state_path.parent / f".dws-sync-state-{lock_key}.lock"
+def _state_lock_path(
+    _state_path: Path,
+    project_id: str,
+    *,
+    root: Path | None = None,
+) -> Path:
+    lock_key = hashlib.sha256(project_id.encode("utf-8")).hexdigest()
+    return (PRIVATE_LOCK_ROOT if root is None else root) / f"{lock_key}.lock"
 
 
 def _try_lock(stream: BinaryIO) -> None:
@@ -57,9 +62,11 @@ def acquire_state_lock(
     timeout: float = MAX_LOCK_WAIT_SECONDS,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    root: Path | None = None,
 ) -> Iterator[Path]:
-    lock_path = _state_lock_path(state_path, project_id)
+    lock_path = _state_lock_path(state_path, project_id, root=root)
     try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
         stream = lock_path.open("a+b", buffering=0)
     except OSError:
         raise ValueError("private_file_write_failed") from None
