@@ -515,6 +515,67 @@ def test_sync_accepts_decision_with_exact_active_reference(tmp_path: Path) -> No
     assert repository.load_active_generation(PROJECT_ID) is not None
 
 
+def test_sync_accepts_first_decision_after_failed_only_history(
+    tmp_path: Path,
+) -> None:
+    service, repository, _, _ = sync_service(tmp_path)
+    for cursor in (1, 2):
+        observed_at = NOW + timedelta(minutes=cursor - 1)
+        failed = envelope(
+            cursor=cursor,
+            generated_at=observed_at,
+            sources=(
+                failed_source(
+                    SyncSourceType.DOCUMENT,
+                    fetched_at=observed_at,
+                ),
+            ),
+        )
+        failed = failed.model_copy(
+            update={
+                "context": failed.context.model_copy(
+                    update={"source_refs": ()}
+                )
+            }
+        )
+        failed = failed.model_copy(
+            update={"content_hash": compute_envelope_content_hash(failed)}
+        )
+        service.apply(failed, principal=PRINCIPAL, now=observed_at)
+
+    generated_at = NOW + timedelta(minutes=2)
+    candidate = envelope(cursor=3, generated_at=generated_at)
+    decision = DecisionCard(
+        decision_id="decision-1",
+        project_id=PROJECT_ID,
+        topic="terminal plan",
+        decision_text="Use plan B",
+        rationale="Stable rollout",
+        owner="project-owner",
+        decided_at=NOW,
+        source_refs=(DOCUMENT_REF,),
+        status="active",
+        confidence=0.9,
+    )
+    candidate = candidate.model_copy(
+        update={
+            "context": candidate.context.model_copy(
+                update={"active_decisions": (decision,)}
+            )
+        }
+    )
+    candidate = candidate.model_copy(
+        update={"content_hash": compute_envelope_content_hash(candidate)}
+    )
+
+    result = service.apply(candidate, principal=PRINCIPAL, now=generated_at)
+
+    stored = repository.load_active_generation(PROJECT_ID)
+    assert result.outcome == "applied"
+    assert stored is not None
+    assert stored.context.active_decisions == (decision,)
+
+
 def test_sync_accepts_sourced_fact_with_active_exact_excerpt(tmp_path: Path) -> None:
     service, repository, _, _ = sync_service(tmp_path)
     candidate = envelope()

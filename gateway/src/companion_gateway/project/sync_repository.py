@@ -839,6 +839,15 @@ class ProjectSyncRepository:
                     stored_context,
                     envelope.context,
                     envelope.tombstones,
+                    allow_initial_decisions=(
+                        envelope.source_cursor > active_cursor
+                        and envelope.content_hash != active_hash
+                        and self._is_first_successful_bootstrap(
+                            connection,
+                            candidate,
+                            stored_context,
+                        )
+                    ),
                 )
                 if envelope.source_cursor == active_cursor:
                     if envelope.content_hash != active_hash:
@@ -1384,12 +1393,20 @@ class ProjectSyncRepository:
         stored: ProjectContextPackage | None,
         candidate: ProjectContextPackage,
         tombstones: tuple[SourceTombstone, ...],
+        *,
+        allow_initial_decisions: bool = False,
     ) -> None:
         if stored is None:
             return
         if stored.permission_scope != candidate.permission_scope:
             raise SyncConflict("permission_conflict")
         if stored.active_decisions == candidate.active_decisions:
+            return
+        if (
+            allow_initial_decisions
+            and not stored.active_decisions
+            and candidate.active_decisions
+        ):
             return
         candidate_ids = {item.decision_id for item in candidate.active_decisions}
         retained = tuple(
@@ -1423,6 +1440,34 @@ class ProjectSyncRepository:
             )
         ):
             raise SyncConflict("decision_change_requires_review")
+
+    @staticmethod
+    def _is_first_successful_bootstrap(
+        connection: sqlite3.Connection,
+        candidate: SyncCommit,
+        stored: ProjectContextPackage | None,
+    ) -> bool:
+        if (
+            stored is None
+            or stored.permission_scope != candidate.envelope.context.permission_scope
+            or stored.active_decisions
+            or not candidate.envelope.context.active_decisions
+            or not any(
+                state.status is SourceSyncStatus.ACTIVE
+                and state.last_success_at == candidate.audit.finished_at
+                for state in candidate.source_states
+            )
+        ):
+            return False
+        source_version = connection.execute(
+            """
+            SELECT 1 FROM project_source_versions
+            WHERE project_id = ?
+            LIMIT 1
+            """,
+            (candidate.envelope.project_id,),
+        ).fetchone()
+        return source_version is None
 
     @staticmethod
     def _validate_source_heads(

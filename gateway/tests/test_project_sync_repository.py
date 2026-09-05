@@ -14,6 +14,7 @@ from companion_gateway.project.models import (
     EvidenceRef,
     ProjectContextPackage,
 )
+from companion_gateway.project.repository import ProjectMemoryRepository
 from companion_gateway.project.sync_models import (
     EvidenceChunk,
     RetrievalRequest,
@@ -305,6 +306,52 @@ def sync_commit(
 
 def repository_at(tmp_path: Path) -> ProjectSyncRepository:
     return ProjectSyncRepository(tmp_path / "project-memory.db")
+
+
+def failed_only_sync_commit(
+    *,
+    cursor: int,
+    content_hash: str = HASH_A,
+    outcome: str | None = None,
+    permission_scope: str = "project:demo",
+    package: ProjectContextPackage | None = None,
+) -> SyncCommit:
+    observed_at = NOW + timedelta(minutes=cursor - 1)
+    failed_state = source_state(
+        source_version=None,
+        content_hash=None,
+        status=SourceSyncStatus.FAILED,
+        last_attempt_at=observed_at,
+        last_success_at=None,
+        last_error_type=SourceErrorType.NETWORK_TIMEOUT,
+    )
+    failed_snapshot = active_snapshot(
+        source_version="unavailable",
+        source_time=None,
+        fetched_at=observed_at,
+        permission_scope=permission_scope,
+        status=SourceSyncStatus.FAILED,
+        chunks=(),
+        content_hash=None,
+        error_type=SourceErrorType.NETWORK_TIMEOUT,
+        retryable=True,
+    )
+    return sync_commit(
+        cursor=cursor,
+        content_hash=content_hash,
+        package=package
+        or context(
+            generated_at=observed_at,
+            source_refs=(),
+            active_decisions=(),
+            permission_scope=permission_scope,
+        ),
+        snapshots=(failed_snapshot,),
+        states=(failed_state,),
+        protected_sources=(),
+        protected_chunks=(),
+        outcome=outcome,
+    )
 
 
 def test_initialize_upgrades_clock_state_before_using_high_watermark(
@@ -875,6 +922,246 @@ def test_commit_rejects_silent_decision_or_permission_changes(
     with pytest.raises(SyncConflict, match=message):
         repository.commit(
             sync_commit(cursor=2, package=package, snapshots=snapshots)
+        )
+
+
+def test_commit_allows_first_sourced_decision_after_failed_only_history(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(failed_only_sync_commit(cursor=1))
+    repository.commit(
+        failed_only_sync_commit(cursor=2, outcome="unchanged")
+    )
+    database_path = tmp_path / "project-memory.db"
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_source_versions WHERE project_id = ?",
+            ("project-1",),
+        ).fetchone() == (0,)
+    success_at = NOW + timedelta(minutes=2, seconds=1)
+    active = active_document_records(
+        source_id="real-source-id",
+        source_version="v1",
+        source_content_hash=HASH_B,
+        chunk_id=HASH_C,
+        chunk_content_hash=HASH_B,
+        observed_at=success_at,
+    )
+
+    result = repository.commit(
+        sync_commit(
+            cursor=3,
+            content_hash=HASH_B,
+            snapshots=(active[0],),
+            states=(active[1],),
+            protected_sources=(active[2],),
+            protected_chunks=(active[3],),
+        )
+    )
+
+    stored = repository.load_active_generation("project-1")
+    assert result.outcome == "applied"
+    assert stored is not None
+    assert stored.context.active_decisions == context().active_decisions
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_source_versions WHERE project_id = ?",
+            ("project-1",),
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_versions WHERE project_id = ?",
+            ("project-1",),
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_conflicts",
+        ).fetchone() == (0,)
+
+
+def test_commit_rejects_initial_decision_without_failed_generation(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    ProjectMemoryRepository(tmp_path / "project-memory.db").save_context(
+        context(source_refs=(), active_decisions=())
+    )
+    assert repository.load_active_generation("project-1") is None
+    success_at = NOW + timedelta(seconds=1)
+    active = active_document_records(
+        source_id="real-source-id",
+        source_version="v1",
+        source_content_hash=HASH_B,
+        chunk_id=HASH_C,
+        chunk_content_hash=HASH_B,
+        observed_at=success_at,
+    )
+
+    with pytest.raises(SyncConflict, match="decision_change_requires_review"):
+        repository.commit(
+            sync_commit(
+                cursor=1,
+                snapshots=(active[0],),
+                states=(active[1],),
+                protected_sources=(active[2],),
+                protected_chunks=(active[3],),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("stored_package", "candidate_package"),
+    [
+        (
+            context(active_decisions=()),
+            context(),
+        ),
+        (
+            context(),
+            context(
+                active_decisions=(
+                    context().active_decisions[0].model_copy(
+                        update={"decision_text": "改用方案 A"}
+                    ),
+                )
+            ),
+        ),
+    ],
+)
+def test_commit_rejects_decision_addition_or_change_after_source_success(
+    tmp_path: Path,
+    stored_package: ProjectContextPackage,
+    candidate_package: ProjectContextPackage,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1, package=stored_package))
+
+    with pytest.raises(SyncConflict, match="decision_change_requires_review"):
+        repository.commit(sync_commit(cursor=2, package=candidate_package))
+
+
+def test_commit_rejects_initial_decision_without_active_success(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(failed_only_sync_commit(cursor=1))
+
+    with pytest.raises(SyncConflict, match="decision_change_requires_review"):
+        repository.commit(
+            failed_only_sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                package=context(
+                    generated_at=NOW + timedelta(minutes=1),
+                ),
+            )
+        )
+
+
+def test_commit_rejects_initial_decision_without_current_success(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(failed_only_sync_commit(cursor=1))
+    earlier_success = active_document_records(
+        source_id="real-source-id",
+        source_version="v1",
+        source_content_hash=HASH_B,
+        chunk_id=HASH_C,
+        chunk_content_hash=HASH_B,
+        observed_at=NOW,
+    )
+
+    with pytest.raises(SyncConflict, match="decision_change_requires_review"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                snapshots=(earlier_success[0],),
+                states=(earlier_success[1],),
+                protected_sources=(earlier_success[2],),
+                protected_chunks=(earlier_success[3],),
+            )
+        )
+
+
+def test_commit_rejects_initial_decision_with_permission_change(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(failed_only_sync_commit(cursor=1))
+    other_reference = evidence_ref(permission_scope="project:other")
+    other_decision = context().active_decisions[0].model_copy(
+        update={"source_refs": (other_reference,)}
+    )
+    other_context = context(
+        generated_at=NOW + timedelta(minutes=1),
+        permission_scope="project:other",
+        source_refs=(other_reference,),
+        active_decisions=(other_decision,),
+    )
+    success_at = NOW + timedelta(minutes=1, seconds=1)
+    active = active_document_records(
+        source_id="real-source-id",
+        source_version="v1",
+        source_content_hash=HASH_B,
+        chunk_id=HASH_C,
+        chunk_content_hash=HASH_B,
+        observed_at=success_at,
+    )
+
+    with pytest.raises(SyncConflict, match="permission_conflict"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                package=other_context,
+                snapshots=(
+                    active[0].model_copy(
+                        update={"permission_scope": "project:other"}
+                    ),
+                ),
+                states=(active[1],),
+                protected_sources=(active[2],),
+                protected_chunks=(active[3],),
+            )
+        )
+
+
+def test_same_failed_cursor_and_hash_cannot_bootstrap_decisions(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(failed_only_sync_commit(cursor=1))
+    repository.commit(
+        failed_only_sync_commit(cursor=2, outcome="unchanged")
+    )
+    success_at = NOW + timedelta(minutes=1, seconds=1)
+    active = active_document_records(
+        source_id="real-source-id",
+        source_version="v1",
+        source_content_hash=HASH_B,
+        chunk_id=HASH_C,
+        chunk_content_hash=HASH_B,
+        observed_at=success_at,
+    )
+
+    with pytest.raises(SyncConflict, match="decision_change_requires_review"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_A,
+                snapshots=(active[0],),
+                states=(active[1],),
+                protected_sources=(active[2],),
+                protected_chunks=(active[3],),
+            )
         )
 
 
