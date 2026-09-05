@@ -217,9 +217,9 @@ class ProjectSyncRepository:
                 ON project_retrieval_requests(project_id, status, created_at);
 
                 INSERT OR IGNORE INTO project_sync_clock_state(
-                    singleton_id, trusted_wall_at, last_observed_wall_at,
-                    clock_untrusted, needs_sync, reason
-                ) VALUES (1, NULL, NULL, 0, 0, 'normal');
+                    singleton_id, trusted_wall_at, clock_untrusted,
+                    needs_sync, reason
+                ) VALUES (1, NULL, 0, 0, 'normal');
                 """
             )
             self._ensure_column(

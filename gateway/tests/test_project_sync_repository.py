@@ -296,6 +296,41 @@ def repository_at(tmp_path: Path) -> ProjectSyncRepository:
     return ProjectSyncRepository(tmp_path / "project-memory.db")
 
 
+def test_initialize_upgrades_clock_state_before_using_high_watermark(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "project-memory.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE project_sync_clock_state (
+                singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                trusted_wall_at TEXT,
+                clock_untrusted INTEGER NOT NULL,
+                needs_sync INTEGER NOT NULL,
+                reason TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO project_sync_clock_state(
+                singleton_id, trusted_wall_at, clock_untrusted,
+                needs_sync, reason
+            ) VALUES (1, '2026-09-05T08:00:00Z', 0, 1, 'resume_detected')
+            """
+        )
+
+    repository = repository_at(tmp_path)
+    repository.initialize()
+
+    state = repository.load_clock_state()
+    assert state.trusted_wall_at == NOW
+    assert state.last_observed_wall_at is None
+    assert state.needs_sync
+    assert state.reason == "resume_detected"
+
+
 def test_protection_descriptor_persists_and_rejects_identity_or_version_change(
     tmp_path: Path,
 ) -> None:
