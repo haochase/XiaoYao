@@ -349,6 +349,15 @@ class SyncAudit(BaseModel):
         return self
 
 
+class RetrievalSourceBaseline(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_id_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_version: str = Field(min_length=1, max_length=256)
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    chunk_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class RetrievalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -362,6 +371,10 @@ class RetrievalRequest(BaseModel):
         pattern=r"^[0-9a-f]{64}$",
     )
     baseline_source_cursor: int | None = Field(default=None, ge=1)
+    baseline_sources: tuple[RetrievalSourceBaseline, ...] = Field(
+        default=(),
+        max_length=30,
+    )
     status: RetrievalRequestStatus
     created_at: datetime
     expires_at: datetime
@@ -411,10 +424,23 @@ class RetrievalRequest(BaseModel):
             self.baseline_content_hash,
             self.baseline_source_cursor,
         )
-        if any(item is not None for item in baseline) and not all(
-            item is not None for item in baseline
+        has_baseline = any(item is not None for item in baseline)
+        if has_baseline and (
+            not all(item is not None for item in baseline)
+            or not self.baseline_sources
         ):
             raise ValueError("retrieval baseline fields must be supplied together")
+        if self.baseline_sources and not has_baseline:
+            raise ValueError("retrieval baseline fields must be supplied together")
+        baseline_hashes = [item.source_id_hash for item in self.baseline_sources]
+        if (
+            len(baseline_hashes) != len(set(baseline_hashes))
+            or (
+                self.baseline_sources
+                and set(baseline_hashes) != set(self.source_id_hashes)
+            )
+        ):
+            raise ValueError("retrieval baselines must match requested sources")
         if self.status is RetrievalRequestStatus.COMPLETED:
             if self.completed_at is None:
                 raise ValueError("completed request requires completed_at")

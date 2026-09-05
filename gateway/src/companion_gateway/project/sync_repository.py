@@ -14,6 +14,7 @@ from companion_gateway.project.repository import ProjectMemoryRepository
 from companion_gateway.project.sync_models import (
     RetrievalRequest,
     RetrievalRequestStatus,
+    RetrievalSourceBaseline,
     SourceState,
     SourceSyncStatus,
     SyncAudit,
@@ -204,6 +205,7 @@ class ProjectSyncRepository:
                     baseline_generation_id TEXT,
                     baseline_content_hash TEXT,
                     baseline_source_cursor INTEGER,
+                    baseline_sources_json TEXT,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
@@ -246,6 +248,12 @@ class ProjectSyncRepository:
                 "baseline_source_cursor",
                 "INTEGER",
             )
+            self._ensure_column(
+                connection,
+                "project_retrieval_requests",
+                "baseline_sources_json",
+                "TEXT",
+            )
             connection.execute(
                 """
                 UPDATE project_retrieval_requests
@@ -255,6 +263,7 @@ class ProjectSyncRepository:
                     baseline_generation_id IS NULL
                     OR baseline_content_hash IS NULL
                     OR baseline_source_cursor IS NULL
+                    OR baseline_sources_json IS NULL
                   )
                 """
             )
@@ -553,10 +562,6 @@ class ProjectSyncRepository:
             completed = self._complete_retrieval_requests(
                 connection,
                 candidate,
-                self._available_source_hashes(
-                    candidate.protected_sources,
-                    candidate.protected_chunks,
-                ),
             )
             connection.execute(
                 """
@@ -708,36 +713,45 @@ class ProjectSyncRepository:
                 return stored
             if request.status is not RetrievalRequestStatus.PENDING:
                 raise ValueError("new retrieval request must be pending")
-            if active is not None:
-                baseline = (
-                    str(active["generation_id"]),
-                    str(active["content_hash"]),
-                    int(active["source_cursor"]),
-                )
-                supplied = (
-                    request.baseline_generation_id,
-                    request.baseline_content_hash,
-                    request.baseline_source_cursor,
-                )
-                if any(item is not None for item in supplied) and supplied != baseline:
-                    raise SyncConflict("retrieval_request_conflict")
-                request = request.model_copy(
-                    update={
-                        "baseline_generation_id": baseline[0],
-                        "baseline_content_hash": baseline[1],
-                        "baseline_source_cursor": baseline[2],
-                    }
-                )
-            elif request.baseline_generation_id is not None:
+            if active is None:
+                raise SyncConflict("retrieval_source_unavailable")
+            baseline = (
+                str(active["generation_id"]),
+                str(active["content_hash"]),
+                int(active["source_cursor"]),
+            )
+            baseline_sources = self._source_baselines_for_generation(
+                connection,
+                request.project_id,
+                baseline[0],
+                request.source_id_hashes,
+            )
+            supplied = (
+                request.baseline_generation_id,
+                request.baseline_content_hash,
+                request.baseline_source_cursor,
+            )
+            if any(item is not None for item in supplied) and (
+                supplied != baseline
+                or request.baseline_sources != baseline_sources
+            ):
                 raise SyncConflict("retrieval_request_conflict")
+            request = request.model_copy(
+                update={
+                    "baseline_generation_id": baseline[0],
+                    "baseline_content_hash": baseline[1],
+                    "baseline_source_cursor": baseline[2],
+                    "baseline_sources": baseline_sources,
+                }
+            )
             connection.execute(
                 """
                 INSERT INTO project_retrieval_requests(
                     request_id, project_id, query_hash, source_id_hashes_json,
                     baseline_generation_id, baseline_content_hash,
-                    baseline_source_cursor, status, created_at, expires_at,
-                    completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    baseline_source_cursor, baseline_sources_json, status,
+                    created_at, expires_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _retrieval_values(request),
             )
@@ -1064,10 +1078,6 @@ class ProjectSyncRepository:
         completed = self._complete_retrieval_requests(
             connection,
             candidate,
-            self._available_source_hashes(
-                candidate.protected_sources,
-                candidate.protected_chunks,
-            ),
         )
         connection.execute(
             """
@@ -1372,7 +1382,6 @@ class ProjectSyncRepository:
         self,
         connection: sqlite3.Connection,
         candidate: SyncCommit,
-        available_hashes: set[str],
     ) -> tuple[str, ...]:
         completed: list[str] = []
         for request_id in candidate.envelope.completed_retrieval_request_ids:
@@ -1396,17 +1405,42 @@ class ProjectSyncRepository:
             baseline_generation_id = row["baseline_generation_id"]
             baseline_content_hash = row["baseline_content_hash"]
             baseline_source_cursor = row["baseline_source_cursor"]
+            baseline_sources_json = row["baseline_sources_json"]
             if (
                 baseline_generation_id is None
                 or baseline_content_hash is None
                 or baseline_source_cursor is None
+                or baseline_sources_json is None
                 or candidate.generation_id == baseline_generation_id
                 or candidate.envelope.content_hash == baseline_content_hash
                 or candidate.envelope.source_cursor <= int(baseline_source_cursor)
                 or candidate.audit.finished_at >= _parse_datetime(row["expires_at"])
-                or not requested_hashes.issubset(available_hashes)
             ):
                 raise SyncConflict("retrieval_evidence_missing")
+            try:
+                baseline_sources = tuple(
+                    RetrievalSourceBaseline.model_validate(item)
+                    for item in json.loads(baseline_sources_json)
+                )
+            except (TypeError, ValueError):
+                raise SyncConflict("retrieval_evidence_missing") from None
+            current_sources = self._candidate_source_baselines(
+                candidate,
+                tuple(sorted(requested_hashes)),
+            )
+            baseline_by_hash = {
+                item.source_id_hash: item for item in baseline_sources
+            }
+            if set(baseline_by_hash) != requested_hashes:
+                raise SyncConflict("retrieval_evidence_missing")
+            for current in current_sources:
+                baseline = baseline_by_hash[current.source_id_hash]
+                if (
+                    current.content_hash == baseline.content_hash
+                    and current.chunk_fingerprint
+                    == baseline.chunk_fingerprint
+                ):
+                    raise SyncConflict("retrieval_evidence_missing")
             updated = connection.execute(
                 """
                 UPDATE project_retrieval_requests
@@ -1429,13 +1463,114 @@ class ProjectSyncRepository:
         return tuple(completed)
 
     @staticmethod
-    def _available_source_hashes(
-        sources: tuple[ProtectedSourceRecord, ...],
-        chunks: tuple[ProtectedChunkRecord, ...],
-    ) -> set[str]:
-        return {item.source_id_hash for item in sources} | {
-            item.source_id_hash for item in chunks
+    def _candidate_source_baselines(
+        candidate: SyncCommit,
+        source_id_hashes: tuple[str, ...],
+    ) -> tuple[RetrievalSourceBaseline, ...]:
+        states = {
+            item.source_id_hash: item for item in candidate.source_states
         }
+        protected_hashes = {
+            item.source_id_hash for item in candidate.protected_sources
+        }
+        chunks: dict[str, list[tuple[int, str]]] = {}
+        for item in candidate.protected_chunks:
+            chunks.setdefault(item.source_id_hash, []).append(
+                (item.ordinal, item.content_hash)
+            )
+        baselines: list[RetrievalSourceBaseline] = []
+        for source_id_hash in source_id_hashes:
+            state = states.get(source_id_hash)
+            source_chunks = sorted(chunks.get(source_id_hash, []))
+            if (
+                state is None
+                or state.status is not SourceSyncStatus.ACTIVE
+                or source_id_hash not in protected_hashes
+                or state.source_version is None
+                or state.content_hash is None
+                or (
+                    state.source_type
+                    in {
+                        SyncSourceType.DOCUMENT,
+                        SyncSourceType.MEETING_NOTE,
+                    }
+                    and not source_chunks
+                )
+            ):
+                raise SyncConflict("retrieval_evidence_missing")
+            baselines.append(
+                RetrievalSourceBaseline(
+                    source_id_hash=source_id_hash,
+                    source_version=state.source_version,
+                    content_hash=state.content_hash,
+                    chunk_fingerprint=_chunk_fingerprint(source_chunks),
+                )
+            )
+        return tuple(baselines)
+
+    @staticmethod
+    def _source_baselines_for_generation(
+        connection: sqlite3.Connection,
+        project_id: str,
+        generation_id: str,
+        source_id_hashes: tuple[str, ...],
+    ) -> tuple[RetrievalSourceBaseline, ...]:
+        placeholders = ", ".join("?" for _ in source_id_hashes)
+        rows = connection.execute(
+            f"""
+            SELECT source_type, source_id_hash, source_version, content_hash,
+                   status, protected_source_id
+            FROM project_source_states
+            WHERE project_id = ? AND generation_id = ?
+              AND source_id_hash IN ({placeholders})
+            """,
+            (project_id, generation_id, *source_id_hashes),
+        ).fetchall()
+        states = {str(row["source_id_hash"]): row for row in rows}
+        chunk_rows = connection.execute(
+            f"""
+            SELECT source_id_hash, ordinal, content_hash
+            FROM project_evidence_chunks
+            WHERE project_id = ? AND generation_id = ?
+              AND source_id_hash IN ({placeholders})
+            ORDER BY source_id_hash, ordinal, content_hash
+            """,
+            (project_id, generation_id, *source_id_hashes),
+        ).fetchall()
+        chunks: dict[str, list[tuple[int, str]]] = {}
+        for row in chunk_rows:
+            chunks.setdefault(str(row["source_id_hash"]), []).append(
+                (int(row["ordinal"]), str(row["content_hash"]))
+            )
+        baselines: list[RetrievalSourceBaseline] = []
+        for source_id_hash in sorted(source_id_hashes):
+            row = states.get(source_id_hash)
+            source_chunks = chunks.get(source_id_hash, [])
+            if (
+                row is None
+                or row["status"] != SourceSyncStatus.ACTIVE.value
+                or row["protected_source_id"] is None
+                or row["source_version"] is None
+                or row["content_hash"] is None
+                or (
+                    row["source_type"]
+                    in {
+                        SyncSourceType.DOCUMENT.value,
+                        SyncSourceType.MEETING_NOTE.value,
+                    }
+                    and not source_chunks
+                )
+            ):
+                raise SyncConflict("retrieval_source_unavailable")
+            baselines.append(
+                RetrievalSourceBaseline(
+                    source_id_hash=source_id_hash,
+                    source_version=str(row["source_version"]),
+                    content_hash=str(row["content_hash"]),
+                    chunk_fingerprint=_chunk_fingerprint(source_chunks),
+                )
+            )
+        return tuple(baselines)
 
     @staticmethod
     def _insert_audit(
@@ -1487,6 +1622,12 @@ class ProjectSyncRepository:
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _chunk_fingerprint(chunks: list[tuple[int, str]]) -> str:
+    return hashlib.sha256(
+        _canonical_json(chunks).encode("utf-8")
+    ).hexdigest()
 
 
 def _datetime_text(value: datetime) -> str:
@@ -1573,6 +1714,11 @@ def _retrieval_values(request: RetrievalRequest) -> tuple[object, ...]:
         request.baseline_generation_id,
         request.baseline_content_hash,
         request.baseline_source_cursor,
+        _canonical_json(
+            [item.model_dump(mode="json") for item in request.baseline_sources]
+        )
+        if request.baseline_sources
+        else None,
         request.status.value,
         _datetime_text(request.created_at),
         _datetime_text(request.expires_at),
@@ -1592,6 +1738,14 @@ def _retrieval_from_row(row: sqlite3.Row) -> RetrievalRequest:
             int(row["baseline_source_cursor"])
             if row["baseline_source_cursor"] is not None
             else None
+        ),
+        baseline_sources=(
+            tuple(
+                RetrievalSourceBaseline.model_validate(item)
+                for item in json.loads(row["baseline_sources_json"])
+            )
+            if row["baseline_sources_json"] is not None
+            else ()
         ),
         status=row["status"],
         created_at=_parse_datetime(row["created_at"]),

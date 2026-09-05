@@ -24,7 +24,7 @@ from companion_gateway.project.service import (
 )
 from companion_gateway.project.sync_models import (
     EvidenceChunk,
-    RetrievalRequestStatus,
+    RetrievalRequest,
     SourceErrorType,
     SourceState,
     SourceSyncStatus,
@@ -172,6 +172,24 @@ class RecordingSourcePolicy:
                 raise ProjectSourceUnavailable(label)
 
 
+class RecordingRetrievalWriter:
+    def __init__(self) -> None:
+        self.requests: dict[str, RetrievalRequest] = {}
+
+    def save_retrieval_request(
+        self,
+        request: RetrievalRequest,
+    ) -> RetrievalRequest:
+        stored = self.requests.setdefault(request.request_id, request)
+        if (
+            stored.project_id != request.project_id
+            or stored.query_hash != request.query_hash
+            or stored.source_id_hashes != request.source_id_hashes
+        ):
+            raise RuntimeError("retrieval_request_conflict")
+        return stored
+
+
 def decision_for(source: EvidenceSource) -> DecisionCard:
     return DecisionCard(
         decision_id="decision-1",
@@ -191,7 +209,7 @@ def integrated_service(
     snapshot: ProjectRuntimeSnapshot,
     *,
     policy: RecordingSourcePolicy,
-    retrieval_writer: ProjectSyncRepository,
+    retrieval_writer: object,
 ) -> ProjectMemoryService:
     registry = ProjectSnapshotRegistry()
     registry.swap(PROJECT_ID, snapshot)
@@ -341,7 +359,7 @@ def test_missing_evidence_creates_one_idempotent_retrieval_request(
         source_statuses={"document-stale": SourceSyncStatus.STALE},
     )
     policy = RecordingSourcePolicy(errors={"document-stale": "source_stale"})
-    repository = repository_at(tmp_path)
+    repository = RecordingRetrievalWriter()
     service = integrated_service(
         snapshot,
         policy=policy,
@@ -352,10 +370,7 @@ def test_missing_evidence_creates_one_idempotent_retrieval_request(
         with pytest.raises(ProjectContextUnavailable, match="evidence_pending"):
             service.answer(PROJECT_ID, "为什么选择方案B", kind=AnswerKind.FACT)
 
-    requests = repository.list_retrieval_requests(
-        PROJECT_ID,
-        status=RetrievalRequestStatus.PENDING,
-    )
+    requests = tuple(repository.requests.values())
     assert len(requests) == 1
     request = requests[0]
     assert request.query_hash == digest("为什么选择方案b")

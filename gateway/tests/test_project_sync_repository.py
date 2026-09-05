@@ -22,6 +22,7 @@ from companion_gateway.project.sync_models import (
     SourceSnapshot,
     SourceState,
     SourceSyncStatus,
+    SourceTombstone,
     SyncAudit,
     SyncEnvelope,
     SyncSourceType,
@@ -237,6 +238,7 @@ def sync_commit(
     sync_id: str | None = None,
     package: ProjectContextPackage | None = None,
     snapshots: tuple[SourceSnapshot, ...] | None = None,
+    tombstones: tuple[SourceTombstone, ...] = (),
     states: tuple[SourceState, ...] | None = None,
     protected_sources: tuple[ProtectedSourceRecord, ...] | None = None,
     protected_chunks: tuple[ProtectedChunkRecord, ...] | None = None,
@@ -256,6 +258,7 @@ def sync_commit(
         producer="qwenwork-dws",
         context=package or context(generated_at=NOW + timedelta(minutes=cursor - 1)),
         sources=chosen_snapshots,
+        tombstones=tombstones,
         completed_retrieval_request_ids=completed_request_ids,
     )
     failed_count = sum(
@@ -1091,6 +1094,125 @@ def test_retrieval_request_captures_active_generation_baseline(
     assert saved.baseline_generation_id == "generation-1"
     assert saved.baseline_content_hash == HASH_A
     assert saved.baseline_source_cursor == 1
+    assert len(saved.baseline_sources) == 1
+    baseline = saved.baseline_sources[0]
+    assert baseline.source_id_hash == source_id_hash("real-source-id")
+    assert baseline.source_version == "v1"
+    assert baseline.content_hash == HASH_B
+    assert len(baseline.chunk_fingerprint) == 64
+
+
+def test_unrelated_source_change_cannot_complete_retrieval(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    other = active_document_records(
+        source_id="other-source-id",
+        source_version="v1",
+        source_content_hash=HASH_D,
+        chunk_id=HASH_E,
+        chunk_content_hash=HASH_F,
+        observed_at=NOW,
+    )
+    repository.commit(
+        sync_commit(
+            cursor=1,
+            content_hash=HASH_A,
+            snapshots=(active_snapshot(), other[0]),
+            states=(source_state(), other[1]),
+            protected_sources=(protected_source(), other[2]),
+            protected_chunks=(protected_chunk(), other[3]),
+        )
+    )
+    request = repository.save_retrieval_request(retrieval_request())
+    changed_other = active_document_records(
+        source_id="other-source-id",
+        source_version="v2",
+        source_content_hash=HASH_E,
+        chunk_id=HASH_F,
+        chunk_content_hash=HASH_D,
+        observed_at=NOW + timedelta(minutes=1),
+    )
+
+    with pytest.raises(SyncConflict, match="retrieval_evidence_missing"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                snapshots=(active_snapshot(), changed_other[0]),
+                states=(source_state(), changed_other[1]),
+                protected_sources=(protected_source(), changed_other[2]),
+                protected_chunks=(protected_chunk(), changed_other[3]),
+                completed_request_ids=(request.request_id,),
+            )
+        )
+
+
+def test_metadata_only_source_refresh_cannot_complete_retrieval(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
+    request = repository.save_retrieval_request(retrieval_request())
+    metadata_only = active_document_records(
+        source_id="real-source-id",
+        source_version="v2",
+        source_content_hash=HASH_B,
+        chunk_id=HASH_D,
+        chunk_content_hash=HASH_B,
+        observed_at=NOW + timedelta(minutes=1),
+    )
+
+    with pytest.raises(SyncConflict, match="retrieval_evidence_missing"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_C,
+                snapshots=(metadata_only[0],),
+                states=(metadata_only[1],),
+                protected_sources=(metadata_only[2],),
+                protected_chunks=(metadata_only[3],),
+                completed_request_ids=(request.request_id,),
+            )
+        )
+
+
+def test_retrieval_request_rechecks_active_sources_inside_write_transaction(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
+    revoked = source_state(
+        source_version=None,
+        content_hash=None,
+        status=SourceSyncStatus.REVOKED,
+        last_attempt_at=NOW + timedelta(minutes=1),
+        last_success_at=None,
+    )
+    tombstone = SourceTombstone(
+        source_type=SyncSourceType.DOCUMENT,
+        source_id="real-source-id",
+        status=SourceSyncStatus.REVOKED,
+        occurred_at=NOW + timedelta(minutes=1),
+        permission_scope="project:demo",
+    )
+    repository.commit(
+        sync_commit(
+            cursor=2,
+            content_hash=HASH_B,
+            snapshots=(),
+            tombstones=(tombstone,),
+            states=(revoked,),
+            protected_sources=(),
+            protected_chunks=(),
+        )
+    )
+
+    with pytest.raises(SyncConflict, match="retrieval_source_unavailable"):
+        repository.save_retrieval_request(retrieval_request())
 
 
 def test_unchanged_generation_cannot_complete_pending_retrieval(
@@ -1171,10 +1293,11 @@ def test_retrieval_completion_requires_new_evidence_for_every_source(
 def test_retrieval_requests_use_compare_and_set_transitions(tmp_path: Path) -> None:
     repository = repository_at(tmp_path)
     repository.initialize()
+    repository.commit(sync_commit(cursor=1))
     request = retrieval_request()
 
-    assert repository.save_retrieval_request(request) == request
-    assert repository.save_retrieval_request(request) == request
+    saved = repository.save_retrieval_request(request)
+    assert repository.save_retrieval_request(request) == saved
     assert repository.compare_and_set_retrieval_request(
         "project-1",
         "request-1",
@@ -1187,7 +1310,7 @@ def test_retrieval_requests_use_compare_and_set_transitions(tmp_path: Path) -> N
         frozenset({RetrievalRequestStatus.PENDING}),
         RetrievalRequestStatus.EXPIRED,
     )
-    in_progress = request.model_copy(update={"status": "in_progress"})
+    in_progress = saved.model_copy(update={"status": "in_progress"})
     assert repository.get_retrieval_request("project-1", "request-1") == in_progress
     assert repository.list_retrieval_requests("project-1") == (in_progress,)
     with pytest.raises(ValueError, match="completed"):
@@ -1203,15 +1326,16 @@ def test_retrieval_requests_use_compare_and_set_transitions(tmp_path: Path) -> N
 def test_saving_retrieval_request_cannot_bypass_state_cas(tmp_path: Path) -> None:
     repository = repository_at(tmp_path)
     repository.initialize()
+    repository.commit(sync_commit(cursor=1))
     request = retrieval_request()
-    repository.save_retrieval_request(request)
+    saved = repository.save_retrieval_request(request)
 
     with pytest.raises(SyncConflict, match="retrieval_request_conflict"):
         repository.save_retrieval_request(
-            request.model_copy(update={"status": RetrievalRequestStatus.IN_PROGRESS})
+            saved.model_copy(update={"status": RetrievalRequestStatus.IN_PROGRESS})
         )
 
-    assert repository.get_retrieval_request("project-1", "request-1") == request
+    assert repository.get_retrieval_request("project-1", "request-1") == saved
 
 
 def test_completed_retrieval_request_commits_with_evidence(tmp_path: Path) -> None:
@@ -1227,10 +1351,22 @@ def test_completed_retrieval_request_commits_with_evidence(tmp_path: Path) -> No
     )
     request = pending.model_copy(update={"status": RetrievalRequestStatus.IN_PROGRESS})
 
+    updated = active_document_records(
+        source_id="real-source-id",
+        source_version="v2",
+        source_content_hash=HASH_D,
+        chunk_id=HASH_E,
+        chunk_content_hash=HASH_F,
+        observed_at=NOW + timedelta(minutes=1),
+    )
     repository.commit(
         sync_commit(
             cursor=2,
             content_hash=HASH_B,
+            snapshots=(updated[0],),
+            states=(updated[1],),
+            protected_sources=(updated[2],),
+            protected_chunks=(updated[3],),
             completed_request_ids=(request.request_id,),
         )
     )
@@ -1247,8 +1383,8 @@ def test_missing_retrieval_evidence_rolls_back_generation_and_request(
 ) -> None:
     repository = repository_at(tmp_path)
     repository.initialize()
-    request = retrieval_request(source_id_hashes=("d" * 64,))
-    repository.save_retrieval_request(request)
+    repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
+    request = repository.save_retrieval_request(retrieval_request())
     assert repository.compare_and_set_retrieval_request(
         request.project_id,
         request.request_id,
@@ -1256,21 +1392,39 @@ def test_missing_retrieval_evidence_rolls_back_generation_and_request(
         RetrievalRequestStatus.IN_PROGRESS,
     )
     request = request.model_copy(update={"status": RetrievalRequestStatus.IN_PROGRESS})
+    other = active_document_records(
+        source_id="other-source-id",
+        source_version="v2",
+        source_content_hash=HASH_D,
+        chunk_id=HASH_E,
+        chunk_content_hash=HASH_F,
+        observed_at=NOW + timedelta(minutes=1),
+    )
 
     with pytest.raises(SyncConflict, match="retrieval_evidence_missing"):
         repository.commit(
-            sync_commit(cursor=1, completed_request_ids=(request.request_id,))
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                snapshots=(other[0],),
+                states=(other[1],),
+                protected_sources=(other[2],),
+                protected_chunks=(other[3],),
+                completed_request_ids=(request.request_id,),
+            )
         )
 
-    assert repository.load_active_generation("project-1") is None
+    active = repository.load_active_generation("project-1")
+    assert active is not None
+    assert active.source_cursor == 1
     assert repository.get_retrieval_request("project-1", request.request_id) == request
     with sqlite3.connect(tmp_path / "project-memory.db") as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM project_source_states"
-        ).fetchone() == (0,)
+        ).fetchone() == (1,)
         assert connection.execute(
             "SELECT COUNT(*) FROM project_evidence_chunks"
-        ).fetchone() == (0,)
+        ).fetchone() == (1,)
 
 
 def test_failure_before_activation_rolls_back_new_generation(
