@@ -1,0 +1,15 @@
+examples:
+  - id: source-context
+    title:
+      zh: 生成有来源的项目上下文
+      en: Build sourced project context
+    description:
+      zh: 仅依据同步流程提供的已校验资料包生成内部 JSON 产物
+      en: Use only the validated source bundle supplied by the sync workflow
+    prompt:
+      zh: |-
+        请处理本次同步流程提供的 DwsSourceBundle，按技能契约生成内部上下文 JSON。
+        不读取其他资料，不调用 DWS，不写文件，不向网关推送。
+      en: |-
+        Process the DwsSourceBundle supplied by this sync workflow into internal context JSON.
+        Do not fetch other data, call DWS, write files, or push to the gateway.
