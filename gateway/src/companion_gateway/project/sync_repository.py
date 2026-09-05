@@ -179,6 +179,17 @@ class ProjectSyncRepository:
                     PRIMARY KEY (project_id, source_type, source_id_hash)
                 );
 
+                CREATE TABLE IF NOT EXISTS project_source_versions (
+                    project_id TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    source_id_hash TEXT NOT NULL,
+                    source_version TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    PRIMARY KEY (
+                        project_id, source_type, source_id_hash, source_version
+                    )
+                );
+
                 CREATE TABLE IF NOT EXISTS project_evidence_chunks (
                     project_id TEXT NOT NULL,
                     generation_id TEXT NOT NULL,
@@ -253,6 +264,17 @@ class ProjectSyncRepository:
                   AND state.source_version IS NOT NULL
                   AND state.source_time IS NOT NULL
                   AND state.content_hash IS NOT NULL
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO project_source_versions(
+                    project_id, source_type, source_id_hash,
+                    source_version, content_hash
+                )
+                SELECT project_id, source_type, source_id_hash,
+                       source_version, content_hash
+                FROM project_source_heads
                 """
             )
             self._ensure_column(
@@ -1127,11 +1149,24 @@ class ProjectSyncRepository:
             previous_time = _parse_datetime(str(row["source_time"]))
             if source.source_time < previous_time:
                 raise SyncConflict("source_version_rollback")
-            if source.source_version == row["source_version"] and (
-                source.content_hash != row["content_hash"]
-                or source.source_time != previous_time
-            ):
-                raise SyncConflict("source_version_conflict")
+            history = connection.execute(
+                """
+                SELECT content_hash FROM project_source_versions
+                WHERE project_id = ? AND source_type = ?
+                  AND source_id_hash = ? AND source_version = ?
+                """,
+                (
+                    candidate.envelope.project_id,
+                    source.source_type.value,
+                    source_hash,
+                    source.source_version,
+                ),
+            ).fetchone()
+            if history is not None:
+                if source.content_hash != history["content_hash"]:
+                    raise SyncConflict("source_version_conflict")
+                if source.source_version != row["source_version"]:
+                    raise SyncConflict("source_version_rollback")
 
     @staticmethod
     def _upsert_source_heads(
@@ -1144,6 +1179,24 @@ class ProjectSyncRepository:
             assert source.source_version is not None
             assert source.source_time is not None
             assert source.content_hash is not None
+            connection.execute(
+                """
+                INSERT INTO project_source_versions(
+                    project_id, source_type, source_id_hash,
+                    source_version, content_hash
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    project_id, source_type, source_id_hash, source_version
+                ) DO NOTHING
+                """,
+                (
+                    candidate.envelope.project_id,
+                    source.source_type.value,
+                    hashlib.sha256(source.source_id.encode("utf-8")).hexdigest(),
+                    source.source_version,
+                    source.content_hash,
+                ),
+            )
             connection.execute(
                 """
                 INSERT INTO project_source_heads(

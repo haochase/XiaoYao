@@ -581,6 +581,81 @@ def test_higher_cursor_rejects_same_source_version_with_new_content(
         )
 
 
+def test_seen_source_version_cannot_become_head_again(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
+    version_two = active_document_records(
+        source_id="real-source-id",
+        source_version="v2",
+        source_content_hash=HASH_D,
+        chunk_id=HASH_E,
+        chunk_content_hash=HASH_F,
+        observed_at=NOW + timedelta(minutes=1),
+    )
+    repository.commit(
+        sync_commit(
+            cursor=2,
+            content_hash=HASH_B,
+            snapshots=(version_two[0],),
+            states=(version_two[1],),
+            protected_sources=(version_two[2],),
+            protected_chunks=(version_two[3],),
+        )
+    )
+    reused_version = active_document_records(
+        source_id="real-source-id",
+        source_version="v1",
+        source_content_hash=HASH_B,
+        chunk_id=HASH_C,
+        chunk_content_hash=HASH_B,
+        observed_at=NOW + timedelta(minutes=2),
+    )
+
+    with pytest.raises(SyncConflict, match="source_version_rollback"):
+        repository.commit(
+            sync_commit(
+                cursor=3,
+                content_hash=HASH_C,
+                snapshots=(reused_version[0],),
+                states=(reused_version[1],),
+                protected_sources=(reused_version[2],),
+                protected_chunks=(reused_version[3],),
+            )
+        )
+
+
+def test_same_source_version_and_content_allows_later_source_time(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
+    later = active_document_records(
+        source_id="real-source-id",
+        source_version="v1",
+        source_content_hash=HASH_B,
+        chunk_id=HASH_C,
+        chunk_content_hash=HASH_B,
+        observed_at=NOW + timedelta(minutes=1),
+    )
+
+    result = repository.commit(
+        sync_commit(
+            cursor=2,
+            content_hash=HASH_B,
+            snapshots=(later[0],),
+            states=(later[1],),
+            protected_sources=(later[2],),
+            protected_chunks=(later[3],),
+        )
+    )
+
+    assert result.outcome == "applied"
+
+
 @pytest.mark.parametrize(
     "package",
     [

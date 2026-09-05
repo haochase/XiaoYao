@@ -740,6 +740,25 @@ def test_future_client_fetched_at_never_extends_gateway_freshness(
     ).health is ProjectSyncHealth.STALE
 
 
+def test_old_client_fetched_at_remains_valid_provenance(tmp_path: Path) -> None:
+    service, repository, _, _ = sync_service(tmp_path)
+
+    result = service.apply(
+        envelope(
+            sources=(
+                active_document(fetched_at=NOW - timedelta(days=1)),
+            )
+        ),
+        principal=PRINCIPAL,
+        now=NOW,
+    )
+
+    assert result.outcome == "applied"
+    stored = repository.load_active_generation(PROJECT_ID)
+    assert stored is not None
+    assert stored.source_states[0].last_success_at == NOW
+
+
 def test_resume_detection_requests_one_immediate_sync(tmp_path: Path) -> None:
     service, _, _, _ = sync_service(tmp_path)
 

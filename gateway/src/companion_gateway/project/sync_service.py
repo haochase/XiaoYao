@@ -629,7 +629,7 @@ class ProjectSyncService:
             *(tombstone.occurred_at for tombstone in envelope.tombstones),
         )
         if any(
-            abs((timestamp - now).total_seconds()) > self._clock_skew_seconds
+            (timestamp - now).total_seconds() > self._clock_skew_seconds
             for timestamp in timestamps
         ):
             raise ProjectSyncValidationError("source_fetch_time_invalid")
