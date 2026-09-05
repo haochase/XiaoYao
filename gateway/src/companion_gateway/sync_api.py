@@ -81,6 +81,7 @@ _SAFE_CONFLICT_ERRORS = frozenset(
 )
 LOCAL_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 _SYNC_INTERVAL_SECONDS = 300.0
+_RETRIEVAL_LEASE_SECONDS = 300
 
 
 class RetrievalRequestCreate(BaseModel):
@@ -437,33 +438,18 @@ def create_sync_app(
         principal = _identify(authenticator, request)
         _authorize(authenticator, principal, project_id=project_id)
         current_time = now()
-        results = []
         try:
-            for item in repository.list_retrieval_requests(project_id, status):
-                target = None
-                if (
-                    item.status
-                    in {
-                        RetrievalRequestStatus.PENDING,
-                        RetrievalRequestStatus.IN_PROGRESS,
-                    }
-                    and item.expires_at <= current_time
-                ):
-                    target = RetrievalRequestStatus.EXPIRED
-                elif item.status is RetrievalRequestStatus.PENDING:
-                    target = RetrievalRequestStatus.IN_PROGRESS
-                if target is not None:
-                    repository.compare_and_set_retrieval_request(
-                        project_id,
-                        item.request_id,
-                        frozenset({item.status}),
-                        target,
-                    )
-                    item = repository.get_retrieval_request(
-                        project_id,
-                        item.request_id,
-                    ) or item
-                results.append(item)
+            if status is RetrievalRequestStatus.PENDING:
+                results = repository.claim_retrieval_requests(
+                    project_id,
+                    now=current_time,
+                    lease_seconds=_RETRIEVAL_LEASE_SECONDS,
+                )
+            else:
+                results = repository.list_retrieval_requests(
+                    project_id,
+                    status,
+                )
         except Exception as exc:
             raise _sync_error(exc) from exc
         return {"requests": jsonable_encoder(results)}

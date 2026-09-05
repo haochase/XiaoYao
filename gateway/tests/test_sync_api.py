@@ -17,6 +17,8 @@ from companion_gateway.project import (
     ProjectContextPackage,
     ProjectSyncHealth,
     ProjectSyncStatus,
+    RetrievalRequest,
+    RetrievalRequestStatus,
     SourceSnapshot,
     SourceState,
     SourceSyncStatus,
@@ -201,6 +203,88 @@ class StubSyncService:
         self.required_refs.append(source_refs)
 
 
+class StubRetrievalRepository:
+    def __init__(self) -> None:
+        self.requests: dict[str, RetrievalRequest] = {}
+
+    def initialize(self) -> None:
+        return None
+
+    def save_retrieval_request(
+        self,
+        request: RetrievalRequest,
+    ) -> RetrievalRequest:
+        stored = self.requests.setdefault(request.request_id, request)
+        if stored != request:
+            raise RuntimeError("retrieval_request_conflict")
+        return stored
+
+    def list_retrieval_requests(
+        self,
+        project_id: str,
+        status: RetrievalRequestStatus | None = None,
+    ) -> tuple[RetrievalRequest, ...]:
+        return tuple(
+            item
+            for item in self.requests.values()
+            if item.project_id == project_id
+            and (status is None or item.status is status)
+        )
+
+    def get_retrieval_request(
+        self,
+        project_id: str,
+        request_id: str,
+    ) -> RetrievalRequest | None:
+        item = self.requests.get(request_id)
+        return item if item is not None and item.project_id == project_id else None
+
+    def claim_retrieval_requests(
+        self,
+        project_id: str,
+        *,
+        now: datetime,
+        lease_seconds: int,
+    ) -> tuple[RetrievalRequest, ...]:
+        claimed: list[RetrievalRequest] = []
+        for request_id, item in tuple(self.requests.items()):
+            if item.project_id != project_id or item.expires_at <= now:
+                continue
+            available = item.status is RetrievalRequestStatus.PENDING or (
+                item.status is RetrievalRequestStatus.IN_PROGRESS
+                and item.lease_expires_at is not None
+                and item.lease_expires_at <= now
+            )
+            if not available:
+                continue
+            updated = item.model_copy(
+                update={
+                    "status": RetrievalRequestStatus.IN_PROGRESS,
+                    "lease_expires_at": min(
+                        now + timedelta(seconds=lease_seconds),
+                        item.expires_at,
+                    ),
+                    "attempt_count": item.attempt_count + 1,
+                }
+            )
+            self.requests[request_id] = updated
+            claimed.append(updated)
+        return tuple(claimed)
+
+    def compare_and_set_retrieval_request(
+        self,
+        project_id: str,
+        request_id: str,
+        expected: frozenset[RetrievalRequestStatus],
+        target: RetrievalRequestStatus,
+    ) -> bool:
+        item = self.get_retrieval_request(project_id, request_id)
+        if item is None or item.status not in expected:
+            return False
+        self.requests[request_id] = item.model_copy(update={"status": target})
+        return True
+
+
 @pytest.fixture
 def sync_service() -> StubSyncService:
     return StubSyncService()
@@ -208,11 +292,15 @@ def sync_service() -> StubSyncService:
 
 @pytest.fixture
 def client(tmp_path, sync_service: StubSyncService) -> Iterator[TestClient]:
+    repository = StubRetrievalRepository()
+    test_clock = {"now": NOW}
     app = create_sync_app(
         settings(tmp_path / "sync-api.db"),
         sync_service=sync_service,
-        clock=lambda: NOW,
+        repository=repository,
+        clock=lambda: test_clock["now"],
     )
+    app.state.project_test_clock = test_clock
     with TestClient(
         app,
         base_url="http://127.0.0.1:8731",
@@ -604,7 +692,7 @@ def test_retrieval_request_create_list_and_get(
     assert created.json()["request"]["status"] == "pending"
     assert created.json()["request"]["source_id_hashes"] == [digest("doc-1")]
     assert len(listed.json()["requests"]) == 1
-    assert listed.json()["requests"][0]["status"] == "in_progress"
+    assert listed.json()["requests"][0]["status"] == "pending"
     assert fetched.json()["request"] == listed.json()["requests"][0]
     assert sync_service.required_refs == [(source_ref(),)]
 
@@ -614,8 +702,6 @@ def test_retrieval_request_list_filters_pending_before_claiming(
 ) -> None:
     first = retrieval_body()
     first["request_id"] = "retrieval-first"
-    second = retrieval_body()
-    second["request_id"] = "retrieval-second"
     assert client.post(
         f"/v1/projects/{PROJECT_ID}/retrieval-requests",
         json=first,
@@ -625,23 +711,35 @@ def test_retrieval_request_list_filters_pending_before_claiming(
         f"/v1/projects/{PROJECT_ID}/retrieval-requests?status=pending",
         headers=AUTH,
     )
-    assert [item["request_id"] for item in claimed.json()["requests"]] == [
-        "retrieval-first"
-    ]
-    assert client.post(
-        f"/v1/projects/{PROJECT_ID}/retrieval-requests",
-        json=second,
+    claimed_request = claimed.json()["requests"][0]
+    assert claimed_request["request_id"] == "retrieval-first"
+    assert claimed_request["status"] == "in_progress"
+    assert claimed_request["attempt_count"] == 1
+    assert claimed_request["lease_expires_at"] == (
+        NOW + timedelta(minutes=5)
+    ).isoformat().replace("+00:00", "Z")
+    repeated = client.get(
+        f"/v1/projects/{PROJECT_ID}/retrieval-requests?status=pending",
         headers=AUTH,
-    ).status_code == 201
+    )
+    assert repeated.json() == {"requests": []}
 
-    pending = client.get(
+    client.app.state.project_test_clock["now"] = NOW + timedelta(
+        minutes=5,
+        seconds=1,
+    )
+    reclaimed = client.get(
         f"/v1/projects/{PROJECT_ID}/retrieval-requests?status=pending",
         headers=AUTH,
     )
 
-    assert [item["request_id"] for item in pending.json()["requests"]] == [
-        "retrieval-second"
-    ]
+    reclaimed_request = reclaimed.json()["requests"][0]
+    assert reclaimed_request["request_id"] == "retrieval-first"
+    assert reclaimed_request["status"] == "in_progress"
+    assert reclaimed_request["attempt_count"] == 2
+    assert reclaimed_request["lease_expires_at"] == (
+        NOW + timedelta(minutes=10, seconds=1)
+    ).isoformat().replace("+00:00", "Z")
 
 
 def test_retrieval_request_rejects_unregistered_source_summary(

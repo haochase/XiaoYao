@@ -1298,21 +1298,28 @@ def test_retrieval_requests_use_compare_and_set_transitions(tmp_path: Path) -> N
 
     saved = repository.save_retrieval_request(request)
     assert repository.save_retrieval_request(request) == saved
-    assert repository.compare_and_set_retrieval_request(
+    claimed = repository.claim_retrieval_requests(
         "project-1",
-        "request-1",
-        frozenset({RetrievalRequestStatus.PENDING}),
-        RetrievalRequestStatus.IN_PROGRESS,
-    )
-    assert not repository.compare_and_set_retrieval_request(
+        now=NOW + timedelta(seconds=1),
+        lease_seconds=60,
+    )[0]
+    assert claimed.status is RetrievalRequestStatus.IN_PROGRESS
+    assert claimed.attempt_count == 1
+    assert claimed.lease_expires_at == NOW + timedelta(seconds=61)
+    assert repository.claim_retrieval_requests(
         "project-1",
-        "request-1",
-        frozenset({RetrievalRequestStatus.PENDING}),
-        RetrievalRequestStatus.EXPIRED,
-    )
-    in_progress = saved.model_copy(update={"status": "in_progress"})
-    assert repository.get_retrieval_request("project-1", "request-1") == in_progress
-    assert repository.list_retrieval_requests("project-1") == (in_progress,)
+        now=NOW + timedelta(seconds=60),
+        lease_seconds=60,
+    ) == ()
+    reclaimed = repository.claim_retrieval_requests(
+        "project-1",
+        now=NOW + timedelta(seconds=62),
+        lease_seconds=60,
+    )[0]
+    assert reclaimed.status is RetrievalRequestStatus.IN_PROGRESS
+    assert reclaimed.attempt_count == 2
+    assert reclaimed.lease_expires_at == NOW + timedelta(seconds=122)
+    assert repository.list_retrieval_requests("project-1") == (reclaimed,)
     with pytest.raises(ValueError, match="completed"):
         repository.compare_and_set_retrieval_request(
             "project-1",
@@ -1332,7 +1339,13 @@ def test_saving_retrieval_request_cannot_bypass_state_cas(tmp_path: Path) -> Non
 
     with pytest.raises(SyncConflict, match="retrieval_request_conflict"):
         repository.save_retrieval_request(
-            saved.model_copy(update={"status": RetrievalRequestStatus.IN_PROGRESS})
+            saved.model_copy(
+                update={
+                    "status": RetrievalRequestStatus.IN_PROGRESS,
+                    "lease_expires_at": NOW + timedelta(minutes=1),
+                    "attempt_count": 1,
+                }
+            )
         )
 
     assert repository.get_retrieval_request("project-1", "request-1") == saved
@@ -1343,13 +1356,7 @@ def test_completed_retrieval_request_commits_with_evidence(tmp_path: Path) -> No
     repository.initialize()
     repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
     pending = repository.save_retrieval_request(retrieval_request())
-    assert repository.compare_and_set_retrieval_request(
-        pending.project_id,
-        pending.request_id,
-        frozenset({RetrievalRequestStatus.PENDING}),
-        RetrievalRequestStatus.IN_PROGRESS,
-    )
-    request = pending.model_copy(update={"status": RetrievalRequestStatus.IN_PROGRESS})
+    request = pending
 
     updated = active_document_records(
         source_id="real-source-id",
@@ -1385,13 +1392,6 @@ def test_missing_retrieval_evidence_rolls_back_generation_and_request(
     repository.initialize()
     repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
     request = repository.save_retrieval_request(retrieval_request())
-    assert repository.compare_and_set_retrieval_request(
-        request.project_id,
-        request.request_id,
-        frozenset({RetrievalRequestStatus.PENDING}),
-        RetrievalRequestStatus.IN_PROGRESS,
-    )
-    request = request.model_copy(update={"status": RetrievalRequestStatus.IN_PROGRESS})
     other = active_document_records(
         source_id="other-source-id",
         source_version="v2",

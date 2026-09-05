@@ -378,6 +378,8 @@ class RetrievalRequest(BaseModel):
     status: RetrievalRequestStatus
     created_at: datetime
     expires_at: datetime
+    lease_expires_at: datetime | None = None
+    attempt_count: int = Field(default=0, ge=0)
     completed_at: datetime | None = None
 
     _request_id = field_validator("request_id")(
@@ -399,6 +401,11 @@ class RetrievalRequest(BaseModel):
     )
     _expires_at = field_validator("expires_at")(
         lambda value: _require_aware(value, "expires_at")
+    )
+    _lease_expires_at = field_validator("lease_expires_at")(
+        lambda value: _require_aware(value, "lease_expires_at")
+        if value is not None
+        else value
     )
     _completed_at = field_validator("completed_at")(
         lambda value: _require_aware(value, "completed_at")
@@ -446,6 +453,13 @@ class RetrievalRequest(BaseModel):
                 raise ValueError("completed request requires completed_at")
         elif self.completed_at is not None:
             raise ValueError("non-completed request forbids completed_at")
+        if self.status is RetrievalRequestStatus.IN_PROGRESS:
+            if self.lease_expires_at is None or self.attempt_count < 1:
+                raise ValueError("in-progress request requires an active lease")
+            if self.lease_expires_at > self.expires_at:
+                raise ValueError("retrieval lease cannot exceed request expiry")
+        elif self.lease_expires_at is not None:
+            raise ValueError("non-active request forbids a retrieval lease")
         return self
 
 

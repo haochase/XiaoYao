@@ -5,7 +5,7 @@ import json
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -209,6 +209,8 @@ class ProjectSyncRepository:
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
+                    lease_expires_at TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
                     completed_at TEXT
                 );
 
@@ -229,6 +231,26 @@ class ProjectSyncRepository:
                 "project_sync_clock_state",
                 "last_observed_wall_at",
                 "TEXT",
+            )
+            self._ensure_column(
+                connection,
+                "project_retrieval_requests",
+                "lease_expires_at",
+                "TEXT",
+            )
+            self._ensure_column(
+                connection,
+                "project_retrieval_requests",
+                "attempt_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            connection.execute(
+                """
+                UPDATE project_retrieval_requests
+                SET status = 'pending'
+                WHERE status = 'in_progress'
+                  AND lease_expires_at IS NULL
+                """
             )
             self._ensure_column(
                 connection,
@@ -750,8 +772,9 @@ class ProjectSyncRepository:
                     request_id, project_id, query_hash, source_id_hashes_json,
                     baseline_generation_id, baseline_content_hash,
                     baseline_source_cursor, baseline_sources_json, status,
-                    created_at, expires_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, expires_at, lease_expires_at, attempt_count,
+                    completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _retrieval_values(request),
             )
@@ -790,6 +813,94 @@ class ProjectSyncRepository:
             rows = connection.execute(query, parameters).fetchall()
         return tuple(_retrieval_from_row(row) for row in rows)
 
+    def claim_retrieval_requests(
+        self,
+        project_id: str,
+        *,
+        now: datetime,
+        lease_seconds: int,
+    ) -> tuple[RetrievalRequest, ...]:
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("retrieval_claim_now_invalid")
+        if (
+            not isinstance(lease_seconds, int)
+            or isinstance(lease_seconds, bool)
+            or not 1 <= lease_seconds <= 1_800
+        ):
+            raise ValueError("retrieval_lease_invalid")
+        now_text = _datetime_text(now)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE project_retrieval_requests
+                SET status = ?, lease_expires_at = NULL
+                WHERE project_id = ?
+                  AND status IN (?, ?)
+                  AND expires_at <= ?
+                """,
+                (
+                    RetrievalRequestStatus.EXPIRED.value,
+                    project_id,
+                    RetrievalRequestStatus.PENDING.value,
+                    RetrievalRequestStatus.IN_PROGRESS.value,
+                    now_text,
+                ),
+            )
+            rows = connection.execute(
+                """
+                SELECT * FROM project_retrieval_requests
+                WHERE project_id = ? AND expires_at > ?
+                  AND (
+                    status = ?
+                    OR (
+                      status = ?
+                      AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                    )
+                  )
+                ORDER BY created_at, request_id
+                LIMIT 100
+                """,
+                (
+                    project_id,
+                    now_text,
+                    RetrievalRequestStatus.PENDING.value,
+                    RetrievalRequestStatus.IN_PROGRESS.value,
+                    now_text,
+                ),
+            ).fetchall()
+            claimed: list[RetrievalRequest] = []
+            for row in rows:
+                expires_at = _parse_datetime(row["expires_at"])
+                lease_expires_at = min(
+                    now + timedelta(seconds=lease_seconds),
+                    expires_at,
+                )
+                connection.execute(
+                    """
+                    UPDATE project_retrieval_requests
+                    SET status = ?, lease_expires_at = ?,
+                        attempt_count = attempt_count + 1
+                    WHERE request_id = ? AND project_id = ?
+                    """,
+                    (
+                        RetrievalRequestStatus.IN_PROGRESS.value,
+                        _datetime_text(lease_expires_at),
+                        row["request_id"],
+                        project_id,
+                    ),
+                )
+                updated = connection.execute(
+                    """
+                    SELECT * FROM project_retrieval_requests
+                    WHERE request_id = ? AND project_id = ?
+                    """,
+                    (row["request_id"], project_id),
+                ).fetchone()
+                assert updated is not None
+                claimed.append(_retrieval_from_row(updated))
+        return tuple(claimed)
+
     def compare_and_set_retrieval_request(
         self,
         project_id: str,
@@ -800,10 +911,7 @@ class ProjectSyncRepository:
     ) -> bool:
         if target is RetrievalRequestStatus.COMPLETED:
             raise ValueError("completed transition requires sync commit")
-        if target not in {
-            RetrievalRequestStatus.IN_PROGRESS,
-            RetrievalRequestStatus.EXPIRED,
-        }:
+        if target is not RetrievalRequestStatus.EXPIRED:
             raise ValueError("unsupported retrieval request transition")
         if completed_at is not None:
             raise ValueError("public retrieval transition forbids completed_at")
@@ -820,7 +928,7 @@ class ProjectSyncRepository:
             updated = connection.execute(
                 f"""
                 UPDATE project_retrieval_requests
-                SET status = ?, completed_at = NULL
+                SET status = ?, completed_at = NULL, lease_expires_at = NULL
                 WHERE project_id = ? AND request_id = ?
                 AND status IN ({placeholders})
                 """,
@@ -1444,7 +1552,7 @@ class ProjectSyncRepository:
             updated = connection.execute(
                 """
                 UPDATE project_retrieval_requests
-                SET status = ?, completed_at = ?
+                SET status = ?, completed_at = ?, lease_expires_at = NULL
                 WHERE project_id = ? AND request_id = ?
                   AND status IN (?, ?)
                 """,
@@ -1722,6 +1830,8 @@ def _retrieval_values(request: RetrievalRequest) -> tuple[object, ...]:
         request.status.value,
         _datetime_text(request.created_at),
         _datetime_text(request.expires_at),
+        _optional_datetime_text(request.lease_expires_at),
+        request.attempt_count,
         _optional_datetime_text(request.completed_at),
     )
 
@@ -1750,5 +1860,7 @@ def _retrieval_from_row(row: sqlite3.Row) -> RetrievalRequest:
         status=row["status"],
         created_at=_parse_datetime(row["created_at"]),
         expires_at=_parse_datetime(row["expires_at"]),
+        lease_expires_at=_optional_parse_datetime(row["lease_expires_at"]),
+        attempt_count=int(row["attempt_count"]),
         completed_at=_optional_parse_datetime(row["completed_at"]),
     )

@@ -401,9 +401,19 @@ class PendingUrlOpen:
                     "baseline_generation_id": "generation-1",
                     "baseline_content_hash": "a" * 64,
                     "baseline_source_cursor": 1,
+                    "baseline_sources": [
+                        {
+                            "source_id_hash": self.source_hash,
+                            "source_version": "v1",
+                            "content_hash": "b" * 64,
+                            "chunk_fingerprint": "c" * 64,
+                        }
+                    ],
                     "status": "in_progress",
                     "created_at": NOW.isoformat(),
                     "expires_at": (NOW + timedelta(minutes=30)).isoformat(),
+                    "lease_expires_at": (NOW + timedelta(minutes=5)).isoformat(),
+                    "attempt_count": 1,
                     "completed_at": None,
                 }
             ]
