@@ -814,3 +814,16 @@ def test_qwen_prompt_only_completes_retrieval_with_obtained_evidence() -> None:
     assert "未完成的检索请求绝不能加入 completed_retrieval_request_ids" in normalized
     assert "只有已取得对应证据" in normalized
     assert "遗漏的请求保持 pending" in normalized
+
+
+def test_qwen_prompt_uses_only_module_cli_entrypoints() -> None:
+    prompt = (
+        Path(__file__).resolve().parents[2]
+        / "prompts"
+        / "qwenwork-dws-project-sync.md"
+    ).read_text(encoding="utf-8")
+
+    assert "python -m tools.dws_project_sync collect" in prompt
+    assert "python -m tools.dws_project_sync push" in prompt
+    assert "tools/dws_project_sync.py collect" not in prompt
+    assert "tools/dws_project_sync.py push" not in prompt
