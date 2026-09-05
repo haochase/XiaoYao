@@ -13,6 +13,7 @@ from companion_gateway.project.auth import (
 )
 from companion_gateway.project.index import ProjectSnapshotRegistry
 from companion_gateway.project.models import EvidenceRef, ProjectContextPackage
+from companion_gateway.project.repository import ProjectMemoryRepository
 from companion_gateway.project.sync_models import (
     EvidenceChunk,
     ProjectSyncHealth,
@@ -376,6 +377,88 @@ def test_unchanged_sync_renews_source_without_new_generation(tmp_path: Path) -> 
     status = service.status(PROJECT_ID, now=NOW + timedelta(minutes=6))
     assert status.health is ProjectSyncHealth.HEALTHY
     assert status.last_success_at == NOW + timedelta(minutes=5)
+
+
+def test_unchanged_sync_renews_context_across_multiple_freshness_periods(
+    tmp_path: Path,
+) -> None:
+    service, repository, _, registry = sync_service(
+        tmp_path,
+        source_freshness_seconds=300,
+    )
+
+    first = service.apply(envelope(cursor=1), principal=PRINCIPAL, now=NOW)
+    second_at = NOW + timedelta(minutes=5)
+    third_at = NOW + timedelta(minutes=10)
+    second = service.apply(
+        envelope(cursor=2, generated_at=second_at),
+        principal=PRINCIPAL,
+        now=second_at,
+    )
+    third = service.apply(
+        envelope(cursor=3, generated_at=third_at),
+        principal=PRINCIPAL,
+        now=third_at,
+    )
+
+    stored = repository.load_active_generation(PROJECT_ID)
+    runtime = registry.get(PROJECT_ID)
+    device_context = ProjectMemoryRepository(
+        tmp_path / "project-memory.db"
+    ).get_context(PROJECT_ID)
+    assert stored is not None
+    assert runtime is not None
+    assert device_context is not None
+    assert first.generation_id == second.generation_id == third.generation_id
+    assert stored.context.generated_at == third_at
+    assert runtime.context.generated_at == third_at
+    assert device_context.generated_at == third_at
+    assert service.status(
+        PROJECT_ID,
+        now=third_at + timedelta(minutes=4, seconds=59),
+    ).health is ProjectSyncHealth.HEALTHY
+
+
+def test_unchanged_failed_source_refreshes_attempt_without_false_success(
+    tmp_path: Path,
+) -> None:
+    service, repository, _, registry = sync_service(tmp_path)
+    first_source = failed_source(
+        SyncSourceType.DOCUMENT,
+        fetched_at=NOW,
+        error_type=SourceErrorType.NETWORK_TIMEOUT,
+    )
+    later_at = NOW + timedelta(minutes=5)
+    later_source = failed_source(
+        SyncSourceType.DOCUMENT,
+        fetched_at=later_at,
+        error_type=SourceErrorType.PERMISSION_DENIED,
+    )
+
+    service.apply(
+        envelope(cursor=1, sources=(first_source,)),
+        principal=PRINCIPAL,
+        now=NOW,
+    )
+    result = service.apply(
+        envelope(
+            cursor=2,
+            generated_at=later_at,
+            sources=(later_source,),
+        ),
+        principal=PRINCIPAL,
+        now=later_at,
+    )
+
+    stored = repository.load_active_generation(PROJECT_ID)
+    runtime = registry.get(PROJECT_ID)
+    assert stored is not None
+    assert runtime is not None
+    assert result.outcome == "unchanged"
+    for state in (stored.source_states[0], runtime.source_states[0]):
+        assert state.last_attempt_at == later_at
+        assert state.last_error_type is SourceErrorType.PERMISSION_DENIED
+        assert state.last_success_at is None
 
 
 def test_task_failure_does_not_block_fresh_decision_source(tmp_path: Path) -> None:

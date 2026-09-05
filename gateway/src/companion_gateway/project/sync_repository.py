@@ -682,24 +682,29 @@ class ProjectSyncRepository:
         project_id = candidate.envelope.project_id
         generation_id = str(active["generation_id"])
         for state in candidate.source_states:
-            if state.status is not SourceSyncStatus.ACTIVE:
-                continue
-            connection.execute(
+            updated = connection.execute(
                 """
                 UPDATE project_source_states
-                SET last_attempt_at = ?, last_success_at = ?
+                SET last_attempt_at = ?,
+                    last_success_at = CASE WHEN ? = 'active' THEN ?
+                                           ELSE last_success_at END,
+                    last_error_type = ?
                 WHERE project_id = ? AND generation_id = ?
                   AND source_type = ? AND source_id_hash = ?
                 """,
                 (
                     _datetime_text(state.last_attempt_at),
+                    state.status.value,
                     _optional_datetime_text(state.last_success_at),
+                    state.last_error_type.value if state.last_error_type else None,
                     project_id,
                     generation_id,
                     state.source_type.value,
                     state.source_id_hash,
                 ),
             )
+            if updated.rowcount != 1:
+                raise SyncConflict("source_state_envelope_mismatch")
         available_hashes = self._available_hashes_for_generation(
             connection,
             project_id,
@@ -712,11 +717,29 @@ class ProjectSyncRepository:
         )
         connection.execute(
             """
+            UPDATE project_contexts
+            SET payload_json = ?
+            WHERE project_id = ?
+            """,
+            (
+                candidate.envelope.context.model_dump_json(),
+                project_id,
+            ),
+        )
+        connection.execute(
+            """
             UPDATE project_sync_generations
-            SET source_cursor = ?
+            SET source_cursor = ?, context_json = ?
             WHERE project_id = ? AND generation_id = ?
             """,
-            (candidate.envelope.source_cursor, project_id, generation_id),
+            (
+                candidate.envelope.source_cursor,
+                _canonical_json(
+                    candidate.envelope.context.model_dump(mode="json")
+                ),
+                project_id,
+                generation_id,
+            ),
         )
         self._insert_audit(connection, candidate.audit, "unchanged")
         return SyncCommitResult(

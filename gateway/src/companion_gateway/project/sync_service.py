@@ -666,7 +666,7 @@ class ProjectSyncService:
                 active,
                 states,
             )
-            context = active.context
+            context = envelope.context
             runtime_generation_id = active.generation_id
         else:
             retained_keys = {
@@ -844,32 +844,7 @@ class ProjectSyncService:
     ) -> tuple[SourceState, ...]:
         if envelope.source_cursor <= active.source_cursor:
             return active.source_states
-        incoming_by_key = {
-            (item.source_type, item.source_id_hash): item for item in incoming
-        }
-        renewed: list[SourceState] = []
-        for state in active.source_states:
-            candidate = incoming_by_key.get(
-                (state.source_type, state.source_id_hash)
-            )
-            if candidate is None or candidate.status is not SourceSyncStatus.ACTIVE:
-                renewed.append(state)
-                continue
-            renewed.append(
-                SourceState(
-                    project_id=state.project_id,
-                    source_type=state.source_type,
-                    source_id_hash=state.source_id_hash,
-                    source_version=state.source_version,
-                    content_hash=state.content_hash,
-                    permission_hash=state.permission_hash,
-                    status=state.status,
-                    last_attempt_at=candidate.last_attempt_at,
-                    last_success_at=candidate.last_success_at,
-                    last_error_type=state.last_error_type,
-                )
-            )
-        return tuple(renewed)
+        return incoming
 
     @staticmethod
     def _expected_outcome(
