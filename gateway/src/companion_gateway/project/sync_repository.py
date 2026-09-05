@@ -264,6 +264,17 @@ class ProjectSyncRepository:
             return None
         return str(row["identity_digest"]), str(row["protector_version"])
 
+    def has_active_generation(self, project_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM project_active_generations
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+        return row is not None
+
     def list_active_project_ids(self) -> tuple[str, ...]:
         with self._connect() as connection:
             self._assert_protection_access(connection)

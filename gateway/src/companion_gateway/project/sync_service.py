@@ -24,6 +24,10 @@ from companion_gateway.project.index import (
 )
 from companion_gateway.project.models import EvidenceRef
 from companion_gateway.project.protection import ContentProtector
+from companion_gateway.project.snapshot_loader import (
+    ProjectSnapshotHydrator,
+    SnapshotHydrationError,
+)
 from companion_gateway.project.sync_models import (
     EvidenceChunk,
     ProjectSyncHealth,
@@ -220,6 +224,7 @@ class ProjectSyncService:
 
         self._repository = repository
         self._protector = protector
+        self._snapshot_hydrator = ProjectSnapshotHydrator(protector)
         self._registry = registry
         self._sync_interval_seconds = float(sync_interval_seconds)
         self._source_freshness_seconds = source_freshness_seconds
@@ -335,52 +340,45 @@ class ProjectSyncService:
             active = self._repository.load_active_generation(project_id)
             if active is None:
                 raise ProjectSyncValidationError("active_generation_missing")
-            sources, chunks = self._decrypt_generation(active, None)
-            sources = tuple(
-                sorted(
-                    sources,
-                    key=lambda item: (
-                        item.source_type.value,
-                        item.source_id_hash,
-                    ),
-                )
-            )
-            chunks = tuple(
-                sorted(
-                    chunks,
-                    key=lambda item: (
-                        item.source_id,
-                        item.source_version,
-                        item.ordinal,
-                        item.chunk_id,
-                    ),
-                )
-            )
-            restored.append(
-                (
-                    project_id,
-                    ProjectRuntimeSnapshot(
-                        project_id=project_id,
-                        generation_id=active.generation_id,
-                        context=active.context,
-                        source_states=active.source_states,
-                        sources=sources,
-                        chunks=chunks,
-                        evidence_index=ProjectEvidenceIndex(
-                            active.context,
-                            sources,
-                            chunks,
-                        ),
-                    ),
-                )
-            )
+            try:
+                snapshot = self._snapshot_hydrator.snapshot(active)
+            except SnapshotHydrationError:
+                raise ProjectSyncValidationError(
+                    "protected_content_invalid"
+                ) from None
+            restored.append((project_id, snapshot))
         for project_id, snapshot in restored:
             self._registry.swap(project_id, snapshot)
         return tuple(project_id for project_id, _ in restored)
 
+    def _refresh_active_snapshot(
+        self,
+        project_id: str,
+    ) -> ProjectRuntimeSnapshot | None:
+        active = self._repository.load_active_generation(project_id)
+        if active is None:
+            self._registry.remove(project_id)
+            return None
+        current = self._registry.get(project_id)
+        if (
+            current is not None
+            and current.generation_id == active.generation_id
+            and current.context == active.context
+            and current.source_states == active.source_states
+        ):
+            return current
+        try:
+            snapshot = self._snapshot_hydrator.snapshot(active)
+        except SnapshotHydrationError:
+            raise ProjectSyncValidationError(
+                "protected_content_invalid"
+            ) from None
+        self._registry.swap(project_id, snapshot)
+        return snapshot
+
     def status(self, project_id: str, *, now: datetime) -> ProjectSyncStatus:
         _require_aware(now, "now_must_be_aware")
-        snapshot = self._registry.get(project_id)
+        snapshot = self._refresh_active_snapshot(project_id)
         if snapshot is None:
             raise ProjectSourceUnavailable("project_not_synced")
         with self._clock_lock:
@@ -446,7 +444,7 @@ class ProjectSyncService:
         now: datetime,
     ) -> None:
         _require_aware(now, "now_must_be_aware")
-        snapshot = self._registry.get(project_id)
+        snapshot = self._refresh_active_snapshot(project_id)
         if snapshot is None:
             raise ProjectSourceUnavailable("project_not_synced")
         with self._clock_lock:
@@ -791,99 +789,12 @@ class ProjectSyncService:
     ) -> tuple[tuple[EvidenceSource, ...], tuple[EvidenceChunk, ...]]:
         if active is None:
             return (), ()
-        sources: list[EvidenceSource] = []
-        source_ids: dict[tuple[SyncSourceType, str], str] = {}
-        for item in active.protected_sources:
-            key = (item.source_type, item.source_id_hash)
-            if keys is not None and key not in keys:
-                continue
-            try:
-                source_id = self._unprotect_text(
-                    active.project_id,
-                    item.protected_source_id,
-                )
-                source_title = self._unprotect_text(
-                    active.project_id,
-                    item.protected_title,
-                )
-                source_url = self._unprotect_text(
-                    active.project_id,
-                    item.protected_url,
-                )
-                if (
-                    item.source_version is None
-                    or item.source_time is None
-                    or item.content_hash is None
-                ):
-                    raise ValueError("incomplete protected source")
-                source = EvidenceSource(
-                    source_type=item.source_type,
-                    source_id=source_id,
-                    source_id_hash=item.source_id_hash,
-                    source_title=source_title,
-                    source_url=source_url,
-                    source_version=item.source_version,
-                    source_time=item.source_time,
-                    permission_hash=item.permission_hash,
-                    content_hash=item.content_hash,
-                )
-            except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
-                raise ProjectSyncValidationError(
-                    "protected_content_invalid"
-                ) from None
-            sources.append(source)
-            source_ids[key] = source_id
-
-        chunks: list[EvidenceChunk] = []
-        for item in active.protected_chunks:
-            key = (item.source_type, item.source_id_hash)
-            if keys is not None and key not in keys:
-                continue
-            source_id = source_ids.get(key)
-            if source_id is None:
-                raise ProjectSyncValidationError("protected_content_invalid")
-            try:
-                heading_value = json.loads(
-                    self._unprotect_text(
-                        active.project_id,
-                        item.protected_heading_path,
-                    )
-                )
-                if not isinstance(heading_value, list) or any(
-                    not isinstance(value, str) for value in heading_value
-                ):
-                    raise ValueError("invalid heading path")
-                text = self._unprotect_text(
-                    active.project_id,
-                    item.protected_text,
-                )
-                if hashlib.sha256(text.encode("utf-8")).hexdigest() != (
-                    item.content_hash
-                ):
-                    raise ValueError("invalid text hash")
-                chunk = EvidenceChunk(
-                    chunk_id=item.chunk_id,
-                    source_id=source_id,
-                    source_version=item.source_version,
-                    ordinal=item.ordinal,
-                    heading_path=tuple(heading_value),
-                    text=text,
-                    start_offset=item.start_offset,
-                    end_offset=item.end_offset,
-                    content_hash=item.content_hash,
-                )
-            except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
-                raise ProjectSyncValidationError(
-                    "protected_content_invalid"
-                ) from None
-            chunks.append(chunk)
-        return tuple(sources), tuple(chunks)
-
-    def _unprotect_text(self, project_id: str, protected: bytes) -> str:
-        plaintext = self._protector.unprotect(project_id, protected)
-        if not plaintext:
-            raise ProjectSyncValidationError("protected_content_invalid")
-        return plaintext.decode("utf-8")
+        try:
+            return self._snapshot_hydrator.evidence(active, keys)
+        except SnapshotHydrationError:
+            raise ProjectSyncValidationError(
+                "protected_content_invalid"
+            ) from None
 
     @staticmethod
     def _unchanged_runtime_states(

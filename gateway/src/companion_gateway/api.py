@@ -114,12 +114,20 @@ from companion_gateway.project.models import (
     EvidenceRef,
     ProjectContextPackage,
 )
+from companion_gateway.project.protection import (
+    WindowsDpapiProtector,
+    protection_identity_digest,
+)
+from companion_gateway.project.query_facade import (
+    RepositoryBackedProjectQueryFacade,
+)
+from companion_gateway.project.repository import ProjectMemoryRepository
 from companion_gateway.project.service import (
     ProjectContextUnavailable,
     ProjectMemoryError,
     ProjectMemoryService,
 )
-from companion_gateway.project.repository import ProjectMemoryRepository
+from companion_gateway.project.sync_repository import ProjectSyncRepository
 from companion_gateway.domain.tasks import InvalidTaskTransition, TaskEventType
 from companion_gateway.service import TaskService
 from companion_gateway.settings import Settings, load_environment_file
@@ -555,10 +563,30 @@ def create_app(
     )
     project_repository = ProjectMemoryRepository(settings.database_path)
     project_repository.initialize()
-    project_memory = project_memory_service or ProjectMemoryService(
-        clock=project_clock,
-        repository=project_repository,
-    )
+    project_query_facade = None
+    project_sync_repository = None
+    if project_memory_service is None:
+        project_sync_repository = ProjectSyncRepository(settings.database_path)
+        project_sync_repository.initialize()
+        project_query_facade = RepositoryBackedProjectQueryFacade(
+            project_sync_repository,
+            WindowsDpapiProtector(),
+            identity_digest=protection_identity_digest,
+            source_freshness_seconds=(
+                settings.project_source_freshness_seconds
+            ),
+            clock=project_clock,
+        )
+        project_memory = ProjectMemoryService(
+            clock=project_clock,
+            repository=project_repository,
+            source_policy=project_query_facade,
+            snapshot_reader=project_query_facade,
+            retrieval_writer=project_query_facade,
+            retrieval_ttl_seconds=settings.project_retrieval_ttl_seconds,
+        )
+    else:
+        project_memory = project_memory_service
     project_authenticator = ProjectApiAuthenticator(settings.project_api_principals)
     medication_scheduler = MedicationScheduler(
         service=medication_service,
@@ -590,6 +618,8 @@ def create_app(
     app.state.agent_tool_service = agent_tool_service
     app.state.project_memory_service = project_memory
     app.state.project_memory_repository = project_repository
+    app.state.project_query_facade = project_query_facade
+    app.state.project_sync_repository = project_sync_repository
     app.state.project_api_authenticator = project_authenticator
     app.state.project_clock = project_clock
     if voice_delivery_service is not None:
