@@ -432,13 +432,14 @@ def create_sync_app(
     def list_retrieval_requests(
         project_id: str,
         request: Request,
+        status: RetrievalRequestStatus | None = None,
     ) -> dict[str, object]:
         principal = _identify(authenticator, request)
         _authorize(authenticator, principal, project_id=project_id)
         current_time = now()
         results = []
         try:
-            for item in repository.list_retrieval_requests(project_id):
+            for item in repository.list_retrieval_requests(project_id, status):
                 target = None
                 if (
                     item.status

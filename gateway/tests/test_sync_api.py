@@ -609,6 +609,41 @@ def test_retrieval_request_create_list_and_get(
     assert sync_service.required_refs == [(source_ref(),)]
 
 
+def test_retrieval_request_list_filters_pending_before_claiming(
+    client: TestClient,
+) -> None:
+    first = retrieval_body()
+    first["request_id"] = "retrieval-first"
+    second = retrieval_body()
+    second["request_id"] = "retrieval-second"
+    assert client.post(
+        f"/v1/projects/{PROJECT_ID}/retrieval-requests",
+        json=first,
+        headers=AUTH,
+    ).status_code == 201
+    claimed = client.get(
+        f"/v1/projects/{PROJECT_ID}/retrieval-requests?status=pending",
+        headers=AUTH,
+    )
+    assert [item["request_id"] for item in claimed.json()["requests"]] == [
+        "retrieval-first"
+    ]
+    assert client.post(
+        f"/v1/projects/{PROJECT_ID}/retrieval-requests",
+        json=second,
+        headers=AUTH,
+    ).status_code == 201
+
+    pending = client.get(
+        f"/v1/projects/{PROJECT_ID}/retrieval-requests?status=pending",
+        headers=AUTH,
+    )
+
+    assert [item["request_id"] for item in pending.json()["requests"]] == [
+        "retrieval-second"
+    ]
+
+
 def test_retrieval_request_rejects_unregistered_source_summary(
     client: TestClient,
     sync_service: StubSyncService,
