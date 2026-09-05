@@ -13,6 +13,7 @@ from companion_gateway.project.auth import (
 )
 from companion_gateway.project.index import ProjectSnapshotRegistry
 from companion_gateway.project.models import (
+    DecisionCard,
     EvidenceRef,
     ProjectContextPackage,
     SourcedFact,
@@ -223,7 +224,7 @@ def context(*, generated_at: datetime = NOW) -> ProjectContextPackage:
         project_id=PROJECT_ID,
         project_name="Demo project",
         generated_at=generated_at,
-        source_refs=(DOCUMENT_REF, TASK_REF),
+        source_refs=(DOCUMENT_REF,),
         permission_scope=PERMISSION_SCOPE,
         freshness_seconds=300,
     )
@@ -247,6 +248,16 @@ def envelope(
         context=context(generated_at=generated_at),
         sources=sources or (active_document(fetched_at=generated_at),),
         completed_retrieval_request_ids=completed_ids,
+    )
+    return draft.model_copy(
+        update={"content_hash": compute_envelope_content_hash(draft)}
+    )
+
+
+def envelope_without_context_refs(**values: object) -> SyncEnvelope:
+    draft = envelope(**values)
+    draft = draft.model_copy(
+        update={"context": draft.context.model_copy(update={"source_refs": ()})}
     )
     return draft.model_copy(
         update={"content_hash": compute_envelope_content_hash(draft)}
@@ -413,6 +424,94 @@ def test_sync_rejects_sourced_fact_with_unmatched_excerpt(tmp_path: Path) -> Non
     assert repository.load_active_generation(PROJECT_ID) is None
 
 
+def test_sync_rejects_unmatched_top_level_context_reference(tmp_path: Path) -> None:
+    service, repository, _, _ = sync_service(tmp_path)
+    candidate = envelope()
+    invalid_context = candidate.context.model_copy(
+        update={
+            "source_refs": (
+                DOCUMENT_REF.model_copy(update={"excerpt": "Missing excerpt"}),
+            )
+        }
+    )
+    candidate = candidate.model_copy(update={"context": invalid_context})
+    candidate = candidate.model_copy(
+        update={"content_hash": compute_envelope_content_hash(candidate)}
+    )
+
+    with pytest.raises(
+        ProjectSyncValidationError,
+        match="source_excerpt_mismatch",
+    ):
+        service.apply(candidate, principal=PRINCIPAL, now=NOW)
+
+    assert repository.load_active_generation(PROJECT_ID) is None
+
+
+def test_sync_rejects_decision_reference_metadata_mismatch(tmp_path: Path) -> None:
+    service, repository, _, _ = sync_service(tmp_path)
+    candidate = envelope()
+    invalid_reference = DOCUMENT_REF.model_copy(
+        update={"source_title": "Forged title"}
+    )
+    decision = DecisionCard(
+        decision_id="decision-1",
+        project_id=PROJECT_ID,
+        topic="terminal plan",
+        decision_text="Use plan B",
+        rationale="Stable rollout",
+        owner="project-owner",
+        decided_at=NOW,
+        source_refs=(invalid_reference,),
+        status="active",
+        confidence=0.9,
+    )
+    invalid_context = candidate.context.model_copy(
+        update={"active_decisions": (decision,)}
+    )
+    candidate = candidate.model_copy(update={"context": invalid_context})
+    candidate = candidate.model_copy(
+        update={"content_hash": compute_envelope_content_hash(candidate)}
+    )
+
+    with pytest.raises(
+        ProjectSyncValidationError,
+        match="source_ref_mismatch",
+    ):
+        service.apply(candidate, principal=PRINCIPAL, now=NOW)
+
+    assert repository.load_active_generation(PROJECT_ID) is None
+
+
+def test_sync_accepts_decision_with_exact_active_reference(tmp_path: Path) -> None:
+    service, repository, _, _ = sync_service(tmp_path)
+    candidate = envelope()
+    decision = DecisionCard(
+        decision_id="decision-1",
+        project_id=PROJECT_ID,
+        topic="terminal plan",
+        decision_text="Use plan B",
+        rationale="Stable rollout",
+        owner="project-owner",
+        decided_at=NOW,
+        source_refs=(DOCUMENT_REF,),
+        status="active",
+        confidence=0.9,
+    )
+    valid_context = candidate.context.model_copy(
+        update={"active_decisions": (decision,)}
+    )
+    candidate = candidate.model_copy(update={"context": valid_context})
+    candidate = candidate.model_copy(
+        update={"content_hash": compute_envelope_content_hash(candidate)}
+    )
+
+    result = service.apply(candidate, principal=PRINCIPAL, now=NOW)
+
+    assert result.outcome == "applied"
+    assert repository.load_active_generation(PROJECT_ID) is not None
+
+
 def test_sync_accepts_sourced_fact_with_active_exact_excerpt(tmp_path: Path) -> None:
     service, repository, _, _ = sync_service(tmp_path)
     candidate = envelope()
@@ -532,12 +631,12 @@ def test_unchanged_failed_source_refreshes_attempt_without_false_success(
     )
 
     service.apply(
-        envelope(cursor=1, sources=(first_source,)),
+        envelope_without_context_refs(cursor=1, sources=(first_source,)),
         principal=PRINCIPAL,
         now=NOW,
     )
     result = service.apply(
-        envelope(
+        envelope_without_context_refs(
             cursor=2,
             generated_at=later_at,
             sources=(later_source,),

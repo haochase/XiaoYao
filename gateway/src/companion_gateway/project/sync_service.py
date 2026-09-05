@@ -188,29 +188,35 @@ def _validate_sourced_facts(envelope: SyncEnvelope) -> None:
         for source in envelope.sources
         if source.status is SourceSyncStatus.ACTIVE
     }
-    for fact in facts:
-        for reference in fact.source_refs:
-            try:
-                source_type = SyncSourceType(reference.source_type)
-            except ValueError:
-                raise ProjectSyncValidationError(
-                    "source_ref_mismatch"
-                ) from None
-            source = active_sources.get((source_type, reference.source_id))
-            if source is None or (
-                reference.source_title != source.source_title
-                or reference.source_url != source.source_url
-                or reference.source_time != source.source_time
-                or reference.permission_scope != source.permission_scope
-                or reference.permission_scope != context.permission_scope
-            ):
-                raise ProjectSyncValidationError("source_ref_mismatch")
-            source_text = _normalized_text(
-                "\n".join(chunk.text for chunk in source.chunks)
-            )
-            excerpt = _normalized_text(reference.excerpt)
-            if not source_text or excerpt not in source_text:
-                raise ProjectSyncValidationError("source_excerpt_mismatch")
+    references = (
+        *context.source_refs,
+        *(
+            reference
+            for decision in context.active_decisions
+            for reference in decision.source_refs
+        ),
+        *(reference for fact in facts for reference in fact.source_refs),
+    )
+    for reference in references:
+        try:
+            source_type = SyncSourceType(reference.source_type)
+        except ValueError:
+            raise ProjectSyncValidationError("source_ref_mismatch") from None
+        source = active_sources.get((source_type, reference.source_id))
+        if source is None or (
+            reference.source_title != source.source_title
+            or reference.source_url != source.source_url
+            or reference.source_time != source.source_time
+            or reference.permission_scope != source.permission_scope
+            or reference.permission_scope != context.permission_scope
+        ):
+            raise ProjectSyncValidationError("source_ref_mismatch")
+        source_text = _normalized_text(
+            "\n".join(chunk.text for chunk in source.chunks)
+        )
+        excerpt = _normalized_text(reference.excerpt)
+        if not source_text or excerpt not in source_text:
+            raise ProjectSyncValidationError("source_excerpt_mismatch")
 
 
 class ProjectSyncService:
