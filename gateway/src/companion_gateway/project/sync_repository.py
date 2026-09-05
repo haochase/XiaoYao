@@ -848,10 +848,20 @@ class ProjectSyncRepository:
         if stored[1] != self._configured_protection[1]:
             raise SyncConflict("protection_version_mismatch")
 
-    def save_retrieval_request(self, request: RetrievalRequest) -> RetrievalRequest:
+    def save_retrieval_request(
+        self,
+        request: RetrievalRequest,
+        *,
+        expected_generation_id: str | None = None,
+    ) -> RetrievalRequest:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             active = self._load_active_row(connection, request.project_id)
+            if expected_generation_id is not None and (
+                active is None
+                or active["generation_id"] != expected_generation_id
+            ):
+                raise SyncConflict("retrieval_generation_changed")
             row = connection.execute(
                 """
                 SELECT * FROM project_retrieval_requests

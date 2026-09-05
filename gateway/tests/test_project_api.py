@@ -8,6 +8,8 @@ from fastapi.testclient import TestClient
 from companion_gateway.api import create_app
 from companion_gateway.project.models import AnswerKind
 from companion_gateway.project.auth import ProjectApiPrincipal
+from companion_gateway.project.repository import ProjectMemoryRepository
+from companion_gateway.project.service import ProjectMemoryService
 from companion_gateway.settings import Settings
 
 
@@ -97,11 +99,22 @@ def context(*, generated_at: datetime = NOW) -> dict[str, object]:
     }
 
 
+def legacy_project_service(database_path, clock) -> ProjectMemoryService:
+    repository = ProjectMemoryRepository(database_path)
+    repository.initialize()
+    return ProjectMemoryService(repository=repository, clock=clock)
+
+
 @pytest.fixture
 def client(tmp_path) -> Iterator[TestClient]:
     clock = {"now": NOW}
+    database_path = tmp_path / "project-api.db"
     app = create_app(
-        project_settings(tmp_path / "project-api.db"),
+        project_settings(database_path),
+        project_memory_service=legacy_project_service(
+            database_path,
+            lambda: clock["now"],
+        ),
         project_clock=lambda: clock["now"],
     )
     app.state.project_test_clock = clock
@@ -212,6 +225,10 @@ def test_project_context_survives_app_recreation(tmp_path) -> None:
     database_path = tmp_path / "project-restart.db"
     first_app = create_app(
         project_settings(database_path),
+        project_memory_service=legacy_project_service(
+            database_path,
+            lambda: NOW,
+        ),
         project_clock=lambda: NOW,
     )
     with TestClient(first_app) as first_client:
@@ -226,6 +243,10 @@ def test_project_context_survives_app_recreation(tmp_path) -> None:
 
     second_app = create_app(
         project_settings(database_path),
+        project_memory_service=legacy_project_service(
+            database_path,
+            lambda: NOW,
+        ),
         project_clock=lambda: NOW,
     )
     with TestClient(second_app) as second_client:

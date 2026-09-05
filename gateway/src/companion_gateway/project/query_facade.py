@@ -121,6 +121,24 @@ class RepositoryBackedProjectQueryFacade:
         snapshot = self.refresh(project_id)
         if snapshot is None:
             return
+        self.require_snapshot_sources_fresh(
+            project_id,
+            snapshot,
+            source_refs,
+            now=now,
+        )
+
+    def require_snapshot_sources_fresh(
+        self,
+        project_id: str,
+        snapshot: ProjectRuntimeSnapshot,
+        source_refs: tuple[EvidenceRef, ...],
+        *,
+        now: datetime,
+    ) -> None:
+        _require_aware(now)
+        if snapshot.project_id != project_id:
+            raise ProjectSourceUnavailable("source_unavailable")
         if self._repository.load_clock_state().clock_untrusted:
             raise ProjectSourceUnavailable("clock_untrusted")
         states = {
@@ -158,12 +176,18 @@ class RepositoryBackedProjectQueryFacade:
     def save_retrieval_request(
         self,
         request: RetrievalRequest,
+        *,
+        expected_generation_id: str,
     ) -> RetrievalRequest:
-        if self.refresh(request.project_id) is None:
-            raise ProjectSourceUnavailable("project_not_synced")
         if self._repository.load_clock_state().clock_untrusted:
             raise ProjectSourceUnavailable("clock_untrusted")
-        return self._repository.save_retrieval_request(request)
+        try:
+            return self._repository.save_retrieval_request(
+                request,
+                expected_generation_id=expected_generation_id,
+            )
+        except SyncConflict:
+            raise ProjectSourceUnavailable("source_unavailable") from None
 
     def _configure_protection(self) -> None:
         if self._protection_configured:

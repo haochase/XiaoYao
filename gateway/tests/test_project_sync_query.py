@@ -171,15 +171,31 @@ class RecordingSourcePolicy:
             if label := self.errors.get(item.source_id):
                 raise ProjectSourceUnavailable(label)
 
+    def require_snapshot_sources_fresh(
+        self,
+        project_id: str,
+        snapshot: ProjectRuntimeSnapshot,
+        source_refs: tuple[EvidenceRef, ...],
+        *,
+        now: datetime,
+    ) -> None:
+        assert snapshot.project_id == project_id
+        self.require_sources_fresh(project_id, source_refs, now=now)
+
 
 class RecordingRetrievalWriter:
     def __init__(self) -> None:
         self.requests: dict[str, RetrievalRequest] = {}
+        self.expected_generations: list[str] = []
 
     def save_retrieval_request(
         self,
         request: RetrievalRequest,
+        *,
+        expected_generation_id: str,
     ) -> RetrievalRequest:
+        assert expected_generation_id
+        self.expected_generations.append(expected_generation_id)
         stored = self.requests.setdefault(request.request_id, request)
         if (
             stored.project_id != request.project_id
@@ -410,3 +426,173 @@ def test_missing_evidence_without_usable_document_source_fails_stale(
         service.answer(PROJECT_ID, "为什么选择方案B", kind=AnswerKind.FACT)
 
     assert repository.list_retrieval_requests(PROJECT_ID) == ()
+
+
+def test_query_pins_snapshot_when_generation_swaps_during_validation() -> None:
+    document = evidence_source("document-1")
+    chunk = evidence_chunk(document, "Pinned generation A evidence.")
+    first = project_snapshot(
+        sources=(document,),
+        chunks=(chunk,),
+    )
+    second = project_snapshot(
+        sources=(document,),
+        chunks=(),
+        source_statuses={document.source_id: SourceSyncStatus.STALE},
+    )
+    second = ProjectRuntimeSnapshot(
+        project_id=second.project_id,
+        generation_id="generation-2",
+        context=second.context,
+        source_states=second.source_states,
+        sources=second.sources,
+        chunks=second.chunks,
+        evidence_index=second.evidence_index,
+    )
+    registry = ProjectSnapshotRegistry()
+    registry.swap(PROJECT_ID, first)
+    validated_generations: list[str] = []
+
+    class SwappingPolicy:
+        def require_sources_fresh(
+            self,
+            project_id: str,
+            source_refs: tuple[EvidenceRef, ...],
+            *,
+            now: datetime,
+        ) -> None:
+            pytest.fail("query must use snapshot-scoped source validation")
+
+        def require_snapshot_sources_fresh(
+            self,
+            project_id: str,
+            snapshot: ProjectRuntimeSnapshot,
+            source_refs: tuple[EvidenceRef, ...],
+            *,
+            now: datetime,
+        ) -> None:
+            assert project_id == PROJECT_ID
+            assert source_refs
+            validated_generations.append(snapshot.generation_id)
+            registry.swap(PROJECT_ID, second)
+
+    service = ProjectMemoryService(
+        clock=lambda: NOW,
+        source_policy=SwappingPolicy(),
+        snapshot_reader=registry,
+        retrieval_writer=RecordingRetrievalWriter(),
+    )
+    service.replace_context(first.context)
+
+    answer = service.answer(
+        PROJECT_ID,
+        "Pinned generation A evidence",
+        kind=AnswerKind.FACT,
+    )
+
+    assert answer.text == chunk.text
+    assert answer.source_refs[0].excerpt == chunk.text
+    assert validated_generations == ["generation-1", "generation-1"]
+    assert registry.get(PROJECT_ID).generation_id == "generation-2"
+
+
+def test_structured_decision_uses_pinned_snapshot_context() -> None:
+    document = evidence_source("document-1")
+    first = project_snapshot(
+        sources=(document,),
+        chunks=(),
+        decision=decision_for(document),
+    )
+    changed_decision = decision_for(document).model_copy(
+        update={"decision_text": "采用方案 C"}
+    )
+    second = project_snapshot(
+        sources=(document,),
+        chunks=(),
+        decision=changed_decision,
+    )
+    second = ProjectRuntimeSnapshot(
+        project_id=second.project_id,
+        generation_id="generation-2",
+        context=second.context,
+        source_states=second.source_states,
+        sources=second.sources,
+        chunks=second.chunks,
+        evidence_index=second.evidence_index,
+    )
+    registry = ProjectSnapshotRegistry()
+    registry.swap(PROJECT_ID, first)
+
+    class SwappingPolicy(RecordingSourcePolicy):
+        def require_snapshot_sources_fresh(
+            self,
+            project_id: str,
+            snapshot: ProjectRuntimeSnapshot,
+            source_refs: tuple[EvidenceRef, ...],
+            *,
+            now: datetime,
+        ) -> None:
+            assert snapshot.generation_id == "generation-1"
+            registry.swap(PROJECT_ID, second)
+            super().require_snapshot_sources_fresh(
+                project_id,
+                snapshot,
+                source_refs,
+                now=now,
+            )
+
+    service = ProjectMemoryService(
+        clock=lambda: NOW,
+        source_policy=SwappingPolicy(),
+        snapshot_reader=registry,
+        retrieval_writer=RecordingRetrievalWriter(),
+    )
+    service.replace_context(first.context)
+
+    answer = service.answer(
+        PROJECT_ID,
+        "终端方案",
+        kind=AnswerKind.DECISION_CHECK,
+    )
+
+    assert answer.text == "当前有效决策：采用方案 B"
+    assert registry.get(PROJECT_ID).generation_id == "generation-2"
+
+
+def test_integrated_query_without_snapshot_fails_closed() -> None:
+    document = evidence_source("document-1")
+    context = project_snapshot(
+        sources=(document,),
+        chunks=(),
+        decision=decision_for(document),
+    ).context
+    service = ProjectMemoryService(
+        clock=lambda: NOW,
+        source_policy=RecordingSourcePolicy(),
+        snapshot_reader=ProjectSnapshotRegistry(),
+        retrieval_writer=RecordingRetrievalWriter(),
+    )
+    service.replace_context(context)
+
+    with pytest.raises(ProjectContextUnavailable, match="source_unavailable"):
+        service.answer(
+            PROJECT_ID,
+            "终端方案",
+            kind=AnswerKind.DECISION_CHECK,
+        )
+
+
+def test_retrieval_request_is_fenced_to_pinned_generation() -> None:
+    document = evidence_source("document-1")
+    snapshot = project_snapshot(sources=(document,), chunks=())
+    writer = RecordingRetrievalWriter()
+    service = integrated_service(
+        snapshot,
+        policy=RecordingSourcePolicy(),
+        retrieval_writer=writer,
+    )
+
+    with pytest.raises(ProjectContextUnavailable, match="evidence_pending"):
+        service.answer(PROJECT_ID, "完全无匹配内容", kind=AnswerKind.FACT)
+
+    assert writer.expected_generations == ["generation-1"]

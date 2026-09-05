@@ -40,9 +40,10 @@ class ProjectContextUnavailable(ProjectMemoryError):
 
 
 class ProjectSourcePolicy(Protocol):
-    def require_sources_fresh(
+    def require_snapshot_sources_fresh(
         self,
         project_id: str,
+        snapshot: ProjectRuntimeSnapshot,
         source_refs: tuple[EvidenceRef, ...],
         *,
         now: datetime,
@@ -57,6 +58,8 @@ class RetrievalRequestWriter(Protocol):
     def save_retrieval_request(
         self,
         request: RetrievalRequest,
+        *,
+        expected_generation_id: str,
     ) -> RetrievalRequest: ...
 
 
@@ -80,6 +83,10 @@ class ProjectMemoryService:
             raise ValueError(
                 "project query integration dependencies must be supplied together"
             )
+        if source_policy is not None and not callable(
+            getattr(source_policy, "require_snapshot_sources_fresh", None)
+        ):
+            raise ValueError("project source policy must be snapshot-scoped")
         if (
             not isinstance(retrieval_ttl_seconds, int)
             or isinstance(retrieval_ttl_seconds, bool)
@@ -185,7 +192,27 @@ class ProjectMemoryService:
         now: datetime | None = None,
     ) -> ProjectAnswer:
         timestamp = now or self._clock()
-        context = self._require_fresh_context(project_id, timestamp)
+        try:
+            pinned_snapshot = (
+                self._snapshot_reader.get(project_id)
+                if self._query_integration_enabled
+                and self._snapshot_reader is not None
+                else None
+            )
+        except ProjectSourceUnavailable as exc:
+            label = str(exc)
+            if label in {"source_stale", "clock_untrusted"}:
+                raise ProjectContextUnavailable("source_stale") from None
+            raise ProjectContextUnavailable("source_unavailable") from None
+        if self._query_integration_enabled and pinned_snapshot is None:
+            raise ProjectContextUnavailable("source_unavailable")
+        if pinned_snapshot is None:
+            context = self._require_fresh_context(project_id, timestamp)
+        else:
+            context = self._require_package_fresh(
+                pinned_snapshot.context,
+                timestamp,
+            )
         normalized_query = self._normalize(query)
         if not normalized_query:
             raise ProjectContextUnavailable("source_not_found")
@@ -207,6 +234,7 @@ class ProjectMemoryService:
                 query,
                 normalized_query,
                 timestamp,
+                pinned_snapshot,
             )
 
         if self._source_policy is not None:
@@ -214,6 +242,7 @@ class ProjectMemoryService:
                 project_id,
                 match.source_refs,
                 timestamp,
+                pinned_snapshot,
             )
 
         if kind is AnswerKind.SUGGESTION:
@@ -239,11 +268,11 @@ class ProjectMemoryService:
         query: str,
         normalized_query: str,
         timestamp: datetime,
+        snapshot: ProjectRuntimeSnapshot | None,
     ) -> ProjectAnswer:
         assert self._source_policy is not None
         assert self._snapshot_reader is not None
         assert self._retrieval_writer is not None
-        snapshot = self._snapshot_reader.get(project_id)
         if snapshot is None:
             raise ProjectContextUnavailable("source_not_found")
 
@@ -273,6 +302,7 @@ class ProjectMemoryService:
                 project_id,
                 (source_ref,),
                 timestamp,
+                snapshot,
             )
             return ProjectAnswer(
                 kind=AnswerKind.FACT,
@@ -304,7 +334,8 @@ class ProjectMemoryService:
                 created_at=timestamp,
                 expires_at=timestamp
                 + timedelta(seconds=self._retrieval_ttl_seconds),
-            )
+            ),
+            expected_generation_id=snapshot.generation_id,
         )
         raise ProjectContextUnavailable("evidence_pending")
 
@@ -327,13 +358,13 @@ class ProjectMemoryService:
                 excerpt=source.source_title,
             )
             try:
-                assert self._source_policy is not None
-                self._source_policy.require_sources_fresh(
+                self._require_query_sources_fresh(
                     project_id,
                     (source_ref,),
-                    now=timestamp,
+                    timestamp,
+                    snapshot,
                 )
-            except ProjectSourceUnavailable:
+            except ProjectContextUnavailable:
                 continue
             source_refs_by_hash[source.source_id_hash] = source_ref
         return source_refs_by_hash
@@ -360,11 +391,15 @@ class ProjectMemoryService:
         project_id: str,
         source_refs: tuple[EvidenceRef, ...],
         timestamp: datetime,
+        snapshot: ProjectRuntimeSnapshot | None,
     ) -> None:
         assert self._source_policy is not None
+        if snapshot is None:
+            return
         try:
-            self._source_policy.require_sources_fresh(
+            self._source_policy.require_snapshot_sources_fresh(
                 project_id,
+                snapshot,
                 source_refs,
                 now=timestamp,
             )
@@ -618,6 +653,16 @@ class ProjectMemoryService:
     ) -> ProjectContextPackage:
         timestamp = now or self._clock()
         context = self.get_context(project_id)
+        age_seconds = (timestamp - context.generated_at).total_seconds()
+        if age_seconds > context.freshness_seconds:
+            raise ProjectContextUnavailable("context_expired")
+        return context
+
+    @staticmethod
+    def _require_package_fresh(
+        context: ProjectContextPackage,
+        timestamp: datetime,
+    ) -> ProjectContextPackage:
         age_seconds = (timestamp - context.generated_at).total_seconds()
         if age_seconds > context.freshness_seconds:
             raise ProjectContextUnavailable("context_expired")

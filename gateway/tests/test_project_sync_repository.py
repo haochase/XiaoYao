@@ -1427,6 +1427,22 @@ def test_retrieval_request_rechecks_active_sources_inside_write_transaction(
         repository.save_retrieval_request(retrieval_request())
 
 
+def test_retrieval_request_rejects_changed_expected_generation(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
+
+    with pytest.raises(SyncConflict, match="retrieval_generation_changed"):
+        repository.save_retrieval_request(
+            retrieval_request(),
+            expected_generation_id="generation-stale",
+        )
+
+    assert repository.list_retrieval_requests("project-1") == ()
+
+
 def test_unchanged_generation_cannot_complete_pending_retrieval(
     tmp_path: Path,
 ) -> None:
