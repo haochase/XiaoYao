@@ -48,6 +48,7 @@ _TIME_ALIASES = (
 )
 _TRANSCRIPTION_KEYS = ("paragraphs", "items", "records")
 _MAX_TRANSCRIPTION_PAGES = 100
+_MAX_CALENDAR_PAGES = 100
 _MISSING = object()
 
 
@@ -344,25 +345,40 @@ def read_calendar_event(
     assert spec.window_start is not None
     assert spec.window_end is not None
     fetched_at = _read_clock(clock)
-    listed = unwrap_dws_payload(
-        runner.run(
-            (
-                "calendar",
-                "event",
-                "list",
-                "--start",
-                spec.window_start.isoformat(),
-                "--end",
-                spec.window_end.isoformat(),
-            )
-        )
+    base_args = (
+        "calendar",
+        "event",
+        "list",
+        "--start",
+        spec.window_start.isoformat(),
+        "--end",
+        spec.window_end.isoformat(),
     )
-    events = _calendar_events(listed)
-    matches = [
-        event
-        for event in events
-        if _metadata_value(event, _IDENTITY_ALIASES) == spec.source_id
-    ]
+    matches: list[Mapping[str, object]] = []
+    next_token: str | None = None
+    seen_tokens: set[str] = set()
+    for page_index in range(_MAX_CALENDAR_PAGES):
+        args = base_args
+        if next_token is not None:
+            args += ("--next-token", next_token)
+        page_events, next_token = _calendar_page(
+            unwrap_dws_payload(runner.run(args))
+        )
+        if not page_events and next_token is not None:
+            raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
+        matches.extend(
+            event
+            for event in page_events
+            if _metadata_value(event, _IDENTITY_ALIASES) == spec.source_id
+        )
+        if next_token is None:
+            break
+        if (
+            next_token in seen_tokens
+            or page_index == _MAX_CALENDAR_PAGES - 1
+        ):
+            raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
+        seen_tokens.add(next_token)
     if not matches:
         return _terminal_record(
             spec,
@@ -451,18 +467,32 @@ def collect_sources(
     )
 
 
-def _calendar_events(payload: object) -> list[Mapping[str, object]]:
+def _calendar_page(
+    payload: object,
+) -> tuple[list[Mapping[str, object]], str | None]:
     if isinstance(payload, Mapping):
-        if "events" not in payload or not isinstance(payload["events"], list):
+        if (
+            "events" not in payload
+            or not isinstance(payload["events"], list)
+            or not set(payload).issubset({"events", "nextToken"})
+        ):
             raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
         raw_events = payload["events"]
+        token_value = payload.get("nextToken")
+        if token_value in (None, ""):
+            next_token = None
+        elif isinstance(token_value, str):
+            next_token = token_value
+        else:
+            raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
     elif isinstance(payload, list):
         raw_events = payload
+        next_token = None
     else:
         raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
     if any(not isinstance(event, Mapping) for event in raw_events):
         raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
-    return list(raw_events)  # type: ignore[arg-type]
+    return list(raw_events), next_token  # type: ignore[arg-type]
 
 
 def _active_record(

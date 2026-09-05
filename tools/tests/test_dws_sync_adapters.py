@@ -555,6 +555,115 @@ def test_calendar_lists_fixed_window_and_gets_only_unique_allowlisted_id() -> No
     assert record.content_text == canonical(detail)
 
 
+def test_calendar_reads_all_pages_before_getting_allowlisted_event() -> None:
+    spec = source(
+        "calendar",
+        "event-2",
+        window_start="2026-09-05T08:00:00+08:00",
+        window_end="2026-09-05T18:00:00+08:00",
+    )
+    detail = {"eventId": "event-2", "summary": "复盘"}
+    runner = RecordingRunner(
+        [
+            {"events": [{"eventId": "event-1"}], "nextToken": "page-2"},
+            {"events": [{"eventId": "event-2"}], "nextToken": ""},
+            detail,
+        ]
+    )
+
+    record = read_calendar_event(
+        runner,
+        spec,
+        permission_scope="project:project-1",
+        clock=lambda: NOW,
+    )
+
+    assert record.status == "active"
+    assert runner.calls[1] == (
+        "calendar",
+        "event",
+        "list",
+        "--start",
+        "2026-09-05T08:00:00+08:00",
+        "--end",
+        "2026-09-05T18:00:00+08:00",
+        "--next-token",
+        "page-2",
+    )
+    assert runner.calls[-1] == (
+        "calendar",
+        "event",
+        "get",
+        "--id",
+        "event-2",
+    )
+
+
+@pytest.mark.parametrize(
+    "pages",
+    [
+        [
+            {"events": [{"eventId": "event-1"}], "nextToken": "page-2"},
+            {"events": [], "nextToken": "page-3"},
+        ],
+        [
+            {"events": [{"eventId": "event-1"}], "nextToken": "repeat"},
+            {"events": [{"eventId": "event-3"}], "nextToken": "repeat"},
+        ],
+    ],
+)
+def test_calendar_rejects_incomplete_or_repeated_pagination(
+    pages: list[dict[str, object]],
+) -> None:
+    spec = source(
+        "calendar",
+        "event-2",
+        window_start="2026-09-05T08:00:00+08:00",
+        window_end="2026-09-05T18:00:00+08:00",
+    )
+    runner = RecordingRunner(pages)
+
+    with pytest.raises(DwsReadError) as error:
+        read_calendar_event(
+            runner,
+            spec,
+            permission_scope="project:project-1",
+            clock=lambda: NOW,
+        )
+
+    assert error.value.error_type is SourceErrorType.INVALID_PAYLOAD
+    assert all(call[:3] == ("calendar", "event", "list") for call in runner.calls)
+
+
+def test_calendar_stops_at_one_hundred_pages_without_tombstone() -> None:
+    spec = source(
+        "calendar",
+        "event-2",
+        window_start="2026-09-05T08:00:00+08:00",
+        window_end="2026-09-05T18:00:00+08:00",
+    )
+    runner = RecordingRunner(
+        [
+            {
+                "events": [{"eventId": f"event-{index + 10}"}],
+                "nextToken": f"page-{index + 2}",
+            }
+            for index in range(100)
+        ]
+    )
+
+    with pytest.raises(DwsReadError) as error:
+        read_calendar_event(
+            runner,
+            spec,
+            permission_scope="project:project-1",
+            clock=lambda: NOW,
+        )
+
+    assert error.value.error_type is SourceErrorType.INVALID_PAYLOAD
+    assert len(runner.calls) == 100
+
+
 def test_calendar_zero_match_is_deleted_without_get_and_duplicates_fail() -> None:
     spec = source(
         "calendar",
