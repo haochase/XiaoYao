@@ -279,14 +279,19 @@ class ProjectSyncRepository:
             connection.execute(
                 """
                 UPDATE project_retrieval_requests
-                SET status = 'expired'
-                WHERE status IN ('pending', 'in_progress')
-                  AND (
-                    baseline_generation_id IS NULL
-                    OR baseline_content_hash IS NULL
-                    OR baseline_source_cursor IS NULL
-                    OR baseline_sources_json IS NULL
-                  )
+                SET status = CASE
+                        WHEN status IN ('pending', 'in_progress')
+                        THEN 'expired'
+                        ELSE status
+                    END,
+                    baseline_generation_id = NULL,
+                    baseline_content_hash = NULL,
+                    baseline_source_cursor = NULL,
+                    lease_expires_at = NULL
+                WHERE baseline_generation_id IS NULL
+                   OR baseline_content_hash IS NULL
+                   OR baseline_source_cursor IS NULL
+                   OR baseline_sources_json IS NULL
                 """
             )
 

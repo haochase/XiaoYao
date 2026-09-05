@@ -49,6 +49,10 @@ def source_id_hash(source_id: str) -> str:
     return hashlib.sha256(source_id.encode()).hexdigest()
 
 
+def _datetime_text_for_test(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
 def evidence_ref(**updates: object) -> EvidenceRef:
     values: dict[str, object] = {
         "source_type": SyncSourceType.DOCUMENT,
@@ -332,6 +336,67 @@ def test_initialize_upgrades_clock_state_before_using_high_watermark(
     assert state.last_observed_wall_at is None
     assert state.needs_sync
     assert state.reason == "resume_detected"
+
+
+def test_initialize_migrates_retrievals_without_per_source_baselines(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    database_path = tmp_path / "project-memory.db"
+    with sqlite3.connect(database_path) as connection:
+        values = (
+            "project-1",
+            HASH_A,
+            json.dumps([source_id_hash("real-source-id")]),
+            "generation-1",
+            HASH_B,
+            1,
+            _datetime_text_for_test(NOW),
+            _datetime_text_for_test(NOW + timedelta(hours=1)),
+        )
+        connection.execute(
+            """
+            INSERT INTO project_retrieval_requests(
+                request_id, project_id, query_hash, source_id_hashes_json,
+                baseline_generation_id, baseline_content_hash,
+                baseline_source_cursor, baseline_sources_json, status,
+                created_at, expires_at, lease_expires_at, attempt_count,
+                completed_at
+            ) VALUES ('legacy-pending', ?, ?, ?, ?, ?, ?, NULL, 'in_progress',
+                      ?, ?, ?, 1, NULL)
+            """,
+            (*values, _datetime_text_for_test(NOW + timedelta(minutes=5))),
+        )
+        connection.execute(
+            """
+            INSERT INTO project_retrieval_requests(
+                request_id, project_id, query_hash, source_id_hashes_json,
+                baseline_generation_id, baseline_content_hash,
+                baseline_source_cursor, baseline_sources_json, status,
+                created_at, expires_at, lease_expires_at, attempt_count,
+                completed_at
+            ) VALUES ('legacy-completed', ?, ?, ?, ?, ?, ?, NULL, 'completed',
+                      ?, ?, NULL, 1, ?)
+            """,
+            (*values, _datetime_text_for_test(NOW + timedelta(minutes=1))),
+        )
+
+    repository.initialize()
+
+    pending = repository.get_retrieval_request("project-1", "legacy-pending")
+    completed = repository.get_retrieval_request(
+        "project-1", "legacy-completed"
+    )
+    assert pending is not None
+    assert pending.status is RetrievalRequestStatus.EXPIRED
+    assert pending.baseline_generation_id is None
+    assert pending.baseline_sources == ()
+    assert pending.lease_expires_at is None
+    assert completed is not None
+    assert completed.status is RetrievalRequestStatus.COMPLETED
+    assert completed.baseline_generation_id is None
+    assert completed.baseline_sources == ()
 
 
 def test_protection_descriptor_persists_and_rejects_identity_or_version_change(
