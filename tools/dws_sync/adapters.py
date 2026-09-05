@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Literal, Protocol
@@ -290,17 +291,38 @@ def _next_page_token(value: object) -> str | None:
     raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
 
 
+def _run_unwrapped(
+    runner: Runner,
+    args: tuple[str, ...],
+    *,
+    sleep: Callable[[float], None],
+    unwrap: Callable[[Mapping[str, object]], object] = unwrap_dws_payload,
+) -> object:
+    for attempt in range(2):
+        try:
+            return unwrap(runner.run(args))
+        except DwsReadError as error:
+            if attempt == 1 or not error.retryable:
+                raise
+            if error.retry_after_seconds is not None:
+                sleep(error.retry_after_seconds)
+    raise AssertionError("unreachable")
+
+
 def read_document(
     runner: Runner,
     spec: DwsSourceSpec,
     *,
     permission_scope: str,
     clock: Callable[[], datetime],
+    sleep: Callable[[float], None] = time.sleep,
 ) -> DwsSourceRecord:
     _require_source_type(spec, SyncSourceType.DOCUMENT)
     info = _require_mapping(
-        unwrap_dws_payload(
-            runner.run(("doc", "info", "--node", spec.source_id))
+        _run_unwrapped(
+            runner,
+            ("doc", "info", "--node", spec.source_id),
+            sleep=sleep,
         )
     )
     _validate_identity(info, spec.source_id)
@@ -309,8 +331,10 @@ def read_document(
     if content_type != "ALIDOC" or extension != "adoc":
         raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
     read = _require_mapping(
-        unwrap_dws_payload(
-            runner.run(("doc", "read", "--node", spec.source_id))
+        _run_unwrapped(
+            runner,
+            ("doc", "read", "--node", spec.source_id),
+            sleep=sleep,
         )
     )
     markdown = read.get("markdown")
@@ -332,16 +356,21 @@ def read_meeting_note(
     *,
     permission_scope: str,
     clock: Callable[[], datetime],
+    sleep: Callable[[float], None] = time.sleep,
 ) -> DwsSourceRecord:
     _require_source_type(spec, SyncSourceType.MEETING_NOTE)
     info = _require_mapping(
-        unwrap_dws_payload(
-            runner.run(("minutes", "get", "info", "--id", spec.source_id))
+        _run_unwrapped(
+            runner,
+            ("minutes", "get", "info", "--id", spec.source_id),
+            sleep=sleep,
         )
     )
     _validate_identity(info, spec.source_id)
-    summary = unwrap_dws_payload(
-        runner.run(("minutes", "get", "summary", "--id", spec.source_id))
+    summary = _run_unwrapped(
+        runner,
+        ("minutes", "get", "summary", "--id", spec.source_id),
+        sleep=sleep,
     )
 
     transcription: list[object] = []
@@ -351,7 +380,12 @@ def read_meeting_note(
         args = ("minutes", "get", "transcription", "--id", spec.source_id)
         if next_token is not None:
             args += ("--next-token", next_token)
-        raw_page, wrapper_token = _unwrap_dws_paged_payload(runner.run(args))
+        raw_page, wrapper_token = _run_unwrapped(
+            runner,
+            args,
+            sleep=sleep,
+            unwrap=_unwrap_dws_paged_payload,
+        )
         page = _require_mapping(raw_page)
         present = [key for key in _TRANSCRIPTION_KEYS if key in page]
         if len(present) != 1 or not set(page).issubset(
@@ -371,8 +405,10 @@ def read_meeting_note(
             raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
         seen_tokens.add(next_token)
 
-    todos = unwrap_dws_payload(
-        runner.run(("minutes", "get", "todos", "--id", spec.source_id))
+    todos = _run_unwrapped(
+        runner,
+        ("minutes", "get", "todos", "--id", spec.source_id),
+        sleep=sleep,
     )
     content = {
         "info": info,
@@ -396,11 +432,14 @@ def read_task(
     *,
     permission_scope: str,
     clock: Callable[[], datetime],
+    sleep: Callable[[float], None] = time.sleep,
 ) -> DwsSourceRecord:
     _require_source_type(spec, SyncSourceType.TASK)
     detail = _require_mapping(
-        unwrap_dws_payload(
-            runner.run(("todo", "task", "get", "--task-id", spec.source_id))
+        _run_unwrapped(
+            runner,
+            ("todo", "task", "get", "--task-id", spec.source_id),
+            sleep=sleep,
         )
     )
     _validate_identity(detail, spec.source_id)
@@ -420,6 +459,7 @@ def read_calendar_event(
     *,
     permission_scope: str,
     clock: Callable[[], datetime],
+    sleep: Callable[[float], None] = time.sleep,
 ) -> DwsSourceRecord:
     _require_source_type(spec, SyncSourceType.CALENDAR)
     assert spec.window_start is not None
@@ -441,7 +481,12 @@ def read_calendar_event(
         args = base_args
         if next_token is not None:
             args += ("--next-token", next_token)
-        page_payload, wrapper_token = _unwrap_dws_paged_payload(runner.run(args))
+        page_payload, wrapper_token = _run_unwrapped(
+            runner,
+            args,
+            sleep=sleep,
+            unwrap=_unwrap_dws_paged_payload,
+        )
         page_events, next_token = _calendar_page(page_payload, wrapper_token)
         if not page_events and next_token is not None:
             raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
@@ -468,8 +513,10 @@ def read_calendar_event(
     if len(matches) != 1:
         raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
     detail = _require_mapping(
-        unwrap_dws_payload(
-            runner.run(("calendar", "event", "get", "--id", spec.source_id))
+        _run_unwrapped(
+            runner,
+            ("calendar", "event", "get", "--id", spec.source_id),
+            sleep=sleep,
         )
     )
     _validate_identity(detail, spec.source_id)
@@ -487,6 +534,8 @@ def collect_sources(
     project: DwsProjectManifest,
     runner: Runner,
     clock: Callable[[], datetime],
+    *,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> DwsSourceBundle:
     collected_at = _read_clock(clock)
     adapters = {
@@ -503,6 +552,7 @@ def collect_sources(
                 spec,
                 permission_scope=project.permission_scope,
                 clock=lambda: collected_at,
+                sleep=sleep,
             )
         except DwsReadError as error:
             if error.error_type is SourceErrorType.NODE_NOT_FOUND:

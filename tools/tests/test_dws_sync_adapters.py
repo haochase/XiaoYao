@@ -643,6 +643,132 @@ def test_task_adapter_only_gets_the_allowlisted_task() -> None:
     assert record.content_text == canonical(detail["result"])
 
 
+def test_adapter_retries_one_retryable_command_and_honors_delay() -> None:
+    runner = RecordingRunner(
+        [
+            {
+                "success": False,
+                "error_type": "rate_limited",
+                "retryable": True,
+                "retry_after_seconds": 2.5,
+            },
+            {"taskId": "task-1", "subject": "交付"},
+        ]
+    )
+    sleeps: list[float] = []
+
+    record = read_task(
+        runner,
+        source("task", "task-1"),
+        permission_scope="project:project-1",
+        clock=lambda: NOW,
+        sleep=sleeps.append,
+    )
+
+    expected = ("todo", "task", "get", "--task-id", "task-1")
+    assert runner.calls == [expected, expected]
+    assert sleeps == [2.5]
+    assert record.status == "active"
+
+
+def test_adapter_does_not_retry_nonretryable_command() -> None:
+    runner = RecordingRunner(
+        [
+            {
+                "success": False,
+                "error_type": "authentication_failed",
+                "retryable": False,
+            },
+            {"taskId": "task-1", "subject": "must-not-be-read"},
+        ]
+    )
+    sleeps: list[float] = []
+
+    with pytest.raises(DwsReadError) as error:
+        read_task(
+            runner,
+            source("task", "task-1"),
+            permission_scope="project:project-1",
+            clock=lambda: NOW,
+            sleep=sleeps.append,
+        )
+
+    assert error.value.error_type is SourceErrorType.AUTHENTICATION_FAILED
+    assert len(runner.calls) == 1
+    assert sleeps == []
+
+
+def test_collect_preserves_second_error_after_one_retry() -> None:
+    selected = DwsProjectManifest(
+        project_id="project-1",
+        project_name="Demo",
+        profile="private-profile",
+        permission_scope="project:project-1",
+        sources=(source("task", "task-1"),),
+    )
+    runner = RecordingRunner(
+        [
+            {
+                "success": False,
+                "error_type": "provider_unavailable",
+                "retryable": True,
+                "retry_after_seconds": 1,
+            },
+            {
+                "success": False,
+                "error_type": "network_timeout",
+                "retryable": True,
+                "retry_after_seconds": 4,
+            },
+            {"taskId": "task-1", "subject": "must-not-be-read"},
+        ]
+    )
+    sleeps: list[float] = []
+
+    result = collect_sources(
+        selected,
+        runner,
+        clock=lambda: NOW,
+        sleep=sleeps.append,
+    )
+
+    assert len(runner.calls) == 2
+    assert sleeps == [1]
+    assert result.records[0].status == "failed"
+    assert result.records[0].error_type is SourceErrorType.NETWORK_TIMEOUT
+    assert result.records[0].retryable is True
+    assert result.records[0].retry_after_seconds == 4
+
+
+def test_meeting_page_uses_command_retry_boundary() -> None:
+    runner = RecordingRunner(
+        [
+            {"taskUuid": "abc123"},
+            {"markdown": "summary"},
+            {
+                "success": False,
+                "error_type": "provider_unavailable",
+                "retryable": True,
+            },
+            {"paragraphs": [{"text": "甲"}], "nextToken": ""},
+            {"todos": []},
+        ]
+    )
+
+    record = read_meeting_note(
+        runner,
+        source("meeting_note", "abc123"),
+        permission_scope="project:project-1",
+        clock=lambda: NOW,
+        sleep=lambda _delay: None,
+    )
+
+    assert runner.calls[2] == runner.calls[3]
+    assert json.loads(record.content_text or "")["transcription"] == [
+        {"text": "甲"}
+    ]
+
+
 def test_adapter_rejects_non_finite_json_without_exception_chain() -> None:
     runner = RecordingRunner([{"taskId": "task-1", "value": float("nan")}])
 
