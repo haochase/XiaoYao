@@ -261,9 +261,13 @@ class ProjectSyncService:
             getattr(protector, "unprotect", None)
         ):
             raise TypeError("protector must be a ContentProtector")
+        protector_version = getattr(protector, "protector_version", None)
+        if not isinstance(protector_version, str) or not protector_version:
+            raise ValueError("protector_version_missing")
 
         self._repository = repository
         self._protector = protector
+        self._protector_version = protector_version
         self._snapshot_hydrator = ProjectSnapshotHydrator(protector)
         self._registry = registry
         self._sync_interval_seconds = float(sync_interval_seconds)
@@ -304,6 +308,9 @@ class ProjectSyncService:
         baseline_monotonic = self._read_monotonic()
 
         with self._apply_lock:
+            self._clock_guard.check(
+                wall_now=now, monotonic_now=baseline_monotonic
+            )
             started = time.perf_counter()
             active = self._repository.load_active_generation(envelope.project_id)
             states = self._source_states(envelope, active, observed_at=now)
@@ -447,6 +454,8 @@ class ProjectSyncService:
         )
         if clock_check.clock_untrusted:
             health = ProjectSyncHealth.CLOCK_UNTRUSTED
+        elif self._repository.project_requires_clock_resync(project_id):
+            health = ProjectSyncHealth.STALE
         elif not fresh_decision_source:
             health = ProjectSyncHealth.STALE
         elif has_degraded_source:
@@ -491,6 +500,8 @@ class ProjectSyncService:
             raise ProjectSourceUnavailable("project_not_synced")
         if clock_check.clock_untrusted:
             raise ProjectSourceUnavailable("clock_untrusted")
+        if self._repository.project_requires_clock_resync(project_id):
+            raise ProjectSourceUnavailable("source_stale")
         states = {
             (item.source_type, item.source_id_hash): item
             for item in snapshot.source_states
@@ -670,6 +681,7 @@ class ProjectSyncService:
                     source_time=source.source_time,
                     permission_hash=source.permission_hash,
                     content_hash=source.content_hash,
+                    protector_version=self._protector_version,
                 )
             )
             for chunk in source.chunks:
@@ -703,6 +715,7 @@ class ProjectSyncService:
                         start_offset=chunk.start_offset,
                         end_offset=chunk.end_offset,
                         content_hash=chunk.content_hash,
+                        protector_version=self._protector_version,
                     )
                 )
         return (
@@ -887,8 +900,8 @@ class ProjectSyncService:
     def _is_expired(self, state: SourceState, now: datetime) -> bool:
         return (
             state.last_success_at is not None
-            and (now - state.last_success_at).total_seconds()
-            > self._source_freshness_seconds
+            and not 0 <= (now - state.last_success_at).total_seconds()
+            <= self._source_freshness_seconds
         )
 
     def _read_monotonic(self) -> float:

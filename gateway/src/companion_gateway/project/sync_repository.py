@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import secrets
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass
@@ -12,15 +14,21 @@ from typing import Literal
 from companion_gateway.project.models import ProjectContextPackage
 from companion_gateway.project.repository import ProjectMemoryRepository
 from companion_gateway.project.sync_models import (
+    ClaimedRetrievalRequest,
+    RetrievalCompletionClaim,
     RetrievalRequest,
     RetrievalRequestStatus,
     RetrievalSourceBaseline,
+    SourceTombstone,
     SourceState,
     SourceSyncStatus,
     SyncAudit,
     SyncEnvelope,
     SyncSourceType,
 )
+
+
+_SCHEMA_VERSION = 2
 
 
 class SyncConflict(RuntimeError):
@@ -38,6 +46,7 @@ class ProtectedSourceRecord:
     source_time: datetime | None
     permission_hash: str
     content_hash: str | None
+    protector_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +61,7 @@ class ProtectedChunkRecord:
     start_offset: int
     end_offset: int
     content_hash: str
+    protector_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -111,12 +121,21 @@ class ProjectSyncRepository:
             ProjectMemoryRepository._initialize_tables(connection)
             connection.executescript(
                 """
+                BEGIN IMMEDIATE;
+
+                CREATE TABLE IF NOT EXISTS project_sync_schema (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    schema_version INTEGER NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS project_sync_generations (
                     project_id TEXT NOT NULL,
                     generation_id TEXT NOT NULL,
                     sync_id TEXT NOT NULL,
                     source_cursor INTEGER NOT NULL,
                     content_hash TEXT NOT NULL,
+                    completion_claims_hash TEXT NOT NULL DEFAULT
+                        '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945',
                     context_json TEXT NOT NULL,
                     outcome TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -145,6 +164,10 @@ class ProjectSyncRepository:
                     reason TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS project_sync_clock_recovery (
+                    project_id TEXT PRIMARY KEY
+                );
+
                 CREATE TABLE IF NOT EXISTS project_source_states (
                     project_id TEXT NOT NULL,
                     generation_id TEXT NOT NULL,
@@ -161,6 +184,7 @@ class ProjectSyncRepository:
                     protected_source_id BLOB,
                     protected_title BLOB,
                     protected_url BLOB,
+                    protector_version TEXT,
                     PRIMARY KEY (
                         project_id,
                         generation_id,
@@ -203,6 +227,7 @@ class ProjectSyncRepository:
                     start_offset INTEGER NOT NULL,
                     end_offset INTEGER NOT NULL,
                     content_hash TEXT NOT NULL,
+                    protector_version TEXT,
                     PRIMARY KEY (project_id, generation_id, chunk_id)
                 );
 
@@ -223,6 +248,7 @@ class ProjectSyncRepository:
                     project_id TEXT NOT NULL,
                     query_hash TEXT NOT NULL,
                     source_id_hashes_json TEXT NOT NULL,
+                    request_epoch INTEGER NOT NULL DEFAULT 1,
                     baseline_generation_id TEXT,
                     baseline_content_hash TEXT,
                     baseline_source_cursor INTEGER,
@@ -231,8 +257,12 @@ class ProjectSyncRepository:
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     lease_expires_at TEXT,
+                    lease_token_hash TEXT,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
-                    completed_at TEXT
+                    completed_at TEXT,
+                    completed_epoch INTEGER,
+                    completed_attempt_count INTEGER,
+                    completed_token_hash TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_project_sync_audits_project_finished
@@ -246,6 +276,15 @@ class ProjectSyncRepository:
                     needs_sync, reason
                 ) VALUES (1, NULL, 0, 0, 'normal');
                 """
+            )
+            schema_row = connection.execute(
+                """
+                SELECT schema_version FROM project_sync_schema
+                WHERE singleton_id = 1
+                """
+            ).fetchone()
+            previous_schema_version = (
+                int(schema_row["schema_version"]) if schema_row is not None else 0
             )
             connection.execute(
                 """
@@ -277,11 +316,37 @@ class ProjectSyncRepository:
                 FROM project_source_heads
                 """
             )
+
+            self._ensure_column(
+                connection,
+                "project_sync_generations",
+                "completion_claims_hash",
+                "TEXT NOT NULL DEFAULT "
+                "'4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'",
+            )
             self._ensure_column(
                 connection,
                 "project_sync_clock_state",
                 "last_observed_wall_at",
                 "TEXT",
+            )
+            self._ensure_column(
+                connection,
+                "project_source_states",
+                "protector_version",
+                "TEXT",
+            )
+            self._ensure_column(
+                connection,
+                "project_evidence_chunks",
+                "protector_version",
+                "TEXT",
+            )
+            self._ensure_column(
+                connection,
+                "project_retrieval_requests",
+                "request_epoch",
+                "INTEGER NOT NULL DEFAULT 1",
             )
             self._ensure_column(
                 connection,
@@ -292,9 +357,26 @@ class ProjectSyncRepository:
             self._ensure_column(
                 connection,
                 "project_retrieval_requests",
+                "lease_token_hash",
+                "TEXT",
+            )
+            self._ensure_column(
+                connection,
+                "project_retrieval_requests",
                 "attempt_count",
                 "INTEGER NOT NULL DEFAULT 0",
             )
+            for column, declaration in (
+                ("completed_epoch", "INTEGER"),
+                ("completed_attempt_count", "INTEGER"),
+                ("completed_token_hash", "TEXT"),
+            ):
+                self._ensure_column(
+                    connection,
+                    "project_retrieval_requests",
+                    column,
+                    declaration,
+                )
             connection.execute(
                 """
                 UPDATE project_retrieval_requests
@@ -338,13 +420,78 @@ class ProjectSyncRepository:
                     baseline_generation_id = NULL,
                     baseline_content_hash = NULL,
                     baseline_source_cursor = NULL,
-                    lease_expires_at = NULL
+                    baseline_sources_json = NULL,
+                    lease_expires_at = NULL,
+                    lease_token_hash = NULL
                 WHERE baseline_generation_id IS NULL
                    OR baseline_content_hash IS NULL
                    OR baseline_source_cursor IS NULL
                    OR baseline_sources_json IS NULL
                 """
             )
+            if previous_schema_version < 2:
+                connection.execute(
+                    """
+                    UPDATE project_source_states
+                    SET protector_version = (
+                        SELECT protector_version
+                        FROM project_protection_metadata
+                        WHERE singleton_id = 1
+                    )
+                    WHERE protected_source_id IS NOT NULL
+                      AND protector_version IS NULL
+                      AND EXISTS (
+                        SELECT 1 FROM project_protection_metadata
+                        WHERE singleton_id = 1
+                      )
+                    """
+                )
+                connection.execute(
+                    """
+                    UPDATE project_evidence_chunks
+                    SET protector_version = (
+                        SELECT protector_version
+                        FROM project_protection_metadata
+                        WHERE singleton_id = 1
+                    )
+                    WHERE protector_version IS NULL
+                      AND EXISTS (
+                        SELECT 1 FROM project_protection_metadata
+                        WHERE singleton_id = 1
+                      )
+                    """
+                )
+            connection.execute(
+                """
+                INSERT INTO project_sync_schema(singleton_id, schema_version)
+                VALUES (1, ?)
+                ON CONFLICT(singleton_id) DO UPDATE SET
+                    schema_version = excluded.schema_version
+                """,
+                (_SCHEMA_VERSION,),
+            )
+
+    def project_requires_clock_resync(self, project_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM project_sync_clock_recovery
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _mark_active_projects_for_clock_recovery(
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO project_sync_clock_recovery(project_id)
+            SELECT project_id FROM project_active_generations
+            """
+        )
 
     @staticmethod
     def _ensure_column(
@@ -472,6 +619,23 @@ class ProjectSyncRepository:
                     """,
                     descriptor,
                 )
+                connection.execute(
+                    """
+                    UPDATE project_source_states
+                    SET protector_version = ?
+                    WHERE protected_source_id IS NOT NULL
+                      AND protector_version IS NULL
+                    """,
+                    (protector_version,),
+                )
+                connection.execute(
+                    """
+                    UPDATE project_evidence_chunks
+                    SET protector_version = ?
+                    WHERE protector_version IS NULL
+                    """,
+                    (protector_version,),
+                )
         self._configured_protection = descriptor
 
     @staticmethod
@@ -583,6 +747,8 @@ class ProjectSyncRepository:
                     reason,
                 ),
             )
+            if needs_sync:
+                self._mark_active_projects_for_clock_recovery(connection)
         return SharedClockState(
             trusted_wall_at=current.trusted_wall_at,
             last_observed_wall_at=observed,
@@ -634,6 +800,8 @@ class ProjectSyncRepository:
                     updated_reason,
                 ),
             )
+            if updated_needs_sync:
+                self._mark_active_projects_for_clock_recovery(connection)
         return SharedClockState(
             trusted_wall_at=current.trusted_wall_at,
             last_observed_wall_at=current.last_observed_wall_at,
@@ -667,10 +835,18 @@ class ProjectSyncRepository:
                 if envelope.source_cursor < active_cursor:
                     raise SyncConflict("stale_cursor")
                 self._validate_source_heads(connection, candidate)
-                self._check_context_conflicts(stored_context, envelope.context)
+                self._check_context_conflicts(
+                    stored_context,
+                    envelope.context,
+                    envelope.tombstones,
+                )
                 if envelope.source_cursor == active_cursor:
                     if envelope.content_hash != active_hash:
                         raise SyncConflict("cursor_content_conflict")
+                    if _completion_claims_hash(envelope) != str(
+                        active["completion_claims_hash"]
+                    ):
+                        raise SyncConflict("completion_claims_conflict")
                     stored_result = self._stored_result(
                         connection,
                         candidate,
@@ -683,7 +859,11 @@ class ProjectSyncRepository:
                     return self._commit_unchanged(connection, candidate, active)
 
             if active is None:
-                self._check_context_conflicts(stored_context, envelope.context)
+                self._check_context_conflicts(
+                    stored_context,
+                    envelope.context,
+                    envelope.tombstones,
+                )
                 self._validate_source_heads(connection, candidate)
             outcome: Literal["applied", "degraded"] = (
                 "degraded"
@@ -735,8 +915,9 @@ class ProjectSyncRepository:
                 """
                 INSERT INTO project_sync_generations(
                     project_id, generation_id, sync_id, source_cursor,
-                    content_hash, context_json, outcome, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    content_hash, completion_claims_hash, context_json,
+                    outcome, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     envelope.project_id,
@@ -744,6 +925,7 @@ class ProjectSyncRepository:
                     envelope.sync_id,
                     envelope.source_cursor,
                     envelope.content_hash,
+                    _completion_claims_hash(envelope),
                     _canonical_json(envelope.context.model_dump(mode="json")),
                     outcome,
                     _datetime_text(candidate.audit.finished_at),
@@ -759,7 +941,12 @@ class ProjectSyncRepository:
                 (envelope.project_id, candidate.generation_id),
             )
             self._insert_audit(connection, candidate.audit, outcome)
-            self._record_successful_sync(connection, candidate.audit.finished_at)
+            self._record_successful_sync(
+                connection,
+                envelope.project_id,
+                candidate.audit.finished_at,
+                effective_states,
+            )
             connection.execute(
                 """
                 DELETE FROM project_evidence_chunks
@@ -807,6 +994,7 @@ class ProjectSyncRepository:
                 """,
                 (project_id, generation["generation_id"]),
             ).fetchall()
+            self._assert_protected_row_versions(state_rows, chunk_rows)
         return StoredProjectGeneration(
             project_id=project_id,
             generation_id=str(generation["generation_id"]),
@@ -826,6 +1014,21 @@ class ProjectSyncRepository:
                 _protected_chunk_from_row(row) for row in chunk_rows
             ),
         )
+
+    def _assert_protected_row_versions(
+        self,
+        state_rows: list[sqlite3.Row],
+        chunk_rows: list[sqlite3.Row],
+    ) -> None:
+        if self._configured_protection is None:
+            return
+        expected = self._configured_protection[1]
+        if any(
+            row["protected_source_id"] is not None
+            and row["protector_version"] != expected
+            for row in state_rows
+        ) or any(row["protector_version"] != expected for row in chunk_rows):
+            raise SyncConflict("protected_row_version_mismatch")
 
     def _assert_protection_access(self, connection: sqlite3.Connection) -> None:
         row = connection.execute(
@@ -879,53 +1082,105 @@ class ProjectSyncRepository:
                     or request.completed_at is not None
                 ):
                     raise SyncConflict("retrieval_request_conflict")
+                if stored.status is RetrievalRequestStatus.EXPIRED:
+                    renewed = self._request_with_current_baseline(
+                        connection,
+                        request.model_copy(
+                            update={"request_epoch": stored.request_epoch + 1}
+                        ),
+                        active,
+                    )
+                    connection.execute(
+                        """
+                        UPDATE project_retrieval_requests
+                        SET request_epoch = ?, baseline_generation_id = ?,
+                            baseline_content_hash = ?, baseline_source_cursor = ?,
+                            baseline_sources_json = ?, status = ?, created_at = ?,
+                            expires_at = ?, lease_expires_at = NULL,
+                            lease_token_hash = NULL, attempt_count = 0,
+                            completed_at = NULL, completed_epoch = NULL,
+                            completed_attempt_count = NULL,
+                            completed_token_hash = NULL
+                        WHERE request_id = ? AND project_id = ?
+                        """,
+                        (
+                            renewed.request_epoch,
+                            renewed.baseline_generation_id,
+                            renewed.baseline_content_hash,
+                            renewed.baseline_source_cursor,
+                            _retrieval_baselines_json(renewed),
+                            RetrievalRequestStatus.PENDING.value,
+                            _datetime_text(renewed.created_at),
+                            _datetime_text(renewed.expires_at),
+                            renewed.request_id,
+                            renewed.project_id,
+                        ),
+                    )
+                    return renewed
                 return stored
             if request.status is not RetrievalRequestStatus.PENDING:
                 raise ValueError("new retrieval request must be pending")
-            if active is None:
-                raise SyncConflict("retrieval_source_unavailable")
-            baseline = (
-                str(active["generation_id"]),
-                str(active["content_hash"]),
-                int(active["source_cursor"]),
-            )
-            baseline_sources = self._source_baselines_for_generation(
+            request = self._request_with_current_baseline(
                 connection,
-                request.project_id,
-                baseline[0],
-                request.source_id_hashes,
-            )
-            supplied = (
-                request.baseline_generation_id,
-                request.baseline_content_hash,
-                request.baseline_source_cursor,
-            )
-            if any(item is not None for item in supplied) and (
-                supplied != baseline
-                or request.baseline_sources != baseline_sources
-            ):
-                raise SyncConflict("retrieval_request_conflict")
-            request = request.model_copy(
-                update={
-                    "baseline_generation_id": baseline[0],
-                    "baseline_content_hash": baseline[1],
-                    "baseline_source_cursor": baseline[2],
-                    "baseline_sources": baseline_sources,
-                }
+                request,
+                active,
             )
             connection.execute(
                 """
                 INSERT INTO project_retrieval_requests(
                     request_id, project_id, query_hash, source_id_hashes_json,
+                    request_epoch,
                     baseline_generation_id, baseline_content_hash,
                     baseline_source_cursor, baseline_sources_json, status,
-                    created_at, expires_at, lease_expires_at, attempt_count,
-                    completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, expires_at, lease_expires_at, lease_token_hash,
+                    attempt_count, completed_at, completed_epoch,
+                    completed_attempt_count, completed_token_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _retrieval_values(request),
             )
         return request
+
+    def _request_with_current_baseline(
+        self,
+        connection: sqlite3.Connection,
+        request: RetrievalRequest,
+        active: sqlite3.Row | None,
+    ) -> RetrievalRequest:
+        if active is None:
+            raise SyncConflict("retrieval_source_unavailable")
+        baseline = (
+            str(active["generation_id"]),
+            str(active["content_hash"]),
+            int(active["source_cursor"]),
+        )
+        baseline_sources = self._source_baselines_for_generation(
+            connection,
+            request.project_id,
+            baseline[0],
+            request.source_id_hashes,
+        )
+        supplied = (
+            request.baseline_generation_id,
+            request.baseline_content_hash,
+            request.baseline_source_cursor,
+        )
+        if any(item is not None for item in supplied) and (
+            supplied != baseline or request.baseline_sources != baseline_sources
+        ):
+            raise SyncConflict("retrieval_request_conflict")
+        return request.model_copy(
+            update={
+                "baseline_generation_id": baseline[0],
+                "baseline_content_hash": baseline[1],
+                "baseline_source_cursor": baseline[2],
+                "baseline_sources": baseline_sources,
+                "status": RetrievalRequestStatus.PENDING,
+                "lease_expires_at": None,
+                "attempt_count": 0,
+                "completed_at": None,
+            }
+        )
 
     def get_retrieval_request(
         self,
@@ -966,7 +1221,7 @@ class ProjectSyncRepository:
         *,
         now: datetime,
         lease_seconds: int,
-    ) -> tuple[RetrievalRequest, ...]:
+    ) -> tuple[ClaimedRetrievalRequest, ...]:
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("retrieval_claim_now_invalid")
         if (
@@ -981,7 +1236,8 @@ class ProjectSyncRepository:
             connection.execute(
                 """
                 UPDATE project_retrieval_requests
-                SET status = ?, lease_expires_at = NULL
+                SET status = ?, lease_expires_at = NULL,
+                    lease_token_hash = NULL
                 WHERE project_id = ?
                   AND status IN (?, ?)
                   AND expires_at <= ?
@@ -1016,8 +1272,9 @@ class ProjectSyncRepository:
                     now_text,
                 ),
             ).fetchall()
-            claimed: list[RetrievalRequest] = []
+            claimed: list[ClaimedRetrievalRequest] = []
             for row in rows:
+                lease_token = secrets.token_urlsafe(32)
                 expires_at = _parse_datetime(row["expires_at"])
                 lease_expires_at = min(
                     now + timedelta(seconds=lease_seconds),
@@ -1027,12 +1284,14 @@ class ProjectSyncRepository:
                     """
                     UPDATE project_retrieval_requests
                     SET status = ?, lease_expires_at = ?,
+                        lease_token_hash = ?,
                         attempt_count = attempt_count + 1
                     WHERE request_id = ? AND project_id = ?
                     """,
                     (
                         RetrievalRequestStatus.IN_PROGRESS.value,
                         _datetime_text(lease_expires_at),
+                        hashlib.sha256(lease_token.encode("utf-8")).hexdigest(),
                         row["request_id"],
                         project_id,
                     ),
@@ -1045,7 +1304,12 @@ class ProjectSyncRepository:
                     (row["request_id"], project_id),
                 ).fetchone()
                 assert updated is not None
-                claimed.append(_retrieval_from_row(updated))
+                claimed.append(
+                    ClaimedRetrievalRequest(
+                        **_retrieval_from_row(updated).model_dump(),
+                        lease_token=lease_token,
+                    )
+                )
         return tuple(claimed)
 
     def compare_and_set_retrieval_request(
@@ -1119,12 +1383,45 @@ class ProjectSyncRepository:
     def _check_context_conflicts(
         stored: ProjectContextPackage | None,
         candidate: ProjectContextPackage,
+        tombstones: tuple[SourceTombstone, ...],
     ) -> None:
         if stored is None:
             return
         if stored.permission_scope != candidate.permission_scope:
             raise SyncConflict("permission_conflict")
-        if stored.active_decisions != candidate.active_decisions:
+        if stored.active_decisions == candidate.active_decisions:
+            return
+        candidate_ids = {item.decision_id for item in candidate.active_decisions}
+        retained = tuple(
+            item
+            for item in stored.active_decisions
+            if item.decision_id in candidate_ids
+        )
+        tombstoned_sources = {
+            (item.source_type.value, item.source_id, item.permission_scope)
+            for item in tombstones
+        }
+        removed = tuple(
+            item
+            for item in stored.active_decisions
+            if item.decision_id not in candidate_ids
+        )
+        if (
+            candidate.active_decisions != retained
+            or not removed
+            or any(
+                not any(
+                    (
+                        reference.source_type,
+                        reference.source_id,
+                        reference.permission_scope,
+                    )
+                    in tombstoned_sources
+                    for reference in decision.source_refs
+                )
+                for decision in removed
+            )
+        ):
             raise SyncConflict("decision_change_requires_review")
 
     @staticmethod
@@ -1449,11 +1746,12 @@ class ProjectSyncRepository:
         connection.execute(
             """
             UPDATE project_sync_generations
-            SET source_cursor = ?, context_json = ?
+            SET source_cursor = ?, completion_claims_hash = ?, context_json = ?
             WHERE project_id = ? AND generation_id = ?
             """,
             (
                 candidate.envelope.source_cursor,
+                _completion_claims_hash(candidate.envelope),
                 _canonical_json(
                     candidate.envelope.context.model_dump(mode="json")
                 ),
@@ -1462,7 +1760,12 @@ class ProjectSyncRepository:
             ),
         )
         self._insert_audit(connection, candidate.audit, "unchanged")
-        self._record_successful_sync(connection, candidate.audit.finished_at)
+        self._record_successful_sync(
+            connection,
+            candidate.envelope.project_id,
+            candidate.audit.finished_at,
+            candidate.source_states,
+        )
         return SyncCommitResult(
             outcome="unchanged",
             generation_id=generation_id,
@@ -1473,7 +1776,9 @@ class ProjectSyncRepository:
     @staticmethod
     def _record_successful_sync(
         connection: sqlite3.Connection,
+        project_id: str,
         finished_at: datetime,
+        states: tuple[SourceState, ...],
     ) -> None:
         connection.execute(
             """
@@ -1485,6 +1790,24 @@ class ProjectSyncRepository:
             """,
             (_datetime_text(finished_at), _datetime_text(finished_at)),
         )
+        active_states = tuple(
+            state
+            for state in states
+            if state.status
+            not in {SourceSyncStatus.DELETED, SourceSyncStatus.REVOKED}
+        )
+        if active_states and all(
+            state.status is SourceSyncStatus.ACTIVE
+            and state.last_success_at == finished_at
+            for state in active_states
+        ):
+            connection.execute(
+                """
+                DELETE FROM project_sync_clock_recovery
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            )
 
     def _build_effective_records(
         self,
@@ -1679,8 +2002,9 @@ class ProjectSyncRepository:
                     project_id, generation_id, source_type, source_id_hash,
                     source_version, source_time, content_hash, permission_hash, status,
                     last_attempt_at, last_success_at, last_error_type,
-                    protected_source_id, protected_title, protected_url
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    protected_source_id, protected_title, protected_url,
+                    protector_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -1698,6 +2022,7 @@ class ProjectSyncRepository:
                     source.protected_source_id if source else None,
                     source.protected_title if source else None,
                     source.protected_url if source else None,
+                    source.protector_version if source else None,
                 ),
             )
 
@@ -1715,8 +2040,8 @@ class ProjectSyncRepository:
                     project_id, generation_id, chunk_id, source_type,
                     source_id_hash, source_version, ordinal,
                     protected_heading_path, protected_text, start_offset,
-                    end_offset, content_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    end_offset, content_hash, protector_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -1731,6 +2056,7 @@ class ProjectSyncRepository:
                     item.start_offset,
                     item.end_offset,
                     item.content_hash,
+                    item.protector_version,
                 ),
             )
 
@@ -1740,7 +2066,10 @@ class ProjectSyncRepository:
         candidate: SyncCommit,
     ) -> tuple[str, ...]:
         completed: list[str] = []
-        for request_id in candidate.envelope.completed_retrieval_request_ids:
+        if candidate.envelope.completed_retrieval_request_ids:
+            raise SyncConflict("retrieval_claim_required")
+        for claim in candidate.envelope.completed_retrieval_claims:
+            request_id = claim.request_id
             row = connection.execute(
                 """
                 SELECT * FROM project_retrieval_requests
@@ -1749,14 +2078,41 @@ class ProjectSyncRepository:
                 (candidate.envelope.project_id, request_id),
             ).fetchone()
             if row is None or row["status"] not in {
-                RetrievalRequestStatus.PENDING.value,
                 RetrievalRequestStatus.IN_PROGRESS.value,
                 RetrievalRequestStatus.COMPLETED.value,
             }:
                 raise SyncConflict("retrieval_evidence_missing")
             if row["status"] == RetrievalRequestStatus.COMPLETED.value:
+                if (
+                    row["completed_epoch"] is None
+                    or row["completed_attempt_count"] is None
+                    or row["completed_token_hash"] is None
+                    or int(row["completed_epoch"]) != claim.request_epoch
+                    or int(row["completed_attempt_count"]) != claim.attempt_count
+                    or not hmac.compare_digest(
+                        str(row["completed_token_hash"]),
+                        _lease_token_hash(claim.lease_token),
+                    )
+                ):
+                    raise SyncConflict("retrieval_claim_invalid")
                 completed.append(request_id)
                 continue
+            lease_expires_at = _optional_parse_datetime(row["lease_expires_at"])
+            if (
+                int(row["request_epoch"]) != claim.request_epoch
+                or int(row["attempt_count"]) != claim.attempt_count
+                or row["lease_token_hash"] is None
+                or not hmac.compare_digest(
+                    str(row["lease_token_hash"]),
+                    _lease_token_hash(claim.lease_token),
+                )
+            ):
+                raise SyncConflict("retrieval_claim_invalid")
+            if (
+                lease_expires_at is None
+                or candidate.audit.finished_at >= lease_expires_at
+            ):
+                raise SyncConflict("retrieval_claim_expired")
             requested_hashes = set(json.loads(row["source_id_hashes_json"]))
             baseline_generation_id = row["baseline_generation_id"]
             baseline_content_hash = row["baseline_content_hash"]
@@ -1800,13 +2156,18 @@ class ProjectSyncRepository:
             updated = connection.execute(
                 """
                 UPDATE project_retrieval_requests
-                SET status = ?, completed_at = ?, lease_expires_at = NULL
+                SET status = ?, completed_at = ?, lease_expires_at = NULL,
+                    lease_token_hash = NULL, completed_epoch = ?,
+                    completed_attempt_count = ?, completed_token_hash = ?
                 WHERE project_id = ? AND request_id = ?
                   AND status IN (?, ?)
                 """,
                 (
                     RetrievalRequestStatus.COMPLETED.value,
                     _datetime_text(candidate.audit.finished_at),
+                    claim.request_epoch,
+                    claim.attempt_count,
+                    _lease_token_hash(claim.lease_token),
                     candidate.envelope.project_id,
                     request_id,
                     RetrievalRequestStatus.PENDING.value,
@@ -1963,7 +2324,8 @@ class ProjectSyncRepository:
         candidate: SyncCommit,
     ) -> tuple[str, ...]:
         completed: list[str] = []
-        for request_id in candidate.envelope.completed_retrieval_request_ids:
+        for claim in candidate.envelope.completed_retrieval_claims:
+            request_id = claim.request_id
             row = connection.execute(
                 """
                 SELECT status FROM project_retrieval_requests
@@ -1978,6 +2340,31 @@ class ProjectSyncRepository:
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _completion_claims_hash(envelope: SyncEnvelope) -> str:
+    payload = {
+        "legacy_ids": sorted(envelope.completed_retrieval_request_ids),
+        "claims": sorted(
+            (
+                {
+                    "request_id": item.request_id,
+                    "request_epoch": item.request_epoch,
+                    "attempt_count": item.attempt_count,
+                    "lease_token_hash": _lease_token_hash(item.lease_token),
+                }
+                for item in envelope.completed_retrieval_claims
+            ),
+            key=lambda item: item["request_id"],
+        ),
+    }
+    if not payload["legacy_ids"] and not payload["claims"]:
+        payload = []
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _lease_token_hash(lease_token: str) -> str:
+    return hashlib.sha256(lease_token.encode("utf-8")).hexdigest()
 
 
 def _chunk_fingerprint(chunks: list[tuple[int, str]]) -> str:
@@ -2043,6 +2430,7 @@ def _protected_source_from_row(row: sqlite3.Row) -> ProtectedSourceRecord:
         source_time=_optional_parse_datetime(row["source_time"]),
         permission_hash=row["permission_hash"],
         content_hash=row["content_hash"],
+        protector_version=row["protector_version"],
     )
 
 
@@ -2058,6 +2446,7 @@ def _protected_chunk_from_row(row: sqlite3.Row) -> ProtectedChunkRecord:
         start_offset=int(row["start_offset"]),
         end_offset=int(row["end_offset"]),
         content_hash=row["content_hash"],
+        protector_version=row["protector_version"],
     )
 
 
@@ -2067,20 +2456,29 @@ def _retrieval_values(request: RetrievalRequest) -> tuple[object, ...]:
         request.project_id,
         request.query_hash,
         _canonical_json(request.source_id_hashes),
+        request.request_epoch,
         request.baseline_generation_id,
         request.baseline_content_hash,
         request.baseline_source_cursor,
-        _canonical_json(
-            [item.model_dump(mode="json") for item in request.baseline_sources]
-        )
-        if request.baseline_sources
-        else None,
+        _retrieval_baselines_json(request),
         request.status.value,
         _datetime_text(request.created_at),
         _datetime_text(request.expires_at),
         _optional_datetime_text(request.lease_expires_at),
+        None,
         request.attempt_count,
         _optional_datetime_text(request.completed_at),
+        None,
+        None,
+        None,
+    )
+
+
+def _retrieval_baselines_json(request: RetrievalRequest) -> str | None:
+    if not request.baseline_sources:
+        return None
+    return _canonical_json(
+        [item.model_dump(mode="json") for item in request.baseline_sources]
     )
 
 
@@ -2090,6 +2488,7 @@ def _retrieval_from_row(row: sqlite3.Row) -> RetrievalRequest:
         project_id=row["project_id"],
         query_hash=row["query_hash"],
         source_id_hashes=tuple(json.loads(row["source_id_hashes_json"])),
+        request_epoch=int(row["request_epoch"]),
         baseline_generation_id=row["baseline_generation_id"],
         baseline_content_hash=row["baseline_content_hash"],
         baseline_source_cursor=(

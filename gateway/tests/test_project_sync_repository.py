@@ -247,24 +247,28 @@ def sync_commit(
     protected_sources: tuple[ProtectedSourceRecord, ...] | None = None,
     protected_chunks: tuple[ProtectedChunkRecord, ...] | None = None,
     completed_request_ids: tuple[str, ...] = (),
+    completion_claims: tuple[object, ...] = (),
     outcome: str | None = None,
 ) -> SyncCommit:
     chosen_snapshots = snapshots if snapshots is not None else (active_snapshot(),)
     chosen_states = states if states is not None else (source_state(),)
     identifier = sync_id or f"sync-{cursor}"
-    envelope = SyncEnvelope(
-        schema_version=1,
-        sync_id=identifier,
-        project_id="project-1",
-        generated_at=NOW + timedelta(minutes=cursor - 1),
-        source_cursor=cursor,
-        content_hash=content_hash,
-        producer="qwenwork-dws",
-        context=package or context(generated_at=NOW + timedelta(minutes=cursor - 1)),
-        sources=chosen_snapshots,
-        tombstones=tombstones,
-        completed_retrieval_request_ids=completed_request_ids,
-    )
+    envelope_values: dict[str, object] = {
+        "schema_version": 1,
+        "sync_id": identifier,
+        "project_id": "project-1",
+        "generated_at": NOW + timedelta(minutes=cursor - 1),
+        "source_cursor": cursor,
+        "content_hash": content_hash,
+        "producer": "qwenwork-dws",
+        "context": package or context(generated_at=NOW + timedelta(minutes=cursor - 1)),
+        "sources": chosen_snapshots,
+        "tombstones": tombstones,
+        "completed_retrieval_request_ids": completed_request_ids,
+    }
+    if completion_claims:
+        envelope_values["completed_retrieval_claims"] = completion_claims
+    envelope = SyncEnvelope(**envelope_values)
     failed_count = sum(
         item.status in {SourceSyncStatus.FAILED, SourceSyncStatus.STALE}
         for item in chosen_states
@@ -391,12 +395,103 @@ def test_initialize_migrates_retrievals_without_per_source_baselines(
     assert pending is not None
     assert pending.status is RetrievalRequestStatus.EXPIRED
     assert pending.baseline_generation_id is None
+    assert pending.baseline_content_hash is None
+    assert pending.baseline_source_cursor is None
     assert pending.baseline_sources == ()
     assert pending.lease_expires_at is None
     assert completed is not None
     assert completed.status is RetrievalRequestStatus.COMPLETED
     assert completed.baseline_generation_id is None
+    assert completed.baseline_content_hash is None
+    assert completed.baseline_source_cursor is None
     assert completed.baseline_sources == ()
+
+
+def test_initialize_serializes_schema_migrations_and_records_version(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "project-memory.db"
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def initialize() -> None:
+        try:
+            barrier.wait(timeout=5)
+            ProjectSyncRepository(database_path).initialize()
+        except BaseException as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=initialize) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert errors == []
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM project_sync_schema WHERE singleton_id = 1"
+        ).fetchone() == (2,)
+
+
+def test_protected_rows_persist_and_validate_protector_version(tmp_path: Path) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.configure_protection(HASH_A, "test-protector-v1")
+    repository.commit(
+        sync_commit(
+            cursor=1,
+            protected_sources=(
+                protected_source(protector_version="test-protector-v1"),
+            ),
+            protected_chunks=(
+                protected_chunk(protector_version="test-protector-v1"),
+            ),
+        )
+    )
+    with sqlite3.connect(tmp_path / "project-memory.db") as connection:
+        assert connection.execute(
+            "SELECT protector_version FROM project_source_states"
+        ).fetchone() == ("test-protector-v1",)
+        assert connection.execute(
+            "SELECT protector_version FROM project_evidence_chunks"
+        ).fetchone() == ("test-protector-v1",)
+        connection.execute(
+            "UPDATE project_evidence_chunks SET protector_version = 'wrong-v2'"
+        )
+
+    with pytest.raises(SyncConflict, match="protected_row_version_mismatch"):
+        repository.load_active_generation("project-1")
+
+
+def test_initialize_backfills_protector_version_only_for_legacy_schema(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.configure_protection(HASH_A, "test-protector-v1")
+    repository.commit(sync_commit(cursor=1))
+    database_path = tmp_path / "project-memory.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE project_source_states SET protector_version = NULL"
+        )
+        connection.execute(
+            "UPDATE project_evidence_chunks SET protector_version = NULL"
+        )
+        connection.execute(
+            "UPDATE project_sync_schema SET schema_version = 1"
+        )
+
+    reopened = ProjectSyncRepository(database_path)
+    reopened.initialize()
+    reopened.configure_protection(HASH_A, "test-protector-v1")
+
+    stored = reopened.load_active_generation("project-1")
+    assert stored is not None
+    assert stored.protected_sources[0].protector_version == "test-protector-v1"
+    assert stored.protected_chunks[0].protector_version == "test-protector-v1"
 
 
 def test_protection_descriptor_persists_and_rejects_identity_or_version_change(
@@ -781,6 +876,58 @@ def test_commit_rejects_silent_decision_or_permission_changes(
         repository.commit(
             sync_commit(cursor=2, package=package, snapshots=snapshots)
         )
+
+
+def test_commit_allows_removing_decision_when_its_source_is_revoked(
+    tmp_path: Path,
+) -> None:
+    reference = evidence_ref(source_id="real-source-id")
+    decision = context().active_decisions[0].model_copy(
+        update={"source_refs": (reference,)}
+    )
+    original = context(
+        source_refs=(reference,),
+        active_decisions=(decision,),
+    )
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1, package=original))
+    revoked_at = NOW + timedelta(minutes=1)
+
+    result = repository.commit(
+        sync_commit(
+            cursor=2,
+            content_hash=HASH_B,
+            package=context(
+                generated_at=revoked_at,
+                source_refs=(),
+                active_decisions=(),
+            ),
+            snapshots=(),
+            tombstones=(
+                SourceTombstone(
+                    source_type=SyncSourceType.DOCUMENT,
+                    source_id="real-source-id",
+                    status=SourceSyncStatus.REVOKED,
+                    occurred_at=revoked_at,
+                    permission_scope="project:demo",
+                ),
+            ),
+            states=(
+                source_state(
+                    source_version=None,
+                    content_hash=None,
+                    status=SourceSyncStatus.REVOKED,
+                    last_attempt_at=revoked_at,
+                    last_success_at=None,
+                ),
+            ),
+            protected_sources=(),
+            protected_chunks=(),
+        )
+    )
+
+    assert result.outcome == "applied"
 
 
 @pytest.mark.parametrize("status", ["failed", "stale"])
@@ -1294,6 +1441,23 @@ def retrieval_request(**updates: object) -> RetrievalRequest:
     return RetrievalRequest(**values)
 
 
+def completion_claim(claimed) -> object:  # type: ignore[no-untyped-def]
+    from companion_gateway.project.sync_models import RetrievalCompletionClaim
+
+    return RetrievalCompletionClaim(
+        request_id=claimed.request_id,
+        request_epoch=claimed.request_epoch,
+        attempt_count=claimed.attempt_count,
+        lease_token=claimed.lease_token,
+    )
+
+
+def request_without_token(claimed) -> RetrievalRequest:  # type: ignore[no-untyped-def]
+    return RetrievalRequest.model_validate(
+        claimed.model_dump(exclude={"lease_token"})
+    )
+
+
 def test_retrieval_request_captures_active_generation_baseline(
     tmp_path: Path,
 ) -> None:
@@ -1337,7 +1501,10 @@ def test_unrelated_source_change_cannot_complete_retrieval(
             protected_chunks=(protected_chunk(), other[3]),
         )
     )
-    request = repository.save_retrieval_request(retrieval_request())
+    repository.save_retrieval_request(retrieval_request())
+    request = repository.claim_retrieval_requests(
+        "project-1", now=NOW + timedelta(seconds=1), lease_seconds=300
+    )[0]
     changed_other = active_document_records(
         source_id="other-source-id",
         source_version="v2",
@@ -1356,7 +1523,7 @@ def test_unrelated_source_change_cannot_complete_retrieval(
                 states=(source_state(), changed_other[1]),
                 protected_sources=(protected_source(), changed_other[2]),
                 protected_chunks=(protected_chunk(), changed_other[3]),
-                completed_request_ids=(request.request_id,),
+                completion_claims=(completion_claim(request),),
             )
         )
 
@@ -1367,7 +1534,10 @@ def test_metadata_only_source_refresh_cannot_complete_retrieval(
     repository = repository_at(tmp_path)
     repository.initialize()
     repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
-    request = repository.save_retrieval_request(retrieval_request())
+    repository.save_retrieval_request(retrieval_request())
+    request = repository.claim_retrieval_requests(
+        "project-1", now=NOW + timedelta(seconds=1), lease_seconds=300
+    )[0]
     metadata_only = active_document_records(
         source_id="real-source-id",
         source_version="v2",
@@ -1386,7 +1556,7 @@ def test_metadata_only_source_refresh_cannot_complete_retrieval(
                 states=(metadata_only[1],),
                 protected_sources=(metadata_only[2],),
                 protected_chunks=(metadata_only[3],),
-                completed_request_ids=(request.request_id,),
+                completion_claims=(completion_claim(request),),
             )
         )
 
@@ -1449,14 +1619,17 @@ def test_unchanged_generation_cannot_complete_pending_retrieval(
     repository = repository_at(tmp_path)
     repository.initialize()
     repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
-    request = repository.save_retrieval_request(retrieval_request())
+    repository.save_retrieval_request(retrieval_request())
+    request = repository.claim_retrieval_requests(
+        "project-1", now=NOW + timedelta(seconds=1), lease_seconds=300
+    )[0]
 
     with pytest.raises(SyncConflict, match="retrieval_evidence_missing"):
         repository.commit(
             sync_commit(
                 cursor=2,
                 content_hash=HASH_A,
-                completed_request_ids=(request.request_id,),
+                completion_claims=(completion_claim(request),),
                 outcome="unchanged",
             )
         )
@@ -1466,7 +1639,7 @@ def test_unchanged_generation_cannot_complete_pending_retrieval(
     assert active.source_cursor == 1
     assert repository.get_retrieval_request(
         "project-1", request.request_id
-    ) == request
+    ) == request_without_token(request)
 
 
 def test_retrieval_completion_requires_new_evidence_for_every_source(
@@ -1492,7 +1665,7 @@ def test_retrieval_completion_requires_new_evidence_for_every_source(
             protected_chunks=(protected_chunk(), other[3]),
         )
     )
-    request = repository.save_retrieval_request(
+    repository.save_retrieval_request(
         retrieval_request(
             source_id_hashes=(
                 source_id_hash("real-source-id"),
@@ -1500,13 +1673,16 @@ def test_retrieval_completion_requires_new_evidence_for_every_source(
             )
         )
     )
+    request = repository.claim_retrieval_requests(
+        "project-1", now=NOW + timedelta(seconds=1), lease_seconds=300
+    )[0]
 
     with pytest.raises(SyncConflict, match="retrieval_evidence_missing"):
         repository.commit(
             sync_commit(
                 cursor=2,
                 content_hash=HASH_B,
-                completed_request_ids=(request.request_id,),
+                completion_claims=(completion_claim(request),),
             )
         )
 
@@ -1515,7 +1691,7 @@ def test_retrieval_completion_requires_new_evidence_for_every_source(
     assert active.source_cursor == 1
     assert repository.get_retrieval_request(
         "project-1", request.request_id
-    ) == request
+    ) == request_without_token(request)
 
 
 def test_retrieval_requests_use_compare_and_set_transitions(tmp_path: Path) -> None:
@@ -1547,7 +1723,12 @@ def test_retrieval_requests_use_compare_and_set_transitions(tmp_path: Path) -> N
     assert reclaimed.status is RetrievalRequestStatus.IN_PROGRESS
     assert reclaimed.attempt_count == 2
     assert reclaimed.lease_expires_at == NOW + timedelta(seconds=122)
-    assert repository.list_retrieval_requests("project-1") == (reclaimed,)
+    listed = repository.list_retrieval_requests("project-1")
+    assert listed == (
+        RetrievalRequest.model_validate(
+            reclaimed.model_dump(exclude={"lease_token"})
+        ),
+    )
     with pytest.raises(ValueError, match="completed"):
         repository.compare_and_set_retrieval_request(
             "project-1",
@@ -1555,6 +1736,226 @@ def test_retrieval_requests_use_compare_and_set_transitions(tmp_path: Path) -> N
             frozenset({RetrievalRequestStatus.IN_PROGRESS}),
             RetrievalRequestStatus.COMPLETED,
             completed_at=NOW,
+        )
+
+
+def test_retrieval_claim_uses_fencing_token_and_rejects_stale_lease(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
+    repository.save_retrieval_request(retrieval_request())
+    first = repository.claim_retrieval_requests(
+        "project-1",
+        now=NOW + timedelta(seconds=1),
+        lease_seconds=60,
+    )[0]
+    second = repository.claim_retrieval_requests(
+        "project-1",
+        now=NOW + timedelta(seconds=62),
+        lease_seconds=60,
+    )[0]
+    assert first.request_epoch == second.request_epoch == 1
+    assert first.attempt_count == 1
+    assert second.attempt_count == 2
+    assert first.lease_token != second.lease_token
+    updated = active_document_records(
+        source_id="real-source-id",
+        source_version="v2",
+        source_content_hash=HASH_D,
+        chunk_id=HASH_E,
+        chunk_content_hash=HASH_F,
+        observed_at=NOW + timedelta(minutes=1),
+    )
+
+    with pytest.raises(SyncConflict, match="retrieval_claim_invalid"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                snapshots=(updated[0],),
+                states=(updated[1],),
+                protected_sources=(updated[2],),
+                protected_chunks=(updated[3],),
+                completion_claims=(completion_claim(first),),
+            )
+        )
+
+    result = repository.commit(
+        sync_commit(
+            cursor=2,
+            content_hash=HASH_B,
+            snapshots=(updated[0],),
+            states=(updated[1],),
+            protected_sources=(updated[2],),
+            protected_chunks=(updated[3],),
+            completion_claims=(completion_claim(second),),
+        )
+    )
+    assert result.completed_retrieval_request_ids == ("request-1",)
+
+
+def test_retrieval_completion_requires_claim_and_unexpired_lease(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
+    repository.save_retrieval_request(retrieval_request())
+    updated = active_document_records(
+        source_id="real-source-id",
+        source_version="v2",
+        source_content_hash=HASH_D,
+        chunk_id=HASH_E,
+        chunk_content_hash=HASH_F,
+        observed_at=NOW + timedelta(minutes=1),
+    )
+
+    with pytest.raises(SyncConflict, match="retrieval_claim_required"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                snapshots=(updated[0],),
+                states=(updated[1],),
+                protected_sources=(updated[2],),
+                protected_chunks=(updated[3],),
+                completed_request_ids=("request-1",),
+            )
+        )
+
+    claimed = repository.claim_retrieval_requests(
+        "project-1",
+        now=NOW + timedelta(seconds=1),
+        lease_seconds=30,
+    )[0]
+    expired_candidate = sync_commit(
+        cursor=2,
+        content_hash=HASH_B,
+        snapshots=(updated[0],),
+        states=(updated[1],),
+        protected_sources=(updated[2],),
+        protected_chunks=(updated[3],),
+        completion_claims=(completion_claim(claimed),),
+    )
+    expired_candidate = replace(
+        expired_candidate,
+        audit=expired_candidate.audit.model_copy(
+            update={
+                "started_at": NOW + timedelta(seconds=31),
+                "finished_at": NOW + timedelta(seconds=31),
+            }
+        ),
+    )
+    with pytest.raises(SyncConflict, match="retrieval_claim_expired"):
+        repository.commit(expired_candidate)
+
+
+def test_expired_deterministic_retrieval_requeues_with_new_epoch(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
+    first = repository.save_retrieval_request(
+        retrieval_request(expires_at=NOW + timedelta(minutes=1))
+    )
+    assert repository.claim_retrieval_requests(
+        "project-1",
+        now=NOW + timedelta(minutes=2),
+        lease_seconds=60,
+    ) == ()
+
+    renewed = repository.save_retrieval_request(
+        retrieval_request(
+            created_at=NOW + timedelta(minutes=2),
+            expires_at=NOW + timedelta(minutes=32),
+        ),
+        expected_generation_id="generation-1",
+    )
+
+    assert renewed.request_id == first.request_id
+    assert renewed.request_epoch == first.request_epoch + 1
+    assert renewed.status is RetrievalRequestStatus.PENDING
+    assert renewed.attempt_count == 0
+    assert renewed.lease_expires_at is None
+    claimed = repository.claim_retrieval_requests(
+        "project-1",
+        now=NOW + timedelta(minutes=2, seconds=1),
+        lease_seconds=300,
+    )[0]
+    assert claimed.request_epoch == renewed.request_epoch
+    updated = active_document_records(
+        source_id="real-source-id",
+        source_version="v2",
+        source_content_hash=HASH_D,
+        chunk_id=HASH_E,
+        chunk_content_hash=HASH_F,
+        observed_at=NOW + timedelta(minutes=3),
+    )
+
+    result = repository.commit(
+        sync_commit(
+            cursor=2,
+            content_hash=HASH_B,
+            snapshots=(updated[0],),
+            states=(updated[1],),
+            protected_sources=(updated[2],),
+            protected_chunks=(updated[3],),
+            completion_claims=(completion_claim(claimed),),
+        )
+    )
+    assert result.completed_retrieval_request_ids == (renewed.request_id,)
+
+
+def test_same_cursor_rejects_different_completion_claims(tmp_path: Path) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
+    first_request = repository.save_retrieval_request(retrieval_request())
+    second_request = repository.save_retrieval_request(
+        retrieval_request(request_id="request-2", query_hash=HASH_B)
+    )
+    claims = repository.claim_retrieval_requests(
+        "project-1",
+        now=NOW + timedelta(seconds=1),
+        lease_seconds=300,
+    )
+    claimed = {item.request_id: item for item in claims}
+    updated = active_document_records(
+        source_id="real-source-id",
+        source_version="v2",
+        source_content_hash=HASH_D,
+        chunk_id=HASH_E,
+        chunk_content_hash=HASH_F,
+        observed_at=NOW + timedelta(minutes=1),
+    )
+    first_commit = sync_commit(
+        cursor=2,
+        content_hash=HASH_B,
+        snapshots=(updated[0],),
+        states=(updated[1],),
+        protected_sources=(updated[2],),
+        protected_chunks=(updated[3],),
+        completion_claims=(completion_claim(claimed[first_request.request_id]),),
+    )
+    repository.commit(first_commit)
+
+    assert repository.commit(first_commit).outcome == "applied"
+    with pytest.raises(SyncConflict, match="completion_claims_conflict"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                snapshots=(updated[0],),
+                states=(updated[1],),
+                protected_sources=(updated[2],),
+                protected_chunks=(updated[3],),
+                completion_claims=(
+                    completion_claim(claimed[second_request.request_id]),
+                ),
+            )
         )
 
 
@@ -1583,8 +1984,10 @@ def test_completed_retrieval_request_commits_with_evidence(tmp_path: Path) -> No
     repository = repository_at(tmp_path)
     repository.initialize()
     repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
-    pending = repository.save_retrieval_request(retrieval_request())
-    request = pending
+    repository.save_retrieval_request(retrieval_request())
+    request = repository.claim_retrieval_requests(
+        "project-1", now=NOW + timedelta(seconds=1), lease_seconds=300
+    )[0]
 
     updated = active_document_records(
         source_id="real-source-id",
@@ -1602,7 +2005,7 @@ def test_completed_retrieval_request_commits_with_evidence(tmp_path: Path) -> No
             states=(updated[1],),
             protected_sources=(updated[2],),
             protected_chunks=(updated[3],),
-            completed_request_ids=(request.request_id,),
+            completion_claims=(completion_claim(request),),
         )
     )
 
@@ -1619,7 +2022,10 @@ def test_missing_retrieval_evidence_rolls_back_generation_and_request(
     repository = repository_at(tmp_path)
     repository.initialize()
     repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
-    request = repository.save_retrieval_request(retrieval_request())
+    repository.save_retrieval_request(retrieval_request())
+    request = repository.claim_retrieval_requests(
+        "project-1", now=NOW + timedelta(seconds=1), lease_seconds=300
+    )[0]
     other = active_document_records(
         source_id="other-source-id",
         source_version="v2",
@@ -1638,14 +2044,16 @@ def test_missing_retrieval_evidence_rolls_back_generation_and_request(
                 states=(other[1],),
                 protected_sources=(other[2],),
                 protected_chunks=(other[3],),
-                completed_request_ids=(request.request_id,),
+                completion_claims=(completion_claim(request),),
             )
         )
 
     active = repository.load_active_generation("project-1")
     assert active is not None
     assert active.source_cursor == 1
-    assert repository.get_retrieval_request("project-1", request.request_id) == request
+    assert repository.get_retrieval_request(
+        "project-1", request.request_id
+    ) == request_without_token(request)
     with sqlite3.connect(tmp_path / "project-memory.db") as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM project_source_states"

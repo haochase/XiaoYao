@@ -26,6 +26,7 @@ from companion_gateway.project.protection_state import (
 from companion_gateway.project.sync_models import (
     EvidenceChunk,
     ProjectSyncHealth,
+    RetrievalCompletionClaim,
     RetrievalRequest,
     RetrievalRequestStatus,
     SourceErrorType,
@@ -236,6 +237,7 @@ def envelope(
     generated_at: datetime = NOW,
     sources: tuple[SourceSnapshot, ...] | None = None,
     completed_ids: tuple[str, ...] = (),
+    completed_claims: tuple[RetrievalCompletionClaim, ...] = (),
 ) -> SyncEnvelope:
     draft = SyncEnvelope(
         schema_version=1,
@@ -248,6 +250,7 @@ def envelope(
         context=context(generated_at=generated_at),
         sources=sources or (active_document(fetched_at=generated_at),),
         completed_retrieval_request_ids=completed_ids,
+        completed_retrieval_claims=completed_claims,
     )
     return draft.model_copy(
         update={"content_hash": compute_envelope_content_hash(draft)}
@@ -876,6 +879,33 @@ def test_resume_detection_requests_one_immediate_sync(tmp_path: Path) -> None:
     assert not service.consume_immediate_sync_request()
 
 
+@pytest.mark.parametrize("elapsed_monotonic", [1.0, 601.0])
+def test_resume_blocks_facts_until_project_resync(
+    tmp_path: Path, elapsed_monotonic: float
+) -> None:
+    sample = {"value": 100.0}
+    service, _, _, _ = sync_service(
+        tmp_path, monotonic=lambda: sample["value"]
+    )
+    service.apply(envelope(), principal=PRINCIPAL, now=NOW)
+    resumed_at = NOW + timedelta(seconds=601)
+    sample["value"] += elapsed_monotonic
+    service.recheck_clock(wall_now=resumed_at)
+
+    assert service.status(PROJECT_ID, now=resumed_at).health is (
+        ProjectSyncHealth.STALE
+    )
+    with pytest.raises(ProjectSourceUnavailable, match="source_stale"):
+        service.require_sources_fresh(PROJECT_ID, (DOCUMENT_REF,), now=resumed_at)
+
+    service.apply(
+        envelope(cursor=2, generated_at=resumed_at),
+        principal=PRINCIPAL,
+        now=resumed_at,
+    )
+    service.require_sources_fresh(PROJECT_ID, (DOCUMENT_REF,), now=resumed_at)
+
+
 def test_clock_rollback_threshold_is_independent_of_envelope_skew(
     tmp_path: Path,
 ) -> None:
@@ -897,6 +927,36 @@ def test_clock_rollback_threshold_is_independent_of_envelope_skew(
     assert large_rollback.reason == "clock_rollback"
     assert large_rollback.clock_untrusted
     assert large_rollback.immediate_sync_required
+
+
+def test_failed_resume_sync_keeps_project_recovery_pending(tmp_path: Path) -> None:
+    service, repository, _, _ = sync_service(tmp_path)
+    service.apply(envelope(), principal=PRINCIPAL, now=NOW)
+    resumed_at = NOW + timedelta(seconds=601)
+    result = service.apply(
+        envelope_without_context_refs(
+            cursor=2,
+            generated_at=resumed_at,
+            sources=(failed_source(SyncSourceType.DOCUMENT, fetched_at=resumed_at),),
+        ),
+        principal=PRINCIPAL,
+        now=resumed_at,
+    )
+
+    assert result.failed_sources == 1
+    assert repository.project_requires_clock_resync(PROJECT_ID)
+    assert result.project_status is ProjectSyncHealth.STALE
+    with pytest.raises(ProjectSourceUnavailable, match="source_stale"):
+        service.require_sources_fresh(PROJECT_ID, (DOCUMENT_REF,), now=resumed_at)
+
+
+def test_future_success_timestamp_is_not_fresh(tmp_path: Path) -> None:
+    service, _, _, _ = sync_service(tmp_path)
+    service.apply(envelope(), principal=PRINCIPAL, now=NOW)
+    with pytest.raises(ProjectSourceUnavailable, match="source_stale"):
+        service.require_sources_fresh(
+            PROJECT_ID, (DOCUMENT_REF,), now=NOW - timedelta(seconds=1)
+        )
 
 
 def test_clock_rollback_fails_closed_until_successful_sync(tmp_path: Path) -> None:
@@ -944,7 +1004,7 @@ def test_retrieval_completion_is_committed_with_available_evidence(
 ) -> None:
     service, repository, _, _ = sync_service(tmp_path)
     service.apply(envelope(cursor=1), principal=PRINCIPAL, now=NOW)
-    request = repository.save_retrieval_request(
+    repository.save_retrieval_request(
         RetrievalRequest(
             request_id="retrieval-1",
             project_id=PROJECT_ID,
@@ -955,6 +1015,11 @@ def test_retrieval_completion_is_committed_with_available_evidence(
             expires_at=NOW + timedelta(minutes=10),
         )
     )
+    claimed = repository.claim_retrieval_requests(
+        PROJECT_ID,
+        now=NOW + timedelta(seconds=1),
+        lease_seconds=300,
+    )[0]
     updated_at = NOW + timedelta(minutes=1)
 
     service.apply(
@@ -971,7 +1036,14 @@ def test_retrieval_completion_is_committed_with_available_evidence(
                     ),
                 ),
             ),
-            completed_ids=(request.request_id,),
+            completed_claims=(
+                RetrievalCompletionClaim(
+                    request_id=claimed.request_id,
+                    request_epoch=claimed.request_epoch,
+                    attempt_count=claimed.attempt_count,
+                    lease_token=claimed.lease_token,
+                ),
+            ),
         ),
         principal=PRINCIPAL,
         now=updated_at,

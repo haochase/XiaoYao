@@ -75,8 +75,12 @@ _SAFE_SOURCE_ERRORS = frozenset(
 )
 _SAFE_CONFLICT_ERRORS = frozenset(
     {
+        "completion_claims_conflict",
         "context_conflict",
         "cursor_content_conflict",
+        "retrieval_claim_expired",
+        "retrieval_claim_invalid",
+        "retrieval_claim_required",
         "retrieval_evidence_missing",
         "retrieval_request_conflict",
         "stale_cursor",

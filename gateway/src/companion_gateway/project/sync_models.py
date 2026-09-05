@@ -365,6 +365,7 @@ class RetrievalRequest(BaseModel):
     project_id: str = Field(min_length=1, max_length=128)
     query_hash: str = Field(pattern=r"[0-9a-f]{64}")
     source_id_hashes: tuple[str, ...] = Field(min_length=1, max_length=30)
+    request_epoch: int = Field(default=1, ge=1)
     baseline_generation_id: str | None = Field(default=None, max_length=128)
     baseline_content_hash: str | None = Field(
         default=None,
@@ -463,6 +464,25 @@ class RetrievalRequest(BaseModel):
         return self
 
 
+class ClaimedRetrievalRequest(RetrievalRequest):
+    lease_token: str = Field(
+        pattern=r"^[A-Za-z0-9_-]{32,128}$",
+    )
+
+
+class RetrievalCompletionClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    request_id: str = Field(min_length=1, max_length=256)
+    request_epoch: int = Field(ge=1)
+    attempt_count: int = Field(ge=1)
+    lease_token: str = Field(pattern=r"^[A-Za-z0-9_-]{32,128}$")
+
+    _request_id = field_validator("request_id")(
+        lambda value: _require_non_blank(value, "request_id")
+    )
+
+
 class ProjectSyncStatus(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -529,6 +549,7 @@ class SyncEnvelope(BaseModel):
     sources: tuple[SourceSnapshot, ...] = Field(max_length=30)
     tombstones: tuple[SourceTombstone, ...] = ()
     completed_retrieval_request_ids: tuple[str, ...] = ()
+    completed_retrieval_claims: tuple[RetrievalCompletionClaim, ...] = ()
 
     _sync_id = field_validator("sync_id")(
         lambda value: _require_project_or_sync_id(value, "sync_id")
@@ -587,4 +608,7 @@ class SyncEnvelope(BaseModel):
             != len(self.completed_retrieval_request_ids)
         ):
             raise ValueError("completed retrieval request IDs must be unique")
+        claim_ids = [item.request_id for item in self.completed_retrieval_claims]
+        if len(claim_ids) != len(set(claim_ids)):
+            raise ValueError("completed retrieval claims must be unique")
         return self

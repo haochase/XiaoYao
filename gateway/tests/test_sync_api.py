@@ -32,6 +32,8 @@ from companion_gateway.project.sync_service import (
     ProjectSyncValidationError,
     compute_envelope_content_hash,
 )
+from companion_gateway.project.sync_models import ClaimedRetrievalRequest
+from companion_gateway.project.sync_repository import SyncConflict
 from companion_gateway.settings import Settings
 from companion_gateway.sync_api import create_sync_app
 from tools.dws_project_sync import _validate_response
@@ -245,8 +247,8 @@ class StubRetrievalRepository:
         *,
         now: datetime,
         lease_seconds: int,
-    ) -> tuple[RetrievalRequest, ...]:
-        claimed: list[RetrievalRequest] = []
+    ) -> tuple[ClaimedRetrievalRequest, ...]:
+        claimed: list[ClaimedRetrievalRequest] = []
         for request_id, item in tuple(self.requests.items()):
             if item.project_id != project_id or item.expires_at <= now:
                 continue
@@ -268,7 +270,12 @@ class StubRetrievalRepository:
                 }
             )
             self.requests[request_id] = updated
-            claimed.append(updated)
+            claimed.append(
+                ClaimedRetrievalRequest(
+                    **updated.model_dump(),
+                    lease_token=f"{updated.attempt_count:032d}",
+                )
+            )
         return tuple(claimed)
 
     def compare_and_set_retrieval_request(
@@ -715,6 +722,7 @@ def test_retrieval_request_list_filters_pending_before_claiming(
     assert claimed_request["request_id"] == "retrieval-first"
     assert claimed_request["status"] == "in_progress"
     assert claimed_request["attempt_count"] == 1
+    assert len(claimed_request["lease_token"]) >= 32
     assert claimed_request["lease_expires_at"] == (
         NOW + timedelta(minutes=5)
     ).isoformat().replace("+00:00", "Z")
@@ -737,9 +745,36 @@ def test_retrieval_request_list_filters_pending_before_claiming(
     assert reclaimed_request["request_id"] == "retrieval-first"
     assert reclaimed_request["status"] == "in_progress"
     assert reclaimed_request["attempt_count"] == 2
+    assert reclaimed_request["lease_token"] != claimed_request["lease_token"]
     assert reclaimed_request["lease_expires_at"] == (
         NOW + timedelta(minutes=10, seconds=1)
     ).isoformat().replace("+00:00", "Z")
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "completion_claims_conflict",
+        "retrieval_claim_expired",
+        "retrieval_claim_invalid",
+        "retrieval_claim_required",
+    ],
+)
+def test_sync_exposes_safe_retrieval_claim_conflicts(
+    client: TestClient,
+    sync_service: StubSyncService,
+    detail: str,
+) -> None:
+    sync_service.apply_error = SyncConflict(detail)
+
+    response = client.post(
+        f"/v1/projects/{PROJECT_ID}/sync",
+        json=envelope_json(),
+        headers=AUTH,
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": detail}
 
 
 def test_retrieval_request_rejects_unregistered_source_summary(
