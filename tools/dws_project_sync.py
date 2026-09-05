@@ -63,6 +63,8 @@ except ModuleNotFoundError as exc:
 
 
 MAX_PAYLOAD_BYTES = 2_097_152
+MAX_PRIVATE_INPUT_BYTES = 2_097_152
+MAX_STATE_BYTES = 65_536
 TOKEN_ENVIRONMENT_VARIABLE = "COMPANION_DWS_SYNC_TOKEN"
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -81,6 +83,7 @@ _PUBLIC_ERROR_TYPES = {
     "context_file_invalid",
     "context_file_not_absolute",
     "context_file_parent_invalid",
+    "context_file_too_large",
     "context_fact_unreferenced",
     "context_mismatch",
     "dws_path_not_absolute",
@@ -120,9 +123,11 @@ _PUBLIC_ERROR_TYPES = {
     "sources_file_invalid",
     "sources_file_not_absolute",
     "sources_file_parent_invalid",
+    "sources_file_too_large",
     "state_file_invalid",
     "state_file_not_absolute",
     "state_file_parent_invalid",
+    "state_file_too_large",
     "state_project_mismatch",
     "sync_failed",
     "token_invalid",
@@ -280,11 +285,19 @@ def _absolute_private_path(raw_path: str, label: str) -> Path:
     return path
 
 
-def _read_json_object(path: Path, label: str) -> dict[str, object]:
+def _read_json_object(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int,
+) -> dict[str, object]:
     try:
-        raw = path.read_bytes()
+        with path.open("rb") as stream:
+            raw = stream.read(max_bytes + 1)
     except OSError:
         raise ValueError(f"{label}_unreadable") from None
+    if len(raw) > max_bytes:
+        raise ValueError(f"{label}_too_large")
     try:
         payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_non_finite)
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
@@ -555,8 +568,13 @@ def _initial_state(project_id: str) -> SyncCliState:
 def _load_state(path: Path, project_id: str) -> SyncCliState:
     if not path.exists():
         return _initial_state(project_id)
+    payload = _read_json_object(
+        path,
+        "state_file",
+        max_bytes=MAX_STATE_BYTES,
+    )
     try:
-        state = SyncCliState.model_validate(_read_json_object(path, "state_file"))
+        state = SyncCliState.model_validate(payload)
     except (TypeError, ValueError):
         raise ValueError("state_file_invalid") from None
     if state.project_id != project_id:
@@ -690,6 +708,8 @@ def _collect_command(
         actual_runner = DwsCommandRunner(dws_path, profile=project.profile)
     source_bundle = collect_sources(project, actual_runner, clock=now)
     encoded = _canonical_bytes(source_bundle.model_dump(mode="json"))
+    if len(encoded) > MAX_PRIVATE_INPUT_BYTES:
+        raise ValueError("sources_file_too_large")
     _atomic_write(output_path, encoded)
     return {
         "status": "collected",
@@ -715,16 +735,22 @@ def _read_push_inputs(
     state_path = _absolute_private_path(args.state_file, "state_file")
     manifest = DwsManifest.load(manifest_path)
     project = _selected_project(manifest, args.project)
+    sources_payload = _read_json_object(
+        sources_path,
+        "sources_file",
+        max_bytes=MAX_PRIVATE_INPUT_BYTES,
+    )
     try:
-        source_bundle = DwsSourceBundle.model_validate(
-            _read_json_object(sources_path, "sources_file")
-        )
+        source_bundle = DwsSourceBundle.model_validate(sources_payload)
     except (TypeError, ValueError):
         raise ValueError("sources_file_invalid") from None
+    context_payload = _read_json_object(
+        context_path,
+        "context_file",
+        max_bytes=MAX_PRIVATE_INPUT_BYTES,
+    )
     try:
-        artifact = QwenProjectContextArtifact.model_validate(
-            _read_json_object(context_path, "context_file")
-        )
+        artifact = QwenProjectContextArtifact.model_validate(context_payload)
     except ValidationError as exc:
         if "context_fact_unreferenced" in str(exc):
             raise ValueError("context_fact_unreferenced") from None

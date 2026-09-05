@@ -5,7 +5,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 import subprocess
-from types import SimpleNamespace
+import threading
 
 import pytest
 from pydantic import ValidationError
@@ -22,7 +22,11 @@ from tools.dws_sync.adapters import (
     unwrap_dws_payload,
 )
 from tools.dws_sync.manifest import DwsProjectManifest, DwsSourceSpec
-from tools.dws_sync.runner import DwsCommandRunner, DwsReadError
+from tools.dws_sync.runner import (
+    MAX_DWS_STDOUT_BYTES,
+    DwsCommandRunner,
+    DwsReadError,
+)
 
 
 NOW = datetime(2026, 9, 5, 4, tzinfo=UTC)
@@ -50,23 +54,118 @@ class RecordingRunner:
         return self.responses.pop(0)
 
 
+class RecordingStdout:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.read_sizes: list[int] = []
+        self.closed = False
+
+    def read(self, size: int) -> bytes:
+        self.read_sizes.append(size)
+        return self.data[:size]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeProcess:
+    def __init__(self, stdout: bytes, *, returncode: int = 0) -> None:
+        self.stdout = RecordingStdout(stdout)
+        self.returncode = returncode
+        self.killed = False
+        self.wait_calls: list[float | None] = []
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+class BlockingStdout(RecordingStdout):
+    def __init__(self) -> None:
+        super().__init__(b"")
+        self.released = threading.Event()
+
+    def read(self, size: int) -> bytes:
+        self.read_sizes.append(size)
+        self.released.wait(1)
+        return b"{}"
+
+
+class BlockingProcess(FakeProcess):
+    def __init__(self) -> None:
+        super().__init__(b"")
+        self.stdout = BlockingStdout()
+
+    def kill(self) -> None:
+        super().kill()
+        self.stdout.released.set()
+
+
+class InterruptingWaitProcess(FakeProcess):
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        if not self.killed:
+            raise KeyboardInterrupt
+        return self.returncode
+
+
+class StuckCleanupProcess(FakeProcess):
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        raise subprocess.TimeoutExpired("private command", timeout)
+
+
+class GuardedBlockingStdout(RecordingStdout):
+    def __init__(self) -> None:
+        super().__init__(b"")
+        self.reading = threading.Event()
+        self.released = threading.Event()
+
+    def read(self, size: int) -> bytes:
+        self.read_sizes.append(size)
+        self.reading.set()
+        self.released.wait()
+        return b"{}"
+
+    def close(self) -> None:
+        if self.reading.is_set() and not self.released.is_set():
+            raise AssertionError("blocking reader must not be closed synchronously")
+        super().close()
+
+
+class UnkillableProcess(StuckCleanupProcess):
+    def __init__(self) -> None:
+        super().__init__(b"")
+        self.stdout = GuardedBlockingStdout()
+
+
+class RecordingPopen:
+    def __init__(self, process: FakeProcess) -> None:
+        self.process = process
+        self.calls: list[tuple[object, ...]] = []
+
+    def __call__(self, *args: object, **kwargs: object) -> FakeProcess:
+        self.calls.append((*args, kwargs))
+        return self.process
+
+
 def test_runner_injects_fixed_profile_json_format_and_safe_subprocess(
     tmp_path: Path,
 ) -> None:
     dws_path = tmp_path / "dws.exe"
     dws_path.write_text("", encoding="utf-8")
-    calls: list[tuple[object, ...]] = []
+    process = FakeProcess(b'{"ok":true}')
+    popen = RecordingPopen(process)
 
-    def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
-        calls.append((*args, kwargs))
-        return SimpleNamespace(returncode=0, stdout='{"ok":true}', stderr="")
-
-    runner = DwsCommandRunner(dws_path, profile="corp:user", run=fake_run)
+    runner = DwsCommandRunner(dws_path, profile="corp:user", popen=popen)
 
     assert runner.run(("todo", "task", "get", "--task-id", "task-1")) == {
         "ok": True
     }
-    assert calls == [
+    assert popen.calls == [
         (
             [
                 str(dws_path),
@@ -82,12 +181,13 @@ def test_runner_injects_fixed_profile_json_format_and_safe_subprocess(
             ],
             {
                 "shell": False,
-                "capture_output": True,
-                "text": True,
-                "timeout": 30.0,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.DEVNULL,
             },
         )
     ]
+    assert process.stdout.read_sizes == [MAX_DWS_STDOUT_BYTES + 1]
+    assert len(process.wait_calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -115,7 +215,7 @@ def test_runner_rejects_caller_controlled_global_or_shell_args(
     runner = DwsCommandRunner(
         dws_path,
         profile="corp:user",
-        run=lambda *_a, **_k: None,
+        popen=lambda *_a, **_k: None,
     )
 
     with pytest.raises(ValueError, match="dws_args_invalid"):
@@ -128,23 +228,25 @@ def test_runner_normalizes_timeout_and_failures_without_leaking_output(
     dws_path = tmp_path / "dws.exe"
     dws_path.write_text("", encoding="utf-8")
 
-    def timeout(*_args: object, **_kwargs: object) -> None:
-        raise subprocess.TimeoutExpired("private command", 30, stderr="secret")
-
+    timed_out = BlockingProcess()
     with pytest.raises(DwsReadError) as timeout_error:
-        DwsCommandRunner(dws_path, profile="corp:user", run=timeout).run(
-            ("doc", "info")
-        )
+        DwsCommandRunner(
+            dws_path,
+            profile="corp:user",
+            timeout_seconds=0.01,
+            popen=RecordingPopen(timed_out),
+        ).run(("doc", "info"))
     assert timeout_error.value.error_type is SourceErrorType.NETWORK_TIMEOUT
     assert timeout_error.value.retryable is True
     assert str(timeout_error.value) == "network_timeout"
     assert timeout_error.value.__cause__ is None
     assert timeout_error.value.__context__ is None
+    assert timed_out.killed is True
+    assert timed_out.wait_calls[-1] == 1.0
+    assert timed_out.stdout.closed is True
 
-    def failed(*_args: object, **_kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(
-            returncode=1,
-            stdout=canonical(
+    failed = FakeProcess(
+        canonical(
                 {
                     "success": False,
                     "error": {
@@ -153,12 +255,16 @@ def test_runner_normalizes_timeout_and_failures_without_leaking_output(
                         "message": "private stdout",
                     },
                 }
-            ),
-            stderr="private stderr",
-        )
+            ).encode("utf-8"),
+        returncode=1,
+    )
 
     with pytest.raises(DwsReadError) as failure:
-        DwsCommandRunner(dws_path, profile="corp:user", run=failed).run(("doc", "info"))
+        DwsCommandRunner(
+            dws_path,
+            profile="corp:user",
+            popen=RecordingPopen(failed),
+        ).run(("doc", "info"))
     assert failure.value.error_type is SourceErrorType.PERMISSION_DENIED
     assert failure.value.retryable is False
     assert str(failure.value) == "permission_denied"
@@ -172,14 +278,14 @@ def test_runner_exit_zero_requires_one_json_object(
 ) -> None:
     dws_path = tmp_path / "dws.exe"
     dws_path.write_text("", encoding="utf-8")
-    run = lambda *_a, **_k: SimpleNamespace(  # noqa: E731
-        returncode=0,
-        stdout=stdout,
-        stderr="private",
-    )
+    process = FakeProcess(stdout.encode("utf-8"))
 
     with pytest.raises(DwsReadError) as error:
-        DwsCommandRunner(dws_path, profile="corp:user", run=run).run(("doc", "info"))
+        DwsCommandRunner(
+            dws_path,
+            profile="corp:user",
+            popen=RecordingPopen(process),
+        ).run(("doc", "info"))
     assert error.value.error_type is SourceErrorType.INVALID_PAYLOAD
     assert error.value.__cause__ is None
     assert error.value.__context__ is None
@@ -192,18 +298,96 @@ def test_runner_rejects_non_finite_json_constants(
 ) -> None:
     dws_path = tmp_path / "dws.exe"
     dws_path.write_text("", encoding="utf-8")
-    run = lambda *_a, **_k: SimpleNamespace(  # noqa: E731
-        returncode=0,
-        stdout=f'{{"value":{constant}}}',
-        stderr="private",
-    )
+    process = FakeProcess(f'{{"value":{constant}}}'.encode("utf-8"))
 
     with pytest.raises(DwsReadError) as error:
-        DwsCommandRunner(dws_path, profile="corp:user", run=run).run(("doc", "info"))
+        DwsCommandRunner(
+            dws_path,
+            profile="corp:user",
+            popen=RecordingPopen(process),
+        ).run(("doc", "info"))
 
     assert error.value.error_type is SourceErrorType.INVALID_PAYLOAD
     assert error.value.__cause__ is None
     assert error.value.__context__ is None
+
+
+def test_runner_kills_and_waits_when_stdout_exceeds_bound(tmp_path: Path) -> None:
+    dws_path = tmp_path / "dws.exe"
+    dws_path.write_text("", encoding="utf-8")
+    process = FakeProcess(b"x" * (MAX_DWS_STDOUT_BYTES + 1))
+
+    with pytest.raises(DwsReadError) as error:
+        DwsCommandRunner(
+            dws_path,
+            profile="corp:user",
+            popen=RecordingPopen(process),
+        ).run(("doc", "info"))
+
+    assert error.value.error_type is SourceErrorType.INVALID_PAYLOAD
+    assert process.stdout.read_sizes == [MAX_DWS_STDOUT_BYTES + 1]
+    assert process.killed is True
+    assert process.wait_calls == [1.0]
+    assert process.stdout.closed is True
+
+
+def test_runner_cleans_up_when_wait_is_interrupted(tmp_path: Path) -> None:
+    dws_path = tmp_path / "dws.exe"
+    dws_path.write_text("", encoding="utf-8")
+    process = InterruptingWaitProcess(b"{}")
+
+    with pytest.raises(KeyboardInterrupt):
+        DwsCommandRunner(
+            dws_path,
+            profile="corp:user",
+            popen=RecordingPopen(process),
+        ).run(("doc", "info"))
+
+    assert process.killed is True
+    assert process.wait_calls[-1] == 1.0
+    assert process.stdout.closed is True
+
+
+def test_runner_cleanup_wait_is_bounded_when_process_will_not_exit(
+    tmp_path: Path,
+) -> None:
+    dws_path = tmp_path / "dws.exe"
+    dws_path.write_text("", encoding="utf-8")
+    process = StuckCleanupProcess(b"x" * (MAX_DWS_STDOUT_BYTES + 1))
+
+    with pytest.raises(DwsReadError) as error:
+        DwsCommandRunner(
+            dws_path,
+            profile="corp:user",
+            popen=RecordingPopen(process),
+        ).run(("doc", "info"))
+
+    assert error.value.error_type is SourceErrorType.INVALID_PAYLOAD
+    assert process.killed is True
+    assert process.wait_calls == [1.0]
+    assert process.stdout.closed is True
+
+
+def test_runner_does_not_block_closing_a_stuck_reader(tmp_path: Path) -> None:
+    dws_path = tmp_path / "dws.exe"
+    dws_path.write_text("", encoding="utf-8")
+    process = UnkillableProcess()
+
+    try:
+        with pytest.raises(DwsReadError) as error:
+            DwsCommandRunner(
+                dws_path,
+                profile="corp:user",
+                timeout_seconds=0.01,
+                popen=RecordingPopen(process),
+            ).run(("doc", "info"))
+
+        assert error.value.error_type is SourceErrorType.NETWORK_TIMEOUT
+        assert process.killed is True
+        assert process.wait_calls == [1.0]
+        assert process.stdout.closed is False
+    finally:
+        process.stdout.released.set()
 
 
 def test_unwrap_dws_payload_has_a_fixed_three_layer_allowlist() -> None:

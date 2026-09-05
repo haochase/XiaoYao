@@ -325,6 +325,48 @@ def test_collect_never_prints_business_content(tmp_path: Path, capsys) -> None:
     assert "private-profile" not in canonical(public)
 
 
+def test_collect_rejects_oversized_bundle_before_atomic_write(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    selected = project()
+    manifest = tmp_path / "manifest.json"
+    output = tmp_path / "private-bundle.json"
+    output.write_bytes(b"existing-private-state")
+    dws_path = tmp_path / "dws.exe"
+    dws_path.write_bytes(b"")
+    write_manifest(manifest, selected)
+
+    class OversizedDws(FakeDws):
+        def run(self, args: tuple[str, ...]) -> dict[str, object]:
+            if args[:2] == ("doc", "read"):
+                return {"markdown": "采用方案 B。" + "x" * 1_100_000}
+            return super().run(args)
+
+    assert main(
+        [
+            "collect",
+            "--manifest",
+            str(manifest),
+            "--project",
+            "project-1",
+            "--dws-path",
+            str(dws_path),
+            "--output",
+            str(output),
+        ],
+        runner=OversizedDws(),
+        urlopen=lambda *_a, **_k: pytest.fail("collect must not use network"),
+        now=lambda: NOW,
+    ) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "sources_file_too_large",
+    }
+    assert output.read_bytes() == b"existing-private-state"
+
+
 def test_build_envelope_maps_statuses_and_uses_authoritative_hash() -> None:
     failed = DwsSourceRecord(
         source_type="task",
@@ -701,7 +743,7 @@ def test_payload_over_limit_fails_before_state_or_network(
     tmp_path: Path, capsys
 ) -> None:
     paths = write_push_inputs(tmp_path)
-    huge = "# 大文档\n采用方案 B。\n" + "甲" * 2_100_000
+    huge = "# 大文档\n采用方案 B。\n" + "x" * 2_080_000
     write_json(
         paths["sources"],
         bundle(active_record(content=huge)).model_dump(mode="json"),
@@ -717,6 +759,43 @@ def test_payload_over_limit_fails_before_state_or_network(
         "error_type": "payload_too_large",
     }
     assert not paths["state"].exists()
+
+
+@pytest.mark.parametrize(
+    ("file_key", "limit", "error_type", "dry_run"),
+    [
+        ("sources", 2_097_152, "sources_file_too_large", True),
+        ("context", 2_097_152, "context_file_too_large", True),
+        ("state", 65_536, "state_file_too_large", False),
+    ],
+)
+def test_private_input_limits_fail_before_network_or_state_write(
+    tmp_path: Path,
+    capsys,
+    file_key: str,
+    limit: int,
+    error_type: str,
+    dry_run: bool,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    oversized = b"x" * (limit + 1)
+    paths[file_key].write_bytes(oversized)
+    extra = ("--dry-run",) if dry_run else ()
+
+    assert main(
+        push_args(paths, *extra),
+        urlopen=lambda *_a, **_k: pytest.fail("size gate must precede network"),
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": error_type,
+    }
+    if file_key == "state":
+        assert paths["state"].read_bytes() == oversized
+    else:
+        assert not paths["state"].exists()
 
 
 def test_internal_error_text_is_never_exposed(tmp_path: Path, capsys) -> None:

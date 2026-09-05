@@ -5,11 +5,15 @@ import math
 from collections.abc import Callable, Mapping
 from pathlib import Path
 import subprocess
+import threading
+import time
 from typing import Any
 
 from companion_gateway.project.sync_models import SourceErrorType
 
 
+MAX_DWS_STDOUT_BYTES = 2_097_152
+_PROCESS_CLEANUP_TIMEOUT_SECONDS = 1.0
 _FORBIDDEN_FLAGS = {
     "--client-id",
     "--client-secret",
@@ -139,7 +143,7 @@ class DwsCommandRunner:
         *,
         profile: str,
         timeout_seconds: float = 30.0,
-        run: Callable[..., Any] = subprocess.run,
+        popen: Callable[..., Any] = subprocess.Popen,
     ) -> None:
         if not dws_path.is_absolute():
             raise ValueError("dws_path_not_absolute")
@@ -152,7 +156,7 @@ class DwsCommandRunner:
         self._dws_path = dws_path
         self._profile = profile
         self._timeout_seconds = timeout_seconds
-        self._run = run
+        self._popen = popen
 
     def run(self, args: tuple[str, ...]) -> dict[str, object]:
         if (
@@ -172,22 +176,23 @@ class DwsCommandRunner:
         ]
         run_error: DwsReadError | None = None
         try:
-            completed = self._run(
+            process = self._popen(
                 command,
                 shell=False,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout_seconds,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
             )
-        except subprocess.TimeoutExpired:
-            run_error = DwsReadError(SourceErrorType.NETWORK_TIMEOUT, True)
         except (OSError, subprocess.SubprocessError):
             run_error = DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, False)
         if run_error is not None:
             raise run_error
 
-        payload = _parse_json_object(getattr(completed, "stdout", ""))
-        if getattr(completed, "returncode", 1) == 0:
+        stdout, returncode = _bounded_process_output(
+            process,
+            timeout_seconds=self._timeout_seconds,
+        )
+        payload = _parse_json_object(stdout)
+        if returncode == 0:
             if payload is None:
                 raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
             return payload
@@ -197,6 +202,96 @@ class DwsCommandRunner:
                 fallback=SourceErrorType.PROVIDER_UNAVAILABLE,
             )
         raise DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, False)
+
+
+def _bounded_process_output(
+    process: Any,
+    *,
+    timeout_seconds: float,
+) -> tuple[bytes, int]:
+    stream = getattr(process, "stdout", None)
+    output: list[bytes] = []
+    read_failed = threading.Event()
+    reader: threading.Thread | None = None
+
+    def read_stdout() -> None:
+        try:
+            value = stream.read(MAX_DWS_STDOUT_BYTES + 1)
+        except Exception:
+            read_failed.set()
+            return
+        if isinstance(value, bytes):
+            output.append(value)
+        else:
+            read_failed.set()
+
+    try:
+        if stream is None or not callable(getattr(stream, "read", None)):
+            raise DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, False)
+        started_at = time.monotonic()
+        reader = threading.Thread(target=read_stdout, daemon=True)
+        reader.start()
+        reader.join(timeout_seconds)
+        if reader.is_alive():
+            raise DwsReadError(SourceErrorType.NETWORK_TIMEOUT, True)
+        if read_failed.is_set() or not output:
+            raise DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, False)
+        if len(output[0]) > MAX_DWS_STDOUT_BYTES:
+            raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
+
+        remaining = max(0.0, timeout_seconds - (time.monotonic() - started_at))
+        wait_error: DwsReadError | None = None
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            wait_error = DwsReadError(SourceErrorType.NETWORK_TIMEOUT, True)
+        except (OSError, subprocess.SubprocessError):
+            wait_error = DwsReadError(
+                SourceErrorType.PROVIDER_UNAVAILABLE,
+                False,
+            )
+        if wait_error is not None:
+            raise wait_error
+        if isinstance(returncode, bool) or not isinstance(returncode, int):
+            raise DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, False)
+    except BaseException:
+        _terminate_process(process, stream=stream, reader=reader)
+        raise
+    _close_stdout(stream)
+    return output[0], returncode
+
+
+def _terminate_process(
+    process: Any,
+    *,
+    stream: Any,
+    reader: threading.Thread | None,
+) -> None:
+    try:
+        process.kill()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        process.wait(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if reader is not None and reader.is_alive():
+        try:
+            reader.join(_PROCESS_CLEANUP_TIMEOUT_SECONDS)
+        except (KeyboardInterrupt, RuntimeError):
+            pass
+    if reader is None or not reader.is_alive():
+        _close_stdout(stream)
+
+
+def _close_stdout(stream: Any) -> None:
+    close = getattr(stream, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except (OSError, ValueError):
+        pass
 
 
 def _parse_json_object(value: object) -> dict[str, object] | None:
