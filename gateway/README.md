@@ -73,6 +73,124 @@ $python = (Get-Command python -CommandType Application).Source
 ..\scripts\check-xiaoyao-gateway-runtime.ps1 -ExpectedHost 0.0.0.0
 ```
 
+## Private DWS project synchronization
+
+The DWS synchronization listener is a separate, opt-in process. It is fixed to
+`127.0.0.1:8731`; it must not be bound to a LAN address, proxied, or mounted on
+the ESP32-facing port `8723`. Keep the private manifest, generated source bundle,
+QwenWork context artifact, cursor state, and every credential outside Git.
+
+The synchronization listener and the QwenWork task must run as the same fixed
+Windows user. Evidence is protected with CurrentUser DPAPI, so another user or
+a service without that user's loaded profile cannot decrypt it. A protection
+identity mismatch or decryption failure closes the affected source instead of
+falling back to plaintext.
+
+Configure these names only in an ignored local environment or the process
+environment:
+
+```text
+COMPANION_PROJECT_API_PRINCIPALS=<principal-to-token-digest-and-project-scope-json>
+COMPANION_DWS_SYNC_TOKEN=<matching-raw-bearer-for-the-QwenWork-process>
+COMPANION_DEVICE_PROJECT_IDS=<device-to-project-json>
+COMPANION_PROJECT_SYNC_HOST=127.0.0.1
+COMPANION_PROJECT_SYNC_PORT=8731
+COMPANION_PROJECT_SYNC_MAX_BODY_BYTES=2097152
+COMPANION_PROJECT_SYNC_CLOCK_SKEW_SECONDS=300
+COMPANION_PROJECT_RETRIEVAL_TTL_SECONDS=1800
+COMPANION_PROJECT_SOURCE_FRESHNESS_SECONDS=1800
+```
+
+`COMPANION_DWS_SYNC_TOKEN` is read directly by `push`; there is no CLI option
+for a token or token-variable name. Store only its SHA-256 digest in
+`COMPANION_PROJECT_API_PRINCIPALS`. Never place the raw token in the manifest,
+command line, generated artifacts, logs, or this repository.
+
+The private manifest is strict JSON. Each project requires a private DWS
+`profile`, one permission scope, and at most 30 unique allowlisted sources.
+Calendar sources also require a bounded, timezone-aware window. The values below
+are placeholders, not real DWS resource identifiers:
+
+```json
+{
+  "schema_version": 1,
+  "projects": [
+    {
+      "project_id": "project-test-only",
+      "project_name": "脱敏测试项目",
+      "profile": "<private-dws-profile>",
+      "permission_scope": "project:project-test-only",
+      "sources": [
+        {"source_type": "document", "source_id": "<document-resource-id>"},
+        {"source_type": "meeting_note", "source_id": "<meeting-note-resource-id>"},
+        {"source_type": "task", "source_id": "<task-resource-id>"},
+        {
+          "source_type": "calendar",
+          "source_id": "<calendar-resource-id>",
+          "window_start": "2026-09-01T00:00:00+08:00",
+          "window_end": "2026-09-30T23:59:59+08:00"
+        }
+      ]
+    }
+  ]
+}
+```
+
+From the repository root, first check the runner and then start the dedicated
+listener. The selected Python must already contain the gateway dependencies:
+
+```powershell
+$python = 'E:\python\python.exe'
+& $python scripts\run_xiaoyao_sync.py --gateway-root gateway --check
+.\scripts\run-xiaoyao-sync.ps1 -GatewayRoot gateway -PythonPath $python
+```
+
+In another shell, confirm that 8731 is loopback-only, both health endpoints are
+ready, and port 8723 has no synchronization routes:
+
+```powershell
+.\scripts\check-xiaoyao-sync-runtime.ps1
+```
+
+Run the following three-stage workflow from the repository root in QwenWork.
+Use `python -m tools.dws_project_sync`; invoking the file directly is not the
+supported repository import mode.
+
+```powershell
+python -m tools.dws_project_sync collect `
+  --manifest 'E:\private\dws-projects.json' `
+  --project 'project-test-only' `
+  --dws-path 'E:\private-tools\dws.exe' `
+  --output 'E:\private\dws-source-bundle.json'
+
+# QwenWork now follows prompts/qwenwork-dws-project-sync.md and writes the
+# validated QwenProjectContextArtifact to the private context path.
+
+python -m tools.dws_project_sync push `
+  --manifest 'E:\private\dws-projects.json' `
+  --project 'project-test-only' `
+  --sources-file 'E:\private\dws-source-bundle.json' `
+  --context-file 'E:\private\qwen-project-context.json' `
+  --state-file 'E:\private\dws-sync-state.json' `
+  --gateway 'http://127.0.0.1:8731' `
+  --dry-run
+```
+
+`collect` always supplies the manifest's private profile to the fixed DWS read
+commands and requests JSON output. The QwenWork Skill must cite only active
+collected sources and omit unsupported facts. `push --dry-run` validates the
+artifact and reports only status, counts, payload size, and a content hash; it
+does not call the gateway. Remove `--dry-run` only after explicit approval for
+a real synchronization.
+
+Create the QwenWork schedule only after one approved manual run. Use the full
+contents of `prompts/qwenwork-dws-project-sync.md`, run it every five minutes in
+this repository root, keep it disabled until its first manual run succeeds, and
+coalesce missed intervals into one recovery run. Any `collect`, Skill, or
+`push` failure stops that run. Failed sources do not renew freshness, and facts
+depending on a source older than 30 minutes remain closed until that source is
+successfully refreshed.
+
 ## Bootstrap a Xiaozhi device
 
 For a firmware build that requests its WebSocket settings through OTA, configure

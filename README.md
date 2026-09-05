@@ -28,6 +28,27 @@ $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 See [`gateway/README.md`](gateway/README.md) for device authentication,
 WebSocket controls, and local server setup.
 
+## Private DWS project synchronization
+
+The optional DWS workflow keeps connector credentials and its resource
+allowlist outside this repository. It collects only manifest-listed document,
+meeting-note, task, and calendar sources, lets the QwenWork project-memory Skill
+produce a validated context artifact, and then pushes the result to the
+loopback-only synchronization listener at `127.0.0.1:8731`. The ESP32-facing
+service on port `8723` does not expose the synchronization routes.
+
+Run the synchronization CLI from the repository root as a module:
+
+```powershell
+python -m tools.dws_project_sync --help
+```
+
+See [the gateway DWS runbook](gateway/README.md#private-dws-project-synchronization)
+for the sanitized manifest schema, required environment-variable names, exact
+`collect` and `push` commands, and the five-minute QwenWork schedule. A failed
+or overdue source does not have its freshness renewed; answers that depend on
+that source remain unavailable until a successful allowed-source refresh.
+
 See [`docs/verification/mimo-v25-smoke.md`](docs/verification/mimo-v25-smoke.md)
 for a public-safe runtime verification record. Hardware-specific acceptance
 records and deployment notes remain outside the public repository.
