@@ -11,8 +11,13 @@ from urllib.error import URLError
 from urllib.request import ProxyHandler
 
 import pytest
+from pydantic import ValidationError
 
-from companion_gateway.project.models import ProjectContextPackage
+from companion_gateway.project.models import (
+    EvidenceRef,
+    ProjectContextPackage,
+    SourcedFact,
+)
 from companion_gateway.project.sync_models import SourceErrorType
 import tools.dws_project_sync as sync_cli
 from tools.dws_project_sync import (
@@ -131,6 +136,29 @@ def context(*, excerpt: str = "采用 方案 B。") -> ProjectContextPackage:
             "permission_scope": SCOPE,
             "freshness_seconds": 300,
         }
+    )
+
+
+def sourced_fact(
+    *,
+    source_type: str = "document",
+    source_id: str = "doc-1",
+    excerpt: str = "采用 方案 B。",
+) -> SourcedFact:
+    record = active_record(source_type=source_type, source_id=source_id)
+    return SourcedFact(
+        text="采用方案 B",
+        source_refs=(
+            EvidenceRef(
+                source_type=record.source_type.value,
+                source_id=record.source_id,
+                source_title=record.source_title or "",
+                source_url=record.source_url or "",
+                source_time=record.source_time or NOW,
+                excerpt=excerpt,
+                permission_scope=record.permission_scope,
+            ),
+        ),
     )
 
 
@@ -370,6 +398,104 @@ def test_build_envelope_rejects_unanchored_qwen_facts(
             ProjectContextPackage.model_validate(data),
             now=NOW,
         )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["sourced_actions", "sourced_risks", "sourced_next_meeting"],
+)
+def test_build_envelope_validates_each_sourced_fact_field(field: str) -> None:
+    fact = sourced_fact()
+    value: object = fact if field == "sourced_next_meeting" else (fact,)
+    sourced_context = context().model_copy(update={field: value})
+
+    envelope = build_envelope(project(), bundle(), sourced_context, now=NOW)
+
+    assert getattr(envelope.context, field) == value
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["sourced_actions", "sourced_risks", "sourced_next_meeting"],
+)
+@pytest.mark.parametrize(
+    ("records", "fact", "error_type"),
+    [
+        (
+            (
+                active_record(),
+                DwsSourceRecord(
+                    source_type="task",
+                    source_id="task-1",
+                    permission_scope=SCOPE,
+                    fetched_at=NOW,
+                    status="failed",
+                    error_type=SourceErrorType.NETWORK_TIMEOUT,
+                    retryable=True,
+                ),
+            ),
+            sourced_fact(source_type="task", source_id="task-1"),
+            "source_ref_mismatch",
+        ),
+        (
+            (active_record(),),
+            sourced_fact(excerpt="来源中不存在的摘录"),
+            "source_excerpt_mismatch",
+        ),
+    ],
+)
+def test_build_envelope_rejects_invalid_sourced_fact_references(
+    field: str,
+    records: tuple[DwsSourceRecord, ...],
+    fact: SourcedFact,
+    error_type: str,
+) -> None:
+    selected = project(
+        sources=tuple(
+            source_spec(record.source_type.value, record.source_id)
+            for record in records
+        )
+    )
+    value: object = fact if field == "sourced_next_meeting" else (fact,)
+    sourced_context = context().model_copy(update={field: value})
+
+    with pytest.raises(ValueError, match=error_type):
+        build_envelope(selected, bundle(*records), sourced_context, now=NOW)
+
+
+def test_qwen_artifact_and_push_reject_nonempty_legacy_facts(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    legacy_context = context().model_copy(
+        update={"open_actions": ("无来源行动项",)}
+    )
+    with pytest.raises(ValidationError, match="context_fact_unreferenced"):
+        QwenProjectContextArtifact(
+            schema_version=1,
+            context=legacy_context,
+        )
+
+    paths = write_push_inputs(tmp_path)
+    write_json(
+        paths["context"],
+        {
+            "schema_version": 1,
+            "context": legacy_context.model_dump(mode="json"),
+            "completed_retrieval_request_ids": [],
+        },
+    )
+
+    assert main(
+        push_args(paths, "--dry-run"),
+        urlopen=lambda *_a, **_k: pytest.fail("invalid facts must fail first"),
+        environ={},
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "context_fact_unreferenced",
+    }
+    assert not paths["state"].exists()
 
 
 def test_push_dry_run_never_uses_network_or_state(tmp_path: Path, capsys) -> None:

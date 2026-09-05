@@ -71,6 +71,17 @@ class EvidenceRef(BaseModel):
     )
 
 
+class SourcedFact(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    text: str = Field(min_length=1, max_length=2000)
+    source_refs: tuple[EvidenceRef, ...] = Field(min_length=1)
+
+    _text = field_validator("text")(
+        lambda value: _require_non_blank(value, "text")
+    )
+
+
 class DecisionCard(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -169,6 +180,9 @@ class ProjectContextPackage(BaseModel):
     open_actions: tuple[str, ...] = ()
     current_risks: tuple[str, ...] = ()
     next_meeting: str | None = Field(default=None, max_length=512)
+    sourced_actions: tuple[SourcedFact, ...] = ()
+    sourced_risks: tuple[SourcedFact, ...] = ()
+    sourced_next_meeting: SourcedFact | None = None
     permission_scope: str = Field(min_length=1, max_length=256)
     freshness_seconds: int = Field(default=300, gt=0, le=86400)
 
@@ -207,6 +221,17 @@ class ProjectContextPackage(BaseModel):
         for source in self.source_refs:
             if source.permission_scope != self.permission_scope:
                 raise ValueError("all sources must use the context permission scope")
+        sourced_facts = (*self.sourced_actions, *self.sourced_risks)
+        if self.sourced_next_meeting is not None:
+            sourced_facts += (self.sourced_next_meeting,)
+        if any(
+            source.permission_scope != self.permission_scope
+            for fact in sourced_facts
+            for source in fact.source_refs
+        ):
+            raise ValueError(
+                "all sourced facts must use the context permission scope"
+            )
         return self
 
 

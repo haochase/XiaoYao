@@ -22,7 +22,14 @@ from urllib.request import (
     build_opener,
 )
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from companion_gateway.project.index import chunk_text
 from companion_gateway.project.models import EvidenceRef, ProjectContextPackage
@@ -74,6 +81,7 @@ _PUBLIC_ERROR_TYPES = {
     "context_file_invalid",
     "context_file_not_absolute",
     "context_file_parent_invalid",
+    "context_fact_unreferenced",
     "context_mismatch",
     "dws_path_not_absolute",
     "dws_path_not_regular_file",
@@ -153,6 +161,15 @@ class QwenProjectContextArtifact(BaseModel):
     schema_version: Literal[1]
     context: ProjectContextPackage
     completed_retrieval_request_ids: tuple[str, ...] = ()
+
+    @field_validator("context")
+    @classmethod
+    def validate_context_facts(
+        cls,
+        context: ProjectContextPackage,
+    ) -> ProjectContextPackage:
+        _require_sourced_context(context)
+        return context
 
     @field_validator("completed_retrieval_request_ids")
     @classmethod
@@ -344,13 +361,30 @@ def _normalized_text(value: str) -> str:
     return "".join(value.split()).casefold()
 
 
+def _require_sourced_context(context: ProjectContextPackage) -> None:
+    if (
+        context.open_actions
+        or context.current_risks
+        or context.next_meeting is not None
+    ):
+        raise ValueError("context_fact_unreferenced")
+
+
 def _all_references(context: ProjectContextPackage) -> tuple[EvidenceRef, ...]:
     nested = tuple(
         source
         for decision in context.active_decisions
         for source in decision.source_refs
     )
-    return (*context.source_refs, *nested)
+    sourced_facts = (*context.sourced_actions, *context.sourced_risks)
+    if context.sourced_next_meeting is not None:
+        sourced_facts += (context.sourced_next_meeting,)
+    sourced = tuple(
+        source
+        for fact in sourced_facts
+        for source in fact.source_refs
+    )
+    return (*context.source_refs, *nested, *sourced)
 
 
 def _validate_context(
@@ -358,6 +392,7 @@ def _validate_context(
     source_bundle: DwsSourceBundle,
     context: ProjectContextPackage,
 ) -> None:
+    _require_sourced_context(context)
     if (
         context.project_id != project.project_id
         or context.project_name != project.project_name
@@ -690,6 +725,10 @@ def _read_push_inputs(
         artifact = QwenProjectContextArtifact.model_validate(
             _read_json_object(context_path, "context_file")
         )
+    except ValidationError as exc:
+        if "context_fact_unreferenced" in str(exc):
+            raise ValueError("context_fact_unreferenced") from None
+        raise ValueError("context_file_invalid") from None
     except (TypeError, ValueError):
         raise ValueError("context_file_invalid") from None
     return project, source_bundle, artifact, state_path

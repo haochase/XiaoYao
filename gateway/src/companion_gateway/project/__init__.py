@@ -10,6 +10,7 @@ from companion_gateway.project.models import (
     EvidenceRef,
     ProjectAnswer,
     ProjectContextPackage,
+    SourcedFact,
 )
 from companion_gateway.project.service import (
     ProjectContextUnavailable,
@@ -53,6 +54,7 @@ __all__ = [
     "EvidenceRef",
     "ProjectAnswer",
     "ProjectContextPackage",
+    "SourcedFact",
     "ProjectContextUnavailable",
     "ProjectMemoryError",
     "ProjectMemoryService",

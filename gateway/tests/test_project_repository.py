@@ -1,4 +1,6 @@
 from datetime import UTC, datetime, timedelta
+import json
+import sqlite3
 
 import pytest
 
@@ -78,6 +80,40 @@ def test_project_repository_round_trips_context_and_conflict(tmp_path) -> None:
 
     assert reopened.get_context("project-1") == context()
     assert reopened.get_conflict("conflict-1") == candidate()
+
+
+def test_project_repository_reads_legacy_context_json_without_sourced_facts(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "project-memory.db"
+    repository = ProjectMemoryRepository(database_path)
+    repository.initialize()
+    payload = context().model_dump(mode="json")
+    payload.update(
+        open_actions=["补充成本测算"],
+        current_risks=["供应商交期未确认"],
+        next_meeting="2026-09-05 10:00",
+    )
+    payload.pop("sourced_actions", None)
+    payload.pop("sourced_risks", None)
+    payload.pop("sourced_next_meeting", None)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO project_contexts(project_id, payload_json) VALUES (?, ?)",
+            ("project-1", json.dumps(payload, ensure_ascii=False)),
+        )
+
+    restored = ProjectMemoryRepository(database_path).get_context("project-1")
+
+    assert restored is not None
+    assert restored.open_actions == ("补充成本测算",)
+    assert restored.current_risks == ("供应商交期未确认",)
+    assert restored.next_meeting == "2026-09-05 10:00"
+    assert restored.sourced_actions == ()
+    assert restored.sourced_risks == ()
+    assert restored.sourced_next_meeting is None
+    reparsed = ProjectContextPackage.model_validate_json(restored.model_dump_json())
+    assert reparsed == restored
 
 
 def test_project_memory_service_recovers_context_after_restart(tmp_path) -> None:

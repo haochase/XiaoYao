@@ -11,6 +11,7 @@ from companion_gateway.project.models import (
     EvidenceRef,
     ProjectAnswer,
     ProjectContextPackage,
+    SourcedFact,
 )
 
 
@@ -146,6 +147,67 @@ def test_context_package_requires_single_project_scope_and_freshness() -> None:
             source_refs=(source(),),
             active_decisions=(decision(),),
             permission_scope="project:other",
+        )
+
+
+def test_context_package_accepts_sourced_operational_facts() -> None:
+    action = SourcedFact(text="补充成本测算", source_refs=(source(),))
+    risk = SourcedFact(text="供应商交期未确认", source_refs=(source(),))
+    meeting = SourcedFact(text="2026-09-05 10:00", source_refs=(source(),))
+
+    package = ProjectContextPackage(
+        project_id="project-1",
+        project_name="星河零售终端升级项目",
+        generated_at=NOW,
+        sourced_actions=(action,),
+        sourced_risks=(risk,),
+        sourced_next_meeting=meeting,
+        permission_scope="project:star-retail",
+    )
+
+    assert package.sourced_actions == (action,)
+    assert package.sourced_risks == (risk,)
+    assert package.sourced_next_meeting == meeting
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("sourced_actions", ({"text": "行动项", "source_refs": []},)),
+        ("sourced_risks", ({"text": "风险", "source_refs": []},)),
+        (
+            "sourced_next_meeting",
+            {"text": "2026-09-05 10:00", "source_refs": []},
+        ),
+    ],
+)
+def test_sourced_operational_facts_require_source_refs(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError, match="source_refs"):
+        ProjectContextPackage(
+            project_id="project-1",
+            project_name="星河零售终端升级项目",
+            generated_at=NOW,
+            permission_scope="project:star-retail",
+            **{field: value},
+        )
+
+
+def test_context_package_rejects_foreign_sourced_fact_scope() -> None:
+    fact = SourcedFact(
+        text="供应商交期未确认",
+        source_refs=(source(permission_scope="project:other"),),
+    )
+
+    with pytest.raises(ValidationError, match="sourced facts"):
+        ProjectContextPackage(
+            project_id="project-1",
+            project_name="星河零售终端升级项目",
+            generated_at=NOW,
+            sourced_risks=(fact,),
+            permission_scope="project:star-retail",
         )
 
 
