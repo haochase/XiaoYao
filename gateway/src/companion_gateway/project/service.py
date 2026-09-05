@@ -286,7 +286,12 @@ class ProjectMemoryService:
             raise ProjectContextUnavailable("source_stale")
         query_hash = hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()
         request_material = "\0".join(
-            (project_id, query_hash, *source_hashes)
+            (
+                project_id,
+                snapshot.generation_id,
+                query_hash,
+                *source_hashes,
+            )
         ).encode("utf-8")
         request_id = "ret_" + hashlib.sha256(request_material).hexdigest()[:32]
         self._retrieval_writer.save_retrieval_request(

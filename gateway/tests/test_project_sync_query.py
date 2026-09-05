@@ -363,7 +363,12 @@ def test_missing_evidence_creates_one_idempotent_retrieval_request(
         sorted((document.source_id_hash, meeting.source_id_hash))
     )
     request_material = "\0".join(
-        (PROJECT_ID, request.query_hash, *request.source_id_hashes)
+        (
+            PROJECT_ID,
+            snapshot.generation_id,
+            request.query_hash,
+            *request.source_id_hashes,
+        )
     )
     assert request.request_id == f"ret_{digest(request_material)[:32]}"
     assert request.created_at == NOW

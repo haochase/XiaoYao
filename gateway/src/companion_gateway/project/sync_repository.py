@@ -199,6 +199,9 @@ class ProjectSyncRepository:
                     project_id TEXT NOT NULL,
                     query_hash TEXT NOT NULL,
                     source_id_hashes_json TEXT NOT NULL,
+                    baseline_generation_id TEXT,
+                    baseline_content_hash TEXT,
+                    baseline_source_cursor INTEGER,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
@@ -216,6 +219,52 @@ class ProjectSyncRepository:
                     needs_sync, reason
                 ) VALUES (1, NULL, 0, 0, 'normal');
                 """
+            )
+            self._ensure_column(
+                connection,
+                "project_retrieval_requests",
+                "baseline_generation_id",
+                "TEXT",
+            )
+            self._ensure_column(
+                connection,
+                "project_retrieval_requests",
+                "baseline_content_hash",
+                "TEXT",
+            )
+            self._ensure_column(
+                connection,
+                "project_retrieval_requests",
+                "baseline_source_cursor",
+                "INTEGER",
+            )
+            connection.execute(
+                """
+                UPDATE project_retrieval_requests
+                SET status = 'expired'
+                WHERE status IN ('pending', 'in_progress')
+                  AND (
+                    baseline_generation_id IS NULL
+                    OR baseline_content_hash IS NULL
+                    OR baseline_source_cursor IS NULL
+                  )
+                """
+            )
+
+    @staticmethod
+    def _ensure_column(
+        connection: sqlite3.Connection,
+        table: str,
+        column: str,
+        declaration: str,
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        if column not in columns:
+            connection.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
             )
 
     def configure_protection(
@@ -434,7 +483,10 @@ class ProjectSyncRepository:
             completed = self._complete_retrieval_requests(
                 connection,
                 candidate,
-                self._available_source_hashes(effective_sources, effective_chunks),
+                self._available_source_hashes(
+                    candidate.protected_sources,
+                    candidate.protected_chunks,
+                ),
             )
             connection.execute(
                 """
@@ -565,6 +617,7 @@ class ProjectSyncRepository:
     def save_retrieval_request(self, request: RetrievalRequest) -> RetrievalRequest:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            active = self._load_active_row(connection, request.project_id)
             row = connection.execute(
                 """
                 SELECT * FROM project_retrieval_requests
@@ -574,17 +627,47 @@ class ProjectSyncRepository:
             ).fetchone()
             if row is not None:
                 stored = _retrieval_from_row(row)
-                if stored != request:
+                if (
+                    stored.project_id != request.project_id
+                    or stored.query_hash != request.query_hash
+                    or stored.source_id_hashes != request.source_id_hashes
+                    or request.status is not RetrievalRequestStatus.PENDING
+                    or request.completed_at is not None
+                ):
                     raise SyncConflict("retrieval_request_conflict")
                 return stored
             if request.status is not RetrievalRequestStatus.PENDING:
                 raise ValueError("new retrieval request must be pending")
+            if active is not None:
+                baseline = (
+                    str(active["generation_id"]),
+                    str(active["content_hash"]),
+                    int(active["source_cursor"]),
+                )
+                supplied = (
+                    request.baseline_generation_id,
+                    request.baseline_content_hash,
+                    request.baseline_source_cursor,
+                )
+                if any(item is not None for item in supplied) and supplied != baseline:
+                    raise SyncConflict("retrieval_request_conflict")
+                request = request.model_copy(
+                    update={
+                        "baseline_generation_id": baseline[0],
+                        "baseline_content_hash": baseline[1],
+                        "baseline_source_cursor": baseline[2],
+                    }
+                )
+            elif request.baseline_generation_id is not None:
+                raise SyncConflict("retrieval_request_conflict")
             connection.execute(
                 """
                 INSERT INTO project_retrieval_requests(
                     request_id, project_id, query_hash, source_id_hashes_json,
-                    status, created_at, expires_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    baseline_generation_id, baseline_content_hash,
+                    baseline_source_cursor, status, created_at, expires_at,
+                    completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _retrieval_values(request),
             )
@@ -908,15 +991,13 @@ class ProjectSyncRepository:
             )
             if updated.rowcount != 1:
                 raise SyncConflict("source_state_envelope_mismatch")
-        available_hashes = self._available_hashes_for_generation(
-            connection,
-            project_id,
-            generation_id,
-        )
         completed = self._complete_retrieval_requests(
             connection,
             candidate,
-            available_hashes,
+            self._available_source_hashes(
+                candidate.protected_sources,
+                candidate.protected_chunks,
+            ),
         )
         connection.execute(
             """
@@ -1234,10 +1315,26 @@ class ProjectSyncRepository:
             if row is None or row["status"] not in {
                 RetrievalRequestStatus.PENDING.value,
                 RetrievalRequestStatus.IN_PROGRESS.value,
+                RetrievalRequestStatus.COMPLETED.value,
             }:
                 raise SyncConflict("retrieval_evidence_missing")
+            if row["status"] == RetrievalRequestStatus.COMPLETED.value:
+                completed.append(request_id)
+                continue
             requested_hashes = set(json.loads(row["source_id_hashes_json"]))
-            if not requested_hashes & available_hashes:
+            baseline_generation_id = row["baseline_generation_id"]
+            baseline_content_hash = row["baseline_content_hash"]
+            baseline_source_cursor = row["baseline_source_cursor"]
+            if (
+                baseline_generation_id is None
+                or baseline_content_hash is None
+                or baseline_source_cursor is None
+                or candidate.generation_id == baseline_generation_id
+                or candidate.envelope.content_hash == baseline_content_hash
+                or candidate.envelope.source_cursor <= int(baseline_source_cursor)
+                or candidate.audit.finished_at >= _parse_datetime(row["expires_at"])
+                or not requested_hashes.issubset(available_hashes)
+            ):
                 raise SyncConflict("retrieval_evidence_missing")
             updated = connection.execute(
                 """
@@ -1268,25 +1365,6 @@ class ProjectSyncRepository:
         return {item.source_id_hash for item in sources} | {
             item.source_id_hash for item in chunks
         }
-
-    @staticmethod
-    def _available_hashes_for_generation(
-        connection: sqlite3.Connection,
-        project_id: str,
-        generation_id: str,
-    ) -> set[str]:
-        rows = connection.execute(
-            """
-            SELECT source_id_hash FROM project_source_states
-            WHERE project_id = ? AND generation_id = ?
-              AND protected_source_id IS NOT NULL
-            UNION
-            SELECT source_id_hash FROM project_evidence_chunks
-            WHERE project_id = ? AND generation_id = ?
-            """,
-            (project_id, generation_id, project_id, generation_id),
-        ).fetchall()
-        return {str(row["source_id_hash"]) for row in rows}
 
     @staticmethod
     def _insert_audit(
@@ -1418,6 +1496,9 @@ def _retrieval_values(request: RetrievalRequest) -> tuple[object, ...]:
         request.project_id,
         request.query_hash,
         _canonical_json(request.source_id_hashes),
+        request.baseline_generation_id,
+        request.baseline_content_hash,
+        request.baseline_source_cursor,
         request.status.value,
         _datetime_text(request.created_at),
         _datetime_text(request.expires_at),
@@ -1431,6 +1512,13 @@ def _retrieval_from_row(row: sqlite3.Row) -> RetrievalRequest:
         project_id=row["project_id"],
         query_hash=row["query_hash"],
         source_id_hashes=tuple(json.loads(row["source_id_hashes_json"])),
+        baseline_generation_id=row["baseline_generation_id"],
+        baseline_content_hash=row["baseline_content_hash"],
+        baseline_source_cursor=(
+            int(row["baseline_source_cursor"])
+            if row["baseline_source_cursor"] is not None
+            else None
+        ),
         status=row["status"],
         created_at=_parse_datetime(row["created_at"]),
         expires_at=_parse_datetime(row["expires_at"]),

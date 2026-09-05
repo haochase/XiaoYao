@@ -356,6 +356,12 @@ class RetrievalRequest(BaseModel):
     project_id: str = Field(min_length=1, max_length=128)
     query_hash: str = Field(pattern=r"[0-9a-f]{64}")
     source_id_hashes: tuple[str, ...] = Field(min_length=1, max_length=30)
+    baseline_generation_id: str | None = Field(default=None, max_length=128)
+    baseline_content_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    baseline_source_cursor: int | None = Field(default=None, ge=1)
     status: RetrievalRequestStatus
     created_at: datetime
     expires_at: datetime
@@ -369,6 +375,11 @@ class RetrievalRequest(BaseModel):
     )
     _query_hash = field_validator("query_hash")(
         lambda value: _require_sha256(value, "query_hash")
+    )
+    _baseline_generation_id = field_validator("baseline_generation_id")(
+        lambda value: _require_non_blank(value, "baseline_generation_id")
+        if value is not None
+        else value
     )
     _created_at = field_validator("created_at")(
         lambda value: _require_aware(value, "created_at")
@@ -395,6 +406,15 @@ class RetrievalRequest(BaseModel):
             raise ValueError("expires_at must be later than created_at")
         if len(set(self.source_id_hashes)) != len(self.source_id_hashes):
             raise ValueError("source_id_hashes must be unique")
+        baseline = (
+            self.baseline_generation_id,
+            self.baseline_content_hash,
+            self.baseline_source_cursor,
+        )
+        if any(item is not None for item in baseline) and not all(
+            item is not None for item in baseline
+        ):
+            raise ValueError("retrieval baseline fields must be supplied together")
         if self.status is RetrievalRequestStatus.COMPLETED:
             if self.completed_at is None:
                 raise ValueError("completed request requires completed_at")

@@ -1044,6 +1044,95 @@ def retrieval_request(**updates: object) -> RetrievalRequest:
     return RetrievalRequest(**values)
 
 
+def test_retrieval_request_captures_active_generation_baseline(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
+
+    saved = repository.save_retrieval_request(retrieval_request())
+
+    assert saved.baseline_generation_id == "generation-1"
+    assert saved.baseline_content_hash == HASH_A
+    assert saved.baseline_source_cursor == 1
+
+
+def test_unchanged_generation_cannot_complete_pending_retrieval(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
+    request = repository.save_retrieval_request(retrieval_request())
+
+    with pytest.raises(SyncConflict, match="retrieval_evidence_missing"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_A,
+                completed_request_ids=(request.request_id,),
+                outcome="unchanged",
+            )
+        )
+
+    active = repository.load_active_generation("project-1")
+    assert active is not None
+    assert active.source_cursor == 1
+    assert repository.get_retrieval_request(
+        "project-1", request.request_id
+    ) == request
+
+
+def test_retrieval_completion_requires_new_evidence_for_every_source(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    other = active_document_records(
+        source_id="other-source-id",
+        source_version="v1",
+        source_content_hash=HASH_D,
+        chunk_id=HASH_E,
+        chunk_content_hash=HASH_F,
+        observed_at=NOW,
+    )
+    repository.commit(
+        sync_commit(
+            cursor=1,
+            content_hash=HASH_A,
+            snapshots=(active_snapshot(), other[0]),
+            states=(source_state(), other[1]),
+            protected_sources=(protected_source(), other[2]),
+            protected_chunks=(protected_chunk(), other[3]),
+        )
+    )
+    request = repository.save_retrieval_request(
+        retrieval_request(
+            source_id_hashes=(
+                source_id_hash("real-source-id"),
+                source_id_hash("other-source-id"),
+            )
+        )
+    )
+
+    with pytest.raises(SyncConflict, match="retrieval_evidence_missing"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                completed_request_ids=(request.request_id,),
+            )
+        )
+
+    active = repository.load_active_generation("project-1")
+    assert active is not None
+    assert active.source_cursor == 1
+    assert repository.get_retrieval_request(
+        "project-1", request.request_id
+    ) == request
+
+
 def test_retrieval_requests_use_compare_and_set_transitions(tmp_path: Path) -> None:
     repository = repository_at(tmp_path)
     repository.initialize()
@@ -1093,8 +1182,8 @@ def test_saving_retrieval_request_cannot_bypass_state_cas(tmp_path: Path) -> Non
 def test_completed_retrieval_request_commits_with_evidence(tmp_path: Path) -> None:
     repository = repository_at(tmp_path)
     repository.initialize()
-    pending = retrieval_request()
-    assert repository.save_retrieval_request(pending) == pending
+    repository.commit(sync_commit(cursor=1, content_hash=HASH_A))
+    pending = repository.save_retrieval_request(retrieval_request())
     assert repository.compare_and_set_retrieval_request(
         pending.project_id,
         pending.request_id,
@@ -1104,13 +1193,17 @@ def test_completed_retrieval_request_commits_with_evidence(tmp_path: Path) -> No
     request = pending.model_copy(update={"status": RetrievalRequestStatus.IN_PROGRESS})
 
     repository.commit(
-        sync_commit(cursor=1, completed_request_ids=(request.request_id,))
+        sync_commit(
+            cursor=2,
+            content_hash=HASH_B,
+            completed_request_ids=(request.request_id,),
+        )
     )
 
     completed = repository.get_retrieval_request("project-1", request.request_id)
     assert completed is not None
     assert completed.status is RetrievalRequestStatus.COMPLETED
-    assert completed.completed_at == NOW + timedelta(seconds=1)
+    assert completed.completed_at == NOW + timedelta(minutes=1, seconds=1)
     assert repository.load_active_generation("project-1") is not None
 
 

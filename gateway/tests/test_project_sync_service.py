@@ -664,7 +664,8 @@ def test_retrieval_completion_is_committed_with_available_evidence(
     tmp_path: Path,
 ) -> None:
     service, repository, _, _ = sync_service(tmp_path)
-    repository.save_retrieval_request(
+    service.apply(envelope(cursor=1), principal=PRINCIPAL, now=NOW)
+    request = repository.save_retrieval_request(
         RetrievalRequest(
             request_id="retrieval-1",
             project_id=PROJECT_ID,
@@ -675,16 +676,31 @@ def test_retrieval_completion_is_committed_with_available_evidence(
             expires_at=NOW + timedelta(minutes=10),
         )
     )
+    updated_at = NOW + timedelta(minutes=1)
 
     service.apply(
-        envelope(completed_ids=("retrieval-1",)),
+        envelope(
+            cursor=2,
+            generated_at=updated_at,
+            sources=(
+                active_document(
+                    fetched_at=updated_at,
+                    chunks=(
+                        evidence_chunk(
+                            text="Use plan B with newly retrieved evidence.",
+                        ),
+                    ),
+                ),
+            ),
+            completed_ids=(request.request_id,),
+        ),
         principal=PRINCIPAL,
-        now=NOW,
+        now=updated_at,
     )
 
     request = repository.get_retrieval_request(PROJECT_ID, "retrieval-1")
     assert request.status is RetrievalRequestStatus.COMPLETED
-    assert request.completed_at == NOW
+    assert request.completed_at == updated_at
 
 
 def test_protection_failure_prevents_commit_and_snapshot_swap(tmp_path: Path) -> None:
