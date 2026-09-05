@@ -715,6 +715,31 @@ def test_status_projects_expired_active_source_without_mutating_snapshot(
         )
 
 
+def test_future_client_fetched_at_never_extends_gateway_freshness(
+    tmp_path: Path,
+) -> None:
+    service, repository, _, _ = sync_service(
+        tmp_path,
+        source_freshness_seconds=600,
+    )
+    client_future = NOW + timedelta(minutes=5)
+
+    service.apply(
+        envelope(sources=(active_document(fetched_at=client_future),)),
+        principal=PRINCIPAL,
+        now=NOW,
+    )
+
+    stored = repository.load_active_generation(PROJECT_ID)
+    assert stored is not None
+    assert stored.source_states[0].last_attempt_at == NOW
+    assert stored.source_states[0].last_success_at == NOW
+    assert service.status(
+        PROJECT_ID,
+        now=NOW + timedelta(seconds=601),
+    ).health is ProjectSyncHealth.STALE
+
+
 def test_resume_detection_requests_one_immediate_sync(tmp_path: Path) -> None:
     service, _, _, _ = sync_service(tmp_path)
 

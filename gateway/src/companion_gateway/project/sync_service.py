@@ -285,6 +285,7 @@ class ProjectSyncService:
             self._clock_skew_seconds
         ):
             raise ProjectSyncValidationError("clock_skew_exceeded")
+        self._validate_provenance_times(envelope, now)
         ProjectApiAuthenticator.authorize(
             principal,
             project_id=envelope.project_id,
@@ -299,7 +300,7 @@ class ProjectSyncService:
         with self._apply_lock:
             started = time.perf_counter()
             active = self._repository.load_active_generation(envelope.project_id)
-            states = self._source_states(envelope, active)
+            states = self._source_states(envelope, active, observed_at=now)
             protected_sources, protected_chunks = self._protect_active_sources(
                 envelope
             )
@@ -535,6 +536,8 @@ class ProjectSyncService:
         self,
         envelope: SyncEnvelope,
         active: StoredProjectGeneration | None,
+        *,
+        observed_at: datetime,
     ) -> tuple[SourceState, ...]:
         prior = (
             {
@@ -560,7 +563,7 @@ class ProjectSyncService:
             if source.status is SourceSyncStatus.ACTIVE:
                 source_version = source.source_version
                 content_hash = source.content_hash
-                last_success_at = source.fetched_at
+                last_success_at = observed_at
                 last_error_type = None
             else:
                 source_version = (
@@ -580,7 +583,7 @@ class ProjectSyncService:
                     content_hash=content_hash,
                     permission_hash=source.permission_hash,
                     status=source.status,
-                    last_attempt_at=source.fetched_at,
+                    last_attempt_at=observed_at,
                     last_success_at=last_success_at,
                     last_error_type=last_error_type,
                 )
@@ -604,7 +607,7 @@ class ProjectSyncService:
                         else _source_id_hash(tombstone.permission_scope)
                     ),
                     status=tombstone.status,
-                    last_attempt_at=tombstone.occurred_at,
+                    last_attempt_at=observed_at,
                     last_success_at=None,
                     last_error_type=None,
                 )
@@ -615,6 +618,21 @@ class ProjectSyncService:
                 key=lambda item: (item.source_type.value, item.source_id_hash),
             )
         )
+
+    def _validate_provenance_times(
+        self,
+        envelope: SyncEnvelope,
+        now: datetime,
+    ) -> None:
+        timestamps = (
+            *(source.fetched_at for source in envelope.sources),
+            *(tombstone.occurred_at for tombstone in envelope.tombstones),
+        )
+        if any(
+            abs((timestamp - now).total_seconds()) > self._clock_skew_seconds
+            for timestamp in timestamps
+        ):
+            raise ProjectSyncValidationError("source_fetch_time_invalid")
 
     def _protect_active_sources(
         self,
