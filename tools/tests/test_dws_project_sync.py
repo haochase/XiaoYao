@@ -1786,7 +1786,7 @@ def test_qwen_prompt_only_completes_retrieval_with_obtained_evidence() -> None:
     assert "未完成的检索请求绝不能加入 completed_retrieval_request_ids" in normalized
     assert "只有已取得对应证据" in normalized
     assert "遗漏的请求保持 pending" in normalized
-    assert "python -m tools.dws_project_sync pending" in normalized
+    assert "python tools/dws_sync_runtime.py pending" in normalized
     assert "retrieval_requests" in normalized
     assert "request_id" in normalized
     assert "query_hash" in normalized
@@ -1794,10 +1794,10 @@ def test_qwen_prompt_only_completes_retrieval_with_obtained_evidence() -> None:
     assert "request_epoch" in normalized
     assert "attempt_count" in normalized
     assert "lease_token" in normalized
-    collect_at = normalized.index("python -m tools.dws_project_sync collect")
-    pending_at = normalized.index("python -m tools.dws_project_sync pending")
+    collect_at = normalized.index("python tools/dws_sync_runtime.py collect")
+    pending_at = normalized.index("python tools/dws_sync_runtime.py pending")
     skill_at = normalized.index("hui-anchor-dws-project-context-v1", pending_at)
-    push_at = normalized.index("python -m tools.dws_project_sync push")
+    push_at = normalized.index("python tools/dws_sync_runtime.py push")
     assert collect_at < pending_at < skill_at < push_at
 
 
@@ -1810,31 +1810,32 @@ def test_qwen_prompt_fences_full_lifecycle_and_always_releases() -> None:
     normalized = " ".join(prompt.replace("`", "").split())
 
     for command in ("begin", "collect", "pending", "artifact", "push", "end"):
-        assert f"python -m tools.dws_project_sync {command}" in normalized
-    assert "python -m tools.dws_project_sync abort" in normalized
+        assert f"python tools/dws_sync_runtime.py {command}" in normalized
+    assert "python tools/dws_sync_runtime.py abort" in normalized
     assert "--run-token" in normalized
     assert "finally" in normalized
     assert "coalesced" in normalized
     assert "不得直接写 context_artifact" in normalized
     assert "completed_retrieval_claims" in normalized
 
-    begin_at = normalized.index("python -m tools.dws_project_sync begin")
-    collect_at = normalized.index("python -m tools.dws_project_sync collect")
-    artifact_at = normalized.index("python -m tools.dws_project_sync artifact")
-    push_at = normalized.index("python -m tools.dws_project_sync push")
-    end_at = normalized.index("python -m tools.dws_project_sync end")
+    begin_at = normalized.index("python tools/dws_sync_runtime.py begin")
+    collect_at = normalized.index("python tools/dws_sync_runtime.py collect")
+    artifact_at = normalized.index("python tools/dws_sync_runtime.py artifact")
+    push_at = normalized.index("python tools/dws_sync_runtime.py push")
+    end_at = normalized.index("python tools/dws_sync_runtime.py end")
     assert begin_at < collect_at < artifact_at < push_at < end_at
 
 
-def test_qwen_prompt_uses_only_module_cli_entrypoints() -> None:
+def test_qwen_prompt_uses_protected_runtime_entrypoints() -> None:
     prompt = (
         Path(__file__).resolve().parents[2]
         / "prompts"
         / "qwenwork-dws-project-sync.md"
     ).read_text(encoding="utf-8")
 
-    assert "python -m tools.dws_project_sync collect" in prompt
-    assert "python -m tools.dws_project_sync push" in prompt
+    assert "python tools/dws_sync_runtime.py collect" in prompt
+    assert "python tools/dws_sync_runtime.py push" in prompt
+    assert "credential.dpapi" in prompt
     assert "tools/dws_project_sync.py collect" not in prompt
     assert "tools/dws_project_sync.py push" not in prompt
 

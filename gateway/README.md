@@ -75,6 +75,55 @@ $python = (Get-Command python -CommandType Application).Source
 
 ## Private DWS project synchronization
 
+### Protected Runtime Setup
+
+Use a Python interpreter with this worktree's gateway dependencies. The runtime
+script explicitly loads the neighboring `gateway/src`; it does not rely on another
+worktree's editable installation. Run from the repository root. Replace the two
+test-source arguments with your approved private manifest and its exact project key:
+
+```powershell
+python tools/dws_sync_runtime.py prepare `
+  --manifest 'E:\private\approved-dws-projects.json' `
+  --project 'approved-project-key' `
+  --dws "$env:USERPROFILE\.qwenworkcn\bin\dws"
+
+python tools/dws_sync_runtime.py check
+python tools/dws_sync_runtime.py serve
+```
+
+`prepare` requires a real, nonempty validated manifest; it does not discover
+sources or select a profile. It refuses an existing configuration/runtime rather
+than overwrite credentials. It writes the fixed seven-field task config and a
+CurrentUser-DPAPI-encrypted, project/config-bound token below ignored `.private`.
+All new output is on E:. C: is permitted only for the existing DWS executable input.
+No token is printed or added to the Windows user/system environment.
+
+`serve` is a foreground loopback-only 8731 server with its own private database.
+It does not read the device gateway's environment, stop 8723, or wire its database
+into the running device service. Device integration is a separate acceptance gate.
+Do not proxy this listener or reuse this runtime to grant broader project access.
+Stop only the foreground runtime you started after the manual acceptance run.
+
+Import the archive built by `tools/package_dws_context_skill.py` through the
+QwenWork Skills page. Local upload is UI-only; files in this repository do not
+prove that a skill has been installed. Verify the exact registered name before
+running the task. Keep the app's existing storage policy when choosing an install
+location; package generation itself never writes to C:.
+
+The production prompt `prompts/qwenwork-dws-project-sync.md` uses
+`tools/dws_sync_runtime.py begin/collect/pending/artifact/push/end/abort`.
+Only the lease token is passed as a CLI argument. The gateway credential is
+decrypted within each wrapper process and supplied only to authenticated gateway
+operations; DWS retains the QwenWork session's connector environment.
+
+Version 1 of the context Skill deliberately leaves retrieval completion empty:
+a query hash with no question or baseline cannot establish that a request is
+resolved. It still creates source-backed context for normal project queries.
+`check` does not attest skill registration, login validity or a running server.
+
+### Low-Level Interface
+
 The DWS synchronization listener is a separate, opt-in process. It is fixed to
 `127.0.0.1:8731`; it must not be bound to a LAN address, proxied, or mounted on
 the ESP32-facing port `8723`. Keep the private manifest, generated source bundle,
@@ -160,7 +209,8 @@ ready, and port 8723 has no synchronization routes:
 .\scripts\check-xiaoyao-sync-runtime.ps1
 ```
 
-Run the following four-stage workflow from the repository root in QwenWork.
+The following is the low-level manual workflow; the protected runtime setup below
+is the production QwenWork entrypoint. Run the manual workflow from the repository root.
 Use `python -m tools.dws_project_sync`; invoking the file directly is not the
 supported repository import mode.
 

@@ -58,6 +58,15 @@ Scheduled QwenWork runs use the fixed ignored task configuration at
 real values remain outside Git. The context conversion Skill has the fixed name
 `hui-anchor-dws-project-context-v1`.
 
+Its public source lives in `skills/hui-anchor-dws-project-context-v1`.
+Package it with `python -m tools.package_dws_context_skill --output E:\path\context.zip`,
+then import the ZIP through QwenWork's Skills page and verify its registered name.
+Building the archive does not install or enable it. Version 1 does not assert
+retrieval completion from a query hash alone.
+
+For protected local setup, use `python tools/dws_sync_runtime.py --help` and
+the [runtime setup section](gateway/README.md#protected-runtime-setup).
+
 See [the gateway DWS runbook](gateway/README.md#private-dws-project-synchronization)
 for the sanitized manifest schema, required environment-variable names, exact
 `collect`, `pending`, and `push` commands, and the five-minute QwenWork schedule. A failed

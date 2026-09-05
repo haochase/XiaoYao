@@ -61,19 +61,22 @@ schema 验证后，必须用 `Path.resolve(strict=False)` 和 `os.path.normcase`
 
 ## 固定流程
 
-1. 使用参数数组运行 `python -m tools.dws_project_sync begin --project <project>`，其中
-   `project` 只取固定配置。若返回 `coalesced`，本次触发立即正常结束，不执行任何后续步骤；
+生产入口使用 `python tools/dws_sync_runtime.py`，解释器须为已安装本项目依赖的明确绝对路径。
+该入口只读固定配置，以 CurrentUser DPAPI 解封本地凭据，仅向 pending/push 的内部调用
+提供网关 token，不修改父进程环境、不把 token 传给 DWS 采集子进程。不得手工导出凭据。
+先执行 `python tools/dws_sync_runtime.py check`；configured 只证明配置/解密正常，仍需上面的
+Skill 注册表和真实会话检查，不等同于同步已运行。prepare/serve 不属于周期任务，不自动执行。
+
+1. 使用参数数组运行 `python tools/dws_sync_runtime.py begin`，项目只取固定配置。
+   若返回 `coalesced`，本次触发立即正常结束，不执行任何后续步骤；
    若返回 `started`，只在本次任务内部保存 `run_token`，不得向用户输出或写入其他文件。
    从此步开始进入 `try/finally`：只有 `end` 成功才算正常释放；其他任何失败、中断或取消均须
-   在 `finally` 中以同一 token 调用 `python -m tools.dws_project_sync abort`。
-2. 使用参数数组在仓库根目录运行 `python -m tools.dws_project_sync collect`。参数映射固定为：
-   `--manifest` 取 `manifest`，`--project` 取 `project`，`--dws-path` 取 `dws`，
-   `--output` 取 `source_bundle`，`--run-token` 取 begin 返回的 token。不得拼接 shell 命令
-   或增加任何参数。
-3. collect 成功后，使用参数数组运行 `python -m tools.dws_project_sync pending`。参数映射
-   固定为：`--manifest` 取 `manifest`，`--project` 取 `project`，`--sources-file` 取
-   `source_bundle`，`--gateway` 固定为 `http://127.0.0.1:8731`。令牌只由
-   `COMPANION_DWS_SYNC_TOKEN` 提供，`--run-token` 仍取同一 token。该命令只领取状态为
+   在 `finally` 中以同一 token 调用 `python tools/dws_sync_runtime.py abort --run-token TOKEN`。
+2. 使用参数数组在仓库根目录运行 `python tools/dws_sync_runtime.py collect`，仅传入
+   `--run-token`，取 begin 返回的 token。其余参数由固定配置映射。不得拼接 shell 命令。
+3. collect 成功后，使用参数数组运行 `python tools/dws_sync_runtime.py pending`，只传同一
+   `--run-token`。网关固定为 `http://127.0.0.1:8731`，内部只向该请求提供
+   `COMPANION_DWS_SYNC_TOKEN`。该命令只领取状态为
    pending 的项目内请求，将每个
    `source_id_hash` 映射为 manifest 白名单内的 `source_type` 和 `source_id`，并把只含
    `request_id`、`query_hash`、`request_epoch`、`attempt_count`、`lease_expires_at`、
@@ -99,7 +102,9 @@ schema 验证后，必须用 `Path.resolve(strict=False)` 和 `os.path.normcase`
    }
    ```
 
-7. 只有已取得对应证据，且请求 ID 在 `retrieval_requests` 中列出、其 `sources` 全部在
+7. 本次安装的 v1 Skill 缺少问题原文与检索基线，`completed_retrieval_request_ids` 固定为空，
+   不得仅凭 query_hash 或 active 来源猜测已经完成。下述是协议能力的必要条件而不是自动授权：
+   只有已取得对应证据，且请求 ID 在 `retrieval_requests` 中列出、其 `sources` 全部在
    本轮成功取得 active 证据、事实由对应精确摘录支持时，才能加入
    `completed_retrieval_request_ids`。
    未完成的检索请求绝不能加入 `completed_retrieval_request_ids`，遗漏的请求保持
@@ -110,15 +115,13 @@ schema 验证后，必须用 `Path.resolve(strict=False)` 和 `os.path.normcase`
 8. 不得直接写 `context_artifact`。先在内存中用
    `QwenProjectContextArtifact.model_validate` 完整验证 Skill candidate，再编码为 canonical
    UTF-8 JSON；encoded bytes 必须小于或等于 `2097152`。然后使用参数数组运行
-   `python -m tools.dws_project_sync artifact`，传入固定 `--project`、`--context-file` 和同一
-   `--run-token`，并仅通过 stdin 传入 encoded bytes。该命令在 token fencing 下
+   `python tools/dws_sync_runtime.py artifact`，仅传同一 `--run-token`，
+   并仅通过 stdin 传入 encoded bytes。该命令在 token fencing 下
    创建同目录临时文件，依次 `flush`、`fsync`、`os.replace`；验证或写入失败时保留旧目标。
-9. artifact 写入成功后，使用参数数组运行 `python -m tools.dws_project_sync push`。参数映射
-   固定为：`--manifest` 取 `manifest`，`--project` 取 `project`，`--sources-file` 取
-   `source_bundle`，`--context-file` 取 `context_artifact`，`--state-file` 取 `state`；
-   `--gateway` 固定为 `http://127.0.0.1:8731`。令牌只由
-   `COMPANION_DWS_SYNC_TOKEN` 提供，`--run-token` 仍取同一 token。
-10. push 成功后，以同一 token 运行 `python -m tools.dws_project_sync end`。返回 `completed`
+9. artifact 写入成功后，使用参数数组运行 `python tools/dws_sync_runtime.py push`，只传同一
+   `--run-token`。首次人工验收先加 `--dry-run`，预检通过后再实际 push；正常周期不重复 dry-run。
+10. push 成功后，以同一 token 运行 `python tools/dws_sync_runtime.py end --run-token TOKEN`。
+    返回 `completed`
     时结束；返回 `rerun` 时只使用返回的新 token 再执行一次完整的 collect -> pending ->
     Skill -> artifact -> push -> end 链路。任何未成功 end 的路径都必须由 `finally` 调用 abort；
     旧 token 不得再写 bundle、artifact、state 或发起 push。
@@ -131,6 +134,8 @@ schema 验证后，必须用 `Path.resolve(strict=False)` 和 `os.path.normcase`
 - 任务只可写 `source_bundle`、`context_artifact`、`state`，以及 CLI 在仓库固定
   `.private/dws-sync-locks` 下管理的哈希命名 lifecycle/lock 文件。不得创建日志、报告、
   缓存、旁路 artifact 或其他状态文件。
+- runtime 仅可读取 prepare 生成的 `.private/dws-runtime/credential.dpapi`；本任务不得创建、
+  修改、打印或复制它。不得读取其他 Windows 用户或其他应用的凭据。
 - 任一步失败即停止。不得绕过校验、拆分超限同步包、改用其他 gateway、追加 `--yes`、
   重试非 retryable 错误或继续 push。
 - 不得输出其他内容。begin/end 返回的 `run_token` 只供任务内部编排，绝不能成为用户可见
