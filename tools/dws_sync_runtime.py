@@ -18,10 +18,57 @@ from companion_gateway.project.auth import ProjectApiPrincipal
 from companion_gateway.project.protection import ContentProtector, WindowsDpapiProtector
 from companion_gateway.settings import Settings
 from tools.dws_sync.launch import resolve_dws_launch
-from tools.dws_sync.runtime import load_runtime, prepare_runtime, runtime_database
+from tools.dws_sync.manifest import DwsManifest, DwsProjectManifest
+from tools.dws_sync.runtime import (
+    CONFIG_NAME,
+    TaskConfig,
+    load_runtime,
+    prepare_runtime,
+    read_object,
+    require_local,
+    runtime_database,
+)
 
 
-COMMANDS = ("begin", "collect", "pending", "artifact", "push", "end", "abort")
+COMMANDS = (
+    "begin",
+    "collect",
+    "host-import",
+    "pending",
+    "artifact",
+    "push",
+    "end",
+    "abort",
+)
+
+
+def _load_host_import_config(
+    root: Path,
+) -> tuple[TaskConfig, DwsProjectManifest]:
+    require_local(root)
+    config_path = root / CONFIG_NAME
+    config = TaskConfig.model_validate(read_object(config_path))
+    for path in (
+        config.manifest,
+        config.dws,
+        config.source_bundle,
+        config.context_artifact,
+        config.state,
+    ):
+        if path.resolve() == config_path.resolve() or (
+            path.exists() and path.samefile(config_path)
+        ):
+            raise ValueError("runtime_paths_overlap")
+        if not path.parent.is_dir():
+            raise ValueError("runtime_parent_missing")
+    matches = [
+        project
+        for project in DwsManifest.load(config.manifest).projects
+        if project.project_id == config.project
+    ]
+    if len(matches) != 1:
+        raise ValueError("runtime_project_missing")
+    return config, matches[0]
 
 
 def dispatch(
@@ -30,18 +77,26 @@ def dispatch(
     run_token: str | None,
     dry_run: bool,
     protector: ContentProtector,
+    *,
+    input_stream: object | None = None,
 ) -> int:
     from tools import dws_project_sync as cli
 
-    config, _project, token = load_runtime(root, protector)
+    if command == "host-import":
+        config, _project = _load_host_import_config(root)
+        token = None
+    else:
+        config, _project, token = load_runtime(root, protector)
     argv = [command, "--project", config.project]
     if run_token:
         argv += ["--run-token", run_token]
-    if command in {"collect", "pending", "push"}:
+    if command in {"collect", "host-import", "pending", "push"}:
         argv += ["--manifest", str(config.manifest)]
     if command == "collect":
         resolve_dws_launch(config.dws)
         argv += ["--dws-path", str(config.dws), "--output", str(config.source_bundle)]
+    if command == "host-import":
+        argv += ["--output", str(config.source_bundle)]
     if command in {"pending", "push"}:
         argv += [
             "--sources-file", str(config.source_bundle),
@@ -57,7 +112,12 @@ def dispatch(
     environment.pop("COMPANION_DWS_SYNC_TOKEN", None)
     if command in {"pending", "push"} and not dry_run:
         environment["COMPANION_DWS_SYNC_TOKEN"] = token
-    return cli.main(argv, environ=environment)
+    kwargs: dict[str, object] = {"environ": environment}
+    if command == "host-import":
+        kwargs["input_stream"] = (
+            sys.stdin.buffer if input_stream is None else input_stream
+        )
+    return cli.main(argv, **kwargs)
 
 
 def build_app(root: Path, protector: ContentProtector):

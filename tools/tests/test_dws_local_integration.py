@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -258,6 +259,7 @@ def _run_sync_cli(
     arguments: list[str],
     environment: dict[str, str],
     *,
+    input_bytes: bytes | None = None,
     timeout: int = 40,
 ) -> dict[str, object]:
     completed = subprocess.run(
@@ -277,6 +279,7 @@ def _run_sync_cli(
         ],
         cwd=ROOT,
         env=environment,
+        input=input_bytes,
         check=False,
         capture_output=True,
         timeout=timeout,
@@ -284,6 +287,44 @@ def _run_sync_cli(
     assert completed.returncode == 0, completed.stdout.decode("utf-8")
     assert completed.stderr == b""
     return json.loads(completed.stdout)
+
+
+def _host_import_input(markdown: str) -> bytes:
+    payloads = (
+        (
+            "doc_info",
+            {
+                "result": {
+                    "nodeId": "document-local-1",
+                    "contentType": "ALIDOC",
+                    "extension": "adoc",
+                    "title": "Local decision document",
+                    "shareUrl": "dingtalk://doc/document-local-1",
+                    "version": "v-host",
+                    "updatedAt": "2026-09-06T16:30:00+08:00",
+                }
+            },
+        ),
+        ("doc_read", {"data": {"markdown": markdown}}),
+    )
+    results = []
+    for operation, payload in payloads:
+        encoded = _canonical(payload)
+        results.append(
+            {
+                "operation": operation,
+                "encoding": "base64-json",
+                "byte_count": len(encoded),
+                "payload": base64.b64encode(encoded).decode("ascii"),
+            }
+        )
+    return _canonical(
+        {
+            "schema_version": 1,
+            "project_id": PROJECT_ID,
+            "results": results,
+        }
+    )
 
 
 def _begin(environment: dict[str, str]) -> str:
@@ -403,6 +444,38 @@ def _start_listener(
         stderr=subprocess.DEVNULL,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
+
+
+def test_host_import_subprocess_fixture_preserves_unicode(
+    tmp_path: Path,
+) -> None:
+    paths = _write_private_inputs(tmp_path)
+    paths["sources"].unlink()
+    environment = _environment(tmp_path, tmp_path / "unused.db")
+    token = _begin(environment)
+    markdown = '# 决策\n采用方案 B，包含中文与 "引号"。'
+
+    result = _run_sync_cli(
+        [
+            "host-import",
+            "--manifest",
+            str(paths["manifest"]),
+            "--project",
+            PROJECT_ID,
+            "--output",
+            str(paths["sources"]),
+            "--run-token",
+            token,
+        ],
+        environment,
+        input_bytes=_host_import_input(markdown),
+    )
+
+    assert result["status"] == "collected"
+    assert result["source_count"] == 1
+    bundle = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    assert bundle.records[0].status == "active"
+    assert bundle.records[0].content_text == markdown
 
 
 @pytest.mark.skipif(

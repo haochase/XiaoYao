@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -168,3 +169,185 @@ def test_coalesced_chain_can_rerun_at_most_once(tmp_path: Path) -> None:
     assert second.status == "rerun"
     assert completed.status == "completed"
     assert third.status == "started"
+
+
+def test_commit_stage_rolls_back_apply_failure_and_keeps_stage(
+    tmp_path: Path,
+) -> None:
+    started = lifecycle.begin_run("project-1", root=tmp_path, now=lambda: NOW)
+    calls: list[str] = []
+
+    def apply() -> None:
+        calls.append("apply")
+        raise KeyboardInterrupt
+
+    def rollback() -> None:
+        calls.append("rollback")
+
+    with pytest.raises(KeyboardInterrupt):
+        lifecycle.commit_stage(
+            "project-1",
+            started.run_token or "",
+            expected="begun",
+            target="collected",
+            apply=apply,
+            rollback=rollback,
+            root=tmp_path,
+            now=lambda: NOW,
+        )
+
+    assert calls == ["apply", "rollback"]
+    lifecycle.assert_stage(
+        "project-1",
+        started.run_token or "",
+        expected="begun",
+        root=tmp_path,
+        now=lambda: NOW,
+    )
+
+
+def test_commit_stage_rolls_back_state_failure_before_unlocking(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    started = lifecycle.begin_run("project-1", root=tmp_path, now=lambda: NOW)
+    token = started.run_token or ""
+    rollback_entered = threading.Event()
+    release_rollback = threading.Event()
+    contender_started = threading.Event()
+    contender_done = threading.Event()
+    errors: list[BaseException] = []
+    original_write = lifecycle._write_state
+
+    def fail_collected_state(path, payload):  # type: ignore[no-untyped-def]
+        if payload["stage"] == "collected":
+            raise ValueError("private_file_write_failed")
+        return original_write(path, payload)
+
+    def rollback() -> None:
+        rollback_entered.set()
+        assert release_rollback.wait(timeout=5)
+
+    def commit() -> None:
+        try:
+            lifecycle.commit_stage(
+                "project-1",
+                token,
+                expected="begun",
+                target="collected",
+                apply=lambda: None,
+                rollback=rollback,
+                root=tmp_path,
+                now=lambda: NOW,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def contend() -> None:
+        contender_started.set()
+        lifecycle.begin_run("project-1", root=tmp_path, now=lambda: NOW)
+        contender_done.set()
+
+    monkeypatch.setattr(lifecycle, "_write_state", fail_collected_state)
+    commit_thread = threading.Thread(target=commit)
+    contender_thread = threading.Thread(target=contend)
+    commit_thread.start()
+    assert rollback_entered.wait(timeout=5)
+    contender_thread.start()
+    assert contender_started.wait(timeout=5)
+    assert not contender_done.wait(timeout=0.1)
+    release_rollback.set()
+    commit_thread.join(timeout=5)
+    contender_thread.join(timeout=5)
+
+    assert not commit_thread.is_alive()
+    assert not contender_thread.is_alive()
+    assert len(errors) == 1
+    assert str(errors[0]) == "private_file_write_failed"
+    assert contender_done.is_set()
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="begun",
+        root=tmp_path,
+        now=lambda: NOW,
+    )
+
+
+def test_commit_stage_sanitizes_rollback_failure_and_releases_lock(
+    tmp_path: Path,
+) -> None:
+    started = lifecycle.begin_run("project-1", root=tmp_path, now=lambda: NOW)
+    token = started.run_token or ""
+
+    with pytest.raises(ValueError, match="^private_file_write_failed$"):
+        lifecycle.commit_stage(
+            "project-1",
+            token,
+            expected="begun",
+            target="collected",
+            apply=lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
+            rollback=lambda: (_ for _ in ()).throw(
+                RuntimeError("private-rollback-detail")
+            ),
+            root=tmp_path,
+            now=lambda: NOW,
+        )
+
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="begun",
+        root=tmp_path,
+        now=lambda: NOW,
+    )
+
+
+def test_commit_stage_does_not_rollback_apply_when_state_restore_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    started = lifecycle.begin_run("project-1", root=tmp_path, now=lambda: NOW)
+    token = started.run_token or ""
+    original_write = lifecycle._write_state
+    rollback_called = False
+
+    def fail_after_commit_then_fail_restore(
+        path,
+        payload,
+    ):  # type: ignore[no-untyped-def]
+        if payload["stage"] == "collected":
+            original_write(path, payload)
+            raise RuntimeError("private-post-commit-detail")
+        raise RuntimeError("private-restore-detail")
+
+    def rollback() -> None:
+        nonlocal rollback_called
+        rollback_called = True
+
+    monkeypatch.setattr(
+        lifecycle,
+        "_write_state",
+        fail_after_commit_then_fail_restore,
+    )
+
+    with pytest.raises(ValueError, match="^private_file_write_failed$"):
+        lifecycle.commit_stage(
+            "project-1",
+            token,
+            expected="begun",
+            target="collected",
+            apply=lambda: None,
+            rollback=rollback,
+            root=tmp_path,
+            now=lambda: NOW,
+        )
+
+    assert rollback_called is False
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="collected",
+        root=tmp_path,
+        now=lambda: NOW,
+    )

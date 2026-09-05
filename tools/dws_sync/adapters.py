@@ -593,6 +593,21 @@ def collect_sources(
                 )
         records.append(record)
 
+    return build_source_bundle(
+        project,
+        tuple(records),
+        collected_at=collected_at,
+    )
+
+
+def build_source_bundle(
+    project: DwsProjectManifest,
+    records: tuple[DwsSourceRecord, ...],
+    *,
+    collected_at: datetime,
+) -> DwsSourceBundle:
+    collected_at = _read_clock(lambda: collected_at)
+
     hash_payload = {
         "schema_version": 1,
         "project_id": project.project_id,

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import time
@@ -55,6 +56,10 @@ try:
         collect_sources,
     )
     from tools.dws_sync import lifecycle
+    from tools.dws_sync.host_bridge import (
+        MAX_HOST_IMPORT_BYTES,
+        import_single_document_bundle,
+    )
 except ModuleNotFoundError as exc:
     if exc.name != "tools":
         raise
@@ -69,6 +74,10 @@ except ModuleNotFoundError as exc:
         collect_sources,
     )
     from dws_sync import lifecycle  # type: ignore[no-redef]
+    from dws_sync.host_bridge import (  # type: ignore[no-redef]
+        MAX_HOST_IMPORT_BYTES,
+        import_single_document_bundle,
+    )
 
 
 MAX_PAYLOAD_BYTES = 2_097_152
@@ -102,6 +111,7 @@ _PUBLIC_ERROR_TYPES = {
     "gateway_invalid",
     "http_error",
     "host_handoff_required",
+    "host_import_invalid",
     "invalid_payload",
     "manifest_invalid_json",
     "manifest_invalid_utf8",
@@ -292,6 +302,12 @@ def _parser() -> argparse.ArgumentParser:
     collect.add_argument("--output", required=True)
     collect.add_argument("--run-token")
 
+    host_import = commands.add_parser("host-import", add_help=False)
+    host_import.add_argument("--manifest", required=True)
+    host_import.add_argument("--project", required=True)
+    host_import.add_argument("--output", required=True)
+    host_import.add_argument("--run-token", required=True)
+
     pending = commands.add_parser("pending", add_help=False)
     pending.add_argument("--manifest", required=True)
     pending.add_argument("--project", required=True)
@@ -380,6 +396,70 @@ def _atomic_write(path: Path, data: bytes) -> None:
                 os.unlink(temporary_path)
             except OSError:
                 pass
+
+
+class _RecoverableAtomicWrite:
+    def __init__(self, path: Path, data: bytes) -> None:
+        self._path = path
+        self._data = data
+        self._snapshot: tuple[bool, bytes] | None = None
+        self._rolled_back = False
+
+    def apply(self) -> None:
+        if self._snapshot is not None:
+            raise ValueError("private_file_write_failed")
+        try:
+            path_stat = self._path.lstat()
+        except FileNotFoundError:
+            self._snapshot = (False, b"")
+        except OSError:
+            raise ValueError("private_file_write_failed") from None
+        else:
+            original = self._read_original(path_stat)
+            self._snapshot = (True, original)
+        _atomic_write(self._path, self._data)
+
+    def _read_original(self, path_stat: os.stat_result) -> bytes:
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 1024)
+        if not stat.S_ISREG(path_stat.st_mode) or (
+            getattr(path_stat, "st_file_attributes", 0) & reparse_flag
+        ):
+            raise ValueError("private_file_write_failed")
+        try:
+            with self._path.open("rb") as stream:
+                opened_stat = os.fstat(stream.fileno())
+                if (
+                    not stat.S_ISREG(opened_stat.st_mode)
+                    or getattr(opened_stat, "st_file_attributes", 0)
+                    & reparse_flag
+                    or not os.path.samestat(path_stat, opened_stat)
+                    or opened_stat.st_size > MAX_PRIVATE_INPUT_BYTES
+                ):
+                    raise ValueError("private_file_write_failed")
+                original = stream.read(MAX_PRIVATE_INPUT_BYTES + 1)
+            if (
+                len(original) > MAX_PRIVATE_INPUT_BYTES
+                or not os.path.samestat(path_stat, self._path.lstat())
+            ):
+                raise ValueError("private_file_write_failed")
+        except ValueError:
+            raise
+        except OSError:
+            raise ValueError("private_file_write_failed") from None
+        return original
+
+    def rollback(self) -> None:
+        if self._rolled_back or self._snapshot is None:
+            return
+        existed, original = self._snapshot
+        try:
+            if existed:
+                _atomic_write(self._path, original)
+            else:
+                self._path.unlink(missing_ok=True)
+        except BaseException:
+            raise ValueError("private_file_write_failed") from None
+        self._rolled_back = True
 
 
 def _selected_project(manifest: DwsManifest, project_id: str) -> DwsProjectManifest:
@@ -943,6 +1023,69 @@ def _collect_command(
     }
 
 
+def _host_import_command(
+    args: argparse.Namespace,
+    *,
+    input_stream: object,
+    now: Callable[[], datetime],
+) -> dict[str, object]:
+    lifecycle.assert_stage(
+        args.project,
+        args.run_token,
+        expected="begun",
+        root=LIFECYCLE_ROOT,
+        now=now,
+    )
+    try:
+        manifest_path = _absolute_private_path(args.manifest, "manifest")
+        output_path = _absolute_private_path(args.output, "output")
+        manifest = DwsManifest.load(manifest_path)
+        project = _selected_project(manifest, args.project)
+    except Exception:
+        raise ValueError("host_import_invalid") from None
+    read = getattr(input_stream, "read", None)
+    if not callable(read):
+        raise ValueError("host_import_invalid")
+    try:
+        raw = read(MAX_HOST_IMPORT_BYTES + 1)
+    except Exception:
+        raise ValueError("host_import_invalid") from None
+    if not isinstance(raw, bytes) or len(raw) > MAX_HOST_IMPORT_BYTES:
+        raise ValueError("host_import_invalid")
+    collected_at = now()
+    try:
+        source_bundle = import_single_document_bundle(
+            raw,
+            project,
+            collected_at=collected_at,
+        )
+        encoded = _canonical_bytes(source_bundle.model_dump(mode="json"))
+    except Exception:
+        raise ValueError("host_import_invalid") from None
+    if len(encoded) > MAX_PRIVATE_INPUT_BYTES:
+        raise ValueError("host_import_invalid")
+    output_transaction = _RecoverableAtomicWrite(output_path, encoded)
+    lifecycle.commit_stage(
+        project.project_id,
+        args.run_token,
+        expected="begun",
+        target="collected",
+        apply=output_transaction.apply,
+        rollback=output_transaction.rollback,
+        root=LIFECYCLE_ROOT,
+        now=now,
+    )
+    return {
+        "status": "collected",
+        "project_id": project.project_id,
+        "source_count": 1,
+        "active_sources": 1,
+        "failed_sources": 0,
+        "content_hash": source_bundle.content_hash,
+        "output_bytes": len(encoded),
+    }
+
+
 def _pending_response(
     raw: bytes, project_id: str
 ) -> tuple[ClaimedRetrievalRequest, ...]:
@@ -1364,6 +1507,7 @@ def main(
             "artifact",
             "begin",
             "collect",
+            "host-import",
             "end",
             "pending",
             "push",
@@ -1378,6 +1522,7 @@ def main(
                 "commands": [
                     "begin",
                     "collect",
+                    "host-import",
                     "pending",
                     "artifact",
                     "push",
@@ -1400,6 +1545,14 @@ def main(
             }
         elif args.command == "collect":
             output = _collect_command(args, runner=runner, now=now)
+        elif args.command == "host-import":
+            output = _host_import_command(
+                args,
+                input_stream=(
+                    sys.stdin.buffer if input_stream is None else input_stream
+                ),
+                now=now,
+            )
         elif args.command == "pending":
             output = _pending_command(
                 args,

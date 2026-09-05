@@ -55,15 +55,16 @@ schema 验证后，必须用 `Path.resolve(strict=False)` 和 `os.path.normcase`
 架构及同目录现有普通非 reparse 原生 shim 的启动校验；不得复制或修改安装文件。不得把任意
 脚本作为 DWS 启动入口。
 
-`hui-anchor-dws-project-context-v1` 是必须预先安装的外部 Skill 依赖。在执行 collect 前，
+`hui-anchor-dws-project-context-v1` 是必须预先安装的外部 Skill 依赖。在执行宿主采集前，
 只通过 Skill 注册表检查该精确名称；不可用时立即停止。不得搜索、安装或替换 Skill，也
 不得把相近名称、仓库文件或通用模型提示当作降级实现。
 
 ## 固定流程
 
 生产入口使用 `python tools/dws_sync_runtime.py`，解释器须为已安装本项目依赖的明确绝对路径。
-该入口只读固定配置，以 CurrentUser DPAPI 解封本地凭据，仅向 pending/push 的内部调用
-提供网关 token，不修改父进程环境、不把 token 传给 DWS 采集子进程。不得手工导出凭据。
+该入口只读固定配置；`host-import` 不读取或解封凭据，只有 pending/push 的内部调用以
+CurrentUser DPAPI 解封并取得网关 token。runtime 不修改父进程环境，也不把 token 传给
+DWS。不得手工导出凭据。
 先执行 `python tools/dws_sync_runtime.py check`；configured 只证明配置/解密正常，仍需上面的
 Skill 注册表和真实会话检查，不等同于同步已运行。prepare/serve 不属于周期任务，不自动执行。
 
@@ -72,9 +73,29 @@ Skill 注册表和真实会话检查，不等同于同步已运行。prepare/ser
    若返回 `started`，只在本次任务内部保存 `run_token`，不得向用户输出或写入其他文件。
    从此步开始进入 `try/finally`：只有 `end` 成功才算正常释放；其他任何失败、中断或取消均须
    在 `finally` 中以同一 token 调用 `python tools/dws_sync_runtime.py abort --run-token TOKEN`。
-2. 使用参数数组在仓库根目录运行 `python tools/dws_sync_runtime.py collect`，仅传入
-   `--run-token`，取 begin 返回的 token。其余参数由固定配置映射。不得拼接 shell 命令。
-3. collect 成功后，使用参数数组运行 `python tools/dws_sync_runtime.py pending`，只传同一
+2. 从固定配置定位 manifest，按与配置相同的严格文件门禁读取，不回显配置或 manifest。
+   只取项目键精确匹配且来源恰好为一个 document 的项目，并只在任务内保存它的 profile 和
+   source ID。然后进行第一个独立工具调用：使用千问办公原生 Bash 以参数形式执行固定 DWS
+   `doc info` 命令，必须带 `--profile`、`--format json` 和 `--node`。让宿主 PostToolUse 对真实
+   `dws_tool_result` 使用以下已实测 jq 生成封包，不得自行解析、改写或回显结果：
+
+   ```jq
+   tojson as $raw | {encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}
+   ```
+
+   如果结果是 `pending-post-tool-use` 占位符、缺失、超限或 jq 失败，立即停止。
+3. 进行第二个独立工具调用：以相同 dws、profile、JSON 格式和 source ID 执行固定 DWS
+   `doc read` 命令，并使用完全相同的宿主 jq 生成第二个封包。两个 DWS 调用不得合并；不得使用
+   管道。不得使用命令替换，不得使用 Popen，不得重定向到文件或创建临时文件。
+4. 只在内存中给两个封包分别增加固定 operation `doc_info`、`doc_read`，按此顺序装入
+   `schema_version=1`、固定 project ID 和 results 恰好两项的外层 JSON object。进行第三个
+   独立工具调用：运行 `python tools/dws_sync_runtime.py host-import --run-token TOKEN`，用
+   引用 here-document（例如 `<<'DWS_HOST_IMPORT'`）把外层 JSON 字面量原样传入 stdin。
+   不得使用管道、命令替换或 Popen，不得向用户输出封包、Base64 或正文，不得写临时文件。
+   这三个独立工具调用之间只允许宿主在内存中传递封包；payload Base64 是敏感原始 DWS
+   结果，不是脱敏摘要。host-import 成功后才可继续；任一步失败时不得生成或推送空上下文，
+   必须进入 finally 并使用同一 token 执行 abort。
+5. host-import 成功后，使用参数数组运行 `python tools/dws_sync_runtime.py pending`，只传同一
    `--run-token`。网关固定为 `http://127.0.0.1:8731`，内部只向该请求提供
    `COMPANION_DWS_SYNC_TOKEN`。该命令只领取状态为
    pending 的项目内请求，将每个
@@ -82,17 +103,17 @@ Skill 注册表和真实会话检查，不等同于同步已运行。prepare/ser
    `request_id`、`query_hash`、`request_epoch`、`attempt_count`、`lease_expires_at`、
    `lease_token`、`sources` 的 `retrieval_requests` 原子写回 source bundle。
    任一 hash 无法唯一映射时立即停止，不得扩大白名单。
-4. pending 成功后，调用名称精确为 `hui-anchor-dws-project-context-v1` 的 Skill。该 Skill 的
+6. pending 成功后，调用名称精确为 `hui-anchor-dws-project-context-v1` 的 Skill。该 Skill 的
    唯一输入是从 `source_bundle` 读取并校验后的 `DwsSourceBundle`；不得传入历史对话、
    仓库文档、其他私有文件或模型记忆。唯一输出是一个
    `QwenProjectContextArtifact` JSON object，顶层只允许 `schema_version`、`context` 和
    `completed_retrieval_request_ids`。
-5. artifact 中每条事实性决策必须使用 `DecisionCard.source_refs`；每条行动项、风险和下次
+7. artifact 中每条事实性决策必须使用 `DecisionCard.source_refs`；每条行动项、风险和下次
    会议必须分别使用 `sourced_actions`、`sourced_risks` 和
    `sourced_next_meeting` 的 `SourcedFact(text, source_refs)`。每个引用必须精确匹配一个
    `active` 来源的类型、ID、权限域、标题、URL 和时间，且 excerpt 必须是来源正文中的
    精确片段。事实文本必须由这些摘录直接支持；证据不足就省略，不得推断或补写。
-6. legacy 展示字段必须固定为空，不得从 sourced facts 复制或生成：
+8. legacy 展示字段必须固定为空，不得从 sourced facts 复制或生成：
 
    ```json
    {
@@ -102,7 +123,7 @@ Skill 注册表和真实会话检查，不等同于同步已运行。prepare/ser
    }
    ```
 
-7. 本次安装的 v1 Skill 缺少问题原文与检索基线，`completed_retrieval_request_ids` 固定为空，
+9. 本次安装的 v1 Skill 缺少问题原文与检索基线，`completed_retrieval_request_ids` 固定为空，
    不得仅凭 query_hash 或 active 来源猜测已经完成。下述是协议能力的必要条件而不是自动授权：
    只有已取得对应证据，且请求 ID 在 `retrieval_requests` 中列出、其 `sources` 全部在
    本轮成功取得 active 证据、事实由对应精确摘录支持时，才能加入
@@ -112,29 +133,32 @@ Skill 注册表和真实会话检查，不等同于同步已运行。prepare/ser
    捏造请求、修改 `query_hash`、扩大 `sources` 或用旧 bundle 中不存在的 ID 声明完成。
    CLI 会把这些 ID 精确映射为本轮 claim 的 `completed_retrieval_claims`，其中只包含
    `request_id`、`request_epoch`、`attempt_count` 和 `lease_token`；不得自行构造或修改 claim。
-8. 不得直接写 `context_artifact`。先在内存中用
+10. 不得直接写 `context_artifact`。先在内存中用
    `QwenProjectContextArtifact.model_validate` 完整验证 Skill candidate，再编码为 canonical
    UTF-8 JSON；encoded bytes 必须小于或等于 `2097152`。然后使用参数数组运行
    `python tools/dws_sync_runtime.py artifact`，仅传同一 `--run-token`，
    并仅通过 stdin 传入 encoded bytes。该命令在 token fencing 下
    创建同目录临时文件，依次 `flush`、`fsync`、`os.replace`；验证或写入失败时保留旧目标。
-9. artifact 写入成功后，使用参数数组运行 `python tools/dws_sync_runtime.py push`，只传同一
+11. artifact 写入成功后，使用参数数组运行 `python tools/dws_sync_runtime.py push`，只传同一
    `--run-token`。首次人工验收先加 `--dry-run`，预检通过后再实际 push；正常周期不重复 dry-run。
-10. push 成功后，以同一 token 运行 `python tools/dws_sync_runtime.py end --run-token TOKEN`。
+12. push 成功后，以同一 token 运行 `python tools/dws_sync_runtime.py end --run-token TOKEN`。
     返回 `completed`
-    时结束；返回 `rerun` 时只使用返回的新 token 再执行一次完整的 collect -> pending ->
+     时结束；返回 `rerun` 时只使用返回的新 token 再执行一次完整的宿主双 DWS 采集 ->
+     host-import -> pending ->
     Skill -> artifact -> push -> end 链路。任何未成功 end 的路径都必须由 `finally` 调用 abort；
     旧 token 不得再写 bundle、artifact、state 或发起 push。
 
 ## 读取、写入和输出边界
 
-- 任务编排只可读取固定任务配置和 `source_bundle`。Skill 不得读取其他文件、网络资源、
-  历史对话或 manifest 白名单以外的钉钉资料。collect/pending/push 只能通过固定 CLI
-  完成其契约内的 manifest、DWS、retrieval、context 和 state 访问。
+- 任务编排只可读取固定任务配置、其中指定的 manifest 和 `source_bundle`。Skill 不得读取其他文件、网络资源、
+  历史对话或 manifest 白名单以外的钉钉资料。DWS 只允许上述两个独立宿主调用；
+  host-import/pending/push 只能通过固定 CLI 完成其契约内的 manifest、retrieval、context 和
+  state 访问。
 - 任务只可写 `source_bundle`、`context_artifact`、`state`，以及 CLI 在仓库固定
   `.private/dws-sync-locks` 下管理的哈希命名 lifecycle/lock 文件。不得创建日志、报告、
   缓存、旁路 artifact 或其他状态文件。
-- runtime 仅可读取 prepare 生成的 `.private/dws-runtime/credential.dpapi`；本任务不得创建、
+- runtime 仅可在 pending/push/check 需要时读取 prepare 生成的
+  `.private/dws-runtime/credential.dpapi`；host-import 不得读取或解密它。本任务不得创建、
   修改、打印或复制它。不得读取其他 Windows 用户或其他应用的凭据。
 - 任一步失败即停止。不得绕过校验、拆分超限同步包、改用其他 gateway、追加 `--yes`、
   重试非 retryable 错误或继续 push。

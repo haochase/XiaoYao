@@ -112,10 +112,14 @@ running the task. Keep the app's existing storage policy when choosing an instal
 location; package generation itself never writes to C:.
 
 The production prompt `prompts/qwenwork-dws-project-sync.md` uses
-`tools/dws_sync_runtime.py begin/collect/pending/artifact/push/end/abort`.
-Only the lease token is passed as a CLI argument. The gateway credential is
-decrypted within each wrapper process and supplied only to authenticated gateway
-operations; DWS retains the QwenWork session's connector environment.
+`tools/dws_sync_runtime.py begin/host-import/pending/artifact/push/end/abort`.
+The host runs `doc info` and `doc read` as two independent native DWS calls,
+then sends their exact bounded base64-JSON envelopes to `host-import` over
+stdin as a third independent call. No envelope or source content is written to
+an intermediate file. Only the lease token is passed as a CLI argument.
+`host-import` does not decrypt the gateway credential; pending and push decrypt
+it within their wrapper process and supply it only to authenticated gateway
+operations. DWS retains the QwenWork session's connector environment.
 
 Version 1 of the context Skill deliberately leaves retrieval completion empty:
 a query hash with no question or baseline cannot establish that a request is
@@ -240,8 +244,13 @@ python -m tools.dws_project_sync push `
   --dry-run
 ```
 
-`collect` always supplies the manifest's private profile to the fixed DWS read
-commands and requests JSON output. `pending` claims only project-local pending
+`collect` remains a separate compatibility entry point for an explicitly
+approved manual run. Production uses the prompt's fixed host collection and
+`host-import` path: results must be ordered `doc_info`, then `doc_read`, use
+`encoding=base64-json`, match their decoded UTF-8 byte counts, and contain no
+extra fields. The importer accepts exactly one manifest document, reuses the
+normal document identity/ALIDOC/adoc/markdown validation, and advances the run
+from `begun` to `collected` only after an atomic bundle write. `pending` claims only project-local pending
 requests and maps their source hashes back to the manifest whitelist inside the
 private source bundle. The QwenWork Skill must cite only active collected sources
 and omit unsupported facts. `push --dry-run` validates the
@@ -251,7 +260,7 @@ a real synchronization.
 
 These individual module commands remain compatible with approved manual runs
 when that project has no active lifecycle lease. A production task must use the
-complete `begin -> collect -> pending -> artifact -> push -> end` lifecycle,
+complete `begin -> host DWS doc_info -> host DWS doc_read -> host-import -> pending -> artifact -> push -> end` lifecycle,
 pass the same run token to every mutating command, and call `abort` from its
 `finally` path on any failure. The project-keyed lease and lock are stored under
 the repository's ignored `.private/dws-sync-locks` directory; alternate state
@@ -261,7 +270,7 @@ immediate follow-up run.
 Create the QwenWork schedule only after one approved manual run. Use the full
 contents of `prompts/qwenwork-dws-project-sync.md`, run it every five minutes in
 this repository root, keep it disabled until its first manual run succeeds, and
-coalesce missed intervals into one recovery run. Any `collect`, `pending`, Skill, or
+coalesce missed intervals into one recovery run. Any host DWS, `host-import`, `pending`, Skill, or
 `push` failure stops that run. Failed sources do not renew freshness, and facts
 depending on a source older than 30 minutes remain closed until that source is
 successfully refreshed.

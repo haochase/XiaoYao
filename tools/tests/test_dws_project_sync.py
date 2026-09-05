@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import errno
 import hashlib
 import io
@@ -36,6 +37,7 @@ from tools.dws_sync import (
     DwsSourceBundle,
     DwsSourceRecord,
     DwsSourceSpec,
+    lifecycle,
 )
 
 
@@ -253,6 +255,63 @@ def collect_args(paths: dict[str, Path], *extra: str) -> list[str]:
         "--output",
         str(paths["sources"]),
         *extra,
+    ]
+
+
+def host_import_payload(
+    *,
+    project_id: str = "project-1",
+    markdown: str = "# 决策\n采用方案 B。",
+    info: object | None = None,
+) -> bytes:
+    payloads = (
+        (
+            "doc_info",
+            info or {
+                "result": {
+                    "nodeId": "doc-1",
+                    "contentType": "ALIDOC",
+                    "extension": "adoc",
+                    "title": "决策文档",
+                    "shareUrl": "dingtalk://document/doc-1",
+                    "version": "v1",
+                    "updatedAt": NOW.isoformat(),
+                }
+            },
+        ),
+        ("doc_read", {"data": {"markdown": markdown}}),
+    )
+    results = []
+    for operation, value in payloads:
+        raw = canonical(value).encode("utf-8")
+        results.append(
+            {
+                "operation": operation,
+                "encoding": "base64-json",
+                "byte_count": len(raw),
+                "payload": base64.b64encode(raw).decode("ascii"),
+            }
+        )
+    return canonical(
+        {
+            "schema_version": 1,
+            "project_id": project_id,
+            "results": results,
+        }
+    ).encode("utf-8")
+
+
+def host_import_args(paths: dict[str, Path], token: str) -> list[str]:
+    return [
+        "host-import",
+        "--manifest",
+        str(paths["manifest"]),
+        "--project",
+        "project-1",
+        "--output",
+        str(paths["sources"]),
+        "--run-token",
+        token,
     ]
 
 
@@ -887,6 +946,414 @@ def test_collect_rejects_oversized_bundle_before_atomic_write(
         "error_type": "sources_file_too_large",
     }
     assert output.read_bytes() == b"existing-private-state"
+
+
+def test_host_import_writes_active_bundle_and_sanitized_stdout(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    paths["sources"].unlink()
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    private_markdown = '# 决策\n采用方案 B，包含中文与 "引号"。'
+
+    assert main(
+        host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(host_import_payload(markdown=private_markdown)),
+    ) == 0
+
+    public = json.loads(capsys.readouterr().out)
+    assert public == {
+        "status": "collected",
+        "project_id": "project-1",
+        "source_count": 1,
+        "active_sources": 1,
+        "failed_sources": 0,
+        "content_hash": public["content_hash"],
+        "output_bytes": paths["sources"].stat().st_size,
+    }
+    output = canonical(public)
+    for secret in (
+        private_markdown,
+        "private-profile",
+        "doc-1",
+        token,
+    ):
+        assert secret not in output
+    written = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    assert written.records[0].content_text == private_markdown
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="collected",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_host_import_failure_preserves_output_and_begun_stage(
+    tmp_path: Path,
+    capsys,
+    existing: bool,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    if not existing:
+        paths["sources"].unlink()
+    original = paths["sources"].read_bytes() if existing else None
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+
+    assert main(
+        host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(host_import_payload(project_id="wrong")),
+    ) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "host_import_invalid",
+    }
+    assert (
+        paths["sources"].read_bytes() if paths["sources"].exists() else None
+    ) == original
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="begun",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_host_import_checks_stage_before_reading_stdin(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+
+    class ForbiddenInput:
+        def read(self, *_args):  # type: ignore[no-untyped-def]
+            pytest.fail("stdin must not be read before lifecycle validation")
+
+    assert main(
+        host_import_args(paths, "stale-token"),
+        now=lambda: NOW,
+        input_stream=ForbiddenInput(),
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "run_token_invalid",
+    }
+
+
+def test_host_import_normalizes_input_read_failure(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original = paths["sources"].read_bytes()
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+
+    class FailedInput:
+        def read(self, *_args):  # type: ignore[no-untyped-def]
+            raise OSError("private-input-detail")
+
+    assert main(
+        host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=FailedInput(),
+    ) == 1
+    public = capsys.readouterr().out
+    assert json.loads(public) == {
+        "status": "error",
+        "error_type": "host_import_invalid",
+    }
+    assert "private-input-detail" not in public
+    assert paths["sources"].read_bytes() == original
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_host_import_restores_output_when_lifecycle_state_replace_fails(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    existing: bool,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    if not existing:
+        paths["sources"].unlink()
+    original = paths["sources"].read_bytes() if existing else None
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    lifecycle_state = lifecycle.project_state_path(
+        sync_cli.LIFECYCLE_ROOT,
+        "project-1",
+    )
+    real_replace = lifecycle.os.replace
+    failed = False
+
+    def fail_lifecycle_replace(source, destination):  # type: ignore[no-untyped-def]
+        nonlocal failed
+        if Path(destination) == lifecycle_state and not failed:
+            failed = True
+            raise OSError("private-state-replace-detail")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(lifecycle.os, "replace", fail_lifecycle_replace)
+
+    assert main(
+        host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(host_import_payload()),
+    ) == 1
+
+    public = capsys.readouterr().out
+    assert "private-state-replace-detail" not in public
+    assert (
+        paths["sources"].read_bytes() if paths["sources"].exists() else None
+    ) == original
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="begun",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_host_import_restores_state_and_output_when_state_write_interrupts_after_commit(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    existing: bool,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    if not existing:
+        paths["sources"].unlink()
+    original_output = paths["sources"].read_bytes() if existing else None
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    original_write = lifecycle._write_state
+    interrupted = False
+
+    def commit_then_interrupt(path, payload):  # type: ignore[no-untyped-def]
+        nonlocal interrupted
+        original_write(path, payload)
+        if payload["stage"] == "collected" and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(lifecycle, "_write_state", commit_then_interrupt)
+
+    assert main(
+        host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(host_import_payload()),
+    ) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "interrupted",
+    }
+    assert (
+        paths["sources"].read_bytes() if paths["sources"].exists() else None
+    ) == original_output
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="begun",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_host_import_restores_output_when_apply_is_interrupted_after_replace(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    existing: bool,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    if not existing:
+        paths["sources"].unlink()
+    original = paths["sources"].read_bytes() if existing else None
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    real_apply = sync_cli._RecoverableAtomicWrite.apply
+
+    def interrupt_after_replace(operation) -> None:  # type: ignore[no-untyped-def]
+        real_apply(operation)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        sync_cli._RecoverableAtomicWrite,
+        "apply",
+        interrupt_after_replace,
+    )
+
+    assert main(
+        host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(host_import_payload()),
+    ) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "interrupted",
+    }
+    assert (
+        paths["sources"].read_bytes() if paths["sources"].exists() else None
+    ) == original
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="begun",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_host_import_apply_failure_rolls_back_without_state_write(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    existing: bool,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    if not existing:
+        paths["sources"].unlink()
+    original = paths["sources"].read_bytes() if existing else None
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    real_apply = sync_cli._RecoverableAtomicWrite.apply
+    state_write_count = 0
+
+    def interrupt_after_replace(operation) -> None:  # type: ignore[no-untyped-def]
+        real_apply(operation)
+        raise KeyboardInterrupt
+
+    def forbidden_state_write(*_args, **_kwargs) -> None:
+        nonlocal state_write_count
+        state_write_count += 1
+        raise RuntimeError("private-state-writer-detail")
+
+    monkeypatch.setattr(
+        sync_cli._RecoverableAtomicWrite,
+        "apply",
+        interrupt_after_replace,
+    )
+    monkeypatch.setattr(lifecycle, "_write_state", forbidden_state_write)
+
+    assert main(
+        host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(host_import_payload()),
+    ) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "interrupted",
+    }
+    assert state_write_count == 0
+    assert (
+        paths["sources"].read_bytes() if paths["sources"].exists() else None
+    ) == original
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="begun",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_host_import_rejects_existing_output_symlink_without_touching_target(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    target = tmp_path / "target.json"
+    target.write_bytes(paths["sources"].read_bytes())
+    paths["sources"].unlink()
+    try:
+        paths["sources"].symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    original = target.read_bytes()
+
+    assert main(
+        host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(host_import_payload()),
+    ) == 1
+
+    assert target.read_bytes() == original
+    assert paths["sources"].is_symlink()
+
+
+def test_host_import_rejects_duplicate_import_with_same_run(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    args = host_import_args(paths, token)
+    assert main(
+        args,
+        now=lambda: NOW,
+        input_stream=io.BytesIO(host_import_payload()),
+    ) == 0
+    capsys.readouterr()
+    written = paths["sources"].read_bytes()
+
+    assert main(
+        args,
+        now=lambda: NOW,
+        input_stream=io.BytesIO(host_import_payload()),
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "run_stage_invalid",
+    }
+    assert paths["sources"].read_bytes() == written
+
+
+def test_host_import_normalizes_adapter_failure_without_leaking(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original = paths["sources"].read_bytes()
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    private_detail = "private-adapter-detail"
+
+    assert main(
+        host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            host_import_payload(info={"nodeId": private_detail})
+        ),
+    ) == 1
+
+    public = capsys.readouterr().out
+    assert json.loads(public) == {
+        "status": "error",
+        "error_type": "host_import_invalid",
+    }
+    assert private_detail not in public
+    assert token not in public
+    assert paths["sources"].read_bytes() == original
 
 
 def test_build_envelope_maps_statuses_and_uses_authoritative_hash() -> None:
@@ -1794,7 +2261,7 @@ def test_qwen_prompt_only_completes_retrieval_with_obtained_evidence() -> None:
     assert "request_epoch" in normalized
     assert "attempt_count" in normalized
     assert "lease_token" in normalized
-    collect_at = normalized.index("python tools/dws_sync_runtime.py collect")
+    collect_at = normalized.index("python tools/dws_sync_runtime.py host-import")
     pending_at = normalized.index("python tools/dws_sync_runtime.py pending")
     skill_at = normalized.index("hui-anchor-dws-project-context-v1", pending_at)
     push_at = normalized.index("python tools/dws_sync_runtime.py push")
@@ -1809,7 +2276,7 @@ def test_qwen_prompt_fences_full_lifecycle_and_always_releases() -> None:
     ).read_text(encoding="utf-8")
     normalized = " ".join(prompt.replace("`", "").split())
 
-    for command in ("begin", "collect", "pending", "artifact", "push", "end"):
+    for command in ("begin", "host-import", "pending", "artifact", "push", "end"):
         assert f"python tools/dws_sync_runtime.py {command}" in normalized
     assert "python tools/dws_sync_runtime.py abort" in normalized
     assert "--run-token" in normalized
@@ -1819,7 +2286,7 @@ def test_qwen_prompt_fences_full_lifecycle_and_always_releases() -> None:
     assert "completed_retrieval_claims" in normalized
 
     begin_at = normalized.index("python tools/dws_sync_runtime.py begin")
-    collect_at = normalized.index("python tools/dws_sync_runtime.py collect")
+    collect_at = normalized.index("python tools/dws_sync_runtime.py host-import")
     artifact_at = normalized.index("python tools/dws_sync_runtime.py artifact")
     push_at = normalized.index("python tools/dws_sync_runtime.py push")
     end_at = normalized.index("python tools/dws_sync_runtime.py end")
@@ -1833,11 +2300,35 @@ def test_qwen_prompt_uses_protected_runtime_entrypoints() -> None:
         / "qwenwork-dws-project-sync.md"
     ).read_text(encoding="utf-8")
 
-    assert "python tools/dws_sync_runtime.py collect" in prompt
+    assert "python tools/dws_sync_runtime.py host-import" in prompt
     assert "python tools/dws_sync_runtime.py push" in prompt
     assert "credential.dpapi" in prompt
+    assert "python tools/dws_sync_runtime.py collect" not in prompt
     assert "tools/dws_project_sync.py collect" not in prompt
     assert "tools/dws_project_sync.py push" not in prompt
+
+
+def test_qwen_prompt_uses_three_independent_host_collection_calls() -> None:
+    prompt = (
+        Path(__file__).resolve().parents[2]
+        / "prompts"
+        / "qwenwork-dws-project-sync.md"
+    ).read_text(encoding="utf-8")
+    normalized = " ".join(prompt.replace("`", "").split())
+
+    assert "doc info" in normalized
+    assert "doc read" in normalized
+    assert "--format json" in normalized
+    assert 'tojson as $raw | {encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}' in prompt
+    assert "三个独立工具调用" in normalized
+    assert "引用 here-document" in normalized
+    assert "不得使用管道" in normalized
+    assert "不得使用命令替换" in normalized
+    assert "不得使用 Popen" in normalized
+    assert "不得向用户输出封包" in normalized
+    assert "不得写临时文件" in normalized
+    assert "host-import 成功后" in normalized
+    assert "pending-post-tool-use" in normalized
 
 
 def test_qwen_prompt_defines_fixed_strict_private_task_config() -> None:

@@ -45,8 +45,12 @@ python -m tools.dws_project_sync --help
 
 Individual `collect`, `pending`, and `push` commands remain available for an
 approved manual run when no project lifecycle is active. Production QwenWork
-tasks must call `begin`, pass its run token through `collect`, `pending`,
+tasks collect the single allowlisted document through two independent host DWS
+calls, then pass their bounded base64-JSON envelopes through stdin to
+`host-import`. They pass the lifecycle token through `host-import`, `pending`,
 `artifact`, and `push`, then call `end`; their `finally` path must call `abort`.
+The host envelopes, source content, profile, source ID, and token are never
+printed or written to an intermediate file.
 The project-keyed lease lives under the repository's ignored
 `.private/dws-sync-locks` directory, so alternate state-file paths cannot run
 the same project concurrently. Concurrent schedule triggers are coalesced into
@@ -68,8 +72,9 @@ For protected local setup, use `python tools/dws_sync_runtime.py --help` and
 the [runtime setup section](gateway/README.md#protected-runtime-setup).
 
 See [the gateway DWS runbook](gateway/README.md#private-dws-project-synchronization)
-for the sanitized manifest schema, required environment-variable names, exact
-`collect`, `pending`, and `push` commands, and the five-minute QwenWork schedule. A failed
+for the sanitized manifest schema, required environment-variable names, the
+manual `collect` compatibility command, the production host-import flow, and
+the five-minute QwenWork schedule. A failed
 or overdue source does not have its freshness renewed; answers that depend on
 that source remain unavailable until a successful allowed-source refresh.
 

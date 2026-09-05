@@ -277,6 +277,46 @@ def advance_run(
         _write_state(path, state)
 
 
+def commit_stage(
+    project_id: str,
+    token: str,
+    *,
+    expected: Stage,
+    target: Stage,
+    apply: Callable[[], None],
+    rollback: Callable[[], None],
+    root: Path = state_lock.PRIVATE_LOCK_ROOT,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> None:
+    if _STAGES.index(target) != _STAGES.index(expected) + 1:
+        raise ValueError("run_stage_invalid")
+    with _lock(root, project_id):
+        current = _read_now(now)
+        path = project_state_path(root, project_id)
+        state = _validated_state(path, project_id, token, current)
+        if state["stage"] != expected:
+            raise ValueError("run_stage_invalid")
+        original_state = dict(state)
+        state_write_started = False
+        try:
+            apply()
+            state["stage"] = target
+            state["lease_expires_at"] = _expires_at(_read_now(now))
+            state_write_started = True
+            _write_state(path, state)
+        except BaseException:
+            if state_write_started:
+                try:
+                    _write_state(path, original_state)
+                except BaseException:
+                    raise ValueError("private_file_write_failed") from None
+            try:
+                rollback()
+            except BaseException:
+                raise ValueError("private_file_write_failed") from None
+            raise
+
+
 @contextmanager
 def stage_guard(
     project_id: str,

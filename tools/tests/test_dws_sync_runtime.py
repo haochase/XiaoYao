@@ -107,6 +107,52 @@ def test_wrapper_injects_token_only_for_network_commands(tmp_path: Path, monkeyp
     assert "COMPANION_DWS_SYNC_TOKEN" not in wrapper.os.environ
 
 
+def test_host_import_maps_fixed_paths_and_does_not_decrypt_credential(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from tools import dws_project_sync
+    from tools import dws_sync_runtime as wrapper
+
+    class HostImportProtector(Protector):
+        def unprotect(self, project_id: str, protected: bytes) -> bytes:
+            pytest.fail("host-import must not decrypt the gateway credential")
+
+    manifest, dws = inputs(tmp_path)
+    prepare_runtime(tmp_path, manifest, "project-1", dws, Protector())
+    observed = []
+    stdin = object()
+    monkeypatch.setattr(
+        dws_project_sync,
+        "main",
+        lambda argv, **kwargs: observed.append((argv, kwargs)) or 0,
+    )
+
+    assert wrapper.dispatch(
+        tmp_path,
+        "host-import",
+        "lease-token",
+        False,
+        HostImportProtector(),
+        input_stream=stdin,
+    ) == 0
+
+    argv, kwargs = observed[0]
+    assert argv == [
+        "host-import",
+        "--project",
+        "project-1",
+        "--run-token",
+        "lease-token",
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / ".private/dws-runtime/source-bundle.json"),
+    ]
+    assert kwargs["input_stream"] is stdin
+    assert "COMPANION_DWS_SYNC_TOKEN" not in kwargs["environ"]
+
+
 def test_check_missing_config_prints_no_private_details(tmp_path: Path, capsys) -> None:
     from tools.dws_sync_runtime import main
 
