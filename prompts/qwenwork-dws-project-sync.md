@@ -59,17 +59,24 @@ schema 验证后，必须用 `Path.resolve(strict=False)` 和 `os.path.normcase`
 1. 使用参数数组在仓库根目录运行 `python -m tools.dws_project_sync collect`。参数映射固定为：
    `--manifest` 取 `manifest`，`--project` 取 `project`，`--dws-path` 取 `dws`，
    `--output` 取 `source_bundle`。不得拼接 shell 命令或增加任何参数。
-2. collect 成功后，调用名称精确为 `hui-anchor-dws-project-context-v1` 的 Skill。该 Skill 的
+2. collect 成功后，使用参数数组运行 `python -m tools.dws_project_sync pending`。参数映射
+   固定为：`--manifest` 取 `manifest`，`--project` 取 `project`，`--sources-file` 取
+   `source_bundle`，`--gateway` 固定为 `http://127.0.0.1:8731`。令牌只由
+   `COMPANION_DWS_SYNC_TOKEN` 提供。该命令只领取状态为 pending 的项目内请求，将每个
+   `source_id_hash` 映射为 manifest 白名单内的 `source_type` 和 `source_id`，并把只含
+   `request_id`、`query_hash`、`sources` 的 `retrieval_requests` 原子写回 source bundle。
+   任一 hash 无法唯一映射时立即停止，不得扩大白名单。
+3. pending 成功后，调用名称精确为 `hui-anchor-dws-project-context-v1` 的 Skill。该 Skill 的
    唯一输入是从 `source_bundle` 读取并校验后的 `DwsSourceBundle`；不得传入历史对话、
    仓库文档、其他私有文件或模型记忆。唯一输出是一个
    `QwenProjectContextArtifact` JSON object，顶层只允许 `schema_version`、`context` 和
    `completed_retrieval_request_ids`。
-3. artifact 中每条事实性决策必须使用 `DecisionCard.source_refs`；每条行动项、风险和下次
+4. artifact 中每条事实性决策必须使用 `DecisionCard.source_refs`；每条行动项、风险和下次
    会议必须分别使用 `sourced_actions`、`sourced_risks` 和
    `sourced_next_meeting` 的 `SourcedFact(text, source_refs)`。每个引用必须精确匹配一个
    `active` 来源的类型、ID、权限域、标题、URL 和时间，且 excerpt 必须是来源正文中的
    精确片段。事实文本必须由这些摘录直接支持；证据不足就省略，不得推断或补写。
-4. legacy 展示字段必须固定为空，不得从 sourced facts 复制或生成：
+5. legacy 展示字段必须固定为空，不得从 sourced facts 复制或生成：
 
    ```json
    {
@@ -79,18 +86,19 @@ schema 验证后，必须用 `Path.resolve(strict=False)` 和 `os.path.normcase`
    }
    ```
 
-5. 当前 `DwsSourceBundle` 不包含待检索请求输入，因此
-   `completed_retrieval_request_ids` 必须为 `[]`。未完成的检索请求绝不能加入
-   `completed_retrieval_request_ids`，遗漏的请求保持 pending。不得读取检索接口或实现
-   额外 fetch。只有已取得对应证据且请求 ID 明确包含在唯一输入中，才允许记录完成；
-   当前输入契约不满足该条件。
-6. 写文件前先在内存中用 `QwenProjectContextArtifact.model_validate` 完整验证 candidate，
+6. 只有已取得对应证据，且请求 ID 在 `retrieval_requests` 中列出、其 `sources` 全部在
+   本轮成功取得 active 证据、事实由对应精确摘录支持时，才能加入
+   `completed_retrieval_request_ids`。
+   未完成的检索请求绝不能加入 `completed_retrieval_request_ids`，遗漏的请求保持
+   pending。不得
+   捏造请求、修改 `query_hash`、扩大 `sources` 或用旧 bundle 中不存在的 ID 声明完成。
+7. 写文件前先在内存中用 `QwenProjectContextArtifact.model_validate` 完整验证 candidate，
    再编码为 canonical UTF-8 JSON；encoded bytes 必须小于或等于 `2097152`。模型或大小
    检查失败时保留旧目标，且不得创建或打开任何输出文件。两项检查通过后才
    创建同目录临时文件。写入后依次 `flush`、`fsync`，再用 `os.replace` 替换
    `context_artifact`。失败时
    删除临时文件并保留旧目标；不得直接覆盖目标。
-7. artifact 写入成功后，使用参数数组运行 `python -m tools.dws_project_sync push`。参数映射
+8. artifact 写入成功后，使用参数数组运行 `python -m tools.dws_project_sync push`。参数映射
    固定为：`--manifest` 取 `manifest`，`--project` 取 `project`，`--sources-file` 取
    `source_bundle`，`--context-file` 取 `context_artifact`，`--state-file` 取 `state`；
    `--gateway` 固定为 `http://127.0.0.1:8731`。令牌只由
@@ -99,8 +107,8 @@ schema 验证后，必须用 `Path.resolve(strict=False)` 和 `os.path.normcase`
 ## 读取、写入和输出边界
 
 - 任务编排只可读取固定任务配置和 `source_bundle`。Skill 不得读取其他文件、网络资源、
-  历史对话或 manifest 白名单以外的钉钉资料。collect/push 只能通过固定 CLI 完成其契约内
-  的 manifest、DWS、context 和 state 访问。
+  历史对话或 manifest 白名单以外的钉钉资料。collect/pending/push 只能通过固定 CLI
+  完成其契约内的 manifest、DWS、retrieval、context 和 state 访问。
 - 任务只可写 `source_bundle`、`context_artifact` 和 `state`。不得创建日志、报告、缓存、
   旁路 artifact 或额外状态文件。
 - 任一步失败即停止。不得绕过校验、拆分超限同步包、改用其他 gateway、追加 `--yes`、

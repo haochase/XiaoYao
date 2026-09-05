@@ -137,6 +137,37 @@ class DwsSourceRecord(BaseModel):
         return self
 
 
+class DwsRetrievalSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_type: SyncSourceType
+    source_id: str = Field(min_length=1, max_length=256)
+
+    @field_validator("source_id")
+    @classmethod
+    def validate_source_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("source_id must not be blank")
+        return value
+
+
+class DwsRetrievalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    request_id: str = Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    )
+    query_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sources: tuple[DwsRetrievalSource, ...] = Field(min_length=1, max_length=30)
+
+    @model_validator(mode="after")
+    def validate_sources(self) -> "DwsRetrievalRequest":
+        identities = {(item.source_type, item.source_id) for item in self.sources}
+        if len(identities) != len(self.sources):
+            raise ValueError("retrieval source identities must be unique")
+        return self
+
+
 class DwsSourceBundle(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -146,6 +177,10 @@ class DwsSourceBundle(BaseModel):
     permission_scope: str = Field(min_length=1, max_length=256)
     collected_at: datetime
     records: tuple[DwsSourceRecord, ...] = Field(min_length=1, max_length=30)
+    retrieval_requests: tuple[DwsRetrievalRequest, ...] = Field(
+        default=(),
+        max_length=100,
+    )
     content_hash: str = Field(pattern=r"[0-9a-f]{64}")
 
     @field_validator("collected_at")
@@ -172,6 +207,16 @@ class DwsSourceBundle(BaseModel):
             raise ValueError("record identities must be unique")
         if any(item.permission_scope != self.permission_scope for item in self.records):
             raise ValueError("record permission scope must match bundle")
+        request_ids = [item.request_id for item in self.retrieval_requests]
+        if len(request_ids) != len(set(request_ids)):
+            raise ValueError("retrieval request IDs must be unique")
+        requested = {
+            (source.source_type, source.source_id)
+            for request in self.retrieval_requests
+            for source in request.sources
+        }
+        if not requested.issubset(identities):
+            raise ValueError("retrieval sources must belong to bundle")
         return self
 
 

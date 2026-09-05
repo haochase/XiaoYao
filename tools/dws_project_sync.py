@@ -34,6 +34,8 @@ from pydantic import (
 from companion_gateway.project.index import chunk_text
 from companion_gateway.project.models import EvidenceRef, ProjectContextPackage
 from companion_gateway.project.sync_models import (
+    RetrievalRequest,
+    RetrievalRequestStatus,
     SourceSnapshot,
     SourceTombstone,
     SyncEnvelope,
@@ -45,6 +47,8 @@ try:
         DwsCommandRunner,
         DwsManifest,
         DwsProjectManifest,
+        DwsRetrievalRequest,
+        DwsRetrievalSource,
         DwsSourceBundle,
         DwsSourceRecord,
         collect_sources,
@@ -56,6 +60,8 @@ except ModuleNotFoundError as exc:
         DwsCommandRunner,
         DwsManifest,
         DwsProjectManifest,
+        DwsRetrievalRequest,
+        DwsRetrievalSource,
         DwsSourceBundle,
         DwsSourceRecord,
         collect_sources,
@@ -113,6 +119,7 @@ _PUBLIC_ERROR_TYPES = {
     "project_not_found",
     "provider_unavailable",
     "rate_limited",
+    "retrieval_request_invalid",
     "response_invalid",
     "response_sync_mismatch",
     "source_bundle_hash_mismatch",
@@ -265,6 +272,12 @@ def _parser() -> argparse.ArgumentParser:
     collect.add_argument("--dws-path", required=True)
     collect.add_argument("--output", required=True)
 
+    pending = commands.add_parser("pending", add_help=False)
+    pending.add_argument("--manifest", required=True)
+    pending.add_argument("--project", required=True)
+    pending.add_argument("--sources-file", required=True)
+    pending.add_argument("--gateway", required=True)
+
     push = commands.add_parser("push", add_help=False)
     push.add_argument("--manifest", required=True)
     push.add_argument("--project", required=True)
@@ -342,6 +355,25 @@ def _selected_project(manifest: DwsManifest, project_id: str) -> DwsProjectManif
     return matches[0]
 
 
+def _bundle_hash_payload(source_bundle: DwsSourceBundle) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": source_bundle.schema_version,
+        "project_id": source_bundle.project_id,
+        "project_name": source_bundle.project_name,
+        "permission_scope": source_bundle.permission_scope,
+        "collected_at": source_bundle.collected_at.isoformat(),
+        "records": [
+            record.model_dump(mode="json") for record in source_bundle.records
+        ],
+    }
+    if source_bundle.retrieval_requests:
+        payload["retrieval_requests"] = [
+            request.model_dump(mode="json")
+            for request in source_bundle.retrieval_requests
+        ]
+    return payload
+
+
 def _validate_bundle(
     project: DwsProjectManifest,
     source_bundle: DwsSourceBundle,
@@ -356,16 +388,7 @@ def _validate_bundle(
     actual = {(item.source_type, item.source_id) for item in source_bundle.records}
     if actual != expected:
         raise ValueError("source_bundle_mismatch")
-    payload = {
-        "schema_version": source_bundle.schema_version,
-        "project_id": source_bundle.project_id,
-        "project_name": source_bundle.project_name,
-        "permission_scope": source_bundle.permission_scope,
-        "collected_at": source_bundle.collected_at.isoformat(),
-        "records": [
-            record.model_dump(mode="json") for record in source_bundle.records
-        ],
-    }
+    payload = _bundle_hash_payload(source_bundle)
     if _sha256(_canonical_bytes(payload).decode("utf-8")) != source_bundle.content_hash:
         raise ValueError("source_bundle_hash_mismatch")
 
@@ -499,6 +522,13 @@ def _build_envelope(
         raise ValueError("now_not_timezone_aware")
     _validate_bundle(project, source_bundle)
     _validate_context(project, source_bundle, context)
+    available_request_ids = {
+        item.request_id for item in source_bundle.retrieval_requests
+    }
+    if not set(completed_retrieval_request_ids).issubset(
+        available_request_ids
+    ):
+        raise ValueError("retrieval_request_invalid")
     sources = tuple(
         _source_snapshot(record)
         for record in source_bundle.records
@@ -726,6 +756,141 @@ def _collect_command(
     }
 
 
+def _pending_response(raw: bytes, project_id: str) -> tuple[RetrievalRequest, ...]:
+    if len(raw) > 65_536:
+        raise ValueError("response_invalid")
+    try:
+        payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_non_finite)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
+        raise ValueError("response_invalid") from None
+    if not isinstance(payload, dict) or set(payload) != {"requests"}:
+        raise ValueError("response_invalid")
+    raw_requests = payload["requests"]
+    if not isinstance(raw_requests, list) or len(raw_requests) > 100:
+        raise ValueError("response_invalid")
+    requests: list[RetrievalRequest] = []
+    try:
+        for value in raw_requests:
+            request = RetrievalRequest.model_validate(value)
+            if (
+                request.project_id != project_id
+                or request.status is not RetrievalRequestStatus.IN_PROGRESS
+                or request.baseline_generation_id is None
+            ):
+                raise ValueError("invalid pending request")
+            requests.append(request)
+    except (TypeError, ValueError):
+        raise ValueError("response_invalid") from None
+    if len({item.request_id for item in requests}) != len(requests):
+        raise ValueError("response_invalid")
+    return tuple(requests)
+
+
+def _pending_command(
+    args: argparse.Namespace,
+    *,
+    opener: Callable[..., object],
+    environ: Mapping[str, str],
+) -> dict[str, object]:
+    gateway = _gateway_base(args.gateway)
+    manifest_path = _absolute_private_path(args.manifest, "manifest")
+    sources_path = _absolute_private_path(args.sources_file, "sources_file")
+    manifest = DwsManifest.load(manifest_path)
+    project = _selected_project(manifest, args.project)
+    try:
+        source_bundle = DwsSourceBundle.model_validate(
+            _read_json_object(
+                sources_path,
+                "sources_file",
+                max_bytes=MAX_PRIVATE_INPUT_BYTES,
+            )
+        )
+    except (TypeError, ValueError):
+        raise ValueError("sources_file_invalid") from None
+    _validate_bundle(project, source_bundle)
+    token = environ.get(TOKEN_ENVIRONMENT_VARIABLE, "")
+    if not token:
+        raise ValueError("token_missing")
+    if "\r" in token or "\n" in token:
+        raise ValueError("token_invalid")
+    request = Request(
+        (
+            f"{gateway}/v1/projects/"
+            f"{quote(project.project_id, safe='')}/retrieval-requests"
+            "?status=pending"
+        ),
+        headers={"Authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    response = None
+    try:
+        response = opener(request, timeout=30.0)
+        raw_response = response.read(65_537)
+    except HTTPError:
+        raise ValueError("http_error") from None
+    except (TimeoutError, URLError, OSError):
+        raise ValueError("network_error") from None
+    except Exception:
+        raise ValueError("network_error") from None
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+    pending = _pending_response(raw_response, project.project_id)
+    sources_by_hash: dict[str, DwsRetrievalSource] = {}
+    for source in project.sources:
+        source_hash = _sha256(source.source_id)
+        if source_hash in sources_by_hash:
+            raise ValueError("retrieval_request_invalid")
+        sources_by_hash[source_hash] = DwsRetrievalSource(
+            source_type=source.source_type,
+            source_id=source.source_id,
+        )
+    mapped: list[DwsRetrievalRequest] = []
+    try:
+        for item in pending:
+            request_sources = tuple(
+                sources_by_hash[source_hash]
+                for source_hash in item.source_id_hashes
+            )
+            mapped.append(
+                DwsRetrievalRequest(
+                    request_id=item.request_id,
+                    query_hash=item.query_hash,
+                    sources=request_sources,
+                )
+            )
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("retrieval_request_invalid") from None
+    payload = _bundle_hash_payload(source_bundle)
+    if mapped:
+        payload["retrieval_requests"] = [
+            item.model_dump(mode="json") for item in mapped
+        ]
+    else:
+        payload.pop("retrieval_requests", None)
+    updated = DwsSourceBundle(
+        **payload,
+        content_hash=_sha256(_canonical_bytes(payload).decode("utf-8")),
+    )
+    encoded = _canonical_bytes(updated.model_dump(mode="json"))
+    if len(encoded) > MAX_PRIVATE_INPUT_BYTES:
+        raise ValueError("sources_file_too_large")
+    _atomic_write(sources_path, encoded)
+    requested_sources = {
+        (source.source_type, source.source_id)
+        for item in mapped
+        for source in item.sources
+    }
+    return {
+        "status": "pending_fetched",
+        "project_id": project.project_id,
+        "request_count": len(mapped),
+        "source_count": len(requested_sources),
+        "content_hash": updated.content_hash,
+    }
+
+
 def _read_push_inputs(
     args: argparse.Namespace,
 ) -> tuple[DwsProjectManifest, DwsSourceBundle, QwenProjectContextArtifact, Path]:
@@ -898,19 +1063,28 @@ def main(
 ) -> int:
     actual_argv = list(sys.argv[1:] if argv is None else argv)
     if "--help" in actual_argv or "-h" in actual_argv:
-        if actual_argv and actual_argv[0] in {"collect", "push"}:
+        if actual_argv and actual_argv[0] in {"collect", "pending", "push"}:
             output: dict[str, object] = {
                 "status": "help",
                 "command": actual_argv[0],
             }
         else:
-            output = {"status": "help", "commands": ["collect", "push"]}
+            output = {
+                "status": "help",
+                "commands": ["collect", "pending", "push"],
+            }
         _emit(output)
         return 0
     try:
         args = _parser().parse_args(actual_argv)
         if args.command == "collect":
             output = _collect_command(args, runner=runner, now=now)
+        elif args.command == "pending":
+            output = _pending_command(
+                args,
+                opener=urlopen,
+                environ=os.environ if environ is None else environ,
+            )
         else:
             output = _push_command(
                 args,

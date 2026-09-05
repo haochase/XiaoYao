@@ -160,7 +160,7 @@ ready, and port 8723 has no synchronization routes:
 .\scripts\check-xiaoyao-sync-runtime.ps1
 ```
 
-Run the following three-stage workflow from the repository root in QwenWork.
+Run the following four-stage workflow from the repository root in QwenWork.
 Use `python -m tools.dws_project_sync`; invoking the file directly is not the
 supported repository import mode.
 
@@ -170,6 +170,12 @@ python -m tools.dws_project_sync collect `
   --project 'project-test-only' `
   --dws-path 'E:\private-tools\dws.exe' `
   --output 'E:\private\dws-source-bundle.json'
+
+python -m tools.dws_project_sync pending `
+  --manifest 'E:\private\dws-projects.json' `
+  --project 'project-test-only' `
+  --sources-file 'E:\private\dws-source-bundle.json' `
+  --gateway 'http://127.0.0.1:8731'
 
 # QwenWork now follows prompts/qwenwork-dws-project-sync.md and writes the
 # validated QwenProjectContextArtifact to the private context path.
@@ -185,8 +191,10 @@ python -m tools.dws_project_sync push `
 ```
 
 `collect` always supplies the manifest's private profile to the fixed DWS read
-commands and requests JSON output. The QwenWork Skill must cite only active
-collected sources and omit unsupported facts. `push --dry-run` validates the
+commands and requests JSON output. `pending` claims only project-local pending
+requests and maps their source hashes back to the manifest whitelist inside the
+private source bundle. The QwenWork Skill must cite only active collected sources
+and omit unsupported facts. `push --dry-run` validates the
 artifact and reports only status, counts, payload size, and a content hash; it
 does not call the gateway. Remove `--dry-run` only after explicit approval for
 a real synchronization.
@@ -194,7 +202,7 @@ a real synchronization.
 Create the QwenWork schedule only after one approved manual run. Use the full
 contents of `prompts/qwenwork-dws-project-sync.md`, run it every five minutes in
 this repository root, keep it disabled until its first manual run succeeds, and
-coalesce missed intervals into one recovery run. Any `collect`, Skill, or
+coalesce missed intervals into one recovery run. Any `collect`, `pending`, Skill, or
 `push` failure stops that run. Failed sources do not renew freshness, and facts
 depending on a source older than 30 minutes remain closed until that source is
 successfully refreshed.

@@ -1,4 +1,6 @@
 from tools.dws_sync.adapters import (
+    DwsRetrievalRequest,
+    DwsRetrievalSource,
     DwsSourceBundle,
     DwsSourceRecord,
     collect_sources,
@@ -16,6 +18,8 @@ __all__ = [
     "DwsManifest",
     "DwsProjectManifest",
     "DwsReadError",
+    "DwsRetrievalRequest",
+    "DwsRetrievalSource",
     "DwsSourceBundle",
     "DwsSourceRecord",
     "DwsSourceSpec",

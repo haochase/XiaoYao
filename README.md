@@ -51,7 +51,7 @@ real values remain outside Git. The context conversion Skill has the fixed name
 
 See [the gateway DWS runbook](gateway/README.md#private-dws-project-synchronization)
 for the sanitized manifest schema, required environment-variable names, exact
-`collect` and `push` commands, and the five-minute QwenWork schedule. A failed
+`collect`, `pending`, and `push` commands, and the five-minute QwenWork schedule. A failed
 or overdue source does not have its freshness renewed; answers that depend on
 that source remain unavailable until a successful allowed-source refresh.
 

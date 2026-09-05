@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
@@ -190,7 +190,7 @@ def write_push_inputs(tmp_path: Path) -> dict[str, Path]:
     artifact = QwenProjectContextArtifact(
         schema_version=1,
         context=context(),
-        completed_retrieval_request_ids=("retrieval-1",),
+        completed_retrieval_request_ids=(),
     )
     write_json(paths["context"], artifact.model_dump(mode="json"))
     return paths
@@ -212,6 +212,20 @@ def push_args(paths: dict[str, Path], *extra: str) -> list[str]:
         "--gateway",
         "http://127.0.0.1:8731",
         *extra,
+    ]
+
+
+def pending_args(paths: dict[str, Path]) -> list[str]:
+    return [
+        "pending",
+        "--manifest",
+        str(paths["manifest"]),
+        "--project",
+        "project-1",
+        "--sources-file",
+        str(paths["sources"]),
+        "--gateway",
+        "http://127.0.0.1:8731",
     ]
 
 
@@ -275,6 +289,133 @@ class RecordingUrlOpen:
             __enter__=lambda self: self,
             __exit__=lambda *_args: None,
         )
+
+
+class PendingUrlOpen:
+    def __init__(self, source_hash: str) -> None:
+        self.source_hash = source_hash
+        self.request = None
+
+    def __call__(self, request, *, timeout: float):  # type: ignore[no-untyped-def]
+        self.request = request
+        assert timeout == 30.0
+        payload = {
+            "requests": [
+                {
+                    "request_id": "retrieval-1",
+                    "project_id": "project-1",
+                    "query_hash": digest("missing detail"),
+                    "source_id_hashes": [self.source_hash],
+                    "baseline_generation_id": "generation-1",
+                    "baseline_content_hash": "a" * 64,
+                    "baseline_source_cursor": 1,
+                    "status": "in_progress",
+                    "created_at": NOW.isoformat(),
+                    "expires_at": (NOW + timedelta(minutes=30)).isoformat(),
+                    "completed_at": None,
+                }
+            ]
+        }
+        return SimpleNamespace(
+            read=lambda size: canonical(payload).encode("utf-8"),
+            close=lambda: None,
+        )
+
+
+def test_pending_fetch_maps_gateway_hashes_into_private_source_bundle(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    sent = PendingUrlOpen(digest("doc-1"))
+
+    assert main(
+        pending_args(paths),
+        urlopen=sent,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    private = json.loads(paths["sources"].read_text(encoding="utf-8"))
+    request = private["retrieval_requests"][0]
+    assert sent.request.full_url.endswith(
+        "/v1/projects/project-1/retrieval-requests?status=pending"
+    )
+    assert sent.request.method == "GET"
+    assert sent.request.get_header("Authorization") == "Bearer private-token"
+    assert request == {
+        "request_id": "retrieval-1",
+        "query_hash": digest("missing detail"),
+        "sources": [{"source_id": "doc-1", "source_type": "document"}],
+    }
+    assert output == {
+        "status": "pending_fetched",
+        "project_id": "project-1",
+        "request_count": 1,
+        "source_count": 1,
+        "content_hash": private["content_hash"],
+    }
+    assert "private-token" not in canonical(output)
+
+
+def test_pending_fetch_rejects_unmapped_source_without_replacing_bundle(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original = paths["sources"].read_bytes()
+
+    assert main(
+        pending_args(paths),
+        urlopen=PendingUrlOpen("f" * 64),
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "retrieval_request_invalid",
+    }
+    assert paths["sources"].read_bytes() == original
+
+
+def test_push_completes_only_requests_present_in_source_bundle(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    assert main(
+        pending_args(paths),
+        urlopen=PendingUrlOpen(digest("doc-1")),
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 0
+    capsys.readouterr()
+    claimed = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context(),
+        completed_retrieval_request_ids=("retrieval-1",),
+    )
+    write_json(paths["context"], claimed.model_dump(mode="json"))
+
+    assert main(
+        push_args(paths, "--dry-run"),
+        urlopen=lambda *_a, **_k: pytest.fail("dry-run must not use network"),
+        environ={},
+    ) == 0
+    capsys.readouterr()
+
+    unclaimed = claimed.model_copy(
+        update={"completed_retrieval_request_ids": ("retrieval-other",)}
+    )
+    write_json(paths["context"], unclaimed.model_dump(mode="json"))
+    assert main(
+        push_args(paths, "--dry-run"),
+        urlopen=lambda *_a, **_k: pytest.fail("invalid request must not use network"),
+        environ={},
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "retrieval_request_invalid",
+    }
 
 
 def test_collect_never_prints_business_content(tmp_path: Path, capsys) -> None:
@@ -1020,6 +1161,16 @@ def test_qwen_prompt_only_completes_retrieval_with_obtained_evidence() -> None:
     assert "未完成的检索请求绝不能加入 completed_retrieval_request_ids" in normalized
     assert "只有已取得对应证据" in normalized
     assert "遗漏的请求保持 pending" in normalized
+    assert "python -m tools.dws_project_sync pending" in normalized
+    assert "retrieval_requests" in normalized
+    assert "request_id" in normalized
+    assert "query_hash" in normalized
+    assert "sources" in normalized
+    collect_at = normalized.index("python -m tools.dws_project_sync collect")
+    pending_at = normalized.index("python -m tools.dws_project_sync pending")
+    skill_at = normalized.index("hui-anchor-dws-project-context-v1", pending_at)
+    push_at = normalized.index("python -m tools.dws_project_sync push")
+    assert collect_at < pending_at < skill_at < push_at
 
 
 def test_qwen_prompt_uses_only_module_cli_entrypoints() -> None:
