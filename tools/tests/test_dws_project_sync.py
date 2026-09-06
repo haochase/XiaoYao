@@ -1310,8 +1310,18 @@ def test_source_bundle_semantic_hash_is_stable_for_ephemeral_changes_and_order()
         update={
             "collected_at": NOW + timedelta(minutes=5),
             "records": (
-                second.model_copy(update={"fetched_at": NOW + timedelta(minutes=3)}),
-                first.model_copy(update={"fetched_at": NOW + timedelta(minutes=2)}),
+                second.model_copy(
+                    update={
+                        "fetched_at": NOW + timedelta(minutes=3),
+                        "attributes_json": '{"info":{"logId":"request-2"}}',
+                    }
+                ),
+                first.model_copy(
+                    update={
+                        "fetched_at": NOW + timedelta(minutes=2),
+                        "attributes_json": '{"info":{"logId":"request-1"}}',
+                    }
+                ),
             ),
         }
     )
@@ -1330,7 +1340,6 @@ def test_source_bundle_semantic_hash_is_stable_for_ephemeral_changes_and_order()
         ("source_url", "dingtalk://document/other"),
         ("source_version", "v2"),
         ("source_time", NOW + timedelta(seconds=1)),
-        ("attributes_json", '{"changed":true}'),
         ("content_hash", "f" * 64),
         ("status", "revoked"),
     ],

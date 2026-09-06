@@ -640,7 +640,6 @@ def source_bundle_semantic_hash(bundle: DwsSourceBundle) -> str:
         "source_url",
         "source_version",
         "source_time",
-        "attributes_json",
         "content_hash",
         "error_type",
         "retryable",
