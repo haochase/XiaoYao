@@ -4780,6 +4780,39 @@ def test_qwen_prompt_uses_protected_runtime_entrypoints() -> None:
     assert "tools/dws_project_sync.py push" not in prompt
 
 
+def test_qwen_prompt_uses_fixed_fast_runtime_without_discovery() -> None:
+    prompt = (
+        Path(__file__).resolve().parents[2]
+        / "prompts"
+        / "qwenwork-dws-project-sync.md"
+    ).read_text(encoding="utf-8")
+    compact = "".join(prompt.replace("`", "").split())
+
+    assert (
+        "E:\\hackasons\\MiniCPM_Ascend\\.worktrees\\.venvs\\"
+        "feishu-desk-assistant\\Scripts\\python.exe"
+    ) in prompt
+    assert "每个Pythonruntime工具调用" in compact
+    assert "DWS原生命令仍以DWS_PATH_LITERAL作为argv[0]" in compact
+    assert "不得搜索或枚举其他Python解释器" in compact
+    assert "不得检查实现源码或测试文件" in compact
+    assert "不得使用cd&&" in compact
+    assert "不得创建辅助脚本、候选文件或旁路产物" in compact
+    assert "允许只读检查Skill注册表" in compact
+    assert "允许校验DWSwrapper和原生shim" in compact
+    assert "begin前的预检或check失败" in compact
+    assert "不调用abort" in compact
+    arrays = [
+        json.loads(value)
+        for value in re.findall(r"`(\[[^\n`]+\])`", prompt)
+    ]
+    assert [
+        r"E:\hackasons\MiniCPM_Ascend\.worktrees\.venvs\feishu-desk-assistant\Scripts\python.exe",
+        "tools/dws_sync_runtime.py",
+        "check",
+    ] in arrays
+
+
 def test_qwen_prompt_uses_three_independent_host_collection_calls() -> None:
     prompt = (
         Path(__file__).resolve().parents[2]

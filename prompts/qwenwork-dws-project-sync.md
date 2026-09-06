@@ -61,6 +61,19 @@ schema 验证后，必须用 `Path.resolve(strict=False)` 和 `os.path.normcase`
 
 ## 固定流程
 
+本任务唯一允许的Python解释器为
+`E:\hackasons\MiniCPM_Ascend\.worktrees\.venvs\feishu-desk-assistant\Scripts\python.exe`。
+下文命令中的`python`只是该绝对路径的排版缩写；实际每个Python runtime工具调用的argv[0]
+必须直接使用此绝对路径。两次DWS原生命令仍以
+`DWS_PATH_LITERAL`作为argv[0]。`check`的参数数组必须等价于：
+`["E:\\hackasons\\MiniCPM_Ascend\\.worktrees\\.venvs\\feishu-desk-assistant\\Scripts\\python.exe","tools/dws_sync_runtime.py","check"]`。
+不得搜索或枚举其他Python解释器，不得检查实现源码或测试文件，不得使用`cd &&`或
+任何shell命令串联，不得创建辅助脚本、候选文件或旁路产物。任务工作目录已由contextDirs固定为
+仓库根目录，不得再次切换目录。除读取固定配置、manifest、source_bundle以及执行本节明确命令外，
+允许只读检查Skill注册表，允许校验DWS wrapper和原生shim；除此之外不得做解释器发现、代码探查
+或额外诊断。begin前的预检或check失败时输出脱敏固定错误并立即结束，不调用abort；只有begin成功
+取得run_token后，任一固定命令失败才按abort分支结束。
+
 生产入口使用 `python tools/dws_sync_runtime.py`，解释器须为已安装本项目依赖的明确绝对路径。
 该入口只读固定配置；`host-import` 不读取或解封凭据，只有 pending/push 的内部调用以
 CurrentUser DPAPI 解封并取得网关 token。runtime 不修改父进程环境，也不把 token 传给
