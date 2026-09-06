@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import errno
 import hashlib
@@ -4833,6 +4834,88 @@ def test_qwen_prompt_uses_three_independent_host_collection_calls() -> None:
     assert "不得向用户输出封包" in normalized
     assert "不得写临时文件" in normalized
     assert "host-import 成功后" in normalized
+
+
+def test_qwen_prompt_defines_exact_host_import_outer_contract() -> None:
+    prompt = (
+        Path(__file__).resolve().parents[2]
+        / "prompts"
+        / "qwenwork-dws-project-sync.md"
+    ).read_text(encoding="utf-8")
+    compact = "".join(prompt.replace("`", "").split())
+
+    assert "外层键必须恰好为schema_version、project_id、results" in compact
+    assert "键名必须是project_id，禁止使用project" in compact
+    assert "每个results元素必须恰好为operation、encoding、byte_count、payload" in compact
+    assert "第一项operation=doc_info，第二项operation=doc_read" in compact
+    assert "不得增加source_id_hash或其他字段" in compact
+    pseudocode = re.search(
+        r"<!-- host-import-construction -->\s*```python\s*(.*?)\s*```",
+        prompt,
+        re.DOTALL,
+    )
+    assert pseudocode is not None
+    normalized_code = " ".join(pseudocode.group(1).split())
+    assert '"project_id": PROJECT_ID' in normalized_code
+    assert '"project":' not in normalized_code
+    assert normalized_code.index('"operation": "doc_info"') < (
+        normalized_code.index('"operation": "doc_read"')
+    )
+    raw_result = b"{}"
+    host_envelope = {
+        "encoding": "base64-json",
+        "byte_count": len(raw_result),
+        "payload": base64.b64encode(raw_result).decode("ascii"),
+    }
+    module = ast.parse(pseudocode.group(1), mode="exec")
+    assert len(module.body) == 1
+    assignment = module.body[0]
+    assert isinstance(assignment, ast.Assign)
+    assert len(assignment.targets) == 1
+    assert isinstance(assignment.targets[0], ast.Name)
+    assert assignment.targets[0].id == "outer"
+    assert isinstance(assignment.value, ast.Dict)
+    root_keys = [ast.literal_eval(key) for key in assignment.value.keys]
+    assert root_keys == ["schema_version", "project_id", "results"]
+    assert isinstance(assignment.value.values[0], ast.Constant)
+    assert type(assignment.value.values[0].value) is int
+    assert assignment.value.values[0].value == 1
+    assert isinstance(assignment.value.values[1], ast.Name)
+    assert assignment.value.values[1].id == "PROJECT_ID"
+    results_node = assignment.value.values[2]
+    assert isinstance(results_node, ast.List)
+    assert len(results_node.elts) == 2
+    for item, operation, envelope_name in zip(
+        results_node.elts,
+        ("doc_info", "doc_read"),
+        ("DOC_INFO_ENVELOPE", "DOC_READ_ENVELOPE"),
+        strict=True,
+    ):
+        assert isinstance(item, ast.Dict)
+        assert len(item.keys) == 2
+        assert ast.literal_eval(item.keys[0]) == "operation"
+        assert item.keys[1] is None
+        assert ast.literal_eval(item.values[0]) == operation
+        assert isinstance(item.values[1], ast.Name)
+        assert item.values[1].id == envelope_name
+    outer = {
+        "schema_version": 1,
+        "project_id": "project-1",
+        "results": [
+            {"operation": "doc_info", **host_envelope},
+            {"operation": "doc_read", **host_envelope},
+        ],
+    }
+    assert set(outer) == {"schema_version", "project_id", "results"}
+    assert [set(item) for item in outer["results"]] == [
+        {"operation", "encoding", "byte_count", "payload"},
+        {"operation", "encoding", "byte_count", "payload"},
+    ]
+    from tools.dws_sync.host_bridge import _decode_results
+
+    assert _decode_results(
+        canonical(outer).encode("utf-8"), "project-1"
+    ) == ({}, {})
 
 
 def test_qwen_prompt_embeds_jq_in_each_exact_dws_command_template() -> None:

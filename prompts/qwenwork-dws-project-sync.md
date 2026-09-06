@@ -128,6 +128,22 @@ Skill 注册表和真实会话检查，不等同于同步已运行。prepare/ser
    这三个独立工具调用之间只允许宿主在内存中传递封包；payload Base64 是敏感原始 DWS
    结果，不是脱敏摘要。host-import 成功后才可继续；任一步失败时不得生成或推送空上下文，
    必须进入 finally 并使用同一 token 执行 abort。
+   外层键必须恰好为`schema_version`、`project_id`、`results`；键名必须是`project_id`，禁止使用
+   `project`。每个results元素必须恰好为`operation`、`encoding`、`byte_count`、`payload`；第一项
+   `operation=doc_info`，第二项`operation=doc_read`。不得增加`source_id_hash`或其他字段。两个宿主
+   封包在合并前必须已各自恰好包含`encoding/byte_count/payload`，构造只能等价于以下内存伪代码：
+
+   <!-- host-import-construction -->
+   ```python
+   outer = {
+       "schema_version": 1,
+       "project_id": PROJECT_ID,
+       "results": [
+           {"operation": "doc_info", **DOC_INFO_ENVELOPE},
+           {"operation": "doc_read", **DOC_READ_ENVELOPE},
+       ],
+   }
+   ```
 5. host-import 成功后，使用参数数组运行 `python tools/dws_sync_runtime.py pending`，只传同一
    `--run-token`。网关固定为 `http://127.0.0.1:8731`，内部只向该请求提供
    `COMPANION_DWS_SYNC_TOKEN`。该命令只领取状态为
