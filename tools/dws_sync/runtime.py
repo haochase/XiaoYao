@@ -20,6 +20,12 @@ CONFIG_NAME = ".private/qwenwork-dws-project-sync.json"
 RUNTIME_NAME = ".private/dws-runtime"
 
 
+def approved_artifact_path(context_path: Path) -> Path:
+    return context_path.with_name(
+        f"{context_path.stem}.approved{context_path.suffix}"
+    )
+
+
 def runtime_database(root: Path) -> Path:
     path = root / RUNTIME_NAME / "companion.db"
     for suffix in ("", "-wal", "-shm", "-journal"):
@@ -85,7 +91,12 @@ class TaskConfig(BaseModel):
     @model_validator(mode="after")
     def distinct(self) -> "TaskConfig":
         paths = (
-            self.manifest, self.dws, self.source_bundle, self.context_artifact, self.state
+            self.manifest,
+            self.dws,
+            self.source_bundle,
+            self.context_artifact,
+            approved_artifact_path(self.context_artifact),
+            self.state,
         )
         normalized = [os.path.normcase(str(path.resolve())) for path in paths]
         if len(set(normalized)) != len(paths):

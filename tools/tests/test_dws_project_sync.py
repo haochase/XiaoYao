@@ -24,16 +24,20 @@ from companion_gateway.project.models import (
     ProjectContextPackage,
     SourcedFact,
 )
-from companion_gateway.project.sync_models import SourceErrorType
+from companion_gateway.project.sync_models import SourceErrorType, SyncSourceType
 import tools.dws_project_sync as sync_cli
 import tools.dws_sync.state_lock as state_lock
 from tools.dws_project_sync import (
     QwenProjectContextArtifact,
+    SyncCliState,
     build_envelope,
     main,
+    source_bundle_semantic_hash,
 )
 from tools.dws_sync import (
     DwsProjectManifest,
+    DwsRetrievalRequest,
+    DwsRetrievalSource,
     DwsSourceBundle,
     DwsSourceRecord,
     DwsSourceSpec,
@@ -254,9 +258,41 @@ def artifact_args(paths: dict[str, Path], run_token: str) -> list[str]:
         str(paths["sources"]),
         "--context-file",
         str(paths["context"]),
+        "--state-file",
+        str(paths["state"]),
         "--run-token",
         run_token,
     ]
+
+
+def artifact_hash(artifact: QwenProjectContextArtifact) -> str:
+    return digest(canonical(artifact.model_dump(mode="json")))
+
+
+def semantic_state(
+    selected: DwsSourceBundle,
+    approved: QwenProjectContextArtifact,
+    *,
+    pending: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "project_id": "project-1",
+        "last_cursor": 1,
+        "last_content_hash": "a" * 64,
+        "last_sync_id": "sync-1",
+        "pending": pending,
+        "last_source_semantic_hash": source_bundle_semantic_hash(selected),
+        "last_artifact_hash": artifact_hash(approved),
+    }
+
+
+def rehash_bundle(selected: DwsSourceBundle) -> DwsSourceBundle:
+    payload = sync_cli._bundle_hash_payload(selected)
+    return DwsSourceBundle(
+        **payload,
+        content_hash=digest(canonical(payload)),
+    )
 
 
 def start_pending_run() -> str:
@@ -283,6 +319,595 @@ def start_pending_run() -> str:
         now=lambda: NOW,
     )
     return started.run_token
+
+
+def test_sync_state_semantic_hashes_are_optional_but_atomic() -> None:
+    legacy = SyncCliState(
+        schema_version=1,
+        project_id="project-1",
+        last_cursor=1,
+        last_content_hash="a" * 64,
+        last_sync_id="sync-1",
+        pending=None,
+    )
+    assert legacy.last_source_semantic_hash is None
+    assert legacy.last_artifact_hash is None
+
+    with pytest.raises(ValidationError, match="state_artifact_hashes_invalid"):
+        SyncCliState.model_validate(
+            {
+                **legacy.model_dump(),
+                "last_source_semantic_hash": "b" * 64,
+            }
+        )
+    with pytest.raises(ValidationError, match="state_artifact_hashes_invalid"):
+        SyncCliState.model_validate(
+            {
+                **legacy.model_dump(),
+                "last_source_semantic_hash": "B" * 64,
+                "last_artifact_hash": "c" * 64,
+            }
+        )
+    with pytest.raises(ValidationError, match="state_artifact_hashes_invalid"):
+        SyncCliState.model_validate(
+            {
+                **legacy.model_dump(),
+                "last_cursor": 0,
+                "last_content_hash": None,
+                "last_sync_id": None,
+                "last_source_semantic_hash": "b" * 64,
+                "last_artifact_hash": "c" * 64,
+            }
+        )
+
+
+def test_source_bundle_semantic_hash_is_stable_for_ephemeral_changes_and_order() -> None:
+    first = active_record(source_id="doc-1")
+    second = active_record(source_id="doc-2", content="第二份来源")
+    original = bundle(first, second)
+    changed_ephemeral = original.model_copy(
+        update={
+            "collected_at": NOW + timedelta(minutes=5),
+            "records": (
+                second.model_copy(update={"fetched_at": NOW + timedelta(minutes=3)}),
+                first.model_copy(update={"fetched_at": NOW + timedelta(minutes=2)}),
+            ),
+        }
+    )
+    assert source_bundle_semantic_hash(original) == source_bundle_semantic_hash(
+        changed_ephemeral
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_type", SyncSourceType.CALENDAR),
+        ("source_id", "doc-2"),
+        ("permission_scope", "project:other"),
+        ("source_title", "另一标题"),
+        ("source_url", "dingtalk://document/other"),
+        ("source_version", "v2"),
+        ("source_time", NOW + timedelta(seconds=1)),
+        ("attributes_json", '{"changed":true}'),
+        ("content_hash", "f" * 64),
+        ("status", "revoked"),
+    ],
+)
+def test_source_bundle_semantic_hash_changes_for_proof_fields(
+    field: str,
+    value: object,
+) -> None:
+    original = bundle()
+    record = original.records[0]
+    updates = {field: value}
+    if field == "status":
+        updates.update(
+            source_title=None,
+            source_url=None,
+            source_version=None,
+            source_time=None,
+            content_text=None,
+            attributes_json=None,
+            content_hash=None,
+        )
+    changed = original.model_copy(
+        update={"records": (record.model_copy(update=updates),)}
+    )
+    assert source_bundle_semantic_hash(original) != source_bundle_semantic_hash(
+        changed
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("project_id", "project-2"),
+        ("project_name", "另一项目"),
+        ("permission_scope", "project:other"),
+    ],
+)
+def test_source_bundle_semantic_hash_changes_for_project_identity(
+    field: str,
+    value: str,
+) -> None:
+    original = bundle()
+    changed = original.model_copy(update={field: value})
+    assert source_bundle_semantic_hash(original) != source_bundle_semantic_hash(
+        changed
+    )
+
+
+def test_source_bundle_semantic_hash_changes_for_failure_proof_fields() -> None:
+    failed = DwsSourceRecord(
+        source_type="document",
+        source_id="doc-1",
+        permission_scope=SCOPE,
+        fetched_at=NOW,
+        status="failed",
+        error_type=SourceErrorType.PROVIDER_UNAVAILABLE,
+        retryable=True,
+        retry_after_seconds=1,
+    )
+    original = bundle(failed)
+    changed_error = original.model_copy(
+        update={
+            "records": (
+                failed.model_copy(update={"error_type": SourceErrorType.RATE_LIMITED}),
+            )
+        }
+    )
+    changed_retryable = original.model_copy(
+        update={"records": (failed.model_copy(update={"retryable": False}),)}
+    )
+    assert source_bundle_semantic_hash(original) != source_bundle_semantic_hash(
+        changed_error
+    )
+    assert source_bundle_semantic_hash(original) != source_bundle_semantic_hash(
+        changed_retryable
+    )
+
+
+def test_source_bundle_semantic_hash_excludes_ephemeral_record_fields() -> None:
+    failed = DwsSourceRecord(
+        source_type="document",
+        source_id="doc-1",
+        permission_scope=SCOPE,
+        fetched_at=NOW,
+        status="failed",
+        error_type=SourceErrorType.PROVIDER_UNAVAILABLE,
+        retryable=True,
+        retry_after_seconds=1,
+    )
+    original = bundle(failed)
+    changed = original.model_copy(
+        update={
+            "records": (
+                failed.model_copy(
+                    update={
+                        "fetched_at": NOW + timedelta(minutes=1),
+                        "retry_after_seconds": 30,
+                    }
+                ),
+            )
+        }
+    )
+    assert source_bundle_semantic_hash(original) == source_bundle_semantic_hash(
+        changed
+    )
+
+
+def test_recoverable_atomic_write_rejects_hardlinked_target(tmp_path: Path) -> None:
+    target = tmp_path / "target.json"
+    alias = tmp_path / "alias.json"
+    target.write_bytes(b"original")
+    try:
+        sync_cli.os.link(target, alias)
+    except OSError as exc:
+        pytest.skip(f"hardlinks unavailable: {exc}")
+
+    transaction = sync_cli._RecoverableAtomicWrite(target, b"replacement")
+    with pytest.raises(ValueError, match="private_file_write_failed"):
+        transaction.apply()
+    assert target.read_bytes() == b"original"
+    assert alias.read_bytes() == b"original"
+
+
+def test_artifact_reuses_approved_context_for_unchanged_source(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    renewed_at = NOW + timedelta(minutes=3)
+    selected = rehash_bundle(
+        selected.model_copy(
+            update={
+                "collected_at": renewed_at,
+                "records": (
+                    selected.records[0].model_copy(update={"fetched_at": renewed_at}),
+                ),
+            }
+        )
+    )
+    retrieval = DwsRetrievalRequest(
+        request_id="request-1",
+        query_hash="d" * 64,
+        request_epoch=1,
+        attempt_count=1,
+        lease_expires_at=NOW + timedelta(minutes=5),
+        lease_token="x" * 32,
+        sources=(DwsRetrievalSource(source_type="document", source_id="doc-1"),),
+    )
+    selected = rehash_bundle(
+        selected.model_copy(update={"retrieval_requests": (retrieval,)})
+    )
+    write_json(paths["sources"], selected.model_dump(mode="json"))
+    approved = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context(excerpt="采用 方案 B。"),
+    )
+    approved_path = paths["context"].with_name("context.approved.json")
+    write_json(approved_path, approved.model_dump(mode="json"))
+    write_json(paths["state"], semantic_state(selected, approved))
+    candidate = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context(excerpt="方案 B。").model_copy(
+            update={"generated_at": renewed_at}
+        ),
+        completed_retrieval_request_ids=("request-1",),
+    )
+    run_token = start_pending_run()
+
+    assert main(
+        artifact_args(paths, run_token),
+        input_stream=io.BytesIO(
+            canonical(candidate.model_dump(mode="json")).encode("utf-8")
+        ),
+        now=lambda: NOW,
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "artifact_written"
+    written = QwenProjectContextArtifact.model_validate_json(
+        paths["context"].read_bytes()
+    )
+    assert written.context == approved.context.model_copy(
+        update={"generated_at": renewed_at}
+    )
+    assert written.completed_retrieval_request_ids == ("request-1",)
+
+
+def test_artifact_fails_closed_when_unchanged_approved_is_missing(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(paths["state"], semantic_state(selected, approved))
+    before = paths["context"].read_bytes()
+    run_token = start_pending_run()
+
+    assert main(
+        artifact_args(paths, run_token),
+        input_stream=io.BytesIO(
+            canonical(approved.model_dump(mode="json")).encode("utf-8")
+        ),
+        now=lambda: NOW,
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "approved_artifact_unavailable",
+    }
+    assert paths["context"].read_bytes() == before
+
+
+def test_artifact_uses_candidate_when_source_semantics_change(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    approved = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context(excerpt="采用 方案 B。"),
+    )
+    write_json(
+        paths["context"].with_name("context.approved.json"),
+        approved.model_dump(mode="json"),
+    )
+    write_json(paths["state"], semantic_state(original, approved))
+    changed = rehash_bundle(
+        original.model_copy(
+            update={
+                "records": (
+                    original.records[0].model_copy(update={"source_version": "v2"}),
+                )
+            }
+        )
+    )
+    write_json(paths["sources"], changed.model_dump(mode="json"))
+    candidate = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context(excerpt="方案 B。"),
+    )
+
+    assert main(
+        artifact_args(paths, start_pending_run()),
+        input_stream=io.BytesIO(
+            canonical(candidate.model_dump(mode="json")).encode("utf-8")
+        ),
+        now=lambda: NOW,
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "artifact_written"
+    written = QwenProjectContextArtifact.model_validate_json(
+        paths["context"].read_bytes()
+    )
+    assert written.context.source_refs[0].excerpt == "方案 B。"
+
+
+def test_artifact_uses_candidate_for_legacy_state_without_approved(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    write_json(
+        paths["state"],
+        {
+            "schema_version": 1,
+            "project_id": "project-1",
+            "last_cursor": 1,
+            "last_content_hash": "a" * 64,
+            "last_sync_id": "sync-1",
+            "pending": None,
+        },
+    )
+    candidate = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context(excerpt="方案 B。"),
+    )
+
+    assert main(
+        artifact_args(paths, start_pending_run()),
+        input_stream=io.BytesIO(
+            canonical(candidate.model_dump(mode="json")).encode("utf-8")
+        ),
+        now=lambda: NOW,
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "artifact_written"
+    assert QwenProjectContextArtifact.model_validate_json(
+        paths["context"].read_bytes()
+    ).context.source_refs[0].excerpt == "方案 B。"
+
+
+@pytest.mark.parametrize("matches", [True, False])
+def test_artifact_pending_requires_exact_reconstruction(
+    tmp_path: Path,
+    capsys,
+    matches: bool,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    approved = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context(excerpt="采用 方案 B。"),
+    )
+    write_json(
+        paths["context"].with_name("context.approved.json"),
+        approved.model_dump(mode="json"),
+    )
+    pending_context = approved.context if matches else context(excerpt="方案 B。")
+    pending_envelope = sync_cli._build_envelope(
+        project(),
+        selected,
+        pending_context,
+        completed_retrieval_request_ids=(),
+        source_cursor=2,
+        now=NOW,
+    )
+    pending = {
+        "source_cursor": 2,
+        "content_hash": pending_envelope.content_hash,
+        "sync_id": pending_envelope.sync_id,
+        "completion_claims_hash": digest("[]"),
+    }
+    write_json(paths["state"], semantic_state(selected, approved, pending=pending))
+    before = paths["context"].read_bytes()
+
+    result = main(
+        artifact_args(paths, start_pending_run()),
+        input_stream=io.BytesIO(
+            canonical(approved.model_dump(mode="json")).encode("utf-8")
+        ),
+        now=lambda: NOW,
+    )
+    output = json.loads(capsys.readouterr().out)
+    if matches:
+        assert result == 0
+        assert output["status"] == "artifact_written"
+    else:
+        assert result == 1
+        assert output["error_type"] == "pending_sync_conflict"
+        assert paths["context"].read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"not-json", b"{}"],
+)
+def test_approved_reader_rejects_invalid_content(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    context_path = tmp_path / "context.json"
+    approved_path = context_path.with_name("context.approved.json")
+    approved_path.write_bytes(payload)
+    with pytest.raises(ValueError, match="approved_artifact_unavailable"):
+        sync_cli._read_approved_artifact(context_path, "a" * 64)
+
+
+def test_approved_reader_rejects_oversized_content(tmp_path: Path) -> None:
+    context_path = tmp_path / "context.json"
+    approved_path = context_path.with_name("context.approved.json")
+    approved_path.write_bytes(b"x" * (sync_cli.MAX_PRIVATE_INPUT_BYTES + 1))
+    with pytest.raises(ValueError, match="approved_artifact_unavailable"):
+        sync_cli._read_approved_artifact(context_path, "a" * 64)
+
+
+def test_approved_reader_rejects_hash_mismatch(tmp_path: Path) -> None:
+    context_path = tmp_path / "context.json"
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(
+        context_path.with_name("context.approved.json"),
+        approved.model_dump(mode="json"),
+    )
+    with pytest.raises(ValueError, match="approved_artifact_unavailable"):
+        sync_cli._read_approved_artifact(context_path, "a" * 64)
+
+
+def test_approved_reader_rejects_directory(tmp_path: Path) -> None:
+    context_path = tmp_path / "context.json"
+    context_path.with_name("context.approved.json").mkdir()
+    with pytest.raises(ValueError, match="approved_artifact_unavailable"):
+        sync_cli._read_approved_artifact(context_path, "a" * 64)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink"])
+def test_approved_reader_rejects_aliases(tmp_path: Path, kind: str) -> None:
+    context_path = tmp_path / "context.json"
+    approved_path = context_path.with_name("context.approved.json")
+    ordinary_context = tmp_path / "ordinary.json"
+    target = ordinary_context.with_name("ordinary.approved.json")
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(target, approved.model_dump(mode="json"))
+    expected_hash = artifact_hash(approved)
+    assert sync_cli._read_approved_artifact(
+        ordinary_context,
+        expected_hash,
+    ) == approved
+    try:
+        if kind == "symlink":
+            approved_path.symlink_to(target)
+        else:
+            sync_cli.os.link(target, approved_path)
+    except OSError as exc:
+        pytest.skip(f"{kind} unavailable: {exc}")
+    with pytest.raises(ValueError, match="approved_artifact_unavailable"):
+        sync_cli._read_approved_artifact(context_path, expected_hash)
+
+
+def test_approved_reader_rejects_hardlink_added_during_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    context_path = tmp_path / "context.json"
+    approved_path = context_path.with_name("context.approved.json")
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(approved_path, approved.model_dump(mode="json"))
+    expected_hash = artifact_hash(approved)
+    assert sync_cli._read_approved_artifact(context_path, expected_hash) == approved
+    alias = tmp_path / "late-alias.json"
+    path_type = type(approved_path)
+    real_lstat = path_type.lstat
+    calls = 0
+
+    def add_link_before_final_lstat(self):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        if self == approved_path:
+            calls += 1
+            if calls == 2:
+                try:
+                    sync_cli.os.link(approved_path, alias)
+                except OSError as exc:
+                    pytest.skip(f"hardlinks unavailable: {exc}")
+        return real_lstat(self)
+
+    monkeypatch.setattr(path_type, "lstat", add_link_before_final_lstat)
+    with pytest.raises(ValueError, match="approved_artifact_unavailable"):
+        sync_cli._read_approved_artifact(context_path, expected_hash)
+
+
+@pytest.mark.parametrize("command", ["artifact", "push"])
+def test_cli_rejects_derived_approved_state_overlap_before_effects(
+    tmp_path: Path,
+    capsys,
+    command: str,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    paths["state"] = paths["context"].with_name("context.approved.json")
+    before = {key: path.read_bytes() for key, path in paths.items() if path.exists()}
+    if command == "artifact":
+        argv = artifact_args(paths, start_pending_run())
+        kwargs = {
+            "input_stream": io.BytesIO(paths["context"].read_bytes()),
+            "now": lambda: NOW,
+        }
+    else:
+        argv = push_args(paths)
+        kwargs = {
+            "urlopen": lambda *_a, **_k: pytest.fail("overlap must precede network"),
+            "environ": {"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+        }
+
+    assert main(argv, **kwargs) == 1
+    assert json.loads(capsys.readouterr().out)["error_type"] == (
+        "private_paths_overlap"
+    )
+    assert {key: path.read_bytes() for key, path in paths.items() if path.exists()} == (
+        before
+    )
+
+
+def test_cli_rejects_derived_approved_samefile_alias_before_artifact_write(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    approved_path = paths["context"].with_name("context.approved.json")
+    try:
+        sync_cli.os.link(paths["sources"], approved_path)
+    except OSError as exc:
+        pytest.skip(f"hardlinks unavailable: {exc}")
+    before_sources = paths["sources"].read_bytes()
+    before_context = paths["context"].read_bytes()
+
+    assert main(
+        artifact_args(paths, start_pending_run()),
+        input_stream=io.BytesIO(before_context),
+        now=lambda: NOW,
+    ) == 1
+    assert json.loads(capsys.readouterr().out)["error_type"] == (
+        "private_paths_overlap"
+    )
+    assert paths["sources"].read_bytes() == before_sources
+    assert paths["context"].read_bytes() == before_context
+
+
+def test_approved_reader_rejects_final_lstat_race(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    context_path = tmp_path / "context.json"
+    approved_path = context_path.with_name("context.approved.json")
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(approved_path, approved.model_dump(mode="json"))
+    expected_hash = artifact_hash(approved)
+    replacement = tmp_path / "replacement.json"
+    replacement.write_bytes(b"replacement")
+    path_type = type(approved_path)
+    real_lstat = path_type.lstat
+    calls = 0
+
+    def raced_lstat(self):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        if self == approved_path:
+            calls += 1
+            if calls == 2:
+                return real_lstat(replacement)
+        return real_lstat(self)
+
+    monkeypatch.setattr(path_type, "lstat", raced_lstat)
+    with pytest.raises(ValueError, match="approved_artifact_unavailable"):
+        sync_cli._read_approved_artifact(context_path, expected_hash)
 
 
 def collect_args(paths: dict[str, Path], *extra: str) -> list[str]:
@@ -2163,8 +2788,12 @@ def test_push_uses_named_bearer_and_promotes_pending_state(
     assert sent.request.get_header("Content-type") == "application/json"
     assert sent.timeout == 30.0
     assert state == {
+        "last_artifact_hash": digest(paths["context"].read_text(encoding="utf-8")),
         "last_content_hash": request_payload["content_hash"],
         "last_cursor": 1,
+        "last_source_semantic_hash": source_bundle_semantic_hash(
+            DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+        ),
         "last_sync_id": request_payload["sync_id"],
         "pending": None,
         "project_id": "project-1",
@@ -2175,6 +2804,8 @@ def test_push_uses_named_bearer_and_promotes_pending_state(
     assert "sync_id" not in output
     assert "generation_id" not in output
     assert "private-token" not in canonical(output)
+    approved_path = paths["context"].with_name("context.approved.json")
+    assert approved_path.read_bytes() == paths["context"].read_bytes()
 
     lock_path = state_lock._state_lock_path(paths["state"], "project-1")
     assert lock_path.exists()
@@ -2451,8 +3082,12 @@ def test_failed_send_retains_pending_and_retry_reuses_identity(
         environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
     ) == 1
     first_output = json.loads(capsys.readouterr().out)
-    pending = json.loads(paths["state"].read_text(encoding="utf-8"))["pending"]
+    failed_state = json.loads(paths["state"].read_text(encoding="utf-8"))
+    pending = failed_state["pending"]
     assert first_output == {"status": "error", "error_type": "network_error"}
+    assert failed_state["last_source_semantic_hash"] is None
+    assert failed_state["last_artifact_hash"] is None
+    assert not paths["context"].with_name("context.approved.json").exists()
 
     sent = RecordingUrlOpen()
     assert main(
@@ -2462,6 +3097,75 @@ def test_failed_send_retains_pending_and_retry_reuses_identity(
     ) == 0
     capsys.readouterr()
     assert json.loads(sent.request.data)["sync_id"] == pending["sync_id"]
+
+
+def test_push_rolls_back_approved_when_state_promotion_interrupts(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    approved_path = paths["context"].with_name("context.approved.json")
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    old_approved = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context(excerpt="采用 方案"),
+    )
+    write_json(approved_path, old_approved.model_dump(mode="json"))
+    write_json(paths["state"], semantic_state(selected, old_approved))
+    old_approved_bytes = approved_path.read_bytes()
+    real_apply = sync_cli._RecoverableAtomicWrite.apply
+    pending_state_bytes: list[bytes] = []
+
+    def fail_state_after_replace(operation) -> None:  # type: ignore[no-untyped-def]
+        if operation._path == paths["state"]:
+            pending_state_bytes.append(paths["state"].read_bytes())
+        real_apply(operation)
+        if operation._path == paths["state"]:
+            raise RuntimeError("private-state-detail")
+
+    monkeypatch.setattr(
+        sync_cli._RecoverableAtomicWrite,
+        "apply",
+        fail_state_after_replace,
+    )
+
+    first_send = RecordingUrlOpen()
+    assert main(
+        push_args(paths),
+        urlopen=first_send,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 1
+    output = capsys.readouterr().out
+    assert json.loads(output) == {"status": "error", "error_type": "sync_failed"}
+    assert "private-state-detail" not in output
+    assert approved_path.read_bytes() == old_approved_bytes
+    assert pending_state_bytes
+    assert paths["state"].read_bytes() == pending_state_bytes[0]
+    failed_state = SyncCliState.model_validate_json(paths["state"].read_bytes())
+    assert failed_state.pending is not None
+    assert failed_state.last_artifact_hash == artifact_hash(old_approved)
+    assert failed_state.last_source_semantic_hash == source_bundle_semantic_hash(
+        selected
+    )
+
+    monkeypatch.setattr(sync_cli._RecoverableAtomicWrite, "apply", real_apply)
+    retry_send = RecordingUrlOpen()
+    assert main(
+        push_args(paths),
+        urlopen=retry_send,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 0
+    capsys.readouterr()
+    first_envelope = json.loads(first_send.request.data)
+    retry_envelope = json.loads(retry_send.request.data)
+    for field in (
+        "source_cursor",
+        "sync_id",
+        "content_hash",
+        "completed_retrieval_claims",
+    ):
+        assert retry_envelope[field] == first_envelope[field]
 
 
 def test_changed_content_conflicts_with_pending_without_network(
@@ -2531,7 +3235,11 @@ def test_invalid_success_response_is_sanitized_and_keeps_pending(
         "status": "error",
         "error_type": error_type,
     }
-    assert json.loads(paths["state"].read_text(encoding="utf-8"))["pending"]
+    state = json.loads(paths["state"].read_text(encoding="utf-8"))
+    assert state["pending"]
+    assert state["last_source_semantic_hash"] is None
+    assert state["last_artifact_hash"] is None
+    assert not paths["context"].with_name("context.approved.json").exists()
 
 
 def test_payload_over_limit_fails_before_state_or_network(
@@ -2704,7 +3412,11 @@ def test_default_transport_rejects_redirect_without_forwarding_bearer(
         "status": "error",
         "error_type": "http_error",
     }
-    assert json.loads(paths["state"].read_text(encoding="utf-8"))["pending"]
+    state = json.loads(paths["state"].read_text(encoding="utf-8"))
+    assert state["pending"]
+    assert state["last_source_semantic_hash"] is None
+    assert state["last_artifact_hash"] is None
+    assert not paths["context"].with_name("context.approved.json").exists()
 
 
 @pytest.mark.parametrize(

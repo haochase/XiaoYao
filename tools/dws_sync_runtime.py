@@ -90,7 +90,13 @@ def dispatch(
     argv = [command, "--project", config.project]
     if run_token:
         argv += ["--run-token", run_token]
-    if command in {"artifact", "collect", "host-import", "pending", "push"}:
+    if command in {
+        "artifact",
+        "collect",
+        "host-import",
+        "pending",
+        "push",
+    }:
         argv += ["--manifest", str(config.manifest)]
     if command == "collect":
         resolve_dws_launch(config.dws)
@@ -105,8 +111,9 @@ def dispatch(
         ]
     if command in {"artifact", "push"}:
         argv += ["--context-file", str(config.context_artifact)]
-    if command == "push":
+    if command in {"artifact", "push"}:
         argv += ["--state-file", str(config.state)]
+    if command == "push":
         if dry_run:
             argv += ["--dry-run"]
     environment = dict(os.environ)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -57,6 +58,7 @@ try:
         collect_sources,
     )
     from tools.dws_sync import lifecycle
+    from tools.dws_sync.runtime import approved_artifact_path
     from tools.dws_sync.host_bridge import (
         MAX_HOST_IMPORT_BYTES,
         import_single_document_bundle,
@@ -75,6 +77,7 @@ except ModuleNotFoundError as exc:
         collect_sources,
     )
     from dws_sync import lifecycle  # type: ignore[no-redef]
+    from dws_sync.runtime import approved_artifact_path  # type: ignore[no-redef]
     from dws_sync.host_bridge import (  # type: ignore[no-redef]
         MAX_HOST_IMPORT_BYTES,
         import_single_document_bundle,
@@ -134,6 +137,7 @@ _SAFE_GATEWAY_ERROR_TYPES = frozenset(
 )
 _PUBLIC_ERROR_TYPES = {
     "arguments_invalid",
+    "approved_artifact_unavailable",
     "authentication_failed",
     "context_collection_mismatch",
     "context_file_invalid",
@@ -167,6 +171,7 @@ _PUBLIC_ERROR_TYPES = {
     "payload_too_large",
     "pending_sync_conflict",
     "permission_denied",
+    "private_paths_overlap",
     "private_file_write_failed",
     "project_not_found",
     "provider_unavailable",
@@ -287,6 +292,8 @@ class SyncCliState(BaseModel):
     last_content_hash: str | None
     last_sync_id: str | None
     pending: PendingSync | None
+    last_source_semantic_hash: str | None = None
+    last_artifact_hash: str | None = None
 
     @field_validator("project_id")
     @classmethod
@@ -298,6 +305,13 @@ class SyncCliState(BaseModel):
     def validate_last_content_hash(cls, value: str | None) -> str | None:
         if value is not None and _SHA256.fullmatch(value) is None:
             raise ValueError("last_content_hash_invalid")
+        return value
+
+    @field_validator("last_source_semantic_hash", "last_artifact_hash")
+    @classmethod
+    def validate_artifact_hash(cls, value: str | None) -> str | None:
+        if value is not None and _SHA256.fullmatch(value) is None:
+            raise ValueError("state_artifact_hashes_invalid")
         return value
 
     @field_validator("last_sync_id")
@@ -314,6 +328,14 @@ class SyncCliState(BaseModel):
             raise ValueError("state_last_invalid")
         if self.last_cursor > 0 and not has_last:
             raise ValueError("state_last_invalid")
+        semantic_pair = (
+            self.last_source_semantic_hash,
+            self.last_artifact_hash,
+        )
+        if (semantic_pair[0] is None) != (semantic_pair[1] is None) or (
+            self.last_cursor == 0 and semantic_pair != (None, None)
+        ):
+            raise ValueError("state_artifact_hashes_invalid")
         if (
             self.pending is not None
             and self.pending.source_cursor != self.last_cursor + 1
@@ -356,6 +378,7 @@ def _parser() -> argparse.ArgumentParser:
     artifact.add_argument("--project", required=True)
     artifact.add_argument("--sources-file", required=True)
     artifact.add_argument("--context-file", required=True)
+    artifact.add_argument("--state-file", required=True)
     artifact.add_argument("--run-token", required=True)
 
     push = commands.add_parser("push", add_help=False)
@@ -384,6 +407,53 @@ def _absolute_private_path(raw_path: str, label: str) -> Path:
     if not path.parent.exists() or not path.parent.is_dir():
         raise ValueError(f"{label}_parent_invalid")
     return path
+
+
+def _validate_distinct_private_paths(paths: tuple[Path, ...]) -> None:
+    normalized = [
+        os.path.normcase(os.path.normpath(str(path))) for path in paths
+    ]
+    if len(set(normalized)) != len(paths):
+        raise ValueError("private_paths_overlap")
+    try:
+        for index, path in enumerate(paths):
+            for other in paths[index + 1 :]:
+                if path.exists() and other.exists() and path.samefile(other):
+                    raise ValueError("private_paths_overlap")
+    except ValueError:
+        raise
+    except OSError:
+        raise ValueError("private_paths_overlap") from None
+
+
+def _validated_sync_paths(
+    args: argparse.Namespace,
+) -> tuple[Path, Path, Path, Path]:
+    manifest_path = _absolute_private_path(args.manifest, "manifest")
+    sources_path = _absolute_private_path(args.sources_file, "sources_file")
+    context_path = _absolute_private_path(args.context_file, "context_file")
+    state_path = _absolute_private_path(args.state_file, "state_file")
+    _validate_distinct_private_paths(
+        (
+            manifest_path,
+            sources_path,
+            context_path,
+            approved_artifact_path(context_path),
+            state_path,
+        )
+    )
+    return manifest_path, sources_path, context_path, state_path
+
+
+def _safe_regular_file_stat(info: os.stat_result, *, max_bytes: int) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 1024)
+    return (
+        stat.S_ISREG(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and not getattr(info, "st_file_attributes", 0) & reparse_flag
+        and info.st_nlink == 1
+        and info.st_size <= max_bytes
+    )
 
 
 def _read_json_object(
@@ -458,26 +528,37 @@ class _RecoverableAtomicWrite:
         _atomic_write(self._path, self._data)
 
     def _read_original(self, path_stat: os.stat_result) -> bytes:
-        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 1024)
-        if not stat.S_ISREG(path_stat.st_mode) or (
-            getattr(path_stat, "st_file_attributes", 0) & reparse_flag
+        if not _safe_regular_file_stat(
+            path_stat,
+            max_bytes=MAX_PRIVATE_INPUT_BYTES,
         ):
             raise ValueError("private_file_write_failed")
         try:
             with self._path.open("rb") as stream:
                 opened_stat = os.fstat(stream.fileno())
                 if (
-                    not stat.S_ISREG(opened_stat.st_mode)
-                    or getattr(opened_stat, "st_file_attributes", 0)
-                    & reparse_flag
+                    not _safe_regular_file_stat(
+                        opened_stat,
+                        max_bytes=MAX_PRIVATE_INPUT_BYTES,
+                    )
                     or not os.path.samestat(path_stat, opened_stat)
-                    or opened_stat.st_size > MAX_PRIVATE_INPUT_BYTES
                 ):
                     raise ValueError("private_file_write_failed")
                 original = stream.read(MAX_PRIVATE_INPUT_BYTES + 1)
+                final_opened_stat = os.fstat(stream.fileno())
+            final_path_stat = self._path.lstat()
             if (
                 len(original) > MAX_PRIVATE_INPUT_BYTES
-                or not os.path.samestat(path_stat, self._path.lstat())
+                or not _safe_regular_file_stat(
+                    final_opened_stat,
+                    max_bytes=MAX_PRIVATE_INPUT_BYTES,
+                )
+                or not _safe_regular_file_stat(
+                    final_path_stat,
+                    max_bytes=MAX_PRIVATE_INPUT_BYTES,
+                )
+                or not os.path.samestat(path_stat, final_opened_stat)
+                or not os.path.samestat(path_stat, final_path_stat)
             ):
                 raise ValueError("private_file_write_failed")
         except ValueError:
@@ -524,6 +605,95 @@ def _bundle_hash_payload(source_bundle: DwsSourceBundle) -> dict[str, object]:
             for request in source_bundle.retrieval_requests
         ]
     return payload
+
+
+def source_bundle_semantic_hash(bundle: DwsSourceBundle) -> str:
+    fields = (
+        "source_type",
+        "source_id",
+        "permission_scope",
+        "status",
+        "source_title",
+        "source_url",
+        "source_version",
+        "source_time",
+        "attributes_json",
+        "content_hash",
+        "error_type",
+        "retryable",
+    )
+    records = sorted(
+        bundle.records,
+        key=lambda item: (item.source_type.value, item.source_id),
+    )
+    payload = {
+        "project_id": bundle.project_id,
+        "project_name": bundle.project_name,
+        "permission_scope": bundle.permission_scope,
+        "records": [
+            {field: item.model_dump(mode="json")[field] for field in fields}
+            for item in records
+        ],
+    }
+    return hashlib.sha256(_canonical_bytes(payload)).hexdigest()
+
+
+def _read_approved_artifact(
+    context_path: Path,
+    expected_hash: str,
+) -> QwenProjectContextArtifact:
+    path = approved_artifact_path(context_path)
+    try:
+        path_stat = path.lstat()
+        if not _safe_regular_file_stat(
+            path_stat,
+            max_bytes=MAX_PRIVATE_INPUT_BYTES,
+        ):
+            raise ValueError("approved_artifact_unavailable")
+        with path.open("rb") as stream:
+            opened_stat = os.fstat(stream.fileno())
+            if (
+                not _safe_regular_file_stat(
+                    opened_stat,
+                    max_bytes=MAX_PRIVATE_INPUT_BYTES,
+                )
+                or not os.path.samestat(path_stat, opened_stat)
+            ):
+                raise ValueError("approved_artifact_unavailable")
+            raw = stream.read(MAX_PRIVATE_INPUT_BYTES + 1)
+            final_opened_stat = os.fstat(stream.fileno())
+        final_path_stat = path.lstat()
+        if (
+            len(raw) > MAX_PRIVATE_INPUT_BYTES
+            or not _safe_regular_file_stat(
+                final_opened_stat,
+                max_bytes=MAX_PRIVATE_INPUT_BYTES,
+            )
+            or not _safe_regular_file_stat(
+                final_path_stat,
+                max_bytes=MAX_PRIVATE_INPUT_BYTES,
+            )
+            or not os.path.samestat(path_stat, final_opened_stat)
+            or not os.path.samestat(path_stat, final_path_stat)
+        ):
+            raise ValueError("approved_artifact_unavailable")
+        payload = json.loads(
+            raw.decode("utf-8"),
+            parse_constant=_reject_non_finite,
+        )
+        artifact = QwenProjectContextArtifact.model_validate(payload)
+        actual_hash = hashlib.sha256(
+            _canonical_bytes(artifact.model_dump(mode="json"))
+        ).hexdigest()
+        if not hmac.compare_digest(actual_hash, expected_hash):
+            raise ValueError("approved_artifact_unavailable")
+        return artifact
+    except ValueError as exc:
+        if str(exc) == "approved_artifact_unavailable":
+            raise
+        raise ValueError("approved_artifact_unavailable") from None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValidationError):
+        raise ValueError("approved_artifact_unavailable") from None
 
 
 def _validate_bundle(
@@ -1322,12 +1492,11 @@ def _artifact_command(
     input_stream: object,
     now: Callable[[], datetime],
 ) -> dict[str, object]:
-    manifest = DwsManifest.load(
-        _absolute_private_path(args.manifest, "manifest")
+    manifest_path, sources_path, context_path, state_path = (
+        _validated_sync_paths(args)
     )
+    manifest = DwsManifest.load(manifest_path)
     project = _selected_project(manifest, args.project)
-    sources_path = _absolute_private_path(args.sources_file, "sources_file")
-    context_path = _absolute_private_path(args.context_file, "context_file")
     sources_payload = _read_json_object(
         sources_path,
         "sources_file",
@@ -1353,35 +1522,84 @@ def _artifact_command(
         raise ValueError("context_file_invalid") from None
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         raise ValueError("context_file_invalid") from None
-    _validate_context(project, source_bundle, artifact.context)
-    encoded = _canonical_bytes(artifact.model_dump(mode="json"))
-    if len(encoded) > MAX_PRIVATE_INPUT_BYTES:
-        raise ValueError("context_file_too_large")
-    output_transaction = _RecoverableAtomicWrite(context_path, encoded)
+    selected_bytes: list[bytes] = []
+    output_transactions: list[_RecoverableAtomicWrite] = []
+
+    def apply() -> None:
+        state = _load_state(state_path, project.project_id)
+        semantic_hash = source_bundle_semantic_hash(source_bundle)
+        selected = artifact
+        if state.last_source_semantic_hash == semantic_hash:
+            assert state.last_artifact_hash is not None
+            approved = _read_approved_artifact(
+                context_path,
+                state.last_artifact_hash,
+            )
+            selected = QwenProjectContextArtifact(
+                schema_version=1,
+                context=approved.context.model_copy(
+                    update={"generated_at": source_bundle.collected_at}
+                ),
+                completed_retrieval_request_ids=(
+                    artifact.completed_retrieval_request_ids
+                ),
+            )
+        _validate_context(project, source_bundle, selected.context)
+        if state.pending is not None:
+            pending_envelope = _build_envelope(
+                project,
+                source_bundle,
+                selected.context,
+                completed_retrieval_request_ids=(
+                    selected.completed_retrieval_request_ids
+                ),
+                source_cursor=state.pending.source_cursor,
+                now=now(),
+            )
+            if (
+                pending_envelope.content_hash != state.pending.content_hash
+                or pending_envelope.sync_id != state.pending.sync_id
+                or _completion_claims_hash(
+                    pending_envelope.completed_retrieval_claims
+                )
+                != state.pending.completion_claims_hash
+            ):
+                raise ValueError("pending_sync_conflict")
+        encoded = _canonical_bytes(selected.model_dump(mode="json"))
+        if len(encoded) > MAX_PRIVATE_INPUT_BYTES:
+            raise ValueError("context_file_too_large")
+        transaction = _RecoverableAtomicWrite(context_path, encoded)
+        output_transactions.append(transaction)
+        selected_bytes.append(encoded)
+        transaction.apply()
+
+    def rollback() -> None:
+        if output_transactions:
+            output_transactions[0].rollback()
+
     lifecycle.commit_stage(
         project.project_id,
         args.run_token,
         expected="pending",
         target="artifact",
-        apply=output_transaction.apply,
-        rollback=output_transaction.rollback,
+        apply=apply,
+        rollback=rollback,
         root=LIFECYCLE_ROOT,
         now=now,
     )
     return {
         "status": "artifact_written",
         "project_id": project.project_id,
-        "output_bytes": len(encoded),
+        "output_bytes": len(selected_bytes[0]),
     }
 
 
 def _read_push_inputs(
     args: argparse.Namespace,
 ) -> tuple[DwsProjectManifest, DwsSourceBundle, QwenProjectContextArtifact, Path]:
-    manifest_path = _absolute_private_path(args.manifest, "manifest")
-    sources_path = _absolute_private_path(args.sources_file, "sources_file")
-    context_path = _absolute_private_path(args.context_file, "context_file")
-    state_path = _absolute_private_path(args.state_file, "state_file")
+    manifest_path, sources_path, context_path, state_path = (
+        _validated_sync_paths(args)
+    )
     manifest = DwsManifest.load(manifest_path)
     project = _selected_project(manifest, args.project)
     sources_payload = _read_json_object(
@@ -1549,8 +1767,35 @@ def _push_command(
             last_content_hash=envelope.content_hash,
             last_sync_id=envelope.sync_id,
             pending=None,
+            last_source_semantic_hash=source_bundle_semantic_hash(source_bundle),
+            last_artifact_hash=hashlib.sha256(
+                _canonical_bytes(artifact.model_dump(mode="json"))
+            ).hexdigest(),
         )
-        _atomic_write(state_path, _canonical_bytes(promoted.model_dump()))
+        transactions = (
+            _RecoverableAtomicWrite(
+                approved_artifact_path(
+                    _absolute_private_path(args.context_file, "context_file")
+                ),
+                _canonical_bytes(artifact.model_dump(mode="json")),
+            ),
+            _RecoverableAtomicWrite(
+                state_path,
+                _canonical_bytes(promoted.model_dump()),
+            ),
+        )
+        applied: list[_RecoverableAtomicWrite] = []
+        try:
+            for transaction in transactions:
+                applied.append(transaction)
+                transaction.apply()
+        except BaseException:
+            try:
+                for transaction in reversed(applied):
+                    transaction.rollback()
+            except BaseException:
+                raise ValueError("private_file_write_failed") from None
+            raise
         return {
             "status": "synced",
             "project_id": project.project_id,

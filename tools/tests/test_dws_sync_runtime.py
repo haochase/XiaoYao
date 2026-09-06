@@ -3,7 +3,12 @@ from pathlib import Path
 
 import pytest
 
-from tools.dws_sync.runtime import TaskConfig, load_runtime, prepare_runtime
+from tools.dws_sync.runtime import (
+    TaskConfig,
+    approved_artifact_path,
+    load_runtime,
+    prepare_runtime,
+)
 from tools.tests.test_dws_project_sync import project, write_manifest
 
 
@@ -87,6 +92,39 @@ def test_runtime_refuses_overlapping_outputs(tmp_path: Path) -> None:
     }
     with pytest.raises(ValueError, match="runtime_paths_overlap"):
         TaskConfig.model_validate(config)
+
+
+def test_approved_artifact_path_is_derived_without_changing_config_dump(
+    tmp_path: Path,
+) -> None:
+    config = TaskConfig(
+        schema_version=1,
+        project="project-1",
+        manifest=tmp_path / "manifest.json",
+        dws=tmp_path / "dws.exe",
+        source_bundle=tmp_path / "source-bundle.json",
+        context_artifact=tmp_path / "context-artifact.json",
+        state=tmp_path / "sync-state.json",
+    )
+    assert approved_artifact_path(config.context_artifact) == (
+        tmp_path / "context-artifact.approved.json"
+    )
+    assert "approved" not in config.model_dump(mode="json")
+
+
+def test_runtime_refuses_path_overlapping_derived_approved_artifact(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="runtime_paths_overlap"):
+        TaskConfig(
+            schema_version=1,
+            project="project-1",
+            manifest=tmp_path / "manifest.json",
+            dws=tmp_path / "dws.exe",
+            source_bundle=tmp_path / "context-artifact.approved.json",
+            context_artifact=tmp_path / "context-artifact.json",
+            state=tmp_path / "sync-state.json",
+        )
 
 
 def test_wrapper_injects_token_only_for_network_commands(tmp_path: Path, monkeypatch) -> None:
@@ -196,6 +234,8 @@ def test_artifact_maps_fixed_inputs_and_does_not_decrypt_credential(
         str(tmp_path / ".private/dws-runtime/source-bundle.json"),
         "--context-file",
         str(tmp_path / ".private/dws-runtime/context-artifact.json"),
+        "--state-file",
+        str(tmp_path / ".private/dws-runtime/sync-state.json"),
     ]
     assert kwargs["input_stream"] is stdin
     assert "COMPANION_DWS_SYNC_TOKEN" not in kwargs["environ"]
