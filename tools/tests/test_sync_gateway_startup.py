@@ -207,17 +207,27 @@ def test_sync_powershell_runner_serves_and_propagates_exit_code(tmp_path: Path) 
     project, scripts, python = make_fake_sync_project(tmp_path)
     (project / ".private" / "dws-runtime").mkdir(parents=True)
     record = tmp_path / "serve.txt"
+    sleeps = tmp_path / "serve-sleeps.txt"
     environment = os.environ.copy()
     environment.update(TASK3_RECORD=str(record), TASK3_EXIT="37")
+    harness = tmp_path / "serve-exit-harness.ps1"
+    harness.write_text(
+        f'''function Start-Sleep {{
+    param([int]$Seconds)
+    Add-Content -LiteralPath {powershell_literal(sleeps)} -Value $Seconds
+}}
+& {powershell_literal(scripts / "run-xiaoyao-sync.ps1")} -PythonPath {powershell_literal(python)}
+exit $LASTEXITCODE
+''',
+        encoding="utf-8",
+    )
 
     completed = subprocess.run(
         [
             "powershell.exe",
             "-NoProfile",
             "-File",
-            str(scripts / "run-xiaoyao-sync.ps1"),
-            "-PythonPath",
-            str(python),
+            str(harness),
         ],
         check=False,
         capture_output=True,
@@ -227,6 +237,7 @@ def test_sync_powershell_runner_serves_and_propagates_exit_code(tmp_path: Path) 
 
     assert completed.returncode == 37
     assert "command=serve" in record.read_text(encoding="utf-8").lower()
+    assert sleeps.read_text(encoding="utf-8").splitlines() == ["60"] * 3
 
 
 def test_sync_powershell_runner_stops_when_temp_directory_creation_fails(
@@ -254,6 +265,47 @@ function New-Item {{ Write-Error "simulated temp creation failure" }}
 
     assert completed.returncode != 0
     assert not marker.exists()
+
+
+def test_sync_powershell_runner_restarts_failed_serve_child(
+    tmp_path: Path,
+) -> None:
+    project, scripts, _python = make_fake_sync_project(tmp_path)
+    (project / ".private" / "dws-runtime").mkdir(parents=True)
+    counter = tmp_path / "attempts.txt"
+    sleeps = tmp_path / "sleeps.txt"
+    python = tmp_path / "retry-python.cmd"
+    python.write_text(
+        "@echo off\r\n"
+        f'set /p COUNT=<"{counter}" 2>nul\r\n'
+        "if not defined COUNT set COUNT=0\r\n"
+        "set /a COUNT+=1\r\n"
+        f'>"{counter}" echo %COUNT%\r\n'
+        "if %COUNT%==1 exit /b 37\r\n"
+        "exit /b 0\r\n",
+        encoding="ascii",
+    )
+    harness = tmp_path / "retry-harness.ps1"
+    harness.write_text(
+        f'''function Start-Sleep {{
+    param([int]$Seconds)
+    Add-Content -LiteralPath {powershell_literal(sleeps)} -Value $Seconds
+}}
+& {powershell_literal(scripts / "run-xiaoyao-sync.ps1")} -PythonPath {powershell_literal(python)}
+''',
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-File", str(harness)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert counter.read_text(encoding="ascii").strip() == "2"
+    assert sleeps.read_text(encoding="utf-8").strip() == "60"
 
 
 def test_sync_task_registration_whatif_is_a_zero_side_effect_plan(

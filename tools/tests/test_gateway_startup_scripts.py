@@ -238,7 +238,7 @@ def test_sync_runner_propagates_python_exit_code(tmp_path: Path) -> None:
     fake_python = tmp_path / "fake-python.cmd"
     fake_python.write_text(
         "@echo off\r\n"
-        'if /I "%~nx1"=="dws_sync_runtime.py" if /I "%~2"=="serve" exit /b 37\r\n'
+        'if /I "%~nx1"=="dws_sync_runtime.py" if /I "%~2"=="check" exit /b 37\r\n'
         "exit /b 99\r\n",
         encoding="ascii",
     )
@@ -251,6 +251,7 @@ def test_sync_runner_propagates_python_exit_code(tmp_path: Path) -> None:
             str(scripts / "run-xiaoyao-sync.ps1"),
             "-PythonPath",
             str(fake_python),
+            "-Check",
         ],
         check=False,
         capture_output=True,

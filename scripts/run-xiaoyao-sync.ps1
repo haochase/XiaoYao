@@ -33,14 +33,21 @@ $previousTemp = $env:TEMP
 $previousTmp = $env:TMP
 $locationPushed = $false
 $runnerExitCode = 0
+$maxAttempts = if ($Check) { 1 } else { 4 }
 
 try {
     $env:TEMP = $tempRoot
     $env:TMP = $tempRoot
     Push-Location $projectRoot
     $locationPushed = $true
-    & $python $runtimeRunner $command
-    $runnerExitCode = $LASTEXITCODE
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        & $python $runtimeRunner $command
+        $runnerExitCode = $LASTEXITCODE
+        if ($runnerExitCode -eq 0 -or $attempt -eq $maxAttempts) {
+            break
+        }
+        Start-Sleep -Seconds 60
+    }
 } finally {
     if ($locationPushed) {
         Pop-Location
