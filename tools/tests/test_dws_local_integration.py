@@ -22,6 +22,7 @@ from companion_gateway.project.protection import (
     protection_identity_digest,
 )
 from companion_gateway.project.sync_repository import ProjectSyncRepository
+import tools.dws_project_sync as sync_cli
 from tools.dws_project_sync import QwenProjectContextArtifact
 from tools.dws_sync import (
     DwsRetrievalRequest,
@@ -444,6 +445,25 @@ def _start_listener(
         stderr=subprocess.DEVNULL,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
+
+
+@pytest.mark.parametrize(
+    "opcode",
+    [
+        sqlite3.SQLITE_INSERT,
+        sqlite3.SQLITE_UPDATE,
+        sqlite3.SQLITE_DELETE,
+        sqlite3.SQLITE_CREATE_TABLE,
+        sqlite3.SQLITE_DROP_TABLE,
+        sqlite3.SQLITE_ATTACH,
+    ],
+)
+def test_pending_recovery_sqlite_authorizer_denies_write_opcodes(
+    opcode: int,
+) -> None:
+    assert sync_cli._recovery_sqlite_authorizer(
+        opcode, "table", "column", None, None
+    ) == sqlite3.SQLITE_DENY
 
 
 def test_host_import_subprocess_fixture_preserves_unicode(

@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import hmac
 import json
 import os
 import re
+import sqlite3
 import stat
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -170,6 +173,7 @@ _PUBLIC_ERROR_TYPES = {
     "output_parent_invalid",
     "payload_too_large",
     "pending_sync_conflict",
+    "pending_recovery_denied",
     "permission_denied",
     "private_paths_overlap",
     "private_file_write_failed",
@@ -193,6 +197,9 @@ _PUBLIC_ERROR_TYPES = {
     "state_file_parent_invalid",
     "state_file_too_large",
     "state_project_mismatch",
+    "database_file_not_absolute",
+    "database_file_parent_invalid",
+    "database_file_not_regular_file",
     "sync_lock_timeout",
     "sync_failed",
     "token_invalid",
@@ -390,6 +397,14 @@ def _parser() -> argparse.ArgumentParser:
     push.add_argument("--gateway", required=True)
     push.add_argument("--dry-run", action="store_true")
     push.add_argument("--run-token")
+
+    recover_pending = commands.add_parser("recover-pending", add_help=False)
+    recover_pending.add_argument("--manifest", required=True)
+    recover_pending.add_argument("--project", required=True)
+    recover_pending.add_argument("--sources-file", required=True)
+    recover_pending.add_argument("--context-file", required=True)
+    recover_pending.add_argument("--state-file", required=True)
+    recover_pending.add_argument("--database-file", required=True)
 
     begin = commands.add_parser("begin", add_help=False)
     begin.add_argument("--project", required=True)
@@ -1627,6 +1642,534 @@ def _read_push_inputs(
     return project, source_bundle, artifact, state_path
 
 
+_RECOVERY_DATABASE_SIDECARS = ("-wal", "-shm", "-journal")
+
+
+def _normalized_path(path: Path) -> str:
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def _recovery_database_path(raw_path: str, private_paths: tuple[Path, ...]) -> Path:
+    path = Path(raw_path)
+    if not path.is_absolute():
+        raise ValueError("database_file_not_absolute")
+    if not path.parent.exists() or not path.parent.is_dir():
+        raise ValueError("database_file_parent_invalid")
+    try:
+        resolved = path.resolve(strict=True)
+        if path.drive.upper() != "E:" or resolved.drive.upper() != "E:":
+            raise ValueError("database_file_not_regular_file")
+        for current in (*reversed(path.parents), path):
+            info = current.lstat()
+            if stat.S_ISLNK(info.st_mode) or (
+                getattr(info, "st_file_attributes", 0) & 1024
+            ):
+                raise ValueError("database_file_not_regular_file")
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("database_file_not_regular_file")
+        database_paths = (
+            resolved,
+            *(
+                Path(str(resolved) + suffix)
+                for suffix in _RECOVERY_DATABASE_SIDECARS
+            ),
+        )
+        for database_candidate in database_paths:
+            for private_path in private_paths:
+                if _normalized_path(database_candidate) == _normalized_path(
+                    private_path
+                ) or (
+                    database_candidate.exists()
+                    and private_path.exists()
+                    and database_candidate.samefile(private_path)
+                ):
+                    raise ValueError("database_file_not_regular_file")
+    except ValueError:
+        raise
+    except OSError:
+        raise ValueError("database_file_not_regular_file") from None
+    return resolved
+
+
+def _database_file_identity(info: os.stat_result) -> tuple[int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def _open_recovery_database_handle(path: Path) -> int:
+    if os.name != "nt":
+        _pending_recovery_denied()
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        )
+        create_file.restype = ctypes.c_void_p
+        handle = create_file(
+            str(path),
+            0x80000000,  # GENERIC_READ
+            0x00000001,  # FILE_SHARE_READ
+            None,
+            3,  # OPEN_EXISTING
+            0x00000080,  # FILE_ATTRIBUTE_NORMAL
+            None,
+        )
+        if handle in {None, ctypes.c_void_p(-1).value}:
+            _pending_recovery_denied()
+        return int(handle)
+    except ValueError:
+        raise
+    except Exception:
+        _pending_recovery_denied()
+
+
+def _close_recovery_database_handle(handle: int) -> None:
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (ctypes.c_void_p,)
+        close_handle.restype = ctypes.c_int
+        if not close_handle(ctypes.c_void_p(handle)):
+            _pending_recovery_denied()
+    except ValueError:
+        raise
+    except Exception:
+        _pending_recovery_denied()
+
+
+def _read_recovery_database_header(handle: int) -> bytes:
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        set_pointer = kernel32.SetFilePointerEx
+        set_pointer.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_longlong,
+            ctypes.POINTER(ctypes.c_longlong),
+            ctypes.c_uint32,
+        )
+        set_pointer.restype = ctypes.c_int
+        position = ctypes.c_longlong()
+        if not set_pointer(
+            ctypes.c_void_p(handle),
+            ctypes.c_longlong(0),
+            ctypes.byref(position),
+            0,
+        ):
+            _pending_recovery_denied()
+        read_file = kernel32.ReadFile
+        read_file.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_void_p,
+        )
+        read_file.restype = ctypes.c_int
+        buffer = (ctypes.c_ubyte * 20)()
+        read_count = ctypes.c_uint32()
+        if not read_file(
+            ctypes.c_void_p(handle),
+            buffer,
+            len(buffer),
+            ctypes.byref(read_count),
+            None,
+        ):
+            _pending_recovery_denied()
+        return bytes(buffer[: read_count.value])
+    except ValueError:
+        raise
+    except Exception:
+        _pending_recovery_denied()
+
+
+@contextmanager
+def _recovery_database_guard(path: Path) -> Iterator[int]:
+    try:
+        handle = _open_recovery_database_handle(path)
+    except Exception:
+        _pending_recovery_denied()
+    try:
+        yield handle
+    finally:
+        _close_recovery_database_handle(handle)
+
+
+def _recovery_database_snapshot(
+    path: Path,
+    handle: int,
+) -> tuple[int, int, int, int]:
+    try:
+        path_stat = path.lstat()
+        if (
+            not stat.S_ISREG(path_stat.st_mode)
+            or stat.S_ISLNK(path_stat.st_mode)
+            or getattr(path_stat, "st_file_attributes", 0) & 1024
+            or path_stat.st_nlink != 1
+        ):
+            _pending_recovery_denied()
+        for suffix in _RECOVERY_DATABASE_SIDECARS:
+            try:
+                Path(str(path) + suffix).lstat()
+            except FileNotFoundError:
+                continue
+            _pending_recovery_denied()
+        header = _read_recovery_database_header(handle)
+        final_path_stat = path.lstat()
+        if (
+            len(header) != 20
+            or header[:16] != b"SQLite format 3\0"
+            or header[18] != 1
+            or header[19] != 1
+            or not os.path.samestat(path_stat, final_path_stat)
+            or _database_file_identity(path_stat)
+            != _database_file_identity(final_path_stat)
+        ):
+            _pending_recovery_denied()
+    except ValueError:
+        raise
+    except OSError:
+        _pending_recovery_denied()
+    return _database_file_identity(path_stat)
+
+
+def _recovery_sqlite_authorizer(
+    action: int,
+    first: str | None,
+    second: str | None,
+    _database: str | None,
+    _trigger: str | None,
+) -> int:
+    if action in {
+        sqlite3.SQLITE_READ,
+        sqlite3.SQLITE_SELECT,
+        sqlite3.SQLITE_FUNCTION,
+        sqlite3.SQLITE_RECURSIVE,
+    }:
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_PRAGMA:
+        if first == "query_only" and second == "ON":
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_TRANSACTION and first in {
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+    }:
+        return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+
+
+def _pending_recovery_denied() -> None:
+    raise ValueError("pending_recovery_denied")
+
+
+def _load_recovery_state(path: Path, project_id: str) -> SyncCliState:
+    payload = _read_json_object(path, "state_file", max_bytes=MAX_STATE_BYTES)
+    try:
+        state = SyncCliState.model_validate(payload)
+    except (TypeError, ValueError) as exc:
+        if "state_pending_cursor_invalid" in str(exc):
+            _pending_recovery_denied()
+        raise ValueError("state_file_invalid") from None
+    if state.project_id != project_id:
+        raise ValueError("state_project_mismatch")
+    return state
+
+
+def _recovery_source_time(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        _pending_recovery_denied()
+    return parsed
+
+
+def _prove_pending_recovery(
+    database_path: Path,
+    database_handle: int,
+    project: DwsProjectManifest,
+    source_bundle: DwsSourceBundle,
+    state: SyncCliState,
+    *,
+    now: datetime,
+    expected_database_snapshot: tuple[int, int, int, int],
+) -> QwenProjectContextArtifact:
+    pending = state.pending
+    if pending is None or state.last_cursor < 1 or state.last_content_hash is None:
+        _pending_recovery_denied()
+    if (
+        pending.sync_id
+        != _sync_id(
+            project.project_id,
+            pending.source_cursor,
+            pending.content_hash,
+        )
+    ):
+        _pending_recovery_denied()
+    if pending.completion_claims_hash != _completion_claims_hash(()):
+        _pending_recovery_denied()
+    if source_bundle.retrieval_requests or any(
+        record.status != "active" for record in source_bundle.records
+    ):
+        _pending_recovery_denied()
+
+    if (
+        _recovery_database_snapshot(database_path, database_handle)
+        != expected_database_snapshot
+    ):
+        _pending_recovery_denied()
+    uri = f"{database_path.as_uri()}?mode=ro"
+    try:
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            connection.set_authorizer(_recovery_sqlite_authorizer)
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            active_rows = connection.execute(
+                """
+                SELECT generation.generation_id, generation.source_cursor,
+                       generation.content_hash, generation.context_json
+                FROM project_active_generations AS active
+                JOIN project_sync_generations AS generation
+                  ON generation.project_id = active.project_id
+                 AND generation.generation_id = active.generation_id
+                WHERE active.project_id = ?
+                """,
+                (project.project_id,),
+            ).fetchall()
+            if len(active_rows) != 1:
+                _pending_recovery_denied()
+            generation_id, active_cursor, active_hash, context_json = active_rows[0]
+            if (
+                active_cursor != state.last_cursor
+                or active_hash != state.last_content_hash
+            ):
+                _pending_recovery_denied()
+            generation_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM project_sync_generations
+                WHERE sync_id = ? OR (project_id = ? AND source_cursor = ?)
+                """,
+                (pending.sync_id, project.project_id, pending.source_cursor),
+            ).fetchone()
+            audit_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM project_sync_audits
+                WHERE sync_id = ?
+                """,
+                (pending.sync_id,),
+            ).fetchone()
+            retrieval_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM project_retrieval_requests
+                WHERE project_id = ? AND status = 'in_progress'
+                """,
+                (project.project_id,),
+            ).fetchone()
+            if (
+                generation_count != (0,)
+                or audit_count != (0,)
+                or retrieval_count != (0,)
+            ):
+                _pending_recovery_denied()
+            source_rows = connection.execute(
+                """
+                SELECT source_type, source_id_hash, status, source_version,
+                       source_time, content_hash, permission_hash
+                FROM project_source_states
+                WHERE project_id = ? AND generation_id = ?
+                """,
+                (project.project_id, generation_id),
+            ).fetchall()
+    except ValueError:
+        raise
+    except (OSError, sqlite3.Error):
+        _pending_recovery_denied()
+    if (
+        _recovery_database_snapshot(database_path, database_handle)
+        != expected_database_snapshot
+    ):
+        _pending_recovery_denied()
+
+    expected_sources = {
+        (record.source_type.value, _sha256(record.source_id)): record
+        for record in source_bundle.records
+    }
+    if len(expected_sources) != len(source_bundle.records):
+        _pending_recovery_denied()
+    actual_sources = {(row[0], row[1]): row for row in source_rows}
+    if (
+        len(actual_sources) != len(source_rows)
+        or actual_sources.keys() != expected_sources.keys()
+    ):
+        _pending_recovery_denied()
+    try:
+        for identity, record in expected_sources.items():
+            row = actual_sources[identity]
+            if (
+                row[2] != record.status
+                or row[3] != record.source_version
+                or _recovery_source_time(row[4]) != record.source_time
+                or row[5] != record.content_hash
+                or row[6] != _sha256(record.permission_scope)
+            ):
+                _pending_recovery_denied()
+        context_payload = json.loads(
+            context_json, parse_constant=_reject_non_finite
+        )
+        context = ProjectContextPackage.model_validate(context_payload).model_copy(
+            update={"generated_at": source_bundle.collected_at}
+        )
+        _validate_context(project, source_bundle, context)
+        envelope = _build_envelope(
+            project,
+            source_bundle,
+            context,
+            completed_retrieval_request_ids=(),
+            source_cursor=state.last_cursor,
+            now=now,
+        )
+    except ValueError as exc:
+        if str(exc) == "pending_recovery_denied":
+            raise
+        _pending_recovery_denied()
+    except (TypeError, json.JSONDecodeError, ValidationError):
+        _pending_recovery_denied()
+    if not hmac.compare_digest(envelope.content_hash, str(active_hash)):
+        _pending_recovery_denied()
+    return QwenProjectContextArtifact(
+        schema_version=1,
+        context=context,
+        completed_retrieval_request_ids=(),
+    )
+
+
+def _recover_pending_with_database_guard(
+    args: argparse.Namespace,
+    database_path: Path,
+    database_handle: int,
+    manifest_path: Path,
+    sources_path: Path,
+    context_path: Path,
+    state_path: Path,
+    applied: list[_RecoverableAtomicWrite],
+    *,
+    now: Callable[[], datetime],
+) -> dict[str, object]:
+    manifest = DwsManifest.load(manifest_path)
+    project = _selected_project(manifest, args.project)
+    sources_payload = _read_json_object(
+        sources_path,
+        "sources_file",
+        max_bytes=MAX_PRIVATE_INPUT_BYTES,
+    )
+    try:
+        source_bundle = DwsSourceBundle.model_validate(sources_payload)
+    except (TypeError, ValueError):
+        raise ValueError("sources_file_invalid") from None
+    _validate_bundle(project, source_bundle)
+    state = _load_recovery_state(state_path, project.project_id)
+    database_snapshot = _recovery_database_snapshot(
+        database_path, database_handle
+    )
+    artifact = _prove_pending_recovery(
+        database_path,
+        database_handle,
+        project,
+        source_bundle,
+        state,
+        now=now(),
+        expected_database_snapshot=database_snapshot,
+    )
+    pending = state.pending
+    assert pending is not None
+    encoded = _canonical_bytes(artifact.model_dump(mode="json"))
+    promoted = state.model_copy(
+        update={
+            "pending": None,
+            "last_source_semantic_hash": source_bundle_semantic_hash(
+                source_bundle
+            ),
+            "last_artifact_hash": hashlib.sha256(encoded).hexdigest(),
+        }
+    )
+    if (
+        _recovery_database_snapshot(database_path, database_handle)
+        != database_snapshot
+    ):
+        _pending_recovery_denied()
+    transactions = (
+        _RecoverableAtomicWrite(approved_artifact_path(context_path), encoded),
+        _RecoverableAtomicWrite(context_path, encoded),
+        _RecoverableAtomicWrite(
+            state_path, _canonical_bytes(promoted.model_dump())
+        ),
+    )
+    for transaction in transactions:
+        applied.append(transaction)
+        transaction.apply()
+    return {
+        "status": "pending_recovered",
+        "project_id": project.project_id,
+        "active_cursor": state.last_cursor,
+        "abandoned_pending_cursor": pending.source_cursor,
+    }
+
+
+def _recover_pending_command(
+    args: argparse.Namespace,
+    *,
+    now: Callable[[], datetime],
+) -> dict[str, object]:
+    with lifecycle.manual_guard(
+        args.project,
+        root=LIFECYCLE_ROOT,
+        now=now,
+        timeout=SYNC_LOCK_TIMEOUT_SECONDS,
+    ):
+        manifest_path, sources_path, context_path, state_path = (
+            _validated_sync_paths(args)
+        )
+        database_path = _recovery_database_path(
+            args.database_file,
+            (
+                manifest_path,
+                sources_path,
+                context_path,
+                approved_artifact_path(context_path),
+                state_path,
+            ),
+        )
+        applied: list[_RecoverableAtomicWrite] = []
+        try:
+            with _recovery_database_guard(database_path) as database_handle:
+                return _recover_pending_with_database_guard(
+                    args,
+                    database_path,
+                    database_handle,
+                    manifest_path,
+                    sources_path,
+                    context_path,
+                    state_path,
+                    applied,
+                    now=now,
+                )
+        except BaseException:
+            try:
+                for transaction in reversed(applied):
+                    transaction.rollback()
+            except BaseException:
+                raise ValueError("private_file_write_failed") from None
+            raise
+
+
 def _push_command(
     args: argparse.Namespace,
     *,
@@ -1831,6 +2374,7 @@ def main(
             "host-import",
             "end",
             "pending",
+            "recover-pending",
             "push",
         }:
             output: dict[str, object] = {
@@ -1845,6 +2389,7 @@ def main(
                     "collect",
                     "host-import",
                     "pending",
+                    "recover-pending",
                     "artifact",
                     "push",
                     "end",
@@ -1891,6 +2436,8 @@ def main(
                 ),
                 now=now,
             )
+        elif args.command == "recover-pending":
+            output = _recover_pending_command(args, now=now)
         elif args.command == "end":
             ended = lifecycle.end_run(
                 args.project,

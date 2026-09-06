@@ -35,6 +35,7 @@ COMMANDS = (
     "collect",
     "host-import",
     "pending",
+    "recover-pending",
     "artifact",
     "push",
     "end",
@@ -96,6 +97,7 @@ def dispatch(
         "host-import",
         "pending",
         "push",
+        "recover-pending",
     }:
         argv += ["--manifest", str(config.manifest)]
     if command == "collect":
@@ -103,16 +105,18 @@ def dispatch(
         argv += ["--dws-path", str(config.dws), "--output", str(config.source_bundle)]
     if command == "host-import":
         argv += ["--output", str(config.source_bundle)]
-    if command in {"artifact", "pending", "push"}:
+    if command in {"artifact", "pending", "push", "recover-pending"}:
         argv += ["--sources-file", str(config.source_bundle)]
     if command in {"pending", "push"}:
         argv += [
             "--gateway", "http://127.0.0.1:8731",
         ]
-    if command in {"artifact", "push"}:
+    if command in {"artifact", "push", "recover-pending"}:
         argv += ["--context-file", str(config.context_artifact)]
-    if command in {"artifact", "push"}:
+    if command in {"artifact", "push", "recover-pending"}:
         argv += ["--state-file", str(config.state)]
+    if command == "recover-pending":
+        argv += ["--database-file", str(runtime_database(root))]
     if command == "push":
         if dry_run:
             argv += ["--dry-run"]
@@ -162,7 +166,7 @@ def main(
     commands.add_parser("serve")
     for command in COMMANDS:
         sub = commands.add_parser(command)
-        if command != "begin":
+        if command not in {"begin", "recover-pending"}:
             sub.add_argument("--run-token", required=True)
         if command == "push":
             sub.add_argument("--dry-run", action="store_true")

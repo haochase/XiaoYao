@@ -6,7 +6,9 @@ import hashlib
 import io
 import json
 import multiprocessing
+import os
 import re
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -263,6 +265,927 @@ def artifact_args(paths: dict[str, Path], run_token: str) -> list[str]:
         "--run-token",
         run_token,
     ]
+
+
+def recover_pending_args(
+    paths: dict[str, Path], database: Path
+) -> list[str]:
+    return [
+        "recover-pending",
+        "--manifest",
+        str(paths["manifest"]),
+        "--project",
+        "project-1",
+        "--sources-file",
+        str(paths["sources"]),
+        "--context-file",
+        str(paths["context"]),
+        "--state-file",
+        str(paths["state"]),
+        "--database-file",
+        str(database),
+    ]
+
+
+def write_pending_recovery_fixture(
+    tmp_path: Path,
+) -> tuple[dict[str, Path], Path, QwenProjectContextArtifact]:
+    paths = write_push_inputs(tmp_path)
+    selected = bundle()
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    active = sync_cli._build_envelope(
+        project(),
+        selected,
+        approved.context,
+        completed_retrieval_request_ids=(),
+        source_cursor=1,
+        now=NOW,
+    )
+    pending = sync_cli._build_envelope(
+        project(),
+        selected,
+        approved.context,
+        completed_retrieval_request_ids=(),
+        source_cursor=2,
+        now=NOW,
+    )
+    write_json(paths["sources"], selected.model_dump(mode="json"))
+    write_json(paths["context"], {"old": "current"})
+    write_json(
+        paths["context"].with_name("context.approved.json"),
+        {"old": "approved"},
+    )
+    state = semantic_state(
+        selected,
+        approved,
+        pending={
+            "source_cursor": 2,
+            "content_hash": pending.content_hash,
+            "sync_id": pending.sync_id,
+            "completion_claims_hash": digest("[]"),
+        },
+    )
+    state["last_content_hash"] = active.content_hash
+    state["last_sync_id"] = "older-client-sync-id"
+    write_json(paths["state"], state)
+
+    database = tmp_path / "companion.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE project_sync_generations (
+                project_id TEXT NOT NULL,
+                generation_id TEXT NOT NULL,
+                sync_id TEXT NOT NULL,
+                source_cursor INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                completion_claims_hash TEXT NOT NULL,
+                context_json TEXT NOT NULL
+            );
+            CREATE TABLE project_active_generations (
+                project_id TEXT NOT NULL,
+                generation_id TEXT NOT NULL
+            );
+            CREATE TABLE project_source_states (
+                project_id TEXT NOT NULL,
+                generation_id TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_id_hash TEXT NOT NULL,
+                source_version TEXT,
+                source_time TEXT,
+                content_hash TEXT,
+                permission_hash TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE project_sync_audits (
+                sync_id TEXT NOT NULL,
+                project_id TEXT NOT NULL
+            );
+            CREATE TABLE project_retrieval_requests (
+                request_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO project_sync_generations VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "project-1",
+                "generation-1",
+                active.sync_id,
+                1,
+                active.content_hash,
+                digest("[]"),
+                canonical(approved.context.model_dump(mode="json")),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO project_active_generations VALUES (?, ?)",
+            ("project-1", "generation-1"),
+        )
+        record = selected.records[0]
+        connection.execute(
+            "INSERT INTO project_source_states VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "project-1",
+                "generation-1",
+                record.source_type.value,
+                digest(record.source_id),
+                record.source_version,
+                record.source_time.astimezone(UTC).isoformat().replace(
+                    "+00:00", "Z"
+                ),
+                record.content_hash,
+                digest(record.permission_scope),
+                record.status,
+            ),
+        )
+    connection.close()
+    return paths, database, approved
+
+
+def recovery_snapshot(
+    paths: dict[str, Path], database: Path
+) -> dict[Path, tuple[bool, bytes]]:
+    watched = (
+        paths["context"].with_name("context.approved.json"),
+        paths["context"],
+        paths["state"],
+        database,
+        Path(str(database) + "-wal"),
+        Path(str(database) + "-shm"),
+        Path(str(database) + "-journal"),
+    )
+    return {
+        path: (path.exists(), path.read_bytes() if path.exists() else b"")
+        for path in watched
+    }
+
+
+def database_snapshot(database: Path) -> dict[Path, tuple[bool, bytes]]:
+    return {
+        path: (path.exists(), path.read_bytes() if path.exists() else b"")
+        for path in (
+            database,
+            Path(str(database) + "-wal"),
+            Path(str(database) + "-shm"),
+            Path(str(database) + "-journal"),
+        )
+    }
+
+
+def test_recover_pending_rebuilds_active_artifacts_and_checkpoints(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths, database, expected = write_pending_recovery_fixture(tmp_path)
+    database_before = recovery_snapshot(paths, database)
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    connections: list[sqlite3.Connection] = []
+    statements: list[str] = []
+    real_connect = sync_cli.sqlite3.connect
+
+    def tracked_connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append((args, kwargs))
+        connection = real_connect(*args, **kwargs)
+        connections.append(connection)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(sync_cli.sqlite3, "connect", tracked_connect)
+
+    assert main(recover_pending_args(paths, database), now=lambda: NOW) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "pending_recovered",
+        "project_id": "project-1",
+        "active_cursor": 1,
+        "abandoned_pending_cursor": 2,
+    }
+    for path in (
+        paths["context"].with_name("context.approved.json"),
+        paths["context"],
+    ):
+        assert QwenProjectContextArtifact.model_validate_json(
+            path.read_bytes()
+        ) == expected
+    state = SyncCliState.model_validate_json(paths["state"].read_bytes())
+    assert state.last_cursor == 1
+    assert state.last_sync_id == "older-client-sync-id"
+    assert state.pending is None
+    assert state.last_source_semantic_hash == source_bundle_semantic_hash(
+        bundle()
+    )
+    assert state.last_artifact_hash == artifact_hash(expected)
+    assert calls == [((database.resolve().as_uri() + "?mode=ro",), {"uri": True})]
+    assert "immutable" not in calls[0][0][0]
+    assert statements[:2] == ["PRAGMA query_only=ON", "BEGIN"]
+    assert not any(
+        statement.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER")
+        )
+        for statement in statements
+    )
+    after = recovery_snapshot(paths, database)
+    for path in (
+        database,
+        Path(str(database) + "-wal"),
+        Path(str(database) + "-shm"),
+        Path(str(database) + "-journal"),
+    ):
+        assert after[path] == database_before[path]
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connections[0].execute("SELECT 1")
+
+
+def test_recover_pending_allows_drifted_pending_identity(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    state = json.loads(paths["state"].read_text(encoding="utf-8"))
+    pending_hash = "b" * 64
+    state.update(last_cursor=4)
+    state["pending"] = {
+        "source_cursor": 5,
+        "content_hash": pending_hash,
+        "sync_id": sync_cli._sync_id("project-1", 5, pending_hash),
+        "completion_claims_hash": digest("[]"),
+    }
+    write_json(paths["state"], state)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE project_sync_generations SET source_cursor = 4"
+        )
+    connection.close()
+
+    assert main(recover_pending_args(paths, database), now=lambda: NOW) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "pending_recovered",
+        "project_id": "project-1",
+        "active_cursor": 4,
+        "abandoned_pending_cursor": 5,
+    }
+    recovered = SyncCliState.model_validate_json(paths["state"].read_bytes())
+    assert recovered.last_cursor == 4
+    assert recovered.pending is None
+
+
+def test_recover_pending_recreates_missing_approved_and_current_artifacts(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths, database, expected = write_pending_recovery_fixture(tmp_path)
+    paths["context"].unlink()
+    paths["context"].with_name("context.approved.json").unlink()
+
+    assert main(recover_pending_args(paths, database), now=lambda: NOW) == 0
+
+    assert json.loads(capsys.readouterr().out)["status"] == "pending_recovered"
+    for path in (
+        paths["context"].with_name("context.approved.json"),
+        paths["context"],
+    ):
+        assert QwenProjectContextArtifact.model_validate_json(
+            path.read_bytes()
+        ) == expected
+
+
+def test_recover_pending_denies_missing_pending_without_any_write(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    state = json.loads(paths["state"].read_text(encoding="utf-8"))
+    state["pending"] = None
+    write_json(paths["state"], state)
+    before = recovery_snapshot(paths, database)
+
+    assert main(recover_pending_args(paths, database), now=lambda: NOW) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "pending_recovery_denied",
+    }
+    assert recovery_snapshot(paths, database) == before
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "pending_cursor",
+        "last_hash",
+        "pending_hash",
+        "pending_sync_id",
+        "active_missing",
+        "active_cursor",
+        "active_duplicate",
+        "pending_generation",
+        "pending_sync_other_project",
+        "pending_audit",
+        "pending_audit_other_project",
+        "claims",
+        "bundle_retrieval",
+        "in_progress_retrieval",
+        "bundle_status",
+        "source_identity",
+        "source_scope",
+        "source_version",
+        "source_time",
+        "source_content",
+        "source_status",
+        "context_evidence",
+        "context_project",
+    ],
+)
+def test_recover_pending_denial_matrix_preserves_all_files(
+    tmp_path: Path,
+    capsys,
+    case: str,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    state = json.loads(paths["state"].read_text(encoding="utf-8"))
+    pending = state["pending"]
+    assert isinstance(pending, dict)
+    if case == "pending_cursor":
+        pending["source_cursor"] = 3
+        write_json(paths["state"], state)
+    elif case == "last_hash":
+        state["last_content_hash"] = "b" * 64
+        write_json(paths["state"], state)
+    elif case == "pending_hash":
+        pending["content_hash"] = "b" * 64
+        write_json(paths["state"], state)
+    elif case == "pending_sync_id":
+        pending["sync_id"] = "wrong-pending-sync"
+        write_json(paths["state"], state)
+    elif case == "claims":
+        pending["completion_claims_hash"] = "b" * 64
+        write_json(paths["state"], state)
+    elif case == "bundle_retrieval":
+        selected = DwsSourceBundle.model_validate_json(
+            paths["sources"].read_bytes()
+        )
+        retrieval = DwsRetrievalRequest(
+            request_id="request-1",
+            query_hash="d" * 64,
+            request_epoch=1,
+            attempt_count=1,
+            lease_expires_at=NOW + timedelta(minutes=5),
+            lease_token="x" * 32,
+            sources=(
+                DwsRetrievalSource(
+                    source_type="document", source_id="doc-1"
+                ),
+            ),
+        )
+        write_json(
+            paths["sources"],
+            rehash_bundle(
+                selected.model_copy(update={"retrieval_requests": (retrieval,)})
+            ).model_dump(mode="json"),
+        )
+    elif case == "bundle_status":
+        selected = bundle(
+            DwsSourceRecord(
+                source_type="document",
+                source_id="doc-1",
+                permission_scope=SCOPE,
+                fetched_at=NOW,
+                status="failed",
+                error_type="provider_unavailable",
+                retryable=True,
+            )
+        )
+        write_json(paths["sources"], selected.model_dump(mode="json"))
+    else:
+        with sqlite3.connect(database) as connection:
+            if case == "active_missing":
+                connection.execute("DELETE FROM project_active_generations")
+            elif case == "active_cursor":
+                connection.execute(
+                    "UPDATE project_sync_generations SET source_cursor = 9"
+                )
+            elif case == "active_duplicate":
+                row = connection.execute(
+                    "SELECT * FROM project_sync_generations"
+                ).fetchone()
+                connection.execute(
+                    "INSERT INTO project_sync_generations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (row[0], "generation-2", *row[2:]),
+                )
+                connection.execute(
+                    "INSERT INTO project_active_generations VALUES (?, ?)",
+                    ("project-1", "generation-2"),
+                )
+            elif case == "pending_generation":
+                row = connection.execute(
+                    "SELECT * FROM project_sync_generations"
+                ).fetchone()
+                connection.execute(
+                    "INSERT INTO project_sync_generations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        row[0],
+                        "generation-2",
+                        pending["sync_id"],
+                        pending["source_cursor"],
+                        row[4],
+                        row[5],
+                        row[6],
+                    ),
+                )
+            elif case == "pending_sync_other_project":
+                row = connection.execute(
+                    "SELECT * FROM project_sync_generations"
+                ).fetchone()
+                connection.execute(
+                    "INSERT INTO project_sync_generations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "project-2",
+                        "generation-2",
+                        pending["sync_id"],
+                        1,
+                        row[4],
+                        row[5],
+                        row[6],
+                    ),
+                )
+            elif case == "pending_audit":
+                connection.execute(
+                    "INSERT INTO project_sync_audits VALUES (?, ?)",
+                    (pending["sync_id"], "project-1"),
+                )
+            elif case == "pending_audit_other_project":
+                connection.execute(
+                    "INSERT INTO project_sync_audits VALUES (?, ?)",
+                    (pending["sync_id"], "project-2"),
+                )
+            elif case == "in_progress_retrieval":
+                connection.execute(
+                    "INSERT INTO project_retrieval_requests VALUES (?, ?, ?)",
+                    ("request-1", "project-1", "in_progress"),
+                )
+            elif case == "source_identity":
+                connection.execute(
+                    "UPDATE project_source_states SET source_id_hash = ?",
+                    ("b" * 64,),
+                )
+            elif case == "source_scope":
+                connection.execute(
+                    "UPDATE project_source_states SET permission_hash = ?",
+                    ("b" * 64,),
+                )
+            elif case == "source_version":
+                connection.execute(
+                    "UPDATE project_source_states SET source_version = 'v2'"
+                )
+            elif case == "source_time":
+                connection.execute(
+                    "UPDATE project_source_states SET source_time = ?",
+                    ((NOW + timedelta(minutes=1)).isoformat(),),
+                )
+            elif case == "source_content":
+                connection.execute(
+                    "UPDATE project_source_states SET content_hash = ?",
+                    ("b" * 64,),
+                )
+            elif case == "source_status":
+                connection.execute(
+                    "UPDATE project_source_states SET status = 'failed'"
+                )
+            elif case == "context_evidence":
+                invalid_context = context(excerpt="不存在的证据片段")
+                connection.execute(
+                    "UPDATE project_sync_generations SET context_json = ?",
+                    (canonical(invalid_context.model_dump(mode="json")),),
+                )
+            elif case == "context_project":
+                invalid_context = context().model_copy(
+                    update={"project_id": "project-2"}
+                )
+                connection.execute(
+                    "UPDATE project_sync_generations SET context_json = ?",
+                    (canonical(invalid_context.model_dump(mode="json")),),
+                )
+            else:
+                raise AssertionError(case)
+        connection.close()
+    before = recovery_snapshot(paths, database)
+
+    assert main(recover_pending_args(paths, database), now=lambda: NOW) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "pending_recovery_denied",
+    }
+    assert recovery_snapshot(paths, database) == before
+
+
+@pytest.mark.parametrize("failed_index", [1, 2])
+@pytest.mark.parametrize("existing_artifacts", [False, True])
+def test_recover_pending_rolls_back_all_three_files_on_later_apply_failure(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    failed_index: int,
+    existing_artifacts: bool,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    if not existing_artifacts:
+        paths["context"].unlink()
+        paths["context"].with_name("context.approved.json").unlink()
+    before = recovery_snapshot(paths, database)
+    ordered_paths: list[Path] = []
+    real_apply = sync_cli._RecoverableAtomicWrite.apply
+
+    def fail_after_replace(operation) -> None:  # type: ignore[no-untyped-def]
+        ordered_paths.append(operation._path)
+        real_apply(operation)
+        if len(ordered_paths) - 1 == failed_index:
+            raise RuntimeError("private-apply-detail")
+
+    monkeypatch.setattr(
+        sync_cli._RecoverableAtomicWrite,
+        "apply",
+        fail_after_replace,
+    )
+
+    assert main(recover_pending_args(paths, database), now=lambda: NOW) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "sync_failed",
+    }
+    assert ordered_paths == [
+        paths["context"].with_name("context.approved.json"),
+        paths["context"],
+        paths["state"],
+    ][: failed_index + 1]
+    assert recovery_snapshot(paths, database) == before
+
+
+def test_recover_pending_rejects_database_alias_before_open(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    database.unlink()
+    os.link(paths["manifest"], database)
+    before = recovery_snapshot(paths, database)
+
+    assert main(recover_pending_args(paths, database), now=lambda: NOW) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "database_file_not_regular_file",
+    }
+    assert recovery_snapshot(paths, database) == before
+
+
+@pytest.mark.parametrize("offset", [18, 19])
+def test_recover_pending_rejects_non_delete_database_header_before_connect(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    offset: int,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    raw = bytearray(database.read_bytes())
+    raw[offset] = 2
+    database.write_bytes(raw)
+    before = recovery_snapshot(paths, database)
+    monkeypatch.setattr(
+        sync_cli.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail("database must not be opened"),
+    )
+
+    assert main(recover_pending_args(paths, database), now=lambda: NOW) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "pending_recovery_denied",
+    }
+    assert recovery_snapshot(paths, database) == before
+
+
+def test_recover_pending_rejects_real_wal_without_touching_sidecars(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    writer = sqlite3.connect(database)
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute(
+        "INSERT INTO project_sync_audits VALUES (?, ?)",
+        ("independent-audit", "project-1"),
+    )
+    writer.commit()
+    wal = Path(str(database) + "-wal")
+    shm = Path(str(database) + "-shm")
+    assert wal.stat().st_size > 0
+    assert shm.stat().st_size > 0
+    before = recovery_snapshot(paths, database)
+    monkeypatch.setattr(
+        sync_cli.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail("WAL database must not be opened"),
+    )
+    try:
+        assert main(recover_pending_args(paths, database), now=lambda: NOW) == 1
+        assert json.loads(capsys.readouterr().out) == {
+            "status": "error",
+            "error_type": "pending_recovery_denied",
+        }
+        assert recovery_snapshot(paths, database) == before
+    finally:
+        writer.close()
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_recover_pending_rejects_any_existing_database_sidecar(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    suffix: str,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    sidecar = Path(str(database) + suffix)
+    sidecar.write_bytes(b"existing-sidecar")
+    before = recovery_snapshot(paths, database)
+    monkeypatch.setattr(
+        sync_cli.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail("sidecar must prevent open"),
+    )
+
+    assert main(recover_pending_args(paths, database), now=lambda: NOW) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "pending_recovery_denied",
+    }
+    assert recovery_snapshot(paths, database) == before
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_recover_pending_rejects_output_path_matching_database_sidecar(
+    tmp_path: Path,
+    capsys,
+    suffix: str,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    original_context = paths["context"]
+    paths["context"] = Path(str(database) + suffix)
+    before = recovery_snapshot(
+        {**paths, "context": original_context}, database
+    )
+
+    assert main(recover_pending_args(paths, database), now=lambda: NOW) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "database_file_not_regular_file",
+    }
+    assert recovery_snapshot(
+        {**paths, "context": original_context}, database
+    ) == before
+
+
+def test_recover_pending_rejects_output_aliasing_database_sidecar(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    original_context = paths["context"]
+    sidecar = Path(str(database) + "-wal")
+    sidecar.write_bytes(b"sidecar")
+    alias = tmp_path / "sidecar-alias.json"
+    os.link(sidecar, alias)
+    paths["context"] = alias
+    before = recovery_snapshot(
+        {**paths, "context": original_context}, database
+    )
+
+    assert main(recover_pending_args(paths, database), now=lambda: NOW) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "database_file_not_regular_file",
+    }
+    assert recovery_snapshot(
+        {**paths, "context": original_context}, database
+    ) == before
+    assert alias.read_bytes() == b"sidecar"
+
+
+def test_recover_pending_rechecks_sidecars_after_database_open(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    private_before = recovery_snapshot(paths, database)
+    sidecar = Path(str(database) + "-shm")
+    real_connect = sqlite3.connect
+
+    def connect_after_sidecar_appears(*args, **kwargs):  # type: ignore[no-untyped-def]
+        sidecar.write_bytes(b"")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(
+        sync_cli.sqlite3,
+        "connect",
+        connect_after_sidecar_appears,
+    )
+
+    assert main(recover_pending_args(paths, database), now=lambda: NOW) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "pending_recovery_denied",
+    }
+    for path in (
+        paths["context"].with_name("context.approved.json"),
+        paths["context"],
+        paths["state"],
+        database,
+    ):
+        assert recovery_snapshot(paths, database)[path] == private_before[path]
+    assert sidecar.exists()
+    assert sidecar.read_bytes() == b""
+
+
+def test_recovery_database_guard_allows_sqlite_readonly_connection(
+    tmp_path: Path,
+) -> None:
+    _paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+
+    with sync_cli._recovery_database_guard(database) as handle:
+        assert handle
+        with sqlite3.connect(
+            database.resolve().as_uri() + "?mode=ro", uri=True
+        ) as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM project_sync_generations"
+            ).fetchone() == (1,)
+
+
+def test_recover_pending_rejects_existing_writer_without_changes(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    writer = sqlite3.connect(database)
+    writer.execute("BEGIN IMMEDIATE")
+    before = recovery_snapshot(paths, database)
+    try:
+        assert main(recover_pending_args(paths, database), now=lambda: NOW) == 1
+        assert json.loads(capsys.readouterr().out) == {
+            "status": "error",
+            "error_type": "pending_recovery_denied",
+        }
+        assert recovery_snapshot(paths, database) == before
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+def test_recovery_guard_blocks_writer_switching_to_wal_after_precheck(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    real_connect = sqlite3.connect
+    writer_connections: list[sqlite3.Connection] = []
+    writer_blocked = False
+    source_baseline: dict[Path, tuple[bool, bytes]] = {}
+
+    def racing_connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal writer_blocked
+        if kwargs.get("uri"):
+            writer: sqlite3.Connection | None = None
+            try:
+                writer = real_connect(database, timeout=0)
+                assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == (
+                    "wal",
+                )
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute(
+                    "INSERT INTO project_sync_audits VALUES (?, ?)",
+                    ("racing-audit", "project-1"),
+                )
+                writer.commit()
+                writer_connections.append(writer)
+                writer = None
+            except sqlite3.Error:
+                writer_blocked = True
+            finally:
+                if writer is not None:
+                    writer.close()
+            source_baseline.update(database_snapshot(database))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sync_cli.sqlite3, "connect", racing_connect)
+    try:
+        assert main(recover_pending_args(paths, database), now=lambda: NOW) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == (
+            "pending_recovered"
+        )
+        assert writer_blocked
+        assert database_snapshot(database) == source_baseline
+    finally:
+        for writer in writer_connections:
+            writer.close()
+
+
+def test_recovery_windows_api_error_is_sanitized_without_changes(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    before = recovery_snapshot(paths, database)
+
+    def fail_open(_path: Path) -> int:
+        raise OSError("private CreateFileW detail")
+
+    monkeypatch.setattr(
+        sync_cli,
+        "_open_recovery_database_handle",
+        fail_open,
+        raising=False,
+    )
+
+    assert main(recover_pending_args(paths, database), now=lambda: NOW) == 1
+
+    output = capsys.readouterr().out
+    assert json.loads(output) == {
+        "status": "error",
+        "error_type": "pending_recovery_denied",
+    }
+    assert "private CreateFileW detail" not in output
+    assert recovery_snapshot(paths, database) == before
+
+
+@pytest.mark.parametrize("case", ["proof_denied", "query_error"])
+def test_recover_pending_closes_connection_on_denial(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    case: str,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    with sqlite3.connect(database) as connection:
+        if case == "proof_denied":
+            connection.execute(
+                "UPDATE project_source_states SET status = 'failed'"
+            )
+        else:
+            connection.execute("DROP TABLE project_sync_audits")
+    connection.close()
+    real_connect = sqlite3.connect
+    opened: list[sqlite3.Connection] = []
+
+    def tracked_connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+        selected = real_connect(*args, **kwargs)
+        opened.append(selected)
+        return selected
+
+    monkeypatch.setattr(sync_cli.sqlite3, "connect", tracked_connect)
+
+    assert main(recover_pending_args(paths, database), now=lambda: NOW) == 1
+    assert json.loads(capsys.readouterr().out)["error_type"] == (
+        "pending_recovery_denied"
+    )
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        opened[0].execute("SELECT 1")
+
+
+def test_recover_pending_refuses_active_lifecycle_without_writes(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths, database, _expected = write_pending_recovery_fixture(tmp_path)
+    started = lifecycle.begin_run(
+        "project-1", root=sync_cli.LIFECYCLE_ROOT, now=lambda: NOW
+    )
+    assert started.status == "started"
+    before = recovery_snapshot(paths, database)
+
+    assert main(recover_pending_args(paths, database), now=lambda: NOW) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "lifecycle_active",
+    }
+    assert recovery_snapshot(paths, database) == before
 
 
 def artifact_hash(artifact: QwenProjectContextArtifact) -> str:

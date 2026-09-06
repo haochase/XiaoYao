@@ -241,6 +241,71 @@ def test_artifact_maps_fixed_inputs_and_does_not_decrypt_credential(
     assert "COMPANION_DWS_SYNC_TOKEN" not in kwargs["environ"]
 
 
+def test_recover_pending_maps_fixed_inputs_without_exposing_token(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from tools import dws_project_sync
+    from tools import dws_sync_runtime as wrapper
+
+    manifest, dws = inputs(tmp_path)
+    prepare_runtime(tmp_path, manifest, "project-1", dws, Protector())
+    observed = []
+    monkeypatch.setattr(
+        dws_project_sync,
+        "main",
+        lambda argv, **kwargs: observed.append((argv, kwargs)) or 0,
+    )
+    monkeypatch.setenv("COMPANION_DWS_SYNC_TOKEN", "ambient-secret")
+
+    assert wrapper.dispatch(
+        tmp_path,
+        "recover-pending",
+        None,
+        False,
+        Protector(),
+    ) == 0
+
+    argv, kwargs = observed[0]
+    assert argv == [
+        "recover-pending",
+        "--project",
+        "project-1",
+        "--manifest",
+        str(manifest),
+        "--sources-file",
+        str(tmp_path / ".private/dws-runtime/source-bundle.json"),
+        "--context-file",
+        str(tmp_path / ".private/dws-runtime/context-artifact.json"),
+        "--state-file",
+        str(tmp_path / ".private/dws-runtime/sync-state.json"),
+        "--database-file",
+        str(tmp_path / ".private/dws-runtime/companion.db"),
+    ]
+    assert "COMPANION_DWS_SYNC_TOKEN" not in kwargs["environ"]
+
+
+def test_recover_pending_runtime_parser_does_not_require_run_token(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from tools import dws_sync_runtime as wrapper
+
+    monkeypatch.setattr(
+        wrapper,
+        "dispatch",
+        lambda root, command, run_token, dry_run, protector: (
+            0
+            if (root, command, run_token, dry_run)
+            == (tmp_path, "recover-pending", None, False)
+            else pytest.fail("unexpected dispatch")
+        ),
+    )
+    assert wrapper.main(
+        ["recover-pending"], root=tmp_path, protector=Protector()
+    ) == 0
+
+
 def test_check_missing_config_prints_no_private_details(tmp_path: Path, capsys) -> None:
     from tools.dws_sync_runtime import main
 
