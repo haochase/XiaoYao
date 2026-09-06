@@ -91,9 +91,22 @@ Skill 注册表和真实会话检查，不等同于同步已运行。prepare/ser
    ```
 
    如果结果是 `pending-post-tool-use` 占位符、缺失、超限或 jq 失败，立即停止。
+   发起调用前必须逐项确认同一次DWS调用含四个参数 `--profile`、`--format json`、`--node`、
+   `--jq`；缺少 `--jq` 时不得发起 DWS 调用。下列是唯一允许的命令形状。执行前必须把三枚
+   `*_LITERAL`整体替换为本次内存中已经验证的值，并按POSIX单引号规则编码为恰好一个Bash参数；
+   不得依赖shell环境变量，残留任何`<LITERAL>`占位符时不得执行：
+
+   ```bash
+   '<DWS_PATH_LITERAL>' doc info --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq 'tojson as $raw | {encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}'
+   ```
 3. 进行第二个独立工具调用：以相同 dws、profile、JSON 格式和 source ID 执行固定 DWS
    `doc read` 命令，并使用完全相同的宿主 jq 生成第二个封包。两个 DWS 调用不得合并；不得使用
    管道。不得使用命令替换，不得使用 Popen，不得重定向到文件或创建临时文件。
+   调用前再次逐项确认四个参数，且必须使用下列唯一命令形状：
+
+   ```bash
+   '<DWS_PATH_LITERAL>' doc read --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq 'tojson as $raw | {encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}'
+   ```
 4. 只在内存中给两个封包分别增加固定 operation `doc_info`、`doc_read`，按此顺序装入
    `schema_version=1`、固定 project ID 和 results 恰好两项的外层 JSON object。进行第三个
    独立工具调用：运行 `python tools/dws_sync_runtime.py host-import --run-token TOKEN`，用

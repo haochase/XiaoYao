@@ -4800,6 +4800,39 @@ def test_qwen_prompt_uses_three_independent_host_collection_calls() -> None:
     assert "不得向用户输出封包" in normalized
     assert "不得写临时文件" in normalized
     assert "host-import 成功后" in normalized
+
+
+def test_qwen_prompt_embeds_jq_in_each_exact_dws_command_template() -> None:
+    prompt = (
+        Path(__file__).resolve().parents[2]
+        / "prompts"
+        / "qwenwork-dws-project-sync.md"
+    ).read_text(encoding="utf-8")
+    bash_blocks = re.findall(r"```bash\s*(.*?)\s*```", prompt, re.DOTALL)
+    jq = "tojson as $raw | {encoding:\"base64-json\",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}"
+    normalized = " ".join(prompt.replace("`", "").split())
+    compact = "".join(prompt.replace("`", "").split())
+
+    expected = [
+        f"'<DWS_PATH_LITERAL>' doc info --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq '{jq}'",
+        f"'<DWS_PATH_LITERAL>' doc read --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq '{jq}'",
+    ]
+    assert [" ".join(block.split()) for block in bash_blocks] == expected
+    for command in expected:
+        assert command.count("--jq") == 1
+        shell = command.replace(jq, "")
+        for placeholder in (
+            "<DWS_PATH_LITERAL>",
+            "<PROFILE_LITERAL>",
+            "<SOURCE_ID_LITERAL>",
+        ):
+            shell = shell.replace(placeholder, "")
+        assert "|" not in shell
+        assert ">" not in shell
+    assert "四个参数--profile、--formatjson、--node、--jq" in compact
+    assert "缺少--jq时不得发起DWS调用" in compact
+    assert "不得依赖shell环境变量" in compact
+    assert "残留任何<LITERAL>占位符时不得执行" in compact
     assert "pending-post-tool-use" in normalized
 
 
