@@ -250,6 +250,37 @@ def test_query_integration_dependencies_must_be_supplied_together() -> None:
         ProjectMemoryService(source_policy=RecordingSourcePolicy())
 
 
+def test_realistic_decision_fragments_win_before_evidence_fallback(
+    tmp_path: Path,
+) -> None:
+    document = evidence_source("document-1")
+    decision = decision_for(document).model_copy(
+        update={"topic": "桌面终端硬件选型"}
+    )
+    fallback = evidence_chunk(document, "终端方案验收表：硬件检查待完成。")
+    snapshot = project_snapshot(
+        sources=(document,),
+        chunks=(fallback,),
+        decision=decision,
+    )
+    policy = RecordingSourcePolicy()
+    service = integrated_service(
+        snapshot,
+        policy=policy,
+        retrieval_writer=repository_at(tmp_path),
+    )
+
+    answer = service.answer(
+        PROJECT_ID,
+        "终端方案是什么",
+        kind=AnswerKind.DECISION_CHECK,
+    )
+
+    assert answer.text == "当前有效决策：采用方案 B"
+    assert answer.source_refs == decision.source_refs
+    assert policy.calls == [(PROJECT_ID, decision.source_refs, NOW)]
+
+
 def test_stale_task_source_does_not_block_decision_answer(tmp_path: Path) -> None:
     document = evidence_source("document-1")
     task = evidence_source("task-1", source_type=SyncSourceType.TASK)

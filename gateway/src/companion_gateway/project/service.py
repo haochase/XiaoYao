@@ -672,19 +672,38 @@ class ProjectMemoryService:
     def _normalize(value: str) -> str:
         return "".join(value.split()).casefold()
 
+    @staticmethod
+    def _chinese_bigrams(value: str) -> set[str]:
+        fragments: set[str] = set()
+        run = ""
+        for character in value:
+            if "\u4e00" <= character <= "\u9fff":
+                run += character
+                continue
+            fragments.update(run[index : index + 2] for index in range(len(run) - 1))
+            run = ""
+        fragments.update(run[index : index + 2] for index in range(len(run) - 1))
+        return fragments
+
     @classmethod
     def _matches(cls, decision: DecisionCard, query: str) -> bool:
-        for value in (
+        values = (
             decision.decision_id,
             decision.topic,
             decision.decision_text,
-        ):
+        )
+        for value in values:
             normalized_value = cls._normalize(value)
             if query in normalized_value or (
                 len(normalized_value) >= 2 and normalized_value in query
             ):
                 return True
-        return False
+
+        query_fragments = cls._chinese_bigrams(query)
+        decision_fragments = cls._chinese_bigrams(
+            cls._normalize(decision.topic)
+        ) | cls._chinese_bigrams(cls._normalize(decision.decision_text))
+        return len(query_fragments & decision_fragments) >= 2
 
     @staticmethod
     def _require_source_scope(

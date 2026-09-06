@@ -91,6 +91,22 @@ def test_fact_answer_matches_project_topic_inside_a_natural_question() -> None:
     assert answer.source_refs == (source(),)
 
 
+def test_answer_rejects_a_single_generic_chinese_fragment_overlap() -> None:
+    project_decision = decision().model_copy(
+        update={"topic": "桌面终端硬件选型"}
+    )
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(project_decision,)))
+
+    with pytest.raises(ProjectContextUnavailable, match="source_not_found"):
+        service.answer(
+            "project-1",
+            "这个方案怎么样",
+            kind=AnswerKind.DECISION_CHECK,
+            now=NOW,
+        )
+
+
 def test_answer_rejects_expired_context_instead_of_using_stale_facts() -> None:
     service = ProjectMemoryService(clock=lambda: NOW)
     service.replace_context(context(decisions=(decision(),)))
