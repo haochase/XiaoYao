@@ -64,8 +64,9 @@ schema 验证后，必须用 `Path.resolve(strict=False)` 和 `os.path.normcase`
 本任务唯一允许的Python解释器为
 `E:\hackasons\MiniCPM_Ascend\.worktrees\.venvs\feishu-desk-assistant\Scripts\python.exe`。
 下文命令中的`python`只是该绝对路径的排版缩写；实际每个Python runtime工具调用的argv[0]
-必须直接使用此绝对路径。两次DWS原生命令仍以
-`DWS_PATH_LITERAL`作为argv[0]。`check`的参数数组必须等价于：
+必须直接使用此绝对路径。两次DWS原生命令必须以固定字面量`dws`作为argv[0]；必须使用
+PATH-based字面命令`dws`，不得添加引号、路径或前缀。配置中的`dws`绝对路径只用于本地可信入口
+校验，不得作为千问办公宿主Bash调用的argv[0]。`check`的参数数组必须等价于：
 `["E:\\hackasons\\MiniCPM_Ascend\\.worktrees\\.venvs\\feishu-desk-assistant\\Scripts\\python.exe","tools/dws_sync_runtime.py","check"]`。
 不得搜索或枚举其他Python解释器，不得检查实现源码或测试文件，不得使用`cd &&`或
 任何shell命令串联，不得创建辅助脚本、候选文件或旁路产物。任务工作目录已由contextDirs固定为
@@ -78,6 +79,11 @@ schema 验证后，必须用 `Path.resolve(strict=False)` 和 `os.path.normcase`
 该入口只读固定配置；`host-import` 不读取或解封凭据，只有 pending/push 的内部调用以
 CurrentUser DPAPI 解封并取得网关 token。runtime 不修改父进程环境，也不把 token 传给
 DWS。不得手工导出凭据。
+两次字面命令`dws`必须由千问办公原生Bash的宿主PostToolUse路由执行；这里的`dws`是平台托管
+命令令牌，不把guest shell的PATH文件身份作为信任依据。每次调用只接受宿主返回的真实
+`dws_tool_result`通道结果，再由同一次调用的`--jq`生成封包；普通shell stdout、历史结果、
+`pending-post-tool-use`占位符或任何非`dws_tool_result`来源都必须abort并结束。配置中的绝对shim
+及`resolve_dws_launch`仅用于本地runtime边界验证，不能替代或冒充宿主托管命令令牌。
 先执行 `python tools/dws_sync_runtime.py check`；configured 只证明配置/解密正常，仍需上面的
 Skill 注册表和真实会话检查，不等同于同步已运行。prepare/serve 不属于周期任务，不自动执行。
 
@@ -105,12 +111,12 @@ Skill 注册表和真实会话检查，不等同于同步已运行。prepare/ser
 
    如果结果是 `pending-post-tool-use` 占位符、缺失、超限或 jq 失败，立即停止。
    发起调用前必须逐项确认同一次DWS调用含四个参数 `--profile`、`--format json`、`--node`、
-   `--jq`；缺少 `--jq` 时不得发起 DWS 调用。下列是唯一允许的命令形状。执行前必须把三枚
+   `--jq`；缺少 `--jq` 时不得发起 DWS 调用。下列是唯一允许的命令形状。执行前必须把两枚
    `*_LITERAL`整体替换为本次内存中已经验证的值，并按POSIX单引号规则编码为恰好一个Bash参数；
    不得依赖shell环境变量，残留任何`<LITERAL>`占位符时不得执行：
 
    ```bash
-   '<DWS_PATH_LITERAL>' doc info --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq 'tojson as $raw | {encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}'
+   dws doc info --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq 'tojson as $raw | {encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}'
    ```
 3. 进行第二个独立工具调用：以相同 dws、profile、JSON 格式和 source ID 执行固定 DWS
    `doc read` 命令，并使用完全相同的宿主 jq 生成第二个封包。两个 DWS 调用不得合并；不得使用
@@ -118,7 +124,7 @@ Skill 注册表和真实会话检查，不等同于同步已运行。prepare/ser
    调用前再次逐项确认四个参数，且必须使用下列唯一命令形状：
 
    ```bash
-   '<DWS_PATH_LITERAL>' doc read --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq 'tojson as $raw | {encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}'
+   dws doc read --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq 'tojson as $raw | {encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}'
    ```
 4. 只在内存中给两个封包分别增加固定 operation `doc_info`、`doc_read`，按此顺序装入
    `schema_version=1`、固定 project ID 和 results 恰好两项的外层 JSON object。进行第三个

@@ -4794,7 +4794,8 @@ def test_qwen_prompt_uses_fixed_fast_runtime_without_discovery() -> None:
         "feishu-desk-assistant\\Scripts\\python.exe"
     ) in prompt
     assert "每个Pythonruntime工具调用" in compact
-    assert "DWS原生命令仍以DWS_PATH_LITERAL作为argv[0]" in compact
+    assert "DWS原生命令必须以固定字面量dws作为argv[0]" in compact
+    assert "配置中的dws绝对路径只用于本地可信入口校验" in compact
     assert "不得搜索或枚举其他Python解释器" in compact
     assert "不得检查实现源码或测试文件" in compact
     assert "不得使用cd&&" in compact
@@ -4930,15 +4931,14 @@ def test_qwen_prompt_embeds_jq_in_each_exact_dws_command_template() -> None:
     compact = "".join(prompt.replace("`", "").split())
 
     expected = [
-        f"'<DWS_PATH_LITERAL>' doc info --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq '{jq}'",
-        f"'<DWS_PATH_LITERAL>' doc read --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq '{jq}'",
+        f"dws doc info --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq '{jq}'",
+        f"dws doc read --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq '{jq}'",
     ]
     assert [" ".join(block.split()) for block in bash_blocks] == expected
     for command in expected:
         assert command.count("--jq") == 1
         shell = command.replace(jq, "")
         for placeholder in (
-            "<DWS_PATH_LITERAL>",
             "<PROFILE_LITERAL>",
             "<SOURCE_ID_LITERAL>",
         ):
@@ -4947,6 +4947,12 @@ def test_qwen_prompt_embeds_jq_in_each_exact_dws_command_template() -> None:
         assert ">" not in shell
     assert "四个参数--profile、--formatjson、--node、--jq" in compact
     assert "缺少--jq时不得发起DWS调用" in compact
+    assert "DWS_PATH_LITERAL" not in prompt
+    assert "必须使用PATH-based字面命令dws" in compact
+    assert "平台托管命令令牌" in compact
+    assert "真实dws_tool_result通道结果" in compact
+    assert "普通shellstdout" in compact
+    assert "非dws_tool_result来源都必须abort并结束" in compact
     assert "不得依赖shell环境变量" in compact
     assert "残留任何<LITERAL>占位符时不得执行" in compact
     assert "pending-post-tool-use" in normalized
