@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import shutil
 import subprocess
 import sys
 
@@ -226,10 +227,18 @@ def test_gateway_runner_propagates_uvicorn_exit_code(tmp_path: Path) -> None:
 
 
 def test_sync_runner_propagates_python_exit_code(tmp_path: Path) -> None:
+    project = tmp_path / "sync-runner-project"
+    scripts = project / "scripts"
+    tools = project / "tools"
+    scripts.mkdir(parents=True)
+    tools.mkdir()
+    shutil.copy2(SCRIPTS / "run-xiaoyao-sync.ps1", scripts)
+    (tools / "dws_sync_runtime.py").write_text("# test double\n", encoding="ascii")
+    (project / ".private" / "dws-runtime").mkdir(parents=True)
     fake_python = tmp_path / "fake-python.cmd"
     fake_python.write_text(
         "@echo off\r\n"
-        'if /I "%~nx1"=="run_xiaoyao_sync.py" exit /b 37\r\n'
+        'if /I "%~nx1"=="dws_sync_runtime.py" if /I "%~2"=="serve" exit /b 37\r\n'
         "exit /b 99\r\n",
         encoding="ascii",
     )
@@ -239,13 +248,9 @@ def test_sync_runner_propagates_python_exit_code(tmp_path: Path) -> None:
             "powershell.exe",
             "-NoProfile",
             "-File",
-            str(SCRIPTS / "run-xiaoyao-sync.ps1"),
-            "-GatewayRoot",
-            str(ROOT / "gateway"),
+            str(scripts / "run-xiaoyao-sync.ps1"),
             "-PythonPath",
             str(fake_python),
-            "-Port",
-            "8731",
         ],
         check=False,
         capture_output=True,

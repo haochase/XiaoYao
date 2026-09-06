@@ -1,55 +1,60 @@
 [CmdletBinding()]
 param(
-    [string]$GatewayRoot,
+    [Parameter(Mandatory)]
     [string]$PythonPath,
-    [ValidateRange(1, 65535)]
-    [int]$Port = 8731
+    [switch]$Check
 )
 
-if ($Port -ne 8731) {
-    throw "Sync port must be exactly 8731."
+$ErrorActionPreference = "Stop"
+$projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+if ((Split-Path -Path $projectRoot -Qualifier) -ne "E:") {
+    throw "The DWS sync project root must be on the E: drive."
 }
-if ([string]::IsNullOrWhiteSpace($GatewayRoot)) {
-    $GatewayRoot = Join-Path $PSScriptRoot "..\gateway"
-}
-if (-not (Test-Path -LiteralPath $GatewayRoot -PathType Container)) {
-    throw "Gateway root was not found at $GatewayRoot. Specify -GatewayRoot explicitly."
-}
-$gatewayDirectory = (Resolve-Path -LiteralPath $GatewayRoot).Path
 
-if ([string]::IsNullOrWhiteSpace($PythonPath)) {
-    $pythonCommand = Get-Command python -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($null -eq $pythonCommand) {
-        throw "Python was not found. Specify -PythonPath with the gateway Python executable."
-    }
-    $PythonPath = $pythonCommand.Source
+$runtimeRunner = Join-Path $projectRoot "tools\dws_sync_runtime.py"
+$runtimeRoot = Join-Path $projectRoot ".private\dws-runtime"
+$tempRoot = Join-Path $runtimeRoot "tmp"
+if (-not (Test-Path -LiteralPath $runtimeRunner -PathType Leaf)) {
+    throw "DWS sync runtime was not found at $runtimeRunner."
+}
+if (-not (Test-Path -LiteralPath $runtimeRoot -PathType Container)) {
+    throw "DWS sync runtime directory was not found at $runtimeRoot."
 }
 if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
-    throw "Python executable was not found at $PythonPath. Specify -PythonPath explicitly."
+    throw "Python executable was not found at $PythonPath."
 }
-$python = (Resolve-Path -LiteralPath $PythonPath).Path
 
-$sourceDirectory = Join-Path $gatewayDirectory "src"
-$projectRoot = Split-Path $PSScriptRoot -Parent
-$vendorSitePackages = Join-Path $projectRoot ".vendor\python-site"
-$previousPythonPath = $env:PYTHONPATH
-$pythonPathEntries = @($sourceDirectory)
-if (Test-Path -LiteralPath $vendorSitePackages -PathType Container) {
-    $pythonPathEntries += $vendorSitePackages
-}
-if ($previousPythonPath) {
-    $pythonPathEntries += $previousPythonPath
-}
-$env:PYTHONPATH = $pythonPathEntries -join ";"
-$pythonRunnerPath = Join-Path $PSScriptRoot "run_xiaoyao_sync.py"
+$python = (Resolve-Path -LiteralPath $PythonPath -ErrorAction Stop).Path
+$runtimeRunner = (Resolve-Path -LiteralPath $runtimeRunner -ErrorAction Stop).Path
+$command = if ($Check) { "check" } else { "serve" }
+New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+
+$previousTemp = $env:TEMP
+$previousTmp = $env:TMP
+$locationPushed = $false
 $runnerExitCode = 0
 
 try {
-    & $python $pythonRunnerPath --gateway-root $gatewayDirectory --host 127.0.0.1 --port $Port
+    $env:TEMP = $tempRoot
+    $env:TMP = $tempRoot
+    Push-Location $projectRoot
+    $locationPushed = $true
+    & $python $runtimeRunner $command
     $runnerExitCode = $LASTEXITCODE
 } finally {
-    $env:PYTHONPATH = $previousPythonPath
+    if ($locationPushed) {
+        Pop-Location
+    }
+    if ($null -eq $previousTemp) {
+        Remove-Item -LiteralPath Env:TEMP -ErrorAction SilentlyContinue
+    } else {
+        $env:TEMP = $previousTemp
+    }
+    if ($null -eq $previousTmp) {
+        Remove-Item -LiteralPath Env:TMP -ErrorAction SilentlyContinue
+    } else {
+        $env:TMP = $previousTmp
+    }
 }
 
 if ($runnerExitCode -ne 0) {
