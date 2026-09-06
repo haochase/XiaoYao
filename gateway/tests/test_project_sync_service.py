@@ -427,6 +427,37 @@ def test_sync_rejects_sourced_fact_with_unmatched_excerpt(tmp_path: Path) -> Non
     assert repository.load_active_generation(PROJECT_ID) is None
 
 
+def test_sync_rejects_excerpt_that_exists_only_in_markdown_heading(
+    tmp_path: Path,
+) -> None:
+    service, repository, _, _ = sync_service(tmp_path)
+    candidate = envelope(
+        sources=(
+            active_document(
+                chunks=(evidence_chunk(text="采用方案 B"),),
+            ),
+        )
+    )
+    heading_reference = DOCUMENT_REF.model_copy(
+        update={"excerpt": "# 决策\n采用方案 B"}
+    )
+    invalid_context = candidate.context.model_copy(
+        update={"source_refs": (heading_reference,)}
+    )
+    candidate = candidate.model_copy(update={"context": invalid_context})
+    candidate = candidate.model_copy(
+        update={"content_hash": compute_envelope_content_hash(candidate)}
+    )
+
+    with pytest.raises(
+        ProjectSyncValidationError,
+        match="source_excerpt_mismatch",
+    ):
+        service.apply(candidate, principal=PRINCIPAL, now=NOW)
+
+    assert repository.load_active_generation(PROJECT_ID) is None
+
+
 def test_sync_rejects_unmatched_top_level_context_reference(tmp_path: Path) -> None:
     service, repository, _, _ = sync_service(tmp_path)
     candidate = envelope()

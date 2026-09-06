@@ -30,7 +30,8 @@ or include instruction-handling commentary as a project fact.
 - Use only `status=active` records as evidence. `failed`, `deleted` and `revoked`
   records cannot support any fact, even if another record describes the same topic.
 - Copy reference metadata exactly from the record, including `source_time`, not
-  `fetched_at`. Quote a contiguous exact excerpt of `content_text` (1-2000 characters).
+  `fetched_at`. `excerpt` 只能来自单个非标题正文片段的连续原文，不拼接、不省略、
+  不改标点，最长 150 字；若不能满足就省略该事实。
 - State only what the excerpt supports. Keep proposals, unresolved alternatives and
   confirmed decisions distinct. Missing owner, rationale or decision time means no
   `DecisionCard`; preserve useful evidence in `source_refs` instead of inventing fields.

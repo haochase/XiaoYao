@@ -82,7 +82,7 @@ def dispatch(
 ) -> int:
     from tools import dws_project_sync as cli
 
-    if command == "host-import":
+    if command in {"artifact", "host-import"}:
         config, _project = _load_host_import_config(root)
         token = None
     else:
@@ -90,16 +90,17 @@ def dispatch(
     argv = [command, "--project", config.project]
     if run_token:
         argv += ["--run-token", run_token]
-    if command in {"collect", "host-import", "pending", "push"}:
+    if command in {"artifact", "collect", "host-import", "pending", "push"}:
         argv += ["--manifest", str(config.manifest)]
     if command == "collect":
         resolve_dws_launch(config.dws)
         argv += ["--dws-path", str(config.dws), "--output", str(config.source_bundle)]
     if command == "host-import":
         argv += ["--output", str(config.source_bundle)]
+    if command in {"artifact", "pending", "push"}:
+        argv += ["--sources-file", str(config.source_bundle)]
     if command in {"pending", "push"}:
         argv += [
-            "--sources-file", str(config.source_bundle),
             "--gateway", "http://127.0.0.1:8731",
         ]
     if command in {"artifact", "push"}:
@@ -113,7 +114,7 @@ def dispatch(
     if command in {"pending", "push"} and not dry_run:
         environment["COMPANION_DWS_SYNC_TOKEN"] = token
     kwargs: dict[str, object] = {"environ": environment}
-    if command == "host-import":
+    if command in {"artifact", "host-import"}:
         kwargs["input_stream"] = (
             sys.stdin.buffer if input_stream is None else input_stream
         )

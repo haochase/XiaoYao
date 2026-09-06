@@ -32,8 +32,9 @@ from pydantic import (
     model_validator,
 )
 
+from companion_gateway.project.evidence_validation import validate_sourced_context
 from companion_gateway.project.index import chunk_text
-from companion_gateway.project.models import EvidenceRef, ProjectContextPackage
+from companion_gateway.project.models import ProjectContextPackage
 from companion_gateway.project.sync_models import (
     ClaimedRetrievalRequest,
     RetrievalCompletionClaim,
@@ -134,6 +135,7 @@ _SAFE_GATEWAY_ERROR_TYPES = frozenset(
 _PUBLIC_ERROR_TYPES = {
     "arguments_invalid",
     "authentication_failed",
+    "context_collection_mismatch",
     "context_file_invalid",
     "context_file_not_absolute",
     "context_file_parent_invalid",
@@ -350,7 +352,9 @@ def _parser() -> argparse.ArgumentParser:
     pending.add_argument("--run-token")
 
     artifact = commands.add_parser("artifact", add_help=False)
+    artifact.add_argument("--manifest", required=True)
     artifact.add_argument("--project", required=True)
+    artifact.add_argument("--sources-file", required=True)
     artifact.add_argument("--context-file", required=True)
     artifact.add_argument("--run-token", required=True)
 
@@ -541,10 +545,6 @@ def _validate_bundle(
         raise ValueError("source_bundle_hash_mismatch")
 
 
-def _normalized_text(value: str) -> str:
-    return "".join(value.split()).casefold()
-
-
 def _require_sourced_context(context: ProjectContextPackage) -> None:
     if (
         context.open_actions
@@ -552,23 +552,6 @@ def _require_sourced_context(context: ProjectContextPackage) -> None:
         or context.next_meeting is not None
     ):
         raise ValueError("context_fact_unreferenced")
-
-
-def _all_references(context: ProjectContextPackage) -> tuple[EvidenceRef, ...]:
-    nested = tuple(
-        source
-        for decision in context.active_decisions
-        for source in decision.source_refs
-    )
-    sourced_facts = (*context.sourced_actions, *context.sourced_risks)
-    if context.sourced_next_meeting is not None:
-        sourced_facts += (context.sourced_next_meeting,)
-    sourced = tuple(
-        source
-        for fact in sourced_facts
-        for source in fact.source_refs
-    )
-    return (*context.source_refs, *nested, *sourced)
 
 
 def _validate_context(
@@ -583,24 +566,14 @@ def _validate_context(
         or context.permission_scope != project.permission_scope
     ):
         raise ValueError("context_mismatch")
-    active = {
-        (record.source_type.value, record.source_id): record
+    if context.generated_at != source_bundle.collected_at:
+        raise ValueError("context_collection_mismatch")
+    snapshots = (
+        _source_snapshot(record)
         for record in source_bundle.records
-        if record.status == "active"
-    }
-    for source_ref in _all_references(context):
-        record = active.get((source_ref.source_type, source_ref.source_id))
-        if record is None or (
-            source_ref.permission_scope != record.permission_scope
-            or source_ref.source_title != record.source_title
-            or source_ref.source_url != record.source_url
-            or source_ref.source_time != record.source_time
-        ):
-            raise ValueError("source_ref_mismatch")
-        normalized_content = _normalized_text(record.content_text or "")
-        normalized_excerpt = _normalized_text(source_ref.excerpt)
-        if not normalized_content or normalized_excerpt not in normalized_content:
-            raise ValueError("source_excerpt_mismatch")
+        if record.status in {"active", "failed"}
+    )
+    validate_sourced_context(context, snapshots)
 
 
 def _source_snapshot(record: DwsSourceRecord) -> SourceSnapshot:
@@ -1349,8 +1322,22 @@ def _artifact_command(
     input_stream: object,
     now: Callable[[], datetime],
 ) -> dict[str, object]:
-    project_id = _safe_id(args.project, "project_id")
+    manifest = DwsManifest.load(
+        _absolute_private_path(args.manifest, "manifest")
+    )
+    project = _selected_project(manifest, args.project)
+    sources_path = _absolute_private_path(args.sources_file, "sources_file")
     context_path = _absolute_private_path(args.context_file, "context_file")
+    sources_payload = _read_json_object(
+        sources_path,
+        "sources_file",
+        max_bytes=MAX_PRIVATE_INPUT_BYTES,
+    )
+    try:
+        source_bundle = DwsSourceBundle.model_validate(sources_payload)
+    except (TypeError, ValueError):
+        raise ValueError("sources_file_invalid") from None
+    _validate_bundle(project, source_bundle)
     read = getattr(input_stream, "read", None)
     if not callable(read):
         raise ValueError("context_file_invalid")
@@ -1360,23 +1347,30 @@ def _artifact_command(
     try:
         payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_non_finite)
         artifact = QwenProjectContextArtifact.model_validate(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError):
+    except ValidationError as exc:
+        if "context_fact_unreferenced" in str(exc):
+            raise ValueError("context_fact_unreferenced") from None
         raise ValueError("context_file_invalid") from None
-    if artifact.context.project_id != project_id:
-        raise ValueError("context_mismatch")
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ValueError("context_file_invalid") from None
+    _validate_context(project, source_bundle, artifact.context)
     encoded = _canonical_bytes(artifact.model_dump(mode="json"))
-    with lifecycle.stage_guard(
-        project_id,
+    if len(encoded) > MAX_PRIVATE_INPUT_BYTES:
+        raise ValueError("context_file_too_large")
+    output_transaction = _RecoverableAtomicWrite(context_path, encoded)
+    lifecycle.commit_stage(
+        project.project_id,
         args.run_token,
         expected="pending",
         target="artifact",
+        apply=output_transaction.apply,
+        rollback=output_transaction.rollback,
         root=LIFECYCLE_ROOT,
         now=now,
-    ):
-        _atomic_write(context_path, encoded)
+    )
     return {
         "status": "artifact_written",
-        "project_id": project_id,
+        "project_id": project.project_id,
         "output_bytes": len(encoded),
     }
 

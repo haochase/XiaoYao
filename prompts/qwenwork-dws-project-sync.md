@@ -68,6 +68,13 @@ DWS。不得手工导出凭据。
 先执行 `python tools/dws_sync_runtime.py check`；configured 只证明配置/解密正常，仍需上面的
 Skill 注册表和真实会话检查，不等同于同步已运行。prepare/serve 不属于周期任务，不自动执行。
 
+单个调度触发最多一次 `begin`。取得 `run_token` 后，任何命令非成功，都必须先在内存中保存该失败
+命令返回的固定错误，再以同一 token 调用 `abort`；随后原样输出固定错误并 `return`。即使
+`abort` 自身失败，也不得用其结果覆盖原错误。
+`abort` 后不得 `begin`。只有 `end=rerun` 才允许使用 `end` 返回的新 token 完整重跑。每轮重新采集、
+重新调用 Skill、重新生成 artifact；禁止读取或回放 `context_artifact`。确定性 push
+错误不得再次 push。
+
 1. 使用参数数组运行 `python tools/dws_sync_runtime.py begin`，项目只取固定配置。
    若返回 `coalesced`，本次触发立即正常结束，不执行任何后续步骤；
    若返回 `started`，只在本次任务内部保存 `run_token`，不得向用户输出或写入其他文件。

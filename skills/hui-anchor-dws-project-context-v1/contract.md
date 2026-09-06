@@ -33,7 +33,8 @@ Example values above are format examples, never a fallback project or source.
 
 An EvidenceRef has exactly source_type, source_id, source_title, source_url,
 source_time, excerpt, permission_scope. Copy every metadata field from one active
-record. An excerpt is a nonblank contiguous substring of its content_text.
+record. `excerpt` 只能来自单个非标题正文片段的连续原文，不拼接、不省略、不改标点，
+最长 150 字；若不能满足就省略该事实。
 source_type is document, meeting_note, task or calendar in this workflow.
 
 A SourcedFact is `{"text": "supported statement", "source_refs": [EvidenceRef]}`.

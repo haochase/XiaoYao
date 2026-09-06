@@ -243,6 +243,48 @@ def pending_args(paths: dict[str, Path]) -> list[str]:
     ]
 
 
+def artifact_args(paths: dict[str, Path], run_token: str) -> list[str]:
+    return [
+        "artifact",
+        "--manifest",
+        str(paths["manifest"]),
+        "--project",
+        "project-1",
+        "--sources-file",
+        str(paths["sources"]),
+        "--context-file",
+        str(paths["context"]),
+        "--run-token",
+        run_token,
+    ]
+
+
+def start_pending_run() -> str:
+    started = lifecycle.begin_run(
+        "project-1",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+    assert started.run_token is not None
+    lifecycle.advance_run(
+        "project-1",
+        started.run_token,
+        expected="begun",
+        target="collected",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+    lifecycle.advance_run(
+        "project-1",
+        started.run_token,
+        expected="collected",
+        target="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+    return started.run_token
+
+
 def collect_args(paths: dict[str, Path], *extra: str) -> list[str]:
     return [
         "collect",
@@ -662,17 +704,9 @@ def test_production_lifecycle_fences_every_mutating_stage(
         context=context(),
         completed_retrieval_request_ids=("retrieval-1",),
     )
-    artifact_args = [
-        "artifact",
-        "--project",
-        "project-1",
-        "--context-file",
-        str(paths["context"]),
-        "--run-token",
-        token,
-    ]
+    artifact_command = artifact_args(paths, token)
     assert main(
-        artifact_args,
+        artifact_command,
         input_stream=io.BytesIO(
             canonical(artifact.model_dump(mode="json")).encode("utf-8")
         ),
@@ -710,20 +744,357 @@ def test_expired_run_cannot_replace_artifact(tmp_path: Path, capsys, monkeypatch
     capsys.readouterr()
 
     assert main(
-        [
-            "artifact",
-            "--project",
-            "project-1",
-            "--context-file",
-            str(paths["context"]),
-            "--run-token",
-            old_token,
-        ],
+        artifact_args(paths, old_token),
         input_stream=io.BytesIO(original),
         now=lambda: NOW + timedelta(hours=1),
     ) == 1
     assert json.loads(capsys.readouterr().out)["error_type"] == "run_token_invalid"
     assert paths["context"].read_bytes() == original
+
+
+def test_artifact_rejects_heading_excerpt_before_write_or_stage(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original = paths["context"].read_bytes()
+    title_markdown = "# 决策\n采用方案 B"
+    write_json(
+        paths["sources"],
+        bundle(active_record(content=title_markdown)).model_dump(mode="json"),
+    )
+    run_token = start_pending_run()
+    artifact = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context(excerpt=title_markdown),
+    )
+
+    assert main(
+        artifact_args(paths, run_token),
+        input_stream=io.BytesIO(
+            canonical(artifact.model_dump(mode="json")).encode("utf-8")
+        ),
+        now=lambda: NOW,
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "source_excerpt_mismatch",
+    }
+    assert paths["context"].read_bytes() == original
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    ("updates", "error_type"),
+    [
+        ({"project_name": "其他项目"}, "context_mismatch"),
+        (
+            {"permission_scope": "project:other", "source_refs": ()},
+            "context_mismatch",
+        ),
+        (
+            {"generated_at": NOW + timedelta(seconds=1)},
+            "context_collection_mismatch",
+        ),
+    ],
+)
+def test_artifact_validates_context_against_manifest_and_collection(
+    tmp_path: Path,
+    capsys,
+    updates: dict[str, object],
+    error_type: str,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original = paths["context"].read_bytes()
+    run_token = start_pending_run()
+    artifact = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context().model_copy(update=updates),
+    )
+
+    assert main(
+        artifact_args(paths, run_token),
+        input_stream=io.BytesIO(
+            canonical(artifact.model_dump(mode="json")).encode("utf-8")
+        ),
+        now=lambda: NOW,
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": error_type,
+    }
+    assert paths["context"].read_bytes() == original
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_artifact_validates_source_bundle_before_write_or_stage(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original = paths["context"].read_bytes()
+    source_payload = json.loads(paths["sources"].read_text(encoding="utf-8"))
+    source_payload["content_hash"] = "0" * 64
+    write_json(paths["sources"], source_payload)
+    run_token = start_pending_run()
+    artifact = QwenProjectContextArtifact(schema_version=1, context=context())
+
+    assert main(
+        artifact_args(paths, run_token),
+        input_stream=io.BytesIO(
+            canonical(artifact.model_dump(mode="json")).encode("utf-8")
+        ),
+        now=lambda: NOW,
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "source_bundle_hash_mismatch",
+    }
+    assert paths["context"].read_bytes() == original
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_artifact_restores_previous_file_when_stage_commit_interrupts(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    existing: bool,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    if not existing:
+        paths["context"].unlink()
+    original_artifact = paths["context"].read_bytes() if existing else None
+    run_token = start_pending_run()
+    candidate = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context(excerpt="采用方案 B。"),
+    )
+    original_write_state = lifecycle._write_state
+
+    interrupted = False
+
+    def commit_then_interrupt(path: Path, payload: dict[str, object]) -> None:
+        nonlocal interrupted
+        original_write_state(path, payload)
+        if payload["stage"] == "artifact":
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+
+    monkeypatch.setattr(lifecycle, "_write_state", commit_then_interrupt)
+
+    assert main(
+        artifact_args(paths, run_token),
+        input_stream=io.BytesIO(
+            canonical(candidate.model_dump(mode="json")).encode("utf-8")
+        ),
+        now=lambda: NOW,
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "interrupted",
+    }
+    assert (
+        paths["context"].read_bytes() if paths["context"].exists() else None
+    ) == original_artifact
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize(
+    ("failure", "error_type"),
+    [
+        (KeyboardInterrupt, "interrupted"),
+        (RuntimeError, "sync_failed"),
+    ],
+)
+def test_artifact_restores_output_when_apply_fails_after_replace(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    existing: bool,
+    failure: type[BaseException],
+    error_type: str,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    if not existing:
+        paths["context"].unlink()
+    original_artifact = paths["context"].read_bytes() if existing else None
+    run_token = start_pending_run()
+    candidate = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context(excerpt="采用方案 B。"),
+    )
+    real_apply = sync_cli._RecoverableAtomicWrite.apply
+
+    def fail_after_replace(operation) -> None:  # type: ignore[no-untyped-def]
+        real_apply(operation)
+        raise failure("private-apply-detail")
+
+    monkeypatch.setattr(
+        sync_cli._RecoverableAtomicWrite,
+        "apply",
+        fail_after_replace,
+    )
+
+    assert main(
+        artifact_args(paths, run_token),
+        input_stream=io.BytesIO(
+            canonical(candidate.model_dump(mode="json")).encode("utf-8")
+        ),
+        now=lambda: NOW,
+    ) == 1
+    public = capsys.readouterr().out
+    assert json.loads(public) == {"status": "error", "error_type": error_type}
+    assert "private-apply-detail" not in public
+    assert (
+        paths["context"].read_bytes() if paths["context"].exists() else None
+    ) == original_artifact
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_artifact_rollback_failure_is_sanitized_after_restoration(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original_artifact = paths["context"].read_bytes()
+    run_token = start_pending_run()
+    candidate = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context(excerpt="采用方案 B。"),
+    )
+    original_write_state = lifecycle._write_state
+    real_rollback = sync_cli._RecoverableAtomicWrite.rollback
+    rollback_calls = 0
+
+    def fail_artifact_stage(path: Path, payload: dict[str, object]) -> None:
+        if payload["stage"] == "artifact":
+            raise ValueError("private_file_write_failed")
+        original_write_state(path, payload)
+
+    def restore_then_fail(operation) -> None:  # type: ignore[no-untyped-def]
+        nonlocal rollback_calls
+        rollback_calls += 1
+        real_rollback(operation)
+        raise RuntimeError("private-rollback-detail")
+
+    monkeypatch.setattr(lifecycle, "_write_state", fail_artifact_stage)
+    monkeypatch.setattr(
+        sync_cli._RecoverableAtomicWrite,
+        "rollback",
+        restore_then_fail,
+    )
+
+    assert main(
+        artifact_args(paths, run_token),
+        input_stream=io.BytesIO(
+            canonical(candidate.model_dump(mode="json")).encode("utf-8")
+        ),
+        now=lambda: NOW,
+    ) == 1
+    public = capsys.readouterr().out
+    assert json.loads(public) == {
+        "status": "error",
+        "error_type": "private_file_write_failed",
+    }
+    assert "private-rollback-detail" not in public
+    assert rollback_calls == 1
+    assert paths["context"].read_bytes() == original_artifact
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_artifact_rejects_canonical_expansion_before_transaction(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    paths["context"].unlink()
+    run_token = start_pending_run()
+    payload = {
+        "schema_version": 1,
+        "context": {
+            "project_id": "project-1",
+            "project_name": "测试项目",
+            "generated_at": NOW.isoformat(),
+            "permission_scope": SCOPE,
+        },
+    }
+    raw = canonical(payload).encode("utf-8")
+    expanded = canonical(
+        QwenProjectContextArtifact.model_validate(payload).model_dump(mode="json")
+    ).encode("utf-8")
+    assert len(raw) < len(expanded)
+    encoded_limit = len(raw)
+    real_validate_bundle = sync_cli._validate_bundle
+
+    def validate_then_lower_limit(selected, source_bundle) -> None:  # type: ignore[no-untyped-def]
+        real_validate_bundle(selected, source_bundle)
+        monkeypatch.setattr(sync_cli, "MAX_PRIVATE_INPUT_BYTES", encoded_limit)
+
+    monkeypatch.setattr(sync_cli, "_validate_bundle", validate_then_lower_limit)
+    monkeypatch.setattr(
+        sync_cli,
+        "_RecoverableAtomicWrite",
+        lambda *_args: pytest.fail("oversized output must fail before transaction"),
+    )
+
+    assert main(
+        artifact_args(paths, run_token),
+        input_stream=io.BytesIO(raw),
+        now=lambda: NOW,
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "context_file_too_large",
+    }
+    assert not paths["context"].exists()
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
 
 
 def test_active_lifecycle_blocks_all_no_token_commands_before_side_effects(
@@ -2615,6 +2986,83 @@ def test_qwen_prompt_names_skill_and_closes_artifact_io_contract() -> None:
     assert validate_at < temporary_at
     assert size_at < temporary_at
     assert temporary_at < replace_at
+
+
+def test_skill_contract_requires_single_body_excerpt_without_rewriting() -> None:
+    root = Path(__file__).resolve().parents[2]
+    documents = (
+        (root / "skills/hui-anchor-dws-project-context-v1/SKILL.md").read_text(
+            encoding="utf-8"
+        ),
+        (root / "skills/hui-anchor-dws-project-context-v1/contract.md").read_text(
+            encoding="utf-8"
+        ),
+    )
+
+    for document in documents:
+        normalized = " ".join(document.split())
+        assert "单个非标题正文片段" in normalized
+        assert "连续原文" in normalized
+        assert "不拼接" in normalized
+        assert "不省略" in normalized
+        assert "不改标点" in normalized
+        assert "最长 150 字" in normalized
+        assert "省略该事实" in normalized
+
+
+def test_qwen_prompt_stops_after_failures_and_only_reruns_after_end() -> None:
+    prompt = (
+        Path(__file__).resolve().parents[2]
+        / "prompts"
+        / "qwenwork-dws-project-sync.md"
+    ).read_text(encoding="utf-8")
+    normalized = " ".join(prompt.replace("`", "").split())
+    compact = "".join(prompt.replace("`", "").split())
+
+    begin_once_at = compact.index("单个调度触发最多一次begin")
+    failure_at = compact.index("任何命令非成功", begin_once_at)
+    save_error_at = compact.index(
+        "先在内存中保存该失败命令返回的固定错误",
+        failure_at,
+    )
+    abort_at = compact.index("同一token调用abort", save_error_at)
+    output_at = compact.index("原样输出固定错误", abort_at)
+    return_at = compact.index("return", output_at)
+    no_begin_at = compact.index("abort后不得begin", return_at)
+    rerun_only_at = compact.index("只有end=rerun", no_begin_at)
+    full_rerun_at = compact.index("完整重跑", rerun_only_at)
+    recollect_at = compact.index("每轮重新采集", full_rerun_at)
+    replay_ban_at = compact.index(
+        "禁止读取或回放context_artifact",
+        recollect_at,
+    )
+    retry_ban_at = compact.index(
+        "确定性push错误不得再次push",
+        replay_ban_at,
+    )
+    numbered_flow_at = compact.index(
+        "1.使用参数数组运行pythontools/dws_sync_runtime.pybegin",
+        retry_ban_at,
+    )
+    assert begin_once_at < failure_at < save_error_at < abort_at
+    assert abort_at < output_at < return_at < no_begin_at
+    assert no_begin_at < rerun_only_at < full_rerun_at < recollect_at
+    assert recollect_at < replay_ban_at < retry_ban_at < numbered_flow_at
+
+    end_step_at = normalized.index(
+        "12. push 成功后，以同一 token 运行 python tools/dws_sync_runtime.py end"
+    )
+    rerun_response_at = normalized.index("返回 rerun 时", end_step_at)
+    rerun_chain_at = normalized.index(
+        "完整的宿主双 DWS 采集 -> host-import -> pending -> Skill -> artifact -> push -> end 链路",
+        rerun_response_at,
+    )
+    final_abort_at = normalized.index(
+        "任何未成功 end 的路径都必须由 finally 调用 abort",
+        rerun_chain_at,
+    )
+    assert end_step_at < rerun_response_at < rerun_chain_at < final_abort_at
+    assert " begin" not in normalized[rerun_response_at:final_abort_at]
 
 
 def test_private_task_config_is_ignored_and_documented_publicly() -> None:
