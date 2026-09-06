@@ -36,6 +36,7 @@ COMMANDS = (
     "host-import",
     "pending",
     "recover-pending",
+    "reuse-artifact",
     "artifact",
     "push",
     "end",
@@ -83,7 +84,7 @@ def dispatch(
 ) -> int:
     from tools import dws_project_sync as cli
 
-    if command in {"artifact", "host-import"}:
+    if command in {"artifact", "host-import", "reuse-artifact"}:
         config, _project = _load_host_import_config(root)
         token = None
     else:
@@ -98,6 +99,7 @@ def dispatch(
         "pending",
         "push",
         "recover-pending",
+        "reuse-artifact",
     }:
         argv += ["--manifest", str(config.manifest)]
     if command == "collect":
@@ -105,15 +107,21 @@ def dispatch(
         argv += ["--dws-path", str(config.dws), "--output", str(config.source_bundle)]
     if command == "host-import":
         argv += ["--output", str(config.source_bundle)]
-    if command in {"artifact", "pending", "push", "recover-pending"}:
+    if command in {
+        "artifact",
+        "pending",
+        "push",
+        "recover-pending",
+        "reuse-artifact",
+    }:
         argv += ["--sources-file", str(config.source_bundle)]
     if command in {"pending", "push"}:
         argv += [
             "--gateway", "http://127.0.0.1:8731",
         ]
-    if command in {"artifact", "push", "recover-pending"}:
+    if command in {"artifact", "push", "recover-pending", "reuse-artifact"}:
         argv += ["--context-file", str(config.context_artifact)]
-    if command in {"artifact", "push", "recover-pending"}:
+    if command in {"artifact", "push", "recover-pending", "reuse-artifact"}:
         argv += ["--state-file", str(config.state)]
     if command == "recover-pending":
         argv += ["--database-file", str(runtime_database(root))]

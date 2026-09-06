@@ -267,6 +267,24 @@ def artifact_args(paths: dict[str, Path], run_token: str) -> list[str]:
     ]
 
 
+def reuse_artifact_args(paths: dict[str, Path], run_token: str) -> list[str]:
+    return [
+        "reuse-artifact",
+        "--manifest",
+        str(paths["manifest"]),
+        "--project",
+        "project-1",
+        "--sources-file",
+        str(paths["sources"]),
+        "--context-file",
+        str(paths["context"]),
+        "--state-file",
+        str(paths["state"]),
+        "--run-token",
+        run_token,
+    ]
+
+
 def recover_pending_args(
     paths: dict[str, Path], database: Path
 ) -> list[str]:
@@ -1497,6 +1515,255 @@ def test_artifact_reuses_approved_context_for_unchanged_source(
         update={"generated_at": renewed_at}
     )
     assert written.completed_retrieval_request_ids == ("request-1",)
+
+
+def test_reuse_artifact_skips_candidate_for_unchanged_source(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    renewed_at = NOW + timedelta(minutes=3)
+    renewed = rehash_bundle(
+        original.model_copy(
+            update={
+                "collected_at": renewed_at,
+                "records": (
+                    original.records[0].model_copy(update={"fetched_at": renewed_at}),
+                ),
+            }
+        )
+    )
+    write_json(paths["sources"], renewed.model_dump(mode="json"))
+    approved = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context(excerpt="采用 方案 B。"),
+    )
+    write_json(
+        paths["context"].with_name("context.approved.json"),
+        approved.model_dump(mode="json"),
+    )
+    write_json(paths["state"], semantic_state(renewed, approved))
+    run_token = start_pending_run()
+
+    assert main(reuse_artifact_args(paths, run_token), now=lambda: NOW) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "artifact_reused"
+    written = QwenProjectContextArtifact.model_validate_json(
+        paths["context"].read_bytes()
+    )
+    assert written.context == approved.context.model_copy(
+        update={"generated_at": renewed_at}
+    )
+    assert written.completed_retrieval_request_ids == ()
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="artifact",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_reuse_artifact_requires_skill_when_source_changes(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(paths["state"], semantic_state(original, approved))
+    changed = rehash_bundle(
+        original.model_copy(
+            update={
+                "records": (
+                    original.records[0].model_copy(update={"source_version": "v2"}),
+                )
+            }
+        )
+    )
+    write_json(paths["sources"], changed.model_dump(mode="json"))
+    before = paths["context"].read_bytes()
+    run_token = start_pending_run()
+
+    assert main(reuse_artifact_args(paths, run_token), now=lambda: NOW) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "artifact_required"
+    assert paths["context"].read_bytes() == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_reuse_artifact_requires_skill_for_legacy_state(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    write_json(
+        paths["state"],
+        {
+            "schema_version": 1,
+            "project_id": "project-1",
+            "last_cursor": 1,
+            "last_content_hash": "a" * 64,
+            "last_sync_id": "sync-1",
+            "pending": None,
+        },
+    )
+    before = paths["context"].read_bytes()
+    run_token = start_pending_run()
+
+    assert main(reuse_artifact_args(paths, run_token), now=lambda: NOW) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "artifact_required"
+    assert paths["context"].read_bytes() == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_reuse_artifact_fails_closed_when_approved_is_missing(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(paths["state"], semantic_state(selected, approved))
+    before = paths["context"].read_bytes()
+    run_token = start_pending_run()
+
+    assert main(reuse_artifact_args(paths, run_token), now=lambda: NOW) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "approved_artifact_unavailable",
+    }
+    assert paths["context"].read_bytes() == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_reuse_artifact_rolls_back_when_stage_commit_fails(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(
+        paths["context"].with_name("context.approved.json"),
+        approved.model_dump(mode="json"),
+    )
+    write_json(paths["state"], semantic_state(selected, approved))
+    before = paths["context"].read_bytes()
+    run_token = start_pending_run()
+    original_write_state = lifecycle._write_state
+
+    def fail_artifact_stage(path: Path, payload: dict[str, object]) -> None:
+        if payload["stage"] == "artifact":
+            raise ValueError("private_file_write_failed")
+        original_write_state(path, payload)
+
+    monkeypatch.setattr(lifecycle, "_write_state", fail_artifact_stage)
+
+    assert main(reuse_artifact_args(paths, run_token), now=lambda: NOW) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "private_file_write_failed",
+    }
+    assert paths["context"].read_bytes() == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_reuse_artifact_rejects_conflicting_pending_identity(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(
+        paths["context"].with_name("context.approved.json"),
+        approved.model_dump(mode="json"),
+    )
+    conflicting_hash = "b" * 64
+    write_json(
+        paths["state"],
+        semantic_state(
+            selected,
+            approved,
+            pending={
+                "source_cursor": 2,
+                "content_hash": conflicting_hash,
+                "sync_id": sync_cli._sync_id(
+                    "project-1", 2, conflicting_hash
+                ),
+                "completion_claims_hash": digest("[]"),
+            },
+        ),
+    )
+    before = paths["context"].read_bytes()
+    run_token = start_pending_run()
+
+    assert main(reuse_artifact_args(paths, run_token), now=lambda: NOW) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "pending_sync_conflict",
+    }
+    assert paths["context"].read_bytes() == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_reuse_artifact_rejects_non_pending_lifecycle_stage(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    started = lifecycle.begin_run(
+        "project-1",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+    assert started.run_token is not None
+
+    assert main(
+        reuse_artifact_args(paths, started.run_token), now=lambda: NOW
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "run_stage_invalid",
+    }
+    lifecycle.assert_stage(
+        "project-1",
+        started.run_token,
+        expected="begun",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
 
 
 def test_artifact_fails_closed_when_unchanged_approved_is_missing(
@@ -4689,7 +4956,7 @@ def test_qwen_prompt_stops_after_failures_and_only_reruns_after_end() -> None:
     )
     rerun_response_at = normalized.index("返回 rerun 时", end_step_at)
     rerun_chain_at = normalized.index(
-        "完整的宿主双 DWS 采集 -> host-import -> pending -> Skill -> artifact -> push -> end 链路",
+        "完整的宿主双 DWS 采集 -> host-import -> pending -> reuse-artifact ->（artifact_reused，或 artifact_required -> Skill -> artifact）-> push -> end 链路",
         rerun_response_at,
     )
     final_abort_at = normalized.index(
@@ -4698,6 +4965,30 @@ def test_qwen_prompt_stops_after_failures_and_only_reruns_after_end() -> None:
     )
     assert end_step_at < rerun_response_at < rerun_chain_at < final_abort_at
     assert " begin" not in normalized[rerun_response_at:final_abort_at]
+
+
+def test_qwen_prompt_reuses_approved_artifact_before_skill() -> None:
+    prompt = (
+        Path(__file__).resolve().parents[2]
+        / "prompts"
+        / "qwenwork-dws-project-sync.md"
+    ).read_text(encoding="utf-8")
+    normalized = " ".join(prompt.replace("`", "").split())
+
+    pending_at = normalized.index("python tools/dws_sync_runtime.py pending")
+    reuse_at = normalized.index(
+        "python tools/dws_sync_runtime.py reuse-artifact",
+        pending_at,
+    )
+    skill_at = normalized.index("hui-anchor-dws-project-context-v1", reuse_at)
+    assert pending_at < reuse_at < skill_at
+    assert "artifact_reused" in normalized[reuse_at:skill_at]
+    assert "artifact_required" in normalized[reuse_at:skill_at]
+    rerun_at = normalized.index("返回 rerun 时")
+    rerun_reuse_at = normalized.index("reuse-artifact", rerun_at)
+    rerun_skill_at = normalized.index("Skill", rerun_reuse_at)
+    rerun_end_at = normalized.index("end 链路", rerun_skill_at)
+    assert rerun_at < rerun_reuse_at < rerun_skill_at < rerun_end_at
 
 
 def test_private_task_config_is_ignored_and_documented_publicly() -> None:

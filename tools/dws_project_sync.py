@@ -388,6 +388,14 @@ def _parser() -> argparse.ArgumentParser:
     artifact.add_argument("--state-file", required=True)
     artifact.add_argument("--run-token", required=True)
 
+    reuse_artifact = commands.add_parser("reuse-artifact", add_help=False)
+    reuse_artifact.add_argument("--manifest", required=True)
+    reuse_artifact.add_argument("--project", required=True)
+    reuse_artifact.add_argument("--sources-file", required=True)
+    reuse_artifact.add_argument("--context-file", required=True)
+    reuse_artifact.add_argument("--state-file", required=True)
+    reuse_artifact.add_argument("--run-token", required=True)
+
     push = commands.add_parser("push", add_help=False)
     push.add_argument("--manifest", required=True)
     push.add_argument("--project", required=True)
@@ -1609,6 +1617,89 @@ def _artifact_command(
     }
 
 
+def _reuse_artifact_command(
+    args: argparse.Namespace,
+    *,
+    now: Callable[[], datetime],
+) -> dict[str, object]:
+    manifest_path, sources_path, context_path, state_path = (
+        _validated_sync_paths(args)
+    )
+    manifest = DwsManifest.load(manifest_path)
+    project = _selected_project(manifest, args.project)
+    sources_payload = _read_json_object(
+        sources_path,
+        "sources_file",
+        max_bytes=MAX_PRIVATE_INPUT_BYTES,
+    )
+    try:
+        source_bundle = DwsSourceBundle.model_validate(sources_payload)
+    except (TypeError, ValueError):
+        raise ValueError("sources_file_invalid") from None
+    _validate_bundle(project, source_bundle)
+    lifecycle.assert_stage(
+        project.project_id,
+        args.run_token,
+        expected="pending",
+        root=LIFECYCLE_ROOT,
+        now=now,
+    )
+    state = _load_state(state_path, project.project_id)
+    semantic_hash = source_bundle_semantic_hash(source_bundle)
+    if state.last_source_semantic_hash != semantic_hash:
+        return {
+            "status": "artifact_required",
+            "project_id": project.project_id,
+        }
+    assert state.last_artifact_hash is not None
+    approved = _read_approved_artifact(context_path, state.last_artifact_hash)
+    selected = QwenProjectContextArtifact(
+        schema_version=1,
+        context=approved.context.model_copy(
+            update={"generated_at": source_bundle.collected_at}
+        ),
+        completed_retrieval_request_ids=(),
+    )
+    _validate_context(project, source_bundle, selected.context)
+    if state.pending is not None:
+        pending_envelope = _build_envelope(
+            project,
+            source_bundle,
+            selected.context,
+            completed_retrieval_request_ids=(),
+            source_cursor=state.pending.source_cursor,
+            now=now(),
+        )
+        if (
+            pending_envelope.content_hash != state.pending.content_hash
+            or pending_envelope.sync_id != state.pending.sync_id
+            or _completion_claims_hash(
+                pending_envelope.completed_retrieval_claims
+            )
+            != state.pending.completion_claims_hash
+        ):
+            raise ValueError("pending_sync_conflict")
+    encoded = _canonical_bytes(selected.model_dump(mode="json"))
+    if len(encoded) > MAX_PRIVATE_INPUT_BYTES:
+        raise ValueError("context_file_too_large")
+    transaction = _RecoverableAtomicWrite(context_path, encoded)
+    lifecycle.commit_stage(
+        project.project_id,
+        args.run_token,
+        expected="pending",
+        target="artifact",
+        apply=transaction.apply,
+        rollback=transaction.rollback,
+        root=LIFECYCLE_ROOT,
+        now=now,
+    )
+    return {
+        "status": "artifact_reused",
+        "project_id": project.project_id,
+        "output_bytes": len(encoded),
+    }
+
+
 def _read_push_inputs(
     args: argparse.Namespace,
 ) -> tuple[DwsProjectManifest, DwsSourceBundle, QwenProjectContextArtifact, Path]:
@@ -2375,6 +2466,7 @@ def main(
             "end",
             "pending",
             "recover-pending",
+            "reuse-artifact",
             "push",
         }:
             output: dict[str, object] = {
@@ -2390,6 +2482,7 @@ def main(
                     "host-import",
                     "pending",
                     "recover-pending",
+                    "reuse-artifact",
                     "artifact",
                     "push",
                     "end",
@@ -2438,6 +2531,8 @@ def main(
             )
         elif args.command == "recover-pending":
             output = _recover_pending_command(args, now=now)
+        elif args.command == "reuse-artifact":
+            output = _reuse_artifact_command(args, now=now)
         elif args.command == "end":
             ended = lifecycle.end_run(
                 args.project,

@@ -110,7 +110,11 @@ Skill 注册表和真实会话检查，不等同于同步已运行。prepare/ser
    `request_id`、`query_hash`、`request_epoch`、`attempt_count`、`lease_expires_at`、
    `lease_token`、`sources` 的 `retrieval_requests` 原子写回 source bundle。
    任一 hash 无法唯一映射时立即停止，不得扩大白名单。
-6. pending 成功后，调用名称精确为 `hui-anchor-dws-project-context-v1` 的 Skill。该 Skill 的
+6. pending 成功后，先使用参数数组运行
+   `python tools/dws_sync_runtime.py reuse-artifact --run-token TOKEN`。返回
+   `artifact_reused` 时说明来源未变化且已复用最后成功批准的上下文，跳过本步余下内容以及步骤
+   7 至 10，直接进入步骤 11；返回 `artifact_required` 时才继续调用名称精确为
+   `hui-anchor-dws-project-context-v1` 的 Skill。其他状态均按失败分支 abort 并 return。该 Skill 的
    唯一输入是从 `source_bundle` 读取并校验后的 `DwsSourceBundle`；不得传入历史对话、
    仓库文档、其他私有文件或模型记忆。唯一输出是一个
    `QwenProjectContextArtifact` JSON object，顶层只允许 `schema_version`、`context` 和
@@ -151,8 +155,8 @@ Skill 注册表和真实会话检查，不等同于同步已运行。prepare/ser
 12. push 成功后，以同一 token 运行 `python tools/dws_sync_runtime.py end --run-token TOKEN`。
     返回 `completed`
      时结束；返回 `rerun` 时只使用返回的新 token 再执行一次完整的宿主双 DWS 采集 ->
-     host-import -> pending ->
-    Skill -> artifact -> push -> end 链路。任何未成功 end 的路径都必须由 `finally` 调用 abort；
+    host-import -> pending -> reuse-artifact ->（artifact_reused，或 artifact_required -> Skill ->
+    artifact）-> push -> end 链路。任何未成功 end 的路径都必须由 `finally` 调用 abort；
     旧 token 不得再写 bundle、artifact、state 或发起 push。
 
 ## 读取、写入和输出边界
