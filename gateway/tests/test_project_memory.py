@@ -107,6 +107,63 @@ def test_answer_rejects_a_single_generic_chinese_fragment_overlap() -> None:
         )
 
 
+def test_exact_decision_wins_over_an_earlier_fragment_candidate() -> None:
+    fragment_candidate = decision("采用方案 A").model_copy(
+        update={
+            "decision_id": "decision-fragment",
+            "topic": "移动终端软件选型",
+            "source_refs": (source("meeting-fragment"),),
+        }
+    )
+    exact_candidate = decision().model_copy(
+        update={
+            "decision_id": "decision-exact",
+            "source_refs": (source("meeting-exact"),),
+        }
+    )
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(
+        context(decisions=(fragment_candidate, exact_candidate))
+    )
+
+    answer = service.answer(
+        "project-1",
+        "终端方案是什么",
+        kind=AnswerKind.DECISION_CHECK,
+        now=NOW,
+    )
+
+    assert answer.text == "当前有效决策：采用方案 B"
+    assert answer.source_refs == (source("meeting-exact"),)
+
+
+def test_tied_fragment_candidates_fail_closed() -> None:
+    first = decision("采用方案 A").model_copy(
+        update={
+            "decision_id": "decision-first",
+            "topic": "移动终端软件选型",
+            "source_refs": (source("meeting-first"),),
+        }
+    )
+    second = decision().model_copy(
+        update={
+            "decision_id": "decision-second",
+            "topic": "桌面终端硬件选型",
+            "source_refs": (source("meeting-second"),),
+        }
+    )
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(first, second)))
+
+    with pytest.raises(ProjectContextUnavailable, match="source_not_found"):
+        service.answer(
+            "project-1",
+            "终端方案是什么",
+            kind=AnswerKind.DECISION_CHECK,
+            now=NOW,
+        )
+
+
 def test_answer_rejects_expired_context_instead_of_using_stale_facts() -> None:
     service = ProjectMemoryService(clock=lambda: NOW)
     service.replace_context(context(decisions=(decision(),)))

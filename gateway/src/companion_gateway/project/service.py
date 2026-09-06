@@ -217,15 +217,43 @@ class ProjectMemoryService:
         if not normalized_query:
             raise ProjectContextUnavailable("source_not_found")
         with self._lock:
+            active_decisions = tuple(
+                item
+                for item in context.active_decisions
+                if item.status is DecisionStatus.ACTIVE
+            )
             match = next(
                 (
                     item
-                    for item in context.active_decisions
-                    if item.status is DecisionStatus.ACTIVE
-                    and self._matches(item, normalized_query)
+                    for item in active_decisions
+                    if self._matches_exactly(item, normalized_query)
                 ),
                 None,
             )
+            if match is None and kind in {
+                AnswerKind.DECISION_CHECK,
+                AnswerKind.SUGGESTION,
+            }:
+                scored_matches = tuple(
+                    (score, item)
+                    for item in active_decisions
+                    if (
+                        score := self._fragment_match_score(
+                            item,
+                            normalized_query,
+                        )
+                    )
+                    is not None
+                )
+                if scored_matches:
+                    best_score = max(score for score, _item in scored_matches)
+                    best_matches = tuple(
+                        item
+                        for score, item in scored_matches
+                        if score == best_score
+                    )
+                    if len(best_matches) == 1:
+                        match = best_matches[0]
         if match is None:
             if not self._query_integration_enabled:
                 raise ProjectContextUnavailable("source_not_found")
@@ -686,7 +714,7 @@ class ProjectMemoryService:
         return fragments
 
     @classmethod
-    def _matches(cls, decision: DecisionCard, query: str) -> bool:
+    def _matches_exactly(cls, decision: DecisionCard, query: str) -> bool:
         values = (
             decision.decision_id,
             decision.topic,
@@ -698,12 +726,25 @@ class ProjectMemoryService:
                 len(normalized_value) >= 2 and normalized_value in query
             ):
                 return True
+        return False
 
+    @classmethod
+    def _fragment_match_score(
+        cls,
+        decision: DecisionCard,
+        query: str,
+    ) -> tuple[int, int] | None:
         query_fragments = cls._chinese_bigrams(query)
-        decision_fragments = cls._chinese_bigrams(
+        topic_matches = query_fragments & cls._chinese_bigrams(
             cls._normalize(decision.topic)
-        ) | cls._chinese_bigrams(cls._normalize(decision.decision_text))
-        return len(query_fragments & decision_fragments) >= 2
+        )
+        text_matches = query_fragments & cls._chinese_bigrams(
+            cls._normalize(decision.decision_text)
+        )
+        total_matches = topic_matches | text_matches
+        if not topic_matches or len(total_matches) < 2:
+            return None
+        return len(topic_matches), len(total_matches)
 
     @staticmethod
     def _require_source_scope(

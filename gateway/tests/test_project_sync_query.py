@@ -281,6 +281,64 @@ def test_realistic_decision_fragments_win_before_evidence_fallback(
     assert policy.calls == [(PROJECT_ID, decision.source_refs, NOW)]
 
 
+def test_fragment_match_requires_a_topic_fragment() -> None:
+    document = evidence_source("document-1")
+    decision = decision_for(document).model_copy(
+        update={"topic": "桌面终端硬件选型"}
+    )
+    snapshot = project_snapshot(
+        sources=(document,),
+        chunks=(),
+        decision=decision,
+    )
+    writer = RecordingRetrievalWriter()
+    service = integrated_service(
+        snapshot,
+        policy=RecordingSourcePolicy(),
+        retrieval_writer=writer,
+    )
+
+    with pytest.raises(ProjectContextUnavailable, match="evidence_pending"):
+        service.answer(
+            PROJECT_ID,
+            "网站采用什么方案",
+            kind=AnswerKind.DECISION_CHECK,
+        )
+
+    requests = tuple(writer.requests.values())
+    assert len(requests) == 1
+    assert requests[0].query_hash == digest("网站采用什么方案")
+
+
+def test_fact_fragment_overlap_keeps_evidence_retrieval_path() -> None:
+    document = evidence_source("document-1")
+    decision = decision_for(document).model_copy(
+        update={"topic": "桌面终端硬件选型"}
+    )
+    evidence = evidence_chunk(document, "硬件采用 USB-C 接口。")
+    snapshot = project_snapshot(
+        sources=(document,),
+        chunks=(evidence,),
+        decision=decision,
+    )
+    writer = RecordingRetrievalWriter()
+    service = integrated_service(
+        snapshot,
+        policy=RecordingSourcePolicy(),
+        retrieval_writer=writer,
+    )
+
+    answer = service.answer(
+        PROJECT_ID,
+        "硬件采用什么接口",
+        kind=AnswerKind.FACT,
+    )
+
+    assert answer.text == evidence.text
+    assert answer.source_refs == (source_ref(document, excerpt=evidence.text),)
+    assert writer.requests == {}
+
+
 def test_stale_task_source_does_not_block_decision_answer(tmp_path: Path) -> None:
     document = evidence_source("document-1")
     task = evidence_source("task-1", source_type=SyncSourceType.TASK)
