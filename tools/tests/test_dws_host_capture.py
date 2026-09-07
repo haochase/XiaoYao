@@ -482,3 +482,31 @@ def test_prepared_delete_rejects_same_bytes_replacement_without_deleting_it(
         transaction.apply()
 
     assert path.read_bytes() == original
+
+
+def test_discard_allows_unknown_old_token_but_rejects_invalid_payload(
+    capture,
+) -> None:
+    protector = Protector()
+    selected = manifest()
+    capture.capture_document_info(
+        encoded_result("doc_info", document_info()),
+        selected,
+        run_token="old-run-token",
+        protector=protector,
+    )
+
+    assert capture.discard_document_info_capture(
+        "project-1",
+        protector=protector,
+    ) is True
+
+    path = capture.document_info_capture_path("project-1")
+    original = b"not-a-protected-host-capture"
+    path.write_bytes(original)
+    with pytest.raises(ValueError, match="^host_capture_invalid$"):
+        capture.discard_document_info_capture(
+            "project-1",
+            protector=protector,
+        )
+    assert path.read_bytes() == original

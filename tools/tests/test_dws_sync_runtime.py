@@ -191,6 +191,64 @@ def test_host_import_maps_fixed_paths_and_does_not_decrypt_credential(
     assert "COMPANION_DWS_SYNC_TOKEN" not in kwargs["environ"]
 
 
+@pytest.mark.parametrize(
+    "command",
+    (
+        "capture-info",
+        "complete-host-import",
+    ),
+)
+def test_two_phase_host_commands_map_fixed_paths_without_decrypting_credential(
+    tmp_path: Path,
+    monkeypatch,
+    command: str,
+) -> None:
+    from tools import dws_project_sync
+    from tools import dws_sync_runtime as wrapper
+
+    class HostImportProtector(Protector):
+        def unprotect(self, project_id: str, protected: bytes) -> bytes:
+            pytest.fail(f"{command} must not decrypt the gateway credential")
+
+    manifest, dws = inputs(tmp_path)
+    prepare_runtime(tmp_path, manifest, "project-1", dws, Protector())
+    observed = []
+    stdin = object()
+    monkeypatch.setattr(
+        dws_project_sync,
+        "main",
+        lambda argv, **kwargs: observed.append((argv, kwargs)) or 0,
+    )
+    monkeypatch.setenv("COMPANION_DWS_SYNC_TOKEN", "ambient-secret")
+
+    assert wrapper.dispatch(
+        tmp_path,
+        command,
+        "lease-token",
+        False,
+        HostImportProtector(),
+        input_stream=stdin,
+    ) == 0
+
+    argv, kwargs = observed[0]
+    expected = [
+        command,
+        "--project",
+        "project-1",
+        "--run-token",
+        "lease-token",
+        "--manifest",
+        str(manifest),
+    ]
+    expected += [
+        "--output",
+        str(tmp_path / ".private/dws-runtime/source-bundle.json"),
+    ]
+    assert argv == expected
+    assert kwargs["input_stream"] is stdin
+    assert "COMPANION_DWS_SYNC_TOKEN" not in kwargs["environ"]
+
+
 def test_artifact_maps_fixed_inputs_and_does_not_decrypt_credential(
     tmp_path: Path,
     monkeypatch,

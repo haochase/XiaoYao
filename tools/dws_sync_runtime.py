@@ -33,7 +33,9 @@ from tools.dws_sync.runtime import (
 COMMANDS = (
     "begin",
     "collect",
+    "capture-info",
     "host-import",
+    "complete-host-import",
     "pending",
     "recover-pending",
     "reuse-artifact",
@@ -84,7 +86,13 @@ def dispatch(
 ) -> int:
     from tools import dws_project_sync as cli
 
-    if command in {"artifact", "host-import", "reuse-artifact"}:
+    if command in {
+        "artifact",
+        "capture-info",
+        "host-import",
+        "complete-host-import",
+        "reuse-artifact",
+    }:
         config, _project = _load_host_import_config(root)
         token = None
     else:
@@ -95,7 +103,9 @@ def dispatch(
     if command in {
         "artifact",
         "collect",
+        "capture-info",
         "host-import",
+        "complete-host-import",
         "pending",
         "push",
         "recover-pending",
@@ -105,7 +115,11 @@ def dispatch(
     if command == "collect":
         resolve_dws_launch(config.dws)
         argv += ["--dws-path", str(config.dws), "--output", str(config.source_bundle)]
-    if command == "host-import":
+    if command in {
+        "capture-info",
+        "host-import",
+        "complete-host-import",
+    }:
         argv += ["--output", str(config.source_bundle)]
     if command in {
         "artifact",
@@ -133,7 +147,12 @@ def dispatch(
     if command in {"pending", "push"} and not dry_run:
         environment["COMPANION_DWS_SYNC_TOKEN"] = token
     kwargs: dict[str, object] = {"environ": environment}
-    if command in {"artifact", "host-import"}:
+    if command in {
+        "artifact",
+        "capture-info",
+        "host-import",
+        "complete-host-import",
+    }:
         kwargs["input_stream"] = (
             sys.stdin.buffer if input_stream is None else input_stream
         )

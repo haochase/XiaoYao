@@ -202,6 +202,44 @@ def begin_run(
         return BeginResult("started", token)
 
 
+def begin_run_with_cleanup(
+    project_id: str,
+    *,
+    cleanup: Callable[[], None],
+    root: Path = state_lock.PRIVATE_LOCK_ROOT,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> BeginResult:
+    """Start a run and clear stale side state while its lifecycle lock is held."""
+    with _lock(root, project_id):
+        current = _read_now(now)
+        path = project_state_path(root, project_id)
+        state = _read_state(path, project_id)
+        if state is not None and _is_live(state, current):
+            if state["coalesced"] is not True:
+                state["coalesced"] = True
+                _write_state(path, state)
+            return BeginResult("coalesced", None)
+        token = secrets.token_hex(32)
+        state = _new_state(project_id, token, current)
+        _write_state(path, state)
+        try:
+            cleanup()
+        except BaseException:
+            state.update(
+                active=False,
+                run_token_hash=None,
+                stage="aborted",
+                lease_expires_at=None,
+                coalesced=False,
+            )
+            try:
+                _write_state(path, state)
+            except BaseException:
+                raise ValueError("private_file_write_failed") from None
+            raise
+        return BeginResult("started", token)
+
+
 def _validated_state(
     path: Path, project_id: str, token: str, now: datetime
 ) -> dict[str, object]:
@@ -430,3 +468,63 @@ def abort_run(
             coalesced=False,
         )
         _write_state(path, state)
+
+
+def abort_run_with_cleanup(
+    project_id: str,
+    token: str,
+    *,
+    cleanup: Callable[[], None],
+    root: Path = state_lock.PRIVATE_LOCK_ROOT,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> None:
+    """Invalidate a run and clear its side state under one project lock."""
+    with _lock(root, project_id):
+        current = _read_now(now)
+        path = project_state_path(root, project_id)
+        state = _validated_state(path, project_id, token, current)
+        state.update(
+            active=False,
+            run_token_hash=None,
+            stage="aborted",
+            lease_expires_at=None,
+            coalesced=False,
+        )
+        _write_state(path, state)
+        cleanup()
+
+
+def end_run_with_check(
+    project_id: str,
+    token: str,
+    *,
+    check: Callable[[], None],
+    root: Path = state_lock.PRIVATE_LOCK_ROOT,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> BeginResult:
+    """Check side state before completing or rerunning while the lock is held."""
+    with _lock(root, project_id):
+        current = _read_now(now)
+        path = project_state_path(root, project_id)
+        state = _validated_state(path, project_id, token, current)
+        if state["stage"] != "pushed":
+            raise ValueError("run_stage_invalid")
+        check()
+        if state["coalesced"] is True and state["rerun_used"] is False:
+            replacement = secrets.token_hex(32)
+            _write_state(
+                path,
+                _new_state(
+                    project_id, replacement, current, rerun_used=True
+                ),
+            )
+            return BeginResult("rerun", replacement)
+        state.update(
+            active=False,
+            run_token_hash=None,
+            stage="completed",
+            lease_expires_at=None,
+            coalesced=False,
+        )
+        _write_state(path, state)
+        return BeginResult("completed", None)

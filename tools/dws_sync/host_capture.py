@@ -8,6 +8,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import tempfile
 from types import MappingProxyType
@@ -39,6 +40,7 @@ _CAPTURE_KEYS = {
     "run_token_key",
     "document_info",
 }
+_BINDING_KEY = re.compile(r"[0-9a-f]{64}\Z")
 _REPARSE_POINT = 0x400
 _MISSING = object()
 _TITLE_FIELDS = ("source_title", "title", "name", "summary", "subject")
@@ -679,6 +681,57 @@ def _checked_protector(protector: ContentProtector) -> ContentProtector:
     return protector
 
 
+def _validate_discardable_capture(
+    project_id: str,
+    protected: bytes,
+    protector: ContentProtector,
+) -> None:
+    try:
+        plaintext = protector.unprotect(project_id, protected)
+    except Exception:
+        raise ValueError("host_capture_invalid") from None
+    if type(plaintext) is not bytes or not plaintext:
+        raise ValueError("host_capture_invalid")
+    try:
+        payload = _decode_json(plaintext)
+    except ValueError:
+        raise ValueError("host_capture_invalid") from None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _CAPTURE_KEYS
+        or payload["schema_version"] != _CAPTURE_SCHEMA_VERSION
+        or type(payload["schema_version"]) is not int
+        or not isinstance(payload["project_key"], str)
+        or not isinstance(payload["source_key"], str)
+        or not isinstance(payload["run_token_key"], str)
+        or not isinstance(payload["document_info"], dict)
+    ):
+        raise ValueError("host_capture_invalid")
+    stored_document_info = payload["document_info"]
+    result = stored_document_info.get("result")
+    if not isinstance(result, dict) or not isinstance(result.get("nodeId"), str):
+        raise ValueError("host_capture_invalid")
+    source_id = result["nodeId"]
+    if not source_id or len(source_id) > 512:
+        raise ValueError("host_capture_invalid")
+    normalized = _normalized_document_info(stored_document_info, source_id)
+    if _canonical_json(stored_document_info) != _canonical_json(normalized):
+        raise ValueError("host_capture_invalid")
+    if any(
+        _BINDING_KEY.fullmatch(payload[key]) is None
+        for key in ("project_key", "source_key", "run_token_key")
+    ):
+        raise ValueError("host_capture_invalid")
+    if not hmac.compare_digest(
+        payload["project_key"],
+        _binding_key("project", project_id),
+    ):
+        raise ValueError("host_capture_invalid")
+    if not hmac.compare_digest(
+        payload["source_key"],
+        _binding_key("source", source_id),
+    ):
+        raise ValueError("host_capture_invalid")
 def prepare_document_info_capture(
     document_info: dict[str, object],
     project: DwsProjectManifest,
@@ -799,13 +852,31 @@ def clear_document_info_capture(
         return True
 
 
-def discard_document_info_capture(project_id: str) -> bool:
+def discard_document_info_capture(
+    project_id: str,
+    *,
+    protector: ContentProtector,
+) -> bool:
     selected_root = _capture_root()
+    selected_protector = _checked_protector(protector)
     path = document_info_capture_path(project_id)
     _ensure_capture_root(selected_root)
     with state_lock.acquire_state_lock(path, project_id, root=selected_root):
         _ensure_capture_root(selected_root)
-        return _delete_capture(path)
+        snapshot = _read_capture_snapshot(path)
+        if snapshot is None:
+            return False
+        protected, path_info = snapshot
+        _validate_discardable_capture(
+            project_id,
+            protected,
+            selected_protector,
+        )
+        return _delete_capture(
+            path,
+            expected=protected,
+            expected_info=path_info,
+        )
 
 
 def document_info_capture_exists(project_id: str) -> bool:

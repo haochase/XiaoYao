@@ -30,6 +30,7 @@ from tools.dws_sync import (
     DwsSourceRecord,
 )
 from tools.dws_sync import lifecycle
+from tools.dws_sync.runtime import prepare_runtime
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -271,8 +272,14 @@ def _run_sync_cli(
                 "from pathlib import Path; import sys; "
                 "sys.path.insert(0, str(Path.cwd() / 'gateway' / 'src')); "
                 "import tools.dws_project_sync as cli; "
+                "import tools.dws_sync.host_capture as capture; "
                 "import tools.dws_sync.state_lock as lock; "
                 "root=Path(sys.argv[1]); cli.LIFECYCLE_ROOT=root; "
+                "capture._TEST_CAPTURE_ROOT=root.parent / 'dws-host-captures'; "
+                "protector=type('CaptureProtector',(),{"
+                "'protect':lambda self,_project,plain:b'test-capture\\0'+plain,"
+                "'unprotect':lambda self,_project,protected:protected[len(b'test-capture\\0'):]})(); "
+                "cli._host_capture_protector=lambda:protector; "
                 "lock.PRIVATE_LOCK_ROOT=root; raise SystemExit(cli.main(sys.argv[2:]))"
             ),
             str(Path(environment["TEMP"]) / "dws-sync-locks"),
@@ -288,6 +295,86 @@ def _run_sync_cli(
     assert completed.returncode == 0, completed.stdout.decode("utf-8")
     assert completed.stderr == b""
     return json.loads(completed.stdout)
+
+
+def _run_host_import_process(
+    root: Path,
+    capture_root: Path,
+    lifecycle_root: Path,
+    entrypoint: str,
+    arguments: list[str],
+    environment: dict[str, str],
+    *,
+    input_bytes: bytes | None = None,
+) -> dict[str, object]:
+    code = """
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path.cwd() / "gateway" / "src"))
+
+from tools import dws_project_sync as cli
+from tools import dws_sync_runtime as runtime
+from tools.dws_sync import host_capture, state_lock
+
+
+class CaptureProtector:
+    def protect(self, _project_id, plaintext):
+        return b"test-capture\\0" + plaintext
+
+    def unprotect(self, _project_id, protected):
+        prefix = b"test-capture\\0"
+        if not protected.startswith(prefix):
+            raise ValueError("test capture invalid")
+        return protected[len(prefix):]
+
+
+root = Path(sys.argv[1])
+capture_root = Path(sys.argv[2])
+lifecycle_root = Path(sys.argv[3])
+entrypoint = sys.argv[4]
+host_capture._TEST_CAPTURE_ROOT = capture_root
+cli._host_capture_protector = lambda: CaptureProtector()
+cli.LIFECYCLE_ROOT = lifecycle_root
+state_lock.PRIVATE_LOCK_ROOT = lifecycle_root
+argv = sys.argv[5:]
+if entrypoint == "runtime":
+    raise SystemExit(runtime.main(argv, root=root))
+raise SystemExit(cli.main(argv))
+"""
+    completed = subprocess.run(
+        [
+            str(PYTHON),
+            "-c",
+            code,
+            str(root),
+            str(capture_root),
+            str(lifecycle_root),
+            entrypoint,
+            *arguments,
+        ],
+        cwd=ROOT,
+        env=environment,
+        input=input_bytes,
+        check=False,
+        capture_output=True,
+        timeout=40,
+    )
+    assert completed.returncode == 0, completed.stdout.decode("utf-8")
+    assert completed.stderr == b""
+    return json.loads(completed.stdout)
+
+
+def _host_result(operation: str, payload: object) -> bytes:
+    encoded = _canonical(payload)
+    return _canonical(
+        {
+            "operation": operation,
+            "encoding": "base64-json",
+            "byte_count": len(encoded),
+            "payload": base64.b64encode(encoded).decode("ascii"),
+        }
+    )
 
 
 def _host_import_input(markdown: str) -> bytes:
@@ -496,6 +583,135 @@ def test_host_import_subprocess_fixture_preserves_unicode(
     bundle = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
     assert bundle.records[0].status == "active"
     assert bundle.records[0].content_text == markdown
+
+
+def test_two_runtime_subprocesses_complete_host_import_and_abort_crash_capture(
+    tmp_path: Path,
+) -> None:
+    class RuntimeProtector:
+        def protect(self, _project_id: str, plaintext: bytes) -> bytes:
+            return b"runtime-test\0" + plaintext
+
+        def unprotect(self, _project_id: str, protected: bytes) -> bytes:
+            prefix = b"runtime-test\0"
+            if not protected.startswith(prefix):
+                raise ValueError("runtime test protection invalid")
+            return protected[len(prefix) :]
+
+    paths = _write_private_inputs(tmp_path)
+    dws = tmp_path / "dws.exe"
+    dws.write_bytes(b"test fixture")
+    prepare_runtime(
+        tmp_path,
+        paths["manifest"],
+        PROJECT_ID,
+        dws,
+        RuntimeProtector(),
+    )
+    environment = _environment(tmp_path, tmp_path / "unused.db")
+    lifecycle_root = tmp_path / "runtime-locks"
+    capture_root = tmp_path / "runtime-captures"
+    started = lifecycle.begin_run(PROJECT_ID, root=lifecycle_root)
+    token = started.run_token
+    assert started.status == "started"
+    assert isinstance(token, str)
+    info = {
+        "result": {
+            "nodeId": "document-local-1",
+            "contentType": "ALIDOC",
+            "extension": "adoc",
+            "title": "中文 \"标题\"",
+            "shareUrl": "dingtalk://doc/document-local-1",
+            "version": "v-host",
+            "updatedAt": "2026-09-06T16:30:00+08:00",
+        }
+    }
+    markdown = '# 中文标题\n包含 "引号"、反斜杠 C:\\临时\\文档，以及第二行。'
+
+    captured = _run_host_import_process(
+        tmp_path,
+        capture_root,
+        lifecycle_root,
+        "runtime",
+        ["capture-info", "--run-token", token],
+        environment,
+        input_bytes=_host_result("doc_info", info),
+    )
+    assert captured == {
+        "status": "host_info_captured",
+        "project_id": PROJECT_ID,
+    }
+    completed = _run_host_import_process(
+        tmp_path,
+        capture_root,
+        lifecycle_root,
+        "runtime",
+        ["complete-host-import", "--run-token", token],
+        environment,
+        input_bytes=_host_result("doc_read", {"data": {"markdown": markdown}}),
+    )
+    assert completed["status"] == "collected"
+    bundle_path = tmp_path / ".private/dws-runtime/source-bundle.json"
+    bundle = DwsSourceBundle.model_validate_json(bundle_path.read_bytes())
+    assert bundle.records[0].content_text == markdown
+    assert not any(capture_root.glob("*.dpapi"))
+    lifecycle.assert_stage(
+        PROJECT_ID,
+        token,
+        expected="collected",
+        root=lifecycle_root,
+    )
+
+    crash_root = tmp_path / "crash"
+    crash_root.mkdir()
+    crash_paths = _write_private_inputs(crash_root)
+    crash_dws = crash_root / "dws.exe"
+    crash_dws.write_bytes(b"test fixture")
+    prepare_runtime(
+        crash_root,
+        crash_paths["manifest"],
+        PROJECT_ID,
+        crash_dws,
+        RuntimeProtector(),
+    )
+    crash_environment = _environment(crash_root, crash_root / "unused.db")
+    crash_lifecycle_root = crash_root / "runtime-locks"
+    crash_capture_root = crash_root / "runtime-captures"
+    crash_started = lifecycle.begin_run(PROJECT_ID, root=crash_lifecycle_root)
+    crash_token = crash_started.run_token
+    assert isinstance(crash_token, str)
+
+    assert _run_host_import_process(
+        crash_root,
+        crash_capture_root,
+        crash_lifecycle_root,
+        "runtime",
+        ["capture-info", "--run-token", crash_token],
+        crash_environment,
+        input_bytes=_host_result("doc_info", info),
+    )["status"] == "host_info_captured"
+    assert any(crash_capture_root.glob("*.dpapi"))
+    crash_bundle = crash_root / ".private/dws-runtime/source-bundle.json"
+    assert not crash_bundle.exists()
+
+    aborted = _run_host_import_process(
+        crash_root,
+        crash_capture_root,
+        crash_lifecycle_root,
+        "cli",
+        ["abort", "--project", PROJECT_ID, "--run-token", crash_token],
+        crash_environment,
+    )
+    assert aborted == {"status": "aborted", "project_id": PROJECT_ID}
+    assert not any(crash_capture_root.glob("*.dpapi"))
+    assert not crash_bundle.exists()
+    state = lifecycle._read_state(
+        lifecycle.project_state_path(crash_lifecycle_root, PROJECT_ID),
+        PROJECT_ID,
+    )
+    assert state is not None
+    assert state["active"] is False
+    assert state["stage"] == "aborted"
 
 
 @pytest.mark.skipif(

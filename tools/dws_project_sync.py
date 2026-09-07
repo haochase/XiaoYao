@@ -391,6 +391,7 @@ def _parser() -> argparse.ArgumentParser:
     capture_info = commands.add_parser("capture-info", add_help=False)
     capture_info.add_argument("--manifest", required=True)
     capture_info.add_argument("--project", required=True)
+    capture_info.add_argument("--output")
     capture_info.add_argument("--run-token", required=True)
 
     complete_host_import = commands.add_parser(
@@ -2686,6 +2687,75 @@ def _push_command(
         }
 
 
+def _begin_command(
+    args: argparse.Namespace,
+    *,
+    now: Callable[[], datetime],
+) -> dict[str, object]:
+    started = lifecycle.begin_run_with_cleanup(
+        args.project,
+        cleanup=lambda: host_capture.discard_document_info_capture(
+            args.project,
+            protector=_host_capture_protector(),
+        ),
+        root=LIFECYCLE_ROOT,
+        now=now,
+    )
+    return {
+        "status": started.status,
+        "project_id": args.project,
+        "run_token": started.run_token,
+    }
+
+
+def _end_command(
+    args: argparse.Namespace,
+    *,
+    now: Callable[[], datetime],
+) -> dict[str, object]:
+    def reject_remaining_capture() -> None:
+        try:
+            if host_capture.document_info_capture_exists(args.project):
+                raise ValueError("host_capture_remaining")
+        except ValueError as exc:
+            if str(exc) == "host_capture_remaining":
+                raise
+            raise ValueError("host_capture_remaining") from None
+        except Exception:
+            raise ValueError("host_capture_remaining") from None
+
+    ended = lifecycle.end_run_with_check(
+        args.project,
+        args.run_token,
+        check=reject_remaining_capture,
+        root=LIFECYCLE_ROOT,
+        now=now,
+    )
+    return {
+        "status": ended.status,
+        "project_id": args.project,
+        "run_token": ended.run_token,
+    }
+
+
+def _abort_command(
+    args: argparse.Namespace,
+    *,
+    now: Callable[[], datetime],
+) -> dict[str, object]:
+    lifecycle.abort_run_with_cleanup(
+        args.project,
+        args.run_token,
+        cleanup=lambda: host_capture.discard_document_info_capture(
+            args.project,
+            protector=_host_capture_protector(),
+        ),
+        root=LIFECYCLE_ROOT,
+        now=now,
+    )
+    return {"status": "aborted", "project_id": args.project}
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -2740,14 +2810,7 @@ def main(
     try:
         args = _parser().parse_args(actual_argv)
         if args.command == "begin":
-            started = lifecycle.begin_run(
-                args.project, root=LIFECYCLE_ROOT, now=now
-            )
-            output = {
-                "status": started.status,
-                "project_id": args.project,
-                "run_token": started.run_token,
-            }
+            output = _begin_command(args, now=now)
         elif args.command == "collect":
             output = _collect_command(args, runner=runner, now=now)
         elif args.command == "host-import":
@@ -2796,25 +2859,9 @@ def main(
         elif args.command == "reuse-artifact":
             output = _reuse_artifact_command(args, now=now)
         elif args.command == "end":
-            ended = lifecycle.end_run(
-                args.project,
-                args.run_token,
-                root=LIFECYCLE_ROOT,
-                now=now,
-            )
-            output = {
-                "status": ended.status,
-                "project_id": args.project,
-                "run_token": ended.run_token,
-            }
+            output = _end_command(args, now=now)
         elif args.command == "abort":
-            lifecycle.abort_run(
-                args.project,
-                args.run_token,
-                root=LIFECYCLE_ROOT,
-                now=now,
-            )
-            output = {"status": "aborted", "project_id": args.project}
+            output = _abort_command(args, now=now)
         else:
             output = _push_command(
                 args,
