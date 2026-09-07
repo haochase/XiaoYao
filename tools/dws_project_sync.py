@@ -148,6 +148,7 @@ _SAFE_GATEWAY_ERROR_TYPES = frozenset(
 _PUBLIC_ERROR_TYPES = {
     "arguments_invalid",
     "approved_artifact_unavailable",
+    "approved_restore_denied",
     "authentication_failed",
     "context_collection_mismatch",
     "context_file_invalid",
@@ -426,6 +427,14 @@ def _parser() -> argparse.ArgumentParser:
     reuse_artifact.add_argument("--run-token", required=True)
     reuse_artifact.add_argument("--unattended", action="store_true")
 
+    restore_approved = commands.add_parser("restore-approved", add_help=False)
+    restore_approved.add_argument("--manifest", required=True)
+    restore_approved.add_argument("--project", required=True)
+    restore_approved.add_argument("--sources-file", required=True)
+    restore_approved.add_argument("--context-file", required=True)
+    restore_approved.add_argument("--state-file", required=True)
+    restore_approved.add_argument("--run-token", required=True)
+
     push = commands.add_parser("push", add_help=False)
     push.add_argument("--manifest", required=True)
     push.add_argument("--project", required=True)
@@ -522,6 +531,47 @@ def _read_json_object(
         raise ValueError(f"{label}_unreadable") from None
     if len(raw) > max_bytes:
         raise ValueError(f"{label}_too_large")
+    try:
+        payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_non_finite)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
+        raise ValueError(f"{label}_invalid") from None
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label}_invalid")
+    return payload
+
+
+def _read_restore_json_object(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int,
+) -> dict[str, object]:
+    try:
+        path_stat = path.lstat()
+        if not _safe_regular_file_stat(path_stat, max_bytes=max_bytes):
+            raise ValueError(f"{label}_invalid")
+        with path.open("rb") as stream:
+            opened_stat = os.fstat(stream.fileno())
+            if (
+                not _safe_regular_file_stat(opened_stat, max_bytes=max_bytes)
+                or not os.path.samestat(path_stat, opened_stat)
+            ):
+                raise ValueError(f"{label}_invalid")
+            raw = stream.read(max_bytes + 1)
+            final_opened_stat = os.fstat(stream.fileno())
+        final_path_stat = path.lstat()
+    except ValueError:
+        raise
+    except OSError:
+        raise ValueError(f"{label}_unreadable") from None
+    if (
+        len(raw) > max_bytes
+        or not _safe_regular_file_stat(final_opened_stat, max_bytes=max_bytes)
+        or not _safe_regular_file_stat(final_path_stat, max_bytes=max_bytes)
+        or not os.path.samestat(path_stat, final_opened_stat)
+        or not os.path.samestat(path_stat, final_path_stat)
+    ):
+        raise ValueError(f"{label}_invalid")
     try:
         payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_non_finite)
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
@@ -790,6 +840,37 @@ def _validate_context(
         raise ValueError("context_mismatch")
     if context.generated_at != source_bundle.collected_at:
         raise ValueError("context_collection_mismatch")
+    snapshots = (
+        _source_snapshot(record)
+        for record in source_bundle.records
+        if record.status in {"active", "failed"}
+    )
+    validate_sourced_context(context, snapshots)
+
+
+def _validate_restore_context(
+    project: DwsProjectManifest,
+    source_bundle: DwsSourceBundle,
+    context: ProjectContextPackage,
+) -> None:
+    _require_sourced_context(context)
+    if (
+        context.project_id != project.project_id
+        or context.project_name != project.project_name
+        or context.permission_scope != project.permission_scope
+    ):
+        raise ValueError("context_mismatch")
+    if context.generated_at > source_bundle.collected_at:
+        raise ValueError("approved_restore_denied")
+    active_records = (
+        record for record in source_bundle.records if record.status == "active"
+    )
+    if any(
+        record.source_time is not None
+        and record.source_time > context.generated_at
+        for record in active_records
+    ):
+        raise ValueError("approved_restore_denied")
     snapshots = (
         _source_snapshot(record)
         for record in source_bundle.records
@@ -1961,6 +2042,107 @@ def _reuse_artifact_command(
     }
 
 
+def _restore_approved_command(
+    args: argparse.Namespace,
+    *,
+    now: Callable[[], datetime],
+) -> dict[str, object]:
+    manifest_path, sources_path, context_path, state_path = (
+        _validated_sync_paths(args)
+    )
+    manifest = DwsManifest.load(manifest_path)
+    project = _selected_project(manifest, args.project)
+    sources_payload = _read_restore_json_object(
+        sources_path,
+        "sources_file",
+        max_bytes=MAX_PRIVATE_INPUT_BYTES,
+    )
+    try:
+        source_bundle = DwsSourceBundle.model_validate(sources_payload)
+    except (TypeError, ValueError):
+        raise ValueError("sources_file_invalid") from None
+    _validate_bundle(project, source_bundle)
+    context_payload = _read_restore_json_object(
+        context_path,
+        "context_file",
+        max_bytes=MAX_PRIVATE_INPUT_BYTES,
+    )
+    try:
+        artifact = QwenProjectContextArtifact.model_validate(context_payload)
+    except ValidationError as exc:
+        if "context_fact_unreferenced" in str(exc):
+            raise ValueError("context_fact_unreferenced") from None
+        raise ValueError("context_file_invalid") from None
+    except (TypeError, ValueError):
+        raise ValueError("context_file_invalid") from None
+    _validate_restore_context(project, source_bundle, artifact.context)
+    state_payload = _read_restore_json_object(
+        state_path,
+        "state_file",
+        max_bytes=MAX_STATE_BYTES,
+    )
+    try:
+        state = SyncCliState.model_validate(state_payload)
+    except (TypeError, ValueError):
+        raise ValueError("state_file_invalid") from None
+    if state.project_id != project.project_id:
+        raise ValueError("state_project_mismatch")
+    if (
+        state.pending is not None
+        or source_bundle.retrieval_requests
+        or state.last_source_semantic_hash is None
+        or state.last_artifact_hash is None
+        or state.last_source_semantic_hash
+        != source_bundle_semantic_hash(source_bundle)
+    ):
+        raise ValueError("approved_restore_denied")
+    encoded = _canonical_bytes(artifact.model_dump(mode="json"))
+    if len(encoded) > MAX_PRIVATE_INPUT_BYTES:
+        raise ValueError("context_file_too_large")
+    if not hmac.compare_digest(
+        hashlib.sha256(encoded).hexdigest(),
+        state.last_artifact_hash,
+    ):
+        raise ValueError("approved_restore_denied")
+    lifecycle.assert_stage(
+        project.project_id,
+        args.run_token,
+        expected="pending",
+        root=LIFECYCLE_ROOT,
+        now=now,
+    )
+    try:
+        _read_approved_artifact(context_path, state.last_artifact_hash)
+    except ValueError as exc:
+        if str(exc) != "approved_artifact_unavailable":
+            raise
+    else:
+        lifecycle.apply_stage(
+            project.project_id,
+            args.run_token,
+            expected="pending",
+            apply=lambda: None,
+            rollback=lambda: None,
+            root=LIFECYCLE_ROOT,
+            now=now,
+        )
+        return {"status": "approved_restored", "project_id": project.project_id}
+    transaction = _RecoverableAtomicWrite(
+        approved_artifact_path(context_path),
+        encoded,
+    )
+    lifecycle.apply_stage(
+        project.project_id,
+        args.run_token,
+        expected="pending",
+        apply=transaction.apply,
+        rollback=transaction.rollback,
+        root=LIFECYCLE_ROOT,
+        now=now,
+    )
+    return {"status": "approved_restored", "project_id": project.project_id}
+
+
 def _read_push_inputs(
     args: argparse.Namespace,
 ) -> tuple[DwsProjectManifest, DwsSourceBundle, QwenProjectContextArtifact, Path]:
@@ -2799,6 +2981,7 @@ def main(
             "pending",
             "recover-pending",
             "reuse-artifact",
+            "restore-approved",
             "push",
         }:
             output: dict[str, object] = {
@@ -2817,6 +3000,7 @@ def main(
                     "pending",
                     "recover-pending",
                     "reuse-artifact",
+                    "restore-approved",
                     "artifact",
                     "push",
                     "end",
@@ -2876,6 +3060,8 @@ def main(
             output = _recover_pending_command(args, now=now)
         elif args.command == "reuse-artifact":
             output = _reuse_artifact_command(args, now=now)
+        elif args.command == "restore-approved":
+            output = _restore_approved_command(args, now=now)
         elif args.command == "end":
             output = _end_command(args, now=now)
         elif args.command == "abort":

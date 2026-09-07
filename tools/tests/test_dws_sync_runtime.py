@@ -369,6 +369,55 @@ def test_reuse_artifact_maps_fixed_inputs_without_decrypting_credential(
     assert "COMPANION_DWS_SYNC_TOKEN" not in kwargs["environ"]
 
 
+def test_restore_approved_maps_fixed_inputs_without_decrypting_credential(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from tools import dws_project_sync
+    from tools import dws_sync_runtime as wrapper
+
+    class RestoreProtector(Protector):
+        def unprotect(self, project_id: str, protected: bytes) -> bytes:
+            pytest.fail("restore-approved must not decrypt the gateway credential")
+
+    manifest, dws = inputs(tmp_path)
+    prepare_runtime(tmp_path, manifest, "project-1", dws, Protector())
+    observed = []
+    monkeypatch.setattr(
+        dws_project_sync,
+        "main",
+        lambda argv, **kwargs: observed.append((argv, kwargs)) or 0,
+    )
+    monkeypatch.setenv("COMPANION_DWS_SYNC_TOKEN", "ambient-secret")
+
+    assert wrapper.dispatch(
+        tmp_path,
+        "restore-approved",
+        "lease-token",
+        False,
+        RestoreProtector(),
+    ) == 0
+
+    argv, kwargs = observed[0]
+    assert argv == [
+        "restore-approved",
+        "--project",
+        "project-1",
+        "--run-token",
+        "lease-token",
+        "--manifest",
+        str(manifest),
+        "--sources-file",
+        str(tmp_path / ".private/dws-runtime/source-bundle.json"),
+        "--context-file",
+        str(tmp_path / ".private/dws-runtime/context-artifact.json"),
+        "--state-file",
+        str(tmp_path / ".private/dws-runtime/sync-state.json"),
+    ]
+    assert "input_stream" not in kwargs
+    assert "COMPANION_DWS_SYNC_TOKEN" not in kwargs["environ"]
+
+
 def test_unattended_flag_is_mapped_only_for_reuse_artifact(
     tmp_path: Path,
     monkeypatch,

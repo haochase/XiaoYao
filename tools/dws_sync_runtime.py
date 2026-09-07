@@ -38,6 +38,7 @@ COMMANDS = (
     "pending",
     "recover-pending",
     "reuse-artifact",
+    "restore-approved",
     "artifact",
     "push",
     "end",
@@ -96,6 +97,7 @@ def dispatch(
         "host-import",
         "complete-host-import",
         "reuse-artifact",
+        "restore-approved",
     }:
         config, _project = _load_host_import_config(root)
         token = None
@@ -113,6 +115,7 @@ def dispatch(
         "push",
         "recover-pending",
         "reuse-artifact",
+        "restore-approved",
     }:
         argv += ["--manifest", str(config.manifest)]
     if command in {
@@ -127,15 +130,28 @@ def dispatch(
         "push",
         "recover-pending",
         "reuse-artifact",
+        "restore-approved",
     }:
         argv += ["--sources-file", str(config.source_bundle)]
     if command in {"pending", "push"}:
         argv += [
             "--gateway", "http://127.0.0.1:8731",
         ]
-    if command in {"artifact", "push", "recover-pending", "reuse-artifact"}:
+    if command in {
+        "artifact",
+        "push",
+        "recover-pending",
+        "reuse-artifact",
+        "restore-approved",
+    }:
         argv += ["--context-file", str(config.context_artifact)]
-    if command in {"artifact", "push", "recover-pending", "reuse-artifact"}:
+    if command in {
+        "artifact",
+        "push",
+        "recover-pending",
+        "reuse-artifact",
+        "restore-approved",
+    }:
         argv += ["--state-file", str(config.state)]
     if command == "recover-pending":
         argv += ["--database-file", str(runtime_database(root))]

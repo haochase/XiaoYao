@@ -305,6 +305,24 @@ def reuse_artifact_args(
     return args
 
 
+def restore_approved_args(paths: dict[str, Path], run_token: str) -> list[str]:
+    return [
+        "restore-approved",
+        "--manifest",
+        str(paths["manifest"]),
+        "--project",
+        "project-1",
+        "--sources-file",
+        str(paths["sources"]),
+        "--context-file",
+        str(paths["context"]),
+        "--state-file",
+        str(paths["state"]),
+        "--run-token",
+        run_token,
+    ]
+
+
 def recover_pending_args(
     paths: dict[str, Path], database: Path
 ) -> list[str]:
@@ -2037,6 +2055,580 @@ def test_reuse_artifact_fails_closed_when_approved_is_missing(
         "error_type": "approved_artifact_unavailable",
     }
     assert paths["context"].read_bytes() == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_restore_approved_rebuilds_missing_checkpoint_without_state_change(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    artifact = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(paths["context"], artifact.model_dump(mode="json"))
+    write_json(paths["state"], semantic_state(selected, artifact))
+    approved_path = paths["context"].with_name("context.approved.json")
+    before = {
+        path: path.read_bytes()
+        for path in (paths["sources"], paths["context"], paths["state"])
+    }
+    run_token = start_pending_run()
+
+    assert main(restore_approved_args(paths, run_token), now=lambda: NOW) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "approved_restored",
+        "project_id": "project-1",
+    }
+    assert approved_path.read_bytes() == canonical(artifact.model_dump(mode="json")).encode(
+        "utf-8"
+    )
+    assert {
+        path: path.read_bytes()
+        for path in (paths["sources"], paths["context"], paths["state"])
+    } == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+    assert main(restore_approved_args(paths, run_token), now=lambda: NOW) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "approved_restored",
+        "project_id": "project-1",
+    }
+    assert approved_path.read_bytes() == canonical(artifact.model_dump(mode="json")).encode(
+        "utf-8"
+    )
+
+
+def test_restore_approved_atomically_replaces_corrupt_checkpoint(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    artifact = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(paths["context"], artifact.model_dump(mode="json"))
+    write_json(paths["state"], semantic_state(selected, artifact))
+    approved_path = paths["context"].with_name("context.approved.json")
+    approved_path.write_bytes(b"corrupt-approved-checkpoint")
+    run_token = start_pending_run()
+
+    assert main(restore_approved_args(paths, run_token), now=lambda: NOW) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "approved_restored",
+        "project_id": "project-1",
+    }
+    assert approved_path.read_bytes() == canonical(artifact.model_dump(mode="json")).encode(
+        "utf-8"
+    )
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_restore_approved_accepts_historical_artifact_after_recollection(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    configure_host_capture(tmp_path, monkeypatch)
+    original = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    recollected_at = NOW + timedelta(minutes=5)
+    recollected = rehash_bundle(
+        original.model_copy(
+            update={
+                "collected_at": recollected_at,
+                "records": (
+                    original.records[0].model_copy(
+                        update={"fetched_at": recollected_at}
+                    ),
+                ),
+            }
+        )
+    )
+    artifact = QwenProjectContextArtifact(schema_version=1, context=context())
+    approved_bytes = canonical(artifact.model_dump(mode="json")).encode("utf-8")
+    write_json(paths["sources"], recollected.model_dump(mode="json"))
+    write_json(paths["context"], artifact.model_dump(mode="json"))
+    write_json(paths["state"], semantic_state(original, artifact))
+    restore_token = start_pending_run()
+
+    assert main(
+        restore_approved_args(paths, restore_token), now=lambda: NOW
+    ) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "approved_restored",
+        "project_id": "project-1",
+    }
+    approved_path = paths["context"].with_name("context.approved.json")
+    assert approved_path.read_bytes() == approved_bytes
+    assert main(
+        ["abort", "--project", "project-1", "--run-token", restore_token],
+        now=lambda: NOW,
+    ) == 0
+    capsys.readouterr()
+
+    next_token = start_pending_run()
+    assert main(
+        reuse_artifact_args(paths, next_token, unattended=True),
+        now=lambda: NOW,
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "artifact_reused"
+    lifecycle.assert_stage(
+        "project-1",
+        next_token,
+        expected="artifact",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_restore_approved_denies_future_artifact_after_recollection(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    recollected_at = NOW + timedelta(minutes=5)
+    recollected = rehash_bundle(
+        original.model_copy(update={"collected_at": recollected_at})
+    )
+    future_context = context().model_copy(
+        update={"generated_at": recollected_at + timedelta(minutes=1)}
+    )
+    artifact = QwenProjectContextArtifact(
+        schema_version=1,
+        context=future_context,
+    )
+    write_json(paths["sources"], recollected.model_dump(mode="json"))
+    write_json(paths["context"], artifact.model_dump(mode="json"))
+    write_json(paths["state"], semantic_state(original, artifact))
+    run_token = start_pending_run()
+
+    assert main(restore_approved_args(paths, run_token), now=lambda: NOW) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "approved_restore_denied",
+    }
+    assert not paths["context"].with_name("context.approved.json").exists()
+
+
+def test_restore_approved_denies_source_newer_than_historical_artifact(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    future_source_time = NOW + timedelta(minutes=1)
+    recollected = rehash_bundle(
+        original.model_copy(
+            update={
+                "collected_at": NOW + timedelta(minutes=5),
+                "records": (
+                    original.records[0].model_copy(
+                        update={"source_time": future_source_time}
+                    ),
+                ),
+            }
+        )
+    )
+    reference = context().source_refs[0].model_copy(
+        update={"source_time": future_source_time}
+    )
+    historical_context = context().model_copy(update={"source_refs": (reference,)})
+    artifact = QwenProjectContextArtifact(
+        schema_version=1,
+        context=historical_context,
+    )
+    write_json(paths["sources"], recollected.model_dump(mode="json"))
+    write_json(paths["context"], artifact.model_dump(mode="json"))
+    write_json(paths["state"], semantic_state(recollected, artifact))
+    run_token = start_pending_run()
+
+    assert main(restore_approved_args(paths, run_token), now=lambda: NOW) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "approved_restore_denied",
+    }
+    assert not paths["context"].with_name("context.approved.json").exists()
+
+
+def test_restore_approved_rejects_hardlinked_context_without_writes(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    artifact = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(paths["context"], artifact.model_dump(mode="json"))
+    write_json(paths["state"], semantic_state(selected, artifact))
+    context_copy = tmp_path / "context-copy.json"
+    context_copy.write_bytes(paths["context"].read_bytes())
+    paths["context"].unlink()
+    try:
+        os.link(context_copy, paths["context"])
+    except OSError:
+        pytest.skip("hardlink creation is unavailable")
+    approved_path = paths["context"].with_name("context.approved.json")
+    before = {
+        path: path.read_bytes()
+        for path in (paths["sources"], paths["context"], paths["state"])
+    }
+    run_token = start_pending_run()
+
+    assert main(restore_approved_args(paths, run_token), now=lambda: NOW) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "context_file_invalid",
+    }
+    assert not approved_path.exists()
+    assert {
+        path: path.read_bytes()
+        for path in (paths["sources"], paths["context"], paths["state"])
+    } == before
+
+
+def test_restore_approved_write_failure_preserves_inputs_and_pending_stage(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    artifact = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(paths["context"], artifact.model_dump(mode="json"))
+    write_json(paths["state"], semantic_state(selected, artifact))
+    approved_path = paths["context"].with_name("context.approved.json")
+    before = {
+        path: path.read_bytes()
+        for path in (paths["sources"], paths["context"], paths["state"])
+    }
+    real_atomic_write = sync_cli._atomic_write
+
+    def fail_approved_write(path: Path, data: bytes) -> None:
+        if path == approved_path:
+            raise ValueError("private_file_write_failed")
+        real_atomic_write(path, data)
+
+    monkeypatch.setattr(sync_cli, "_atomic_write", fail_approved_write)
+    run_token = start_pending_run()
+
+    assert main(restore_approved_args(paths, run_token), now=lambda: NOW) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "private_file_write_failed",
+    }
+    assert not approved_path.exists()
+    assert {
+        path: path.read_bytes()
+        for path in (paths["sources"], paths["context"], paths["state"])
+    } == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_restore_approved_keeps_malformed_source_error_and_files(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    artifact = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(paths["state"], semantic_state(selected, artifact))
+    paths["sources"].write_bytes(b"{}")
+    original_context = paths["context"].read_bytes()
+    original_state = paths["state"].read_bytes()
+    run_token = start_pending_run()
+
+    assert main(restore_approved_args(paths, run_token), now=lambda: NOW) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "sources_file_invalid",
+    }
+    assert paths["context"].read_bytes() == original_context
+    assert paths["state"].read_bytes() == original_state
+    assert not paths["context"].with_name("context.approved.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_error"),
+    (("context", "context_file_invalid"), ("state", "state_file_invalid")),
+)
+def test_restore_approved_keeps_malformed_input_error_and_files(
+    tmp_path: Path,
+    capsys,
+    target: str,
+    expected_error: str,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    artifact = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(paths["context"], artifact.model_dump(mode="json"))
+    write_json(paths["state"], semantic_state(selected, artifact))
+    paths[target].write_bytes(b"{}")
+    original = {
+        path: path.read_bytes()
+        for path in (paths["sources"], paths["context"], paths["state"])
+    }
+    run_token = start_pending_run()
+
+    assert main(restore_approved_args(paths, run_token), now=lambda: NOW) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": expected_error,
+    }
+    assert {
+        path: path.read_bytes()
+        for path in (paths["sources"], paths["context"], paths["state"])
+    } == original
+    assert not paths["context"].with_name("context.approved.json").exists()
+
+
+def test_restore_approved_is_idempotent_for_valid_checkpoint(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    artifact = QwenProjectContextArtifact(schema_version=1, context=context())
+    encoded = canonical(artifact.model_dump(mode="json")).encode("utf-8")
+    write_json(paths["context"], artifact.model_dump(mode="json"))
+    write_json(paths["state"], semantic_state(selected, artifact))
+    approved_path = paths["context"].with_name("context.approved.json")
+    approved_path.write_bytes(encoded)
+    run_token = start_pending_run()
+
+    assert main(restore_approved_args(paths, run_token), now=lambda: NOW) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "approved_restored",
+        "project_id": "project-1",
+    }
+    assert approved_path.read_bytes() == encoded
+
+
+def test_restore_approved_idempotent_path_rechecks_pending_after_concurrent_reuse(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    artifact = QwenProjectContextArtifact(schema_version=1, context=context())
+    encoded = canonical(artifact.model_dump(mode="json")).encode("utf-8")
+    write_json(paths["context"], artifact.model_dump(mode="json"))
+    write_json(paths["state"], semantic_state(selected, artifact))
+    approved_path = paths["context"].with_name("context.approved.json")
+    approved_path.write_bytes(encoded)
+    run_token = start_pending_run()
+    entered = threading.Event()
+    release = threading.Event()
+    results: list[dict[str, object]] = []
+    errors: list[BaseException] = []
+    calls = 0
+    real_read = sync_cli._read_approved_artifact
+
+    def pause_first_read(context_path: Path, expected_hash: str):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(timeout=5)
+        return real_read(context_path, expected_hash)
+
+    monkeypatch.setattr(sync_cli, "_read_approved_artifact", pause_first_read)
+    parsed = sync_cli._parser().parse_args(restore_approved_args(paths, run_token))
+
+    def restore() -> None:
+        try:
+            results.append(
+                sync_cli._restore_approved_command(parsed, now=lambda: NOW)
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=restore)
+    worker.start()
+    assert entered.wait(timeout=5)
+    assert main(reuse_artifact_args(paths, run_token), now=lambda: NOW) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "artifact_reused"
+    release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert results == []
+    assert [str(error) for error in errors] == ["run_stage_invalid"]
+    assert approved_path.read_bytes() == encoded
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="artifact",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    (
+        ("project", "context_mismatch"),
+        ("permission", "context_mismatch"),
+        ("source", "source_ref_mismatch"),
+        ("excerpt", "source_excerpt_mismatch"),
+    ),
+)
+def test_restore_approved_rejects_context_proof_mismatch_without_writes(
+    tmp_path: Path,
+    capsys,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    base = context()
+    if mutation == "project":
+        changed = base.model_copy(update={"project_id": "other-project"})
+    elif mutation == "permission":
+        changed_reference = base.source_refs[0].model_copy(
+            update={"permission_scope": "project:other"}
+        )
+        changed = base.model_copy(
+            update={
+                "permission_scope": "project:other",
+                "source_refs": (changed_reference,),
+            }
+        )
+    elif mutation == "source":
+        changed_reference = base.source_refs[0].model_copy(
+            update={"source_title": "changed title"}
+        )
+        changed = base.model_copy(update={"source_refs": (changed_reference,)})
+    else:
+        changed_reference = base.source_refs[0].model_copy(
+            update={"excerpt": "not present in source"}
+        )
+        changed = base.model_copy(update={"source_refs": (changed_reference,)})
+    artifact = QwenProjectContextArtifact(schema_version=1, context=changed)
+    write_json(paths["context"], artifact.model_dump(mode="json"))
+    write_json(paths["state"], semantic_state(selected, artifact))
+    approved_path = paths["context"].with_name("context.approved.json")
+    before = {
+        path: path.read_bytes()
+        for path in (paths["sources"], paths["context"], paths["state"])
+    }
+    run_token = start_pending_run()
+
+    assert main(restore_approved_args(paths, run_token), now=lambda: NOW) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": expected_error,
+    }
+    assert not approved_path.exists()
+    assert {
+        path: path.read_bytes()
+        for path in (paths["sources"], paths["context"], paths["state"])
+    } == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize("mutation", ("context", "source", "pending", "retrieval"))
+def test_restore_approved_denies_unproven_checkpoint(
+    tmp_path: Path,
+    capsys,
+    mutation: str,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    artifact = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(paths["context"], artifact.model_dump(mode="json"))
+    state = semantic_state(selected, artifact)
+    if mutation == "context":
+        write_json(
+            paths["context"],
+            QwenProjectContextArtifact(
+                schema_version=1,
+                context=context().model_copy(update={"freshness_seconds": 301}),
+            ).model_dump(mode="json"),
+        )
+    elif mutation == "source":
+        changed = rehash_bundle(
+            selected.model_copy(
+                update={
+                    "records": (
+                        selected.records[0].model_copy(
+                            update={"source_version": "v2"}
+                        ),
+                    )
+                }
+            )
+        )
+        write_json(paths["sources"], changed.model_dump(mode="json"))
+    elif mutation == "pending":
+        state["pending"] = {
+            "source_cursor": 2,
+            "content_hash": "b" * 64,
+            "sync_id": "sync_" + "b" * 32,
+            "completion_claims_hash": digest("[]"),
+        }
+    else:
+        retrieval = DwsRetrievalRequest(
+            request_id="request-1",
+            query_hash="d" * 64,
+            request_epoch=1,
+            attempt_count=1,
+            lease_expires_at=NOW + timedelta(minutes=5),
+            lease_token="x" * 32,
+            sources=(
+                DwsRetrievalSource(source_type="document", source_id="doc-1"),
+            ),
+        )
+        changed = rehash_bundle(
+            selected.model_copy(update={"retrieval_requests": (retrieval,)})
+        )
+        write_json(paths["sources"], changed.model_dump(mode="json"))
+    write_json(paths["state"], state)
+    approved_path = paths["context"].with_name("context.approved.json")
+    original = {
+        path: path.read_bytes()
+        for path in (paths["sources"], paths["context"], paths["state"])
+    }
+    run_token = start_pending_run()
+
+    assert main(restore_approved_args(paths, run_token), now=lambda: NOW) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "approved_restore_denied",
+    }
+    assert not approved_path.exists()
+    assert {
+        path: path.read_bytes()
+        for path in (paths["sources"], paths["context"], paths["state"])
+    } == original
     lifecycle.assert_stage(
         "project-1",
         run_token,
