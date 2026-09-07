@@ -424,6 +424,7 @@ def _parser() -> argparse.ArgumentParser:
     reuse_artifact.add_argument("--context-file", required=True)
     reuse_artifact.add_argument("--state-file", required=True)
     reuse_artifact.add_argument("--run-token", required=True)
+    reuse_artifact.add_argument("--unattended", action="store_true")
 
     push = commands.add_parser("push", add_help=False)
     push.add_argument("--manifest", required=True)
@@ -1891,11 +1892,28 @@ def _reuse_artifact_command(
     semantic_hash = source_bundle_semantic_hash(source_bundle)
     if state.last_source_semantic_hash != semantic_hash:
         return {
-            "status": "artifact_required",
+            "status": (
+                "manual_refresh_required"
+                if args.unattended
+                else "artifact_required"
+            ),
+            "project_id": project.project_id,
+        }
+    if args.unattended and source_bundle.retrieval_requests:
+        return {
+            "status": "manual_refresh_required",
             "project_id": project.project_id,
         }
     assert state.last_artifact_hash is not None
-    approved = _read_approved_artifact(context_path, state.last_artifact_hash)
+    try:
+        approved = _read_approved_artifact(context_path, state.last_artifact_hash)
+    except ValueError as exc:
+        if args.unattended and str(exc) == "approved_artifact_unavailable":
+            return {
+                "status": "manual_refresh_required",
+                "project_id": project.project_id,
+            }
+        raise
     selected = QwenProjectContextArtifact(
         schema_version=1,
         context=approved.context.model_copy(

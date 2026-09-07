@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import base64
 import errno
 import hashlib
@@ -280,8 +279,13 @@ def artifact_args(paths: dict[str, Path], run_token: str) -> list[str]:
     ]
 
 
-def reuse_artifact_args(paths: dict[str, Path], run_token: str) -> list[str]:
-    return [
+def reuse_artifact_args(
+    paths: dict[str, Path],
+    run_token: str,
+    *,
+    unattended: bool = False,
+) -> list[str]:
+    args = [
         "reuse-artifact",
         "--manifest",
         str(paths["manifest"]),
@@ -296,6 +300,9 @@ def reuse_artifact_args(paths: dict[str, Path], run_token: str) -> list[str]:
         "--run-token",
         run_token,
     ]
+    if unattended:
+        args.append("--unattended")
+    return args
 
 
 def recover_pending_args(
@@ -1589,6 +1596,361 @@ def test_reuse_artifact_skips_candidate_for_unchanged_source(
         "project-1",
         run_token,
         expected="artifact",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_unattended_reuse_artifact_reuses_unchanged_approved_context(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(
+        paths["context"].with_name("context.approved.json"),
+        approved.model_dump(mode="json"),
+    )
+    write_json(paths["state"], semantic_state(selected, approved))
+    run_token = start_pending_run()
+
+    assert main(
+        reuse_artifact_args(paths, run_token, unattended=True),
+        now=lambda: NOW,
+    ) == 0
+
+    assert json.loads(capsys.readouterr().out)["status"] == "artifact_reused"
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="artifact",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_unattended_reuse_artifact_requires_manual_refresh_for_changed_source(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(paths["state"], semantic_state(original, approved))
+    changed = rehash_bundle(
+        original.model_copy(
+            update={
+                "records": (
+                    original.records[0].model_copy(update={"source_version": "v2"}),
+                )
+            }
+        )
+    )
+    write_json(paths["sources"], changed.model_dump(mode="json"))
+    before = paths["context"].read_bytes()
+    run_token = start_pending_run()
+
+    assert main(
+        reuse_artifact_args(paths, run_token, unattended=True),
+        now=lambda: NOW,
+    ) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "manual_refresh_required",
+        "project_id": "project-1",
+    }
+    assert paths["context"].read_bytes() == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_unattended_reuse_artifact_requires_manual_refresh_when_approved_missing(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(paths["state"], semantic_state(selected, approved))
+    before = paths["context"].read_bytes()
+    run_token = start_pending_run()
+
+    assert main(
+        reuse_artifact_args(paths, run_token, unattended=True),
+        now=lambda: NOW,
+    ) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "manual_refresh_required",
+        "project_id": "project-1",
+    }
+    assert paths["context"].read_bytes() == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize("approved_bytes", (b"not-json", b"{}"))
+def test_unattended_reuse_artifact_requires_manual_refresh_for_invalid_approved(
+    tmp_path: Path,
+    capsys,
+    approved_bytes: bytes,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(paths["state"], semantic_state(selected, approved))
+    paths["context"].with_name("context.approved.json").write_bytes(approved_bytes)
+    before = paths["context"].read_bytes()
+    run_token = start_pending_run()
+
+    assert main(
+        reuse_artifact_args(paths, run_token, unattended=True),
+        now=lambda: NOW,
+    ) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "manual_refresh_required",
+        "project_id": "project-1",
+    }
+    assert paths["context"].read_bytes() == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_unattended_reuse_artifact_requires_manual_refresh_for_approved_hash_mismatch(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(
+        paths["context"].with_name("context.approved.json"),
+        approved.model_dump(mode="json"),
+    )
+    state = semantic_state(selected, approved)
+    state["last_artifact_hash"] = "a" * 64
+    write_json(paths["state"], state)
+    before = paths["context"].read_bytes()
+    run_token = start_pending_run()
+
+    assert main(
+        reuse_artifact_args(paths, run_token, unattended=True),
+        now=lambda: NOW,
+    ) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "manual_refresh_required",
+        "project_id": "project-1",
+    }
+    assert paths["context"].read_bytes() == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_unattended_reuse_artifact_requires_manual_refresh_when_approved_unreadable(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    approved_path = paths["context"].with_name("context.approved.json")
+    write_json(approved_path, approved.model_dump(mode="json"))
+    write_json(paths["state"], semantic_state(selected, approved))
+    before = paths["context"].read_bytes()
+    path_type = type(approved_path)
+    real_open = path_type.open
+
+    def deny_approved_open(path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if path == approved_path:
+            raise PermissionError("private-approved-detail")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(path_type, "open", deny_approved_open)
+    run_token = start_pending_run()
+
+    assert main(
+        reuse_artifact_args(paths, run_token, unattended=True),
+        now=lambda: NOW,
+    ) == 0
+
+    public = capsys.readouterr().out
+    assert json.loads(public) == {
+        "status": "manual_refresh_required",
+        "project_id": "project-1",
+    }
+    assert "private-approved-detail" not in public
+    assert paths["context"].read_bytes() == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_unattended_reuse_artifact_requires_manual_refresh_when_approved_disappears(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    approved_path = paths["context"].with_name("context.approved.json")
+    write_json(approved_path, approved.model_dump(mode="json"))
+    write_json(paths["state"], semantic_state(selected, approved))
+    before = paths["context"].read_bytes()
+    path_type = type(approved_path)
+    real_open = path_type.open
+
+    class DisappearingStream:
+        def __init__(self, stream) -> None:  # type: ignore[no-untyped-def]
+            self._stream = stream
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            self._stream.__enter__()
+            return self
+
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            result = self._stream.__exit__(*args)
+            approved_path.unlink()
+            return result
+
+        def fileno(self) -> int:
+            return self._stream.fileno()
+
+        def read(self, *args):  # type: ignore[no-untyped-def]
+            return self._stream.read(*args)
+
+    def disappearing_open(path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        stream = real_open(path, *args, **kwargs)
+        if path == approved_path:
+            return DisappearingStream(stream)
+        return stream
+
+    monkeypatch.setattr(path_type, "open", disappearing_open)
+    run_token = start_pending_run()
+
+    assert main(
+        reuse_artifact_args(paths, run_token, unattended=True),
+        now=lambda: NOW,
+    ) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "manual_refresh_required",
+        "project_id": "project-1",
+    }
+    assert paths["context"].read_bytes() == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_error"),
+    (("state", "state_file_invalid"), ("sources", "sources_file_invalid")),
+)
+def test_unattended_reuse_artifact_keeps_malformed_input_errors(
+    tmp_path: Path,
+    capsys,
+    target: str,
+    expected_error: str,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original_context = paths["context"].read_bytes()
+    paths[target].write_bytes(b"{}")
+    run_token = start_pending_run()
+
+    assert main(
+        reuse_artifact_args(paths, run_token, unattended=True),
+        now=lambda: NOW,
+    ) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": expected_error,
+    }
+    assert paths["context"].read_bytes() == original_context
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_unattended_reuse_artifact_requires_manual_refresh_for_retrieval_request(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    retrieval = DwsRetrievalRequest(
+        request_id="request-1",
+        query_hash="d" * 64,
+        request_epoch=1,
+        attempt_count=1,
+        lease_expires_at=NOW + timedelta(minutes=5),
+        lease_token="x" * 32,
+        sources=(DwsRetrievalSource(source_type="document", source_id="doc-1"),),
+    )
+    selected = rehash_bundle(
+        selected.model_copy(update={"retrieval_requests": (retrieval,)})
+    )
+    write_json(paths["sources"], selected.model_dump(mode="json"))
+    approved = QwenProjectContextArtifact(schema_version=1, context=context())
+    write_json(
+        paths["context"].with_name("context.approved.json"),
+        approved.model_dump(mode="json"),
+    )
+    write_json(paths["state"], semantic_state(selected, approved))
+    before = paths["context"].read_bytes()
+    run_token = start_pending_run()
+
+    assert main(
+        reuse_artifact_args(paths, run_token, unattended=True),
+        now=lambda: NOW,
+    ) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "manual_refresh_required",
+        "project_id": "project-1",
+    }
+    assert paths["context"].read_bytes() == before
+    lifecycle.assert_stage(
+        "project-1",
+        run_token,
+        expected="pending",
         root=sync_cli.LIFECYCLE_ROOT,
         now=lambda: NOW,
     )
@@ -5843,7 +6205,7 @@ def test_help_outputs_exactly_one_json_object(
     assert output.out.count("\n") == 1
 
 
-def test_qwen_prompt_only_completes_retrieval_with_obtained_evidence() -> None:
+def test_qwen_prompt_requires_manual_refresh_for_retrieval_requests() -> None:
     prompt = (
         Path(__file__).resolve().parents[2]
         / "prompts"
@@ -5851,22 +6213,23 @@ def test_qwen_prompt_only_completes_retrieval_with_obtained_evidence() -> None:
     ).read_text(encoding="utf-8")
 
     normalized = " ".join(prompt.replace("`", "").split())
-    assert "未完成的检索请求绝不能加入 completed_retrieval_request_ids" in normalized
-    assert "只有已取得对应证据" in normalized
-    assert "遗漏的请求保持 pending" in normalized
     assert "python tools/dws_sync_runtime.py pending" in normalized
     assert "retrieval_requests" in normalized
-    assert "request_id" in normalized
-    assert "query_hash" in normalized
-    assert "sources" in normalized
-    assert "request_epoch" in normalized
-    assert "attempt_count" in normalized
-    assert "lease_token" in normalized
-    collect_at = normalized.index("python tools/dws_sync_runtime.py host-import")
+    assert "manual_refresh_required" in normalized
+    assert "completed_retrieval_request_ids" not in normalized
+    assert "completed_retrieval_claims" not in normalized
+    collect_at = normalized.index(
+        "python tools/dws_sync_runtime.py complete-host-import"
+    )
     pending_at = normalized.index("python tools/dws_sync_runtime.py pending")
-    skill_at = normalized.index("hui-anchor-dws-project-context-v1", pending_at)
+    reuse_at = normalized.index(
+        "python tools/dws_sync_runtime.py reuse-artifact --unattended",
+        pending_at,
+    )
+    manual_at = normalized.index("manual_refresh_required", reuse_at)
+    abort_at = normalized.index("python tools/dws_sync_runtime.py abort", manual_at)
     push_at = normalized.index("python tools/dws_sync_runtime.py push")
-    assert collect_at < pending_at < skill_at < push_at
+    assert collect_at < pending_at < reuse_at < manual_at < abort_at < push_at
 
 
 def test_qwen_prompt_fences_full_lifecycle_and_always_releases() -> None:
@@ -5877,21 +6240,32 @@ def test_qwen_prompt_fences_full_lifecycle_and_always_releases() -> None:
     ).read_text(encoding="utf-8")
     normalized = " ".join(prompt.replace("`", "").split())
 
-    for command in ("begin", "host-import", "pending", "artifact", "push", "end"):
+    for command in (
+        "begin",
+        "capture-info",
+        "complete-host-import",
+        "pending",
+        "reuse-artifact",
+        "push",
+        "end",
+    ):
         assert f"python tools/dws_sync_runtime.py {command}" in normalized
     assert "python tools/dws_sync_runtime.py abort" in normalized
     assert "--run-token" in normalized
     assert "finally" in normalized
     assert "coalesced" in normalized
-    assert "不得直接写 context_artifact" in normalized
-    assert "completed_retrieval_claims" in normalized
+    assert "不得写 context artifact" in normalized
+    assert "--unattended" in normalized
 
     begin_at = normalized.index("python tools/dws_sync_runtime.py begin")
-    collect_at = normalized.index("python tools/dws_sync_runtime.py host-import")
-    artifact_at = normalized.index("python tools/dws_sync_runtime.py artifact")
+    capture_at = normalized.index("python tools/dws_sync_runtime.py capture-info")
+    complete_at = normalized.index(
+        "python tools/dws_sync_runtime.py complete-host-import"
+    )
+    reuse_at = normalized.index("python tools/dws_sync_runtime.py reuse-artifact")
     push_at = normalized.index("python tools/dws_sync_runtime.py push")
     end_at = normalized.index("python tools/dws_sync_runtime.py end")
-    assert begin_at < collect_at < artifact_at < push_at < end_at
+    assert begin_at < capture_at < complete_at < reuse_at < push_at < end_at
 
 
 def test_qwen_prompt_uses_protected_runtime_entrypoints() -> None:
@@ -5901,9 +6275,13 @@ def test_qwen_prompt_uses_protected_runtime_entrypoints() -> None:
         / "qwenwork-dws-project-sync.md"
     ).read_text(encoding="utf-8")
 
-    assert "python tools/dws_sync_runtime.py host-import" in prompt
+    assert "python tools/dws_sync_runtime.py capture-info" in prompt
+    assert "python tools/dws_sync_runtime.py complete-host-import" in prompt
+    assert "python tools/dws_sync_runtime.py reuse-artifact --unattended" in prompt
     assert "python tools/dws_sync_runtime.py push" in prompt
     assert "credential.dpapi" in prompt
+    assert "python tools/dws_sync_runtime.py host-import" not in prompt
+    assert "python tools/dws_sync_runtime.py artifact" not in prompt
     assert "python tools/dws_sync_runtime.py collect" not in prompt
     assert "tools/dws_project_sync.py collect" not in prompt
     assert "tools/dws_project_sync.py push" not in prompt
@@ -5928,7 +6306,6 @@ def test_qwen_prompt_uses_fixed_fast_runtime_without_discovery() -> None:
     assert "不得检查实现源码或测试文件" in compact
     assert "不得使用cd&&" in compact
     assert "不得创建辅助脚本、候选文件或旁路产物" in compact
-    assert "允许只读检查Skill注册表" in compact
     assert "允许校验DWSwrapper和原生shim" in compact
     assert "begin前的预检或check失败" in compact
     assert "不调用abort" in compact
@@ -5943,7 +6320,7 @@ def test_qwen_prompt_uses_fixed_fast_runtime_without_discovery() -> None:
     ] in arrays
 
 
-def test_qwen_prompt_uses_three_independent_host_collection_calls() -> None:
+def test_qwen_prompt_uses_independent_two_phase_host_collection_calls() -> None:
     prompt = (
         Path(__file__).resolve().parents[2]
         / "prompts"
@@ -5954,97 +6331,33 @@ def test_qwen_prompt_uses_three_independent_host_collection_calls() -> None:
     assert "doc info" in normalized
     assert "doc read" in normalized
     assert "--format json" in normalized
-    assert 'tojson as $raw | {encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}' in prompt
-    assert "三个独立工具调用" in normalized
-    assert "引用 here-document" in normalized
+    assert 'operation:"doc_info"' in prompt
+    assert 'operation:"doc_read"' in prompt
+    assert "python tools/dws_sync_runtime.py capture-info" in normalized
+    assert "python tools/dws_sync_runtime.py complete-host-import" in normalized
     assert "不得使用管道" in normalized
     assert "不得使用命令替换" in normalized
     assert "不得使用 Popen" in normalized
-    assert "不得向用户输出封包" in normalized
     assert "不得写临时文件" in normalized
-    assert "host-import 成功后" in normalized
+    assert "完整 envelope 原样交给 stdin" in normalized
+    assert "不得复制 Base64" in normalized
 
 
-def test_qwen_prompt_defines_exact_host_import_outer_contract() -> None:
+def test_qwen_prompt_forbids_host_import_outer_contract() -> None:
     prompt = (
         Path(__file__).resolve().parents[2]
         / "prompts"
         / "qwenwork-dws-project-sync.md"
     ).read_text(encoding="utf-8")
-    compact = "".join(prompt.replace("`", "").split())
+    normalized = " ".join(prompt.replace("`", "").split())
 
-    assert "外层键必须恰好为schema_version、project_id、results" in compact
-    assert "键名必须是project_id，禁止使用project" in compact
-    assert "每个results元素必须恰好为operation、encoding、byte_count、payload" in compact
-    assert "第一项operation=doc_info，第二项operation=doc_read" in compact
-    assert "不得增加source_id_hash或其他字段" in compact
-    pseudocode = re.search(
-        r"<!-- host-import-construction -->\s*```python\s*(.*?)\s*```",
-        prompt,
-        re.DOTALL,
-    )
-    assert pseudocode is not None
-    normalized_code = " ".join(pseudocode.group(1).split())
-    assert '"project_id": PROJECT_ID' in normalized_code
-    assert '"project":' not in normalized_code
-    assert normalized_code.index('"operation": "doc_info"') < (
-        normalized_code.index('"operation": "doc_read"')
-    )
-    raw_result = b"{}"
-    host_envelope = {
-        "encoding": "base64-json",
-        "byte_count": len(raw_result),
-        "payload": base64.b64encode(raw_result).decode("ascii"),
-    }
-    module = ast.parse(pseudocode.group(1), mode="exec")
-    assert len(module.body) == 1
-    assignment = module.body[0]
-    assert isinstance(assignment, ast.Assign)
-    assert len(assignment.targets) == 1
-    assert isinstance(assignment.targets[0], ast.Name)
-    assert assignment.targets[0].id == "outer"
-    assert isinstance(assignment.value, ast.Dict)
-    root_keys = [ast.literal_eval(key) for key in assignment.value.keys]
-    assert root_keys == ["schema_version", "project_id", "results"]
-    assert isinstance(assignment.value.values[0], ast.Constant)
-    assert type(assignment.value.values[0].value) is int
-    assert assignment.value.values[0].value == 1
-    assert isinstance(assignment.value.values[1], ast.Name)
-    assert assignment.value.values[1].id == "PROJECT_ID"
-    results_node = assignment.value.values[2]
-    assert isinstance(results_node, ast.List)
-    assert len(results_node.elts) == 2
-    for item, operation, envelope_name in zip(
-        results_node.elts,
-        ("doc_info", "doc_read"),
-        ("DOC_INFO_ENVELOPE", "DOC_READ_ENVELOPE"),
-        strict=True,
-    ):
-        assert isinstance(item, ast.Dict)
-        assert len(item.keys) == 2
-        assert ast.literal_eval(item.keys[0]) == "operation"
-        assert item.keys[1] is None
-        assert ast.literal_eval(item.values[0]) == operation
-        assert isinstance(item.values[1], ast.Name)
-        assert item.values[1].id == envelope_name
-    outer = {
-        "schema_version": 1,
-        "project_id": "project-1",
-        "results": [
-            {"operation": "doc_info", **host_envelope},
-            {"operation": "doc_read", **host_envelope},
-        ],
-    }
-    assert set(outer) == {"schema_version", "project_id", "results"}
-    assert [set(item) for item in outer["results"]] == [
-        {"operation", "encoding", "byte_count", "payload"},
-        {"operation", "encoding", "byte_count", "payload"},
-    ]
-    from tools.dws_sync.host_bridge import _decode_results
-
-    assert _decode_results(
-        canonical(outer).encode("utf-8"), "project-1"
-    ) == ({}, {})
+    assert "host-import-construction" not in prompt
+    assert "outer =" not in prompt
+    assert '"results"' not in prompt
+    assert "python tools/dws_sync_runtime.py host-import" not in normalized
+    assert "不得由 Agent 增加 operation" in normalized
+    assert "不得由 Agent 增加 operation、合并两次结果、构造外层 object" in normalized
+    assert normalized.index("capture-info") < normalized.index("complete-host-import")
 
 
 def test_qwen_prompt_embeds_jq_in_each_exact_dws_command_template() -> None:
@@ -6054,16 +6367,17 @@ def test_qwen_prompt_embeds_jq_in_each_exact_dws_command_template() -> None:
         / "qwenwork-dws-project-sync.md"
     ).read_text(encoding="utf-8")
     bash_blocks = re.findall(r"```bash\s*(.*?)\s*```", prompt, re.DOTALL)
-    jq = "tojson as $raw | {encoding:\"base64-json\",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}"
+    jq_info = "tojson as $raw | {operation:\"doc_info\",encoding:\"base64-json\",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}"
+    jq_read = "tojson as $raw | {operation:\"doc_read\",encoding:\"base64-json\",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}"
     normalized = " ".join(prompt.replace("`", "").split())
     compact = "".join(prompt.replace("`", "").split())
 
     expected = [
-        f"dws doc info --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq '{jq}'",
-        f"dws doc read --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq '{jq}'",
+        f"dws doc info --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq '{jq_info}'",
+        f"dws doc read --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq '{jq_read}'",
     ]
     assert [" ".join(block.split()) for block in bash_blocks] == expected
-    for command in expected:
+    for command, jq in zip(expected, (jq_info, jq_read), strict=True):
         assert command.count("--jq") == 1
         shell = command.replace(jq, "")
         for placeholder in (
@@ -6073,8 +6387,9 @@ def test_qwen_prompt_embeds_jq_in_each_exact_dws_command_template() -> None:
             shell = shell.replace(placeholder, "")
         assert "|" not in shell
         assert ">" not in shell
-    assert "四个参数--profile、--formatjson、--node、--jq" in compact
-    assert "缺少--jq时不得发起DWS调用" in compact
+    assert "发起调用前必须逐项确认" in compact
+    for option in ("--profile", "--formatjson", "--node", "--jq"):
+        assert option in compact
     assert "DWS_PATH_LITERAL" not in prompt
     assert "必须使用PATH-based字面命令dws" in compact
     assert "平台托管命令令牌" in compact
@@ -6147,39 +6462,23 @@ def test_qwen_prompt_rejects_private_path_aliases() -> None:
     assert "reparse" in prompt
 
 
-def test_qwen_prompt_names_skill_and_closes_artifact_io_contract() -> None:
+def test_qwen_prompt_excludes_model_artifact_work_from_normal_cycle() -> None:
     prompt = (
         Path(__file__).resolve().parents[2]
         / "prompts"
         / "qwenwork-dws-project-sync.md"
     ).read_text(encoding="utf-8")
 
-    assert "hui-anchor-dws-project-context-v1" in prompt
-    assert "DwsSourceBundle" in prompt
-    assert "QwenProjectContextArtifact" in prompt
-    assert "唯一输入" in prompt
-    assert "唯一输出" in prompt
-    assert "同目录临时文件" in prompt
-    assert "flush" in prompt
-    assert "fsync" in prompt
-    assert "os.replace" in prompt
+    assert "hui-anchor-dws-project-context-v1" not in prompt
+    assert "QwenProjectContextArtifact" not in prompt
+    assert "DecisionCard" not in prompt
+    assert "completed_retrieval_request_ids" not in prompt
+    assert "python tools/dws_sync_runtime.py artifact" not in prompt
     assert "不得读取其他文件" in prompt
     assert "不得输出其他内容" in prompt
-    assert '"open_actions": []' in prompt
-    assert '"current_risks": []' in prompt
-    assert '"next_meeting": null' in prompt
-    assert "必须预先安装" in prompt
-    assert "不可用时立即停止" in prompt
-    assert "不得搜索、安装或替换 Skill" in prompt
-
-    normalized = " ".join(prompt.split())
-    validate_at = normalized.index("QwenProjectContextArtifact.model_validate")
-    size_at = normalized.index("2097152")
-    temporary_at = normalized.index("创建同目录临时文件")
-    replace_at = normalized.index("os.replace")
-    assert validate_at < temporary_at
-    assert size_at < temporary_at
-    assert temporary_at < replace_at
+    assert "不得调用模型" in prompt
+    assert "不得写 context artifact" in prompt
+    assert "不得 dry-run" in prompt
 
 
 def test_skill_contract_requires_single_body_excerpt_without_rewriting() -> None:
@@ -6225,7 +6524,7 @@ def test_qwen_prompt_stops_after_failures_and_only_reruns_after_end() -> None:
     no_begin_at = compact.index("abort后不得begin", return_at)
     rerun_only_at = compact.index("只有end=rerun", no_begin_at)
     full_rerun_at = compact.index("完整重跑", rerun_only_at)
-    recollect_at = compact.index("每轮重新采集", full_rerun_at)
+    recollect_at = compact.index("每轮必须重新执行两次DWS和两阶段导入", full_rerun_at)
     replay_ban_at = compact.index(
         "禁止读取或回放context_artifact",
         recollect_at,
@@ -6244,22 +6543,21 @@ def test_qwen_prompt_stops_after_failures_and_only_reruns_after_end() -> None:
     assert recollect_at < replay_ban_at < retry_ban_at < numbered_flow_at
 
     end_step_at = normalized.index(
-        "12. push 成功后，以同一 token 运行 python tools/dws_sync_runtime.py end"
+        "9. push 成功后，以同一 token 运行 python tools/dws_sync_runtime.py end"
     )
     rerun_response_at = normalized.index("返回 rerun 时", end_step_at)
     rerun_chain_at = normalized.index(
-        "完整的宿主双 DWS 采集 -> host-import -> pending -> reuse-artifact ->（artifact_reused，或 artifact_required -> Skill -> artifact）-> push -> end 链路",
+        "依次完整重做 dws doc info -> capture-info -> dws doc read -> complete-host-import -> pending -> reuse-artifact --unattended -> push -> end",
         rerun_response_at,
     )
-    final_abort_at = normalized.index(
-        "任何未成功 end 的路径都必须由 finally 调用 abort",
-        rerun_chain_at,
-    )
+    final_abort_at = normalized.index("任何未成功 end 的路径", rerun_chain_at)
+    finally_at = normalized.index("finally 调用 abort", final_abort_at)
     assert end_step_at < rerun_response_at < rerun_chain_at < final_abort_at
-    assert " begin" not in normalized[rerun_response_at:final_abort_at]
+    assert final_abort_at < finally_at
+    assert " begin" not in normalized[rerun_response_at:finally_at]
 
 
-def test_qwen_prompt_reuses_approved_artifact_before_skill() -> None:
+def test_qwen_prompt_gates_push_on_unattended_approved_reuse() -> None:
     prompt = (
         Path(__file__).resolve().parents[2]
         / "prompts"
@@ -6269,18 +6567,20 @@ def test_qwen_prompt_reuses_approved_artifact_before_skill() -> None:
 
     pending_at = normalized.index("python tools/dws_sync_runtime.py pending")
     reuse_at = normalized.index(
-        "python tools/dws_sync_runtime.py reuse-artifact",
+        "python tools/dws_sync_runtime.py reuse-artifact --unattended",
         pending_at,
     )
-    skill_at = normalized.index("hui-anchor-dws-project-context-v1", reuse_at)
-    assert pending_at < reuse_at < skill_at
-    assert "artifact_reused" in normalized[reuse_at:skill_at]
-    assert "artifact_required" in normalized[reuse_at:skill_at]
+    manual_at = normalized.index("manual_refresh_required", reuse_at)
+    abort_at = normalized.index("python tools/dws_sync_runtime.py abort", manual_at)
+    return_at = normalized.index("return", abort_at)
+    push_at = normalized.index("python tools/dws_sync_runtime.py push", return_at)
+    assert pending_at < reuse_at < manual_at < abort_at < return_at < push_at
+    assert "artifact_reused" in normalized[reuse_at:manual_at]
     rerun_at = normalized.index("返回 rerun 时")
-    rerun_reuse_at = normalized.index("reuse-artifact", rerun_at)
-    rerun_skill_at = normalized.index("Skill", rerun_reuse_at)
-    rerun_end_at = normalized.index("end 链路", rerun_skill_at)
-    assert rerun_at < rerun_reuse_at < rerun_skill_at < rerun_end_at
+    rerun_reuse_at = normalized.index("reuse-artifact --unattended", rerun_at)
+    rerun_push_at = normalized.index("push", rerun_reuse_at)
+    rerun_end_at = normalized.index("end", rerun_push_at)
+    assert rerun_at < rerun_reuse_at < rerun_push_at < rerun_end_at
 
 
 def test_private_task_config_is_ignored_and_documented_publicly() -> None:

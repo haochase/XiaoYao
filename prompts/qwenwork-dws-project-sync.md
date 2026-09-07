@@ -55,10 +55,6 @@ schema 验证后，必须用 `Path.resolve(strict=False)` 和 `os.path.normcase`
 架构及同目录现有普通非 reparse 原生 shim 的启动校验；不得复制或修改安装文件。不得把任意
 脚本作为 DWS 启动入口。
 
-`hui-anchor-dws-project-context-v1` 是必须预先安装的外部 Skill 依赖。在执行宿主采集前，
-只通过 Skill 注册表检查该精确名称；不可用时立即停止。不得搜索、安装或替换 Skill，也
-不得把相近名称、仓库文件或通用模型提示当作降级实现。
-
 ## 固定流程
 
 本任务唯一允许的Python解释器为
@@ -71,12 +67,13 @@ PATH-based字面命令`dws`，不得添加引号、路径或前缀。配置中�
 不得搜索或枚举其他Python解释器，不得检查实现源码或测试文件，不得使用`cd &&`或
 任何shell命令串联，不得创建辅助脚本、候选文件或旁路产物。任务工作目录已由contextDirs固定为
 仓库根目录，不得再次切换目录。除读取固定配置、manifest、source_bundle以及执行本节明确命令外，
-允许只读检查Skill注册表，允许校验DWS wrapper和原生shim；除此之外不得做解释器发现、代码探查
+允许校验DWS wrapper和原生shim；除此之外不得做解释器发现、代码探查
 或额外诊断。begin前的预检或check失败时输出脱敏固定错误并立即结束，不调用abort；只有begin成功
 取得run_token后，任一固定命令失败才按abort分支结束。
 
 生产入口使用 `python tools/dws_sync_runtime.py`，解释器须为已安装本项目依赖的明确绝对路径。
-该入口只读固定配置；`host-import` 不读取或解封凭据，只有 pending/push 的内部调用以
+该入口只读固定配置；`capture-info`、`complete-host-import` 和 `reuse-artifact` 不读取或解封凭据，
+只有 pending/push 的内部调用以
 CurrentUser DPAPI 解封并取得网关 token。runtime 不修改父进程环境，也不把 token 传给
 DWS。不得手工导出凭据。
 两次字面命令`dws`必须由千问办公原生Bash的宿主PostToolUse路由执行；这里的`dws`是平台托管
@@ -84,15 +81,15 @@ DWS。不得手工导出凭据。
 `dws_tool_result`通道结果，再由同一次调用的`--jq`生成封包；普通shell stdout、历史结果、
 `pending-post-tool-use`占位符或任何非`dws_tool_result`来源都必须abort并结束。配置中的绝对shim
 及`resolve_dws_launch`仅用于本地runtime边界验证，不能替代或冒充宿主托管命令令牌。
-先执行 `python tools/dws_sync_runtime.py check`；configured 只证明配置/解密正常，仍需上面的
-Skill 注册表和真实会话检查，不等同于同步已运行。prepare/serve 不属于周期任务，不自动执行。
+先执行 `python tools/dws_sync_runtime.py check`；configured 只证明配置/解密正常，仍需真实会话检查，
+不等同于同步已运行。prepare/serve 不属于周期任务，不自动执行。
 
 单个调度触发最多一次 `begin`。取得 `run_token` 后，任何命令非成功，都必须先在内存中保存该失败
 命令返回的固定错误，再以同一 token 调用 `abort`；随后原样输出固定错误并 `return`。即使
 `abort` 自身失败，也不得用其结果覆盖原错误。
-`abort` 后不得 `begin`。只有 `end=rerun` 才允许使用 `end` 返回的新 token 完整重跑。每轮重新采集、
-重新调用 Skill、重新生成 artifact；禁止读取或回放 `context_artifact`。确定性 push
-错误不得再次 push。
+`abort` 后不得 `begin`。只有 `end=rerun` 才允许使用 `end` 返回的新 token 完整重跑。每轮必须重新
+执行两次 DWS 和两阶段导入，仍通过无人值守复用门禁；禁止读取或回放 `context_artifact`。确定性
+push 错误不得再次 push。
 
 1. 使用参数数组运行 `python tools/dws_sync_runtime.py begin`，项目只取固定配置。
    若返回 `coalesced`，本次触发立即正常结束，不执行任何后续步骤；
@@ -101,124 +98,72 @@ Skill 注册表和真实会话检查，不等同于同步已运行。prepare/ser
    在 `finally` 中以同一 token 调用 `python tools/dws_sync_runtime.py abort --run-token TOKEN`。
 2. 从固定配置定位 manifest，按与配置相同的严格文件门禁读取，不回显配置或 manifest。
    只取项目键精确匹配且来源恰好为一个 document 的项目，并只在任务内保存它的 profile 和
-   source ID。然后进行第一个独立工具调用：使用千问办公原生 Bash 以参数形式执行固定 DWS
-   `doc info` 命令，必须带 `--profile`、`--format json` 和 `--node`。让宿主 PostToolUse 对真实
-   `dws_tool_result` 使用以下已实测 jq 生成封包，不得自行解析、改写或回显结果：
-
-   ```jq
-   tojson as $raw | {encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}
-   ```
-
-   如果结果是 `pending-post-tool-use` 占位符、缺失、超限或 jq 失败，立即停止。
-   发起调用前必须逐项确认同一次DWS调用含四个参数 `--profile`、`--format json`、`--node`、
-   `--jq`；缺少 `--jq` 时不得发起 DWS 调用。下列是唯一允许的命令形状。执行前必须把两枚
-   `*_LITERAL`整体替换为本次内存中已经验证的值，并按POSIX单引号规则编码为恰好一个Bash参数；
-   不得依赖shell环境变量，残留任何`<LITERAL>`占位符时不得执行：
+   source ID。进行第一个独立工具调用：使用千问办公原生 Bash 执行固定 DWS `doc info` 命令。
+   同一次调用的宿主 PostToolUse 必须只从真实 `dws_tool_result` 运行以下 jq，让结果直接包含固定
+   `operation=doc_info`，不得由 Agent 补写任何键：
 
    ```bash
-   dws doc info --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq 'tojson as $raw | {encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}'
+   dws doc info --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq 'tojson as $raw | {operation:"doc_info",encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}'
    ```
-3. 进行第二个独立工具调用：以相同 dws、profile、JSON 格式和 source ID 执行固定 DWS
-   `doc read` 命令，并使用完全相同的宿主 jq 生成第二个封包。两个 DWS 调用不得合并；不得使用
-   管道。不得使用命令替换，不得使用 Popen，不得重定向到文件或创建临时文件。
-   调用前再次逐项确认四个参数，且必须使用下列唯一命令形状：
+
+   发起调用前必须逐项确认 `--profile`、`--format json`、`--node`、`--jq` 四个参数。
+   `*_LITERAL` 必须整体替换为本次内存中已验证的值，并按 POSIX 单引号规则编码为恰好一个 Bash
+   参数；不得依赖 shell 环境变量，残留任何 `<LITERAL>` 占位符时不得执行。结果为
+   `pending-post-tool-use` 占位符、缺失、超限或 jq 失败时立即停止。
+3. 进行下一次独立 CLI 工具调用：运行
+   `python tools/dws_sync_runtime.py capture-info --run-token TOKEN`，只把步骤 2 同一次原生 Bash 返回的
+   完整 envelope 原样交给 stdin。不得使用普通 stdout、历史结果或 pending placeholder，不得复制
+   Base64，不得写临时文件，也不得增加外层 object、数组或其他字段。成功状态必须为
+   `host_info_captured`。
+4. 进行第三个独立工具调用：以相同 dws、profile、JSON 格式和 source ID 执行固定 DWS
+   `doc read`。同一次宿主 jq 直接加入固定 `operation=doc_read`：
 
    ```bash
-   dws doc read --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq 'tojson as $raw | {encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}'
-   ```
-4. 只在内存中给两个封包分别增加固定 operation `doc_info`、`doc_read`，按此顺序装入
-   `schema_version=1`、固定 project ID 和 results 恰好两项的外层 JSON object。进行第三个
-   独立工具调用：运行 `python tools/dws_sync_runtime.py host-import --run-token TOKEN`，用
-   引用 here-document（例如 `<<'DWS_HOST_IMPORT'`）把外层 JSON 字面量原样传入 stdin。
-   不得使用管道、命令替换或 Popen，不得向用户输出封包、Base64 或正文，不得写临时文件。
-   这三个独立工具调用之间只允许宿主在内存中传递封包；payload Base64 是敏感原始 DWS
-   结果，不是脱敏摘要。host-import 成功后才可继续；任一步失败时不得生成或推送空上下文，
-   必须进入 finally 并使用同一 token 执行 abort。
-   外层键必须恰好为`schema_version`、`project_id`、`results`；键名必须是`project_id`，禁止使用
-   `project`。每个results元素必须恰好为`operation`、`encoding`、`byte_count`、`payload`；第一项
-   `operation=doc_info`，第二项`operation=doc_read`。不得增加`source_id_hash`或其他字段。两个宿主
-   封包在合并前必须已各自恰好包含`encoding/byte_count/payload`，构造只能等价于以下内存伪代码：
-
-   <!-- host-import-construction -->
-   ```python
-   outer = {
-       "schema_version": 1,
-       "project_id": PROJECT_ID,
-       "results": [
-           {"operation": "doc_info", **DOC_INFO_ENVELOPE},
-           {"operation": "doc_read", **DOC_READ_ENVELOPE},
-       ],
-   }
-   ```
-5. host-import 成功后，使用参数数组运行 `python tools/dws_sync_runtime.py pending`，只传同一
-   `--run-token`。网关固定为 `http://127.0.0.1:8731`，内部只向该请求提供
-   `COMPANION_DWS_SYNC_TOKEN`。该命令只领取状态为
-   pending 的项目内请求，将每个
-   `source_id_hash` 映射为 manifest 白名单内的 `source_type` 和 `source_id`，并把只含
-   `request_id`、`query_hash`、`request_epoch`、`attempt_count`、`lease_expires_at`、
-   `lease_token`、`sources` 的 `retrieval_requests` 原子写回 source bundle。
-   任一 hash 无法唯一映射时立即停止，不得扩大白名单。
-6. pending 成功后，先使用参数数组运行
-   `python tools/dws_sync_runtime.py reuse-artifact --run-token TOKEN`。返回
-   `artifact_reused` 时说明来源未变化且已复用最后成功批准的上下文，跳过本步余下内容以及步骤
-   7 至 10，直接进入步骤 11；返回 `artifact_required` 时才继续调用名称精确为
-   `hui-anchor-dws-project-context-v1` 的 Skill。其他状态均按失败分支 abort 并 return。该 Skill 的
-   唯一输入是从 `source_bundle` 读取并校验后的 `DwsSourceBundle`；不得传入历史对话、
-   仓库文档、其他私有文件或模型记忆。唯一输出是一个
-   `QwenProjectContextArtifact` JSON object，顶层只允许 `schema_version`、`context` 和
-   `completed_retrieval_request_ids`。
-7. artifact 中每条事实性决策必须使用 `DecisionCard.source_refs`；每条行动项、风险和下次
-   会议必须分别使用 `sourced_actions`、`sourced_risks` 和
-   `sourced_next_meeting` 的 `SourcedFact(text, source_refs)`。每个引用必须精确匹配一个
-   `active` 来源的类型、ID、权限域、标题、URL 和时间，且 excerpt 必须是来源正文中的
-   精确片段。事实文本必须由这些摘录直接支持；证据不足就省略，不得推断或补写。
-8. legacy 展示字段必须固定为空，不得从 sourced facts 复制或生成：
-
-   ```json
-   {
-     "open_actions": [],
-     "current_risks": [],
-     "next_meeting": null
-   }
+   dws doc read --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq 'tojson as $raw | {operation:"doc_read",encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}'
    ```
 
-9. 本次安装的 v1 Skill 缺少问题原文与检索基线，`completed_retrieval_request_ids` 固定为空，
-   不得仅凭 query_hash 或 active 来源猜测已经完成。下述是协议能力的必要条件而不是自动授权：
-   只有已取得对应证据，且请求 ID 在 `retrieval_requests` 中列出、其 `sources` 全部在
-   本轮成功取得 active 证据、事实由对应精确摘录支持时，才能加入
-   `completed_retrieval_request_ids`。
-   未完成的检索请求绝不能加入 `completed_retrieval_request_ids`，遗漏的请求保持
-   pending。不得
-   捏造请求、修改 `query_hash`、扩大 `sources` 或用旧 bundle 中不存在的 ID 声明完成。
-   CLI 会把这些 ID 精确映射为本轮 claim 的 `completed_retrieval_claims`，其中只包含
-   `request_id`、`request_epoch`、`attempt_count` 和 `lease_token`；不得自行构造或修改 claim。
-10. 不得直接写 `context_artifact`。先在内存中用
-   `QwenProjectContextArtifact.model_validate` 完整验证 Skill candidate，再编码为 canonical
-   UTF-8 JSON；encoded bytes 必须小于或等于 `2097152`。然后使用参数数组运行
-   `python tools/dws_sync_runtime.py artifact`，仅传同一 `--run-token`，
-   并仅通过 stdin 传入 encoded bytes。该命令在 token fencing 下
-   创建同目录临时文件，依次 `flush`、`fsync`、`os.replace`；验证或写入失败时保留旧目标。
-11. artifact 写入成功后，使用参数数组运行 `python tools/dws_sync_runtime.py push`，只传同一
-   `--run-token`。首次人工验收先加 `--dry-run`，预检通过后再实际 push；正常周期不重复 dry-run。
-12. push 成功后，以同一 token 运行 `python tools/dws_sync_runtime.py end --run-token TOKEN`。
-    返回 `completed`
-     时结束；返回 `rerun` 时只使用返回的新 token 再执行一次完整的宿主双 DWS 采集 ->
-    host-import -> pending -> reuse-artifact ->（artifact_reused，或 artifact_required -> Skill ->
-    artifact）-> push -> end 链路。任何未成功 end 的路径都必须由 `finally` 调用 abort；
-    旧 token 不得再写 bundle、artifact、state 或发起 push。
+   两次 DWS 调用不得合并。再次逐项确认四个参数；不得使用管道，不得使用命令替换，不得使用
+   Popen、重定向或临时文件。结果只接受同一次真实 `dws_tool_result` 通道生成的完整 envelope。
+5. 进行下一次独立 CLI 工具调用：运行
+   `python tools/dws_sync_runtime.py complete-host-import --run-token TOKEN`，只把步骤 4 同一次原生 Bash
+   返回的完整 envelope 原样交给 stdin。不得由 Agent 增加 operation、合并两次结果、构造外层
+   object 或复制 Base64。成功状态必须为 `collected`。complete 事务失败会先恢复 capture、output 和
+   `host_info`，随后 finally 使用同一 token abort，abort 随后按设计清理 capture；
+   不承诺 abort 后保留诊断文件，也不得为了诊断跳过 abort 或另存 capture。
+6. 两阶段导入成功后，使用参数数组运行 `python tools/dws_sync_runtime.py pending --run-token TOKEN`。
+   网关固定为 `http://127.0.0.1:8731`，内部只向该请求提供 `COMPANION_DWS_SYNC_TOKEN`。该命令只领取
+   pending 的项目内请求，将每个 `source_id_hash` 映射为 manifest 白名单内的 `source_type` 和
+   `source_id`，并把固定 retrieval request 字段原子写回 source bundle。任一 hash 无法唯一映射时
+   立即停止，不得扩大白名单。
+7. pending 成功后，使用参数数组运行
+   `python tools/dws_sync_runtime.py reuse-artifact --unattended --run-token TOKEN`。只有返回
+   `artifact_reused` 才能继续 push。若返回 `manual_refresh_required`，先在内存保存该固定状态，立即
+   使用同一 token 运行 `python tools/dws_sync_runtime.py abort --run-token TOKEN`，随后原样输出
+   `manual_refresh_required` 并 `return`；即使 abort 失败，也不得覆盖原状态。此分支不得调用模型、
+   不得写 context artifact、不得 push、不得 dry-run，也不得第二次 begin。其他状态或错误走相同的
+   fail-closed abort/return 边界。来源变化、approved artifact 缺失或存在 `retrieval_requests` 时均由
+   CLI 返回该人工刷新状态，不得在正常周期自行处理。
+8. artifact_reused 后，使用参数数组运行 `python tools/dws_sync_runtime.py push --run-token TOKEN`。
+   正常周期不得添加 dry-run；确定性 push 错误不得重试。
+9. push 成功后，以同一 token 运行 `python tools/dws_sync_runtime.py end --run-token TOKEN`。返回
+   `completed` 时结束；返回 `rerun` 时只使用返回的新 token，依次完整重做 dws doc info ->
+   capture-info -> dws doc read -> complete-host-import -> pending -> reuse-artifact --unattended -> push ->
+   end。rerun 的 `manual_refresh_required` 同样必须以 rerun token abort 并 return。任何未成功 end 的路径
+   都必须由 finally 调用 abort；旧 token 不得再写 bundle、context artifact、state 或发起 push。
 
 ## 读取、写入和输出边界
 
-- 任务编排只可读取固定任务配置、其中指定的 manifest 和 `source_bundle`。Skill 不得读取其他文件、网络资源、
-  历史对话或 manifest 白名单以外的钉钉资料。DWS 只允许上述两个独立宿主调用；
-  host-import/pending/push 只能通过固定 CLI 完成其契约内的 manifest、retrieval、context 和
-  state 访问。
-- 任务只可写 `source_bundle`、`context_artifact`、`state`，以及 CLI 在仓库固定
-  `.private/dws-sync-locks` 下管理的哈希命名 lifecycle/lock 文件。不得创建日志、报告、
-  缓存、旁路 artifact 或其他状态文件。
+- 任务编排只可读取固定任务配置、其中指定的 manifest 和 `source_bundle`。不得读取其他文件、网络
+  资源、历史对话或 manifest 白名单以外的钉钉资料。DWS 只允许上述两个独立宿主调用；两阶段导入、
+  pending、复用门禁和 push 只能通过固定 CLI 完成。
+- 任务编排只能通过受信 CLI 写 `source_bundle`、`context_artifact`、`state`，以及仓库固定
+  `.private/dws-sync-locks` 下的哈希命名 lifecycle/lock 文件。只有受信 CLI 可以管理固定
+  `.private/dws-host-captures` 下 digest 命名的 capture 文件及相关锁。Agent 不得直接读取 capture，
+  Agent 不得直接复制 capture，Agent 不得直接修改 capture，Agent 不得直接另存 capture，
+  Agent 不得直接删除 capture；也不得创建日志、报告、缓存、旁路 artifact 或其他状态文件。
 - runtime 仅可在 pending/push/check 需要时读取 prepare 生成的
-  `.private/dws-runtime/credential.dpapi`；host-import 不得读取或解密它。本任务不得创建、
-  修改、打印或复制它。不得读取其他 Windows 用户或其他应用的凭据。
+  `.private/dws-runtime/credential.dpapi`；capture-info、complete-host-import 和 reuse-artifact 不得读取或
+  解密它。本任务不得创建、修改、打印或复制它。不得读取其他 Windows 用户或其他应用的凭据。
 - 任一步失败即停止。不得绕过校验、拆分超限同步包、改用其他 gateway、追加 `--yes`、
   重试非 retryable 错误或继续 push。
 - 不得输出其他内容。begin/end 返回的 `run_token` 只供任务内部编排，绝不能成为用户可见

@@ -83,9 +83,12 @@ def dispatch(
     protector: ContentProtector,
     *,
     input_stream: object | None = None,
+    unattended: bool = False,
 ) -> int:
     from tools import dws_project_sync as cli
 
+    if unattended and command != "reuse-artifact":
+        raise ValueError("unattended_command_invalid")
     if command in {
         "artifact",
         "capture-info",
@@ -142,6 +145,8 @@ def dispatch(
     if command == "push":
         if dry_run:
             argv += ["--dry-run"]
+    if command == "reuse-artifact" and unattended:
+        argv += ["--unattended"]
     environment = dict(os.environ)
     environment.pop("COMPANION_DWS_SYNC_TOKEN", None)
     if command in {"pending", "push"} and not dry_run:
@@ -197,6 +202,8 @@ def main(
             sub.add_argument("--run-token", required=True)
         if command == "push":
             sub.add_argument("--dry-run", action="store_true")
+        if command == "reuse-artifact":
+            sub.add_argument("--unattended", action="store_true")
     args = parser.parse_args(argv)
     try:
         selected_protector = protector or WindowsDpapiProtector()
@@ -226,9 +233,13 @@ def main(
             )
             return 0
         else:
+            dispatch_options = {}
+            if getattr(args, "unattended", False):
+                dispatch_options["unattended"] = True
             return dispatch(
                 root, args.command, getattr(args, "run_token", None),
                 getattr(args, "dry_run", False), selected_protector,
+                **dispatch_options,
             )
     except Exception:
         print(json.dumps({"status": "blocked", "error_type": "runtime_not_ready"}))

@@ -346,6 +346,80 @@ def test_reuse_artifact_maps_fixed_inputs_without_decrypting_credential(
     assert "COMPANION_DWS_SYNC_TOKEN" not in kwargs["environ"]
 
 
+def test_unattended_flag_is_mapped_only_for_reuse_artifact(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from tools import dws_project_sync
+    from tools import dws_sync_runtime as wrapper
+
+    manifest, dws = inputs(tmp_path)
+    prepare_runtime(tmp_path, manifest, "project-1", dws, Protector())
+    observed = []
+    monkeypatch.setattr(
+        dws_project_sync,
+        "main",
+        lambda argv, **kwargs: observed.append((argv, kwargs)) or 0,
+    )
+
+    assert wrapper.dispatch(
+        tmp_path,
+        "reuse-artifact",
+        "lease-token",
+        False,
+        Protector(),
+        unattended=True,
+    ) == 0
+    assert observed[0][0][-1] == "--unattended"
+
+    with pytest.raises(ValueError, match="unattended_command_invalid"):
+        wrapper.dispatch(
+            tmp_path,
+            "push",
+            "lease-token",
+            False,
+            Protector(),
+            unattended=True,
+        )
+
+
+def test_runtime_parser_accepts_unattended_only_for_reuse_artifact(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from tools import dws_sync_runtime as wrapper
+
+    observed = []
+    monkeypatch.setattr(
+        wrapper,
+        "dispatch",
+        lambda root, command, run_token, dry_run, protector, **kwargs: (
+            observed.append((root, command, run_token, dry_run, kwargs)) or 0
+        ),
+    )
+
+    assert wrapper.main(
+        ["reuse-artifact", "--run-token", "lease-token", "--unattended"],
+        root=tmp_path,
+        protector=Protector(),
+    ) == 0
+    assert observed == [
+        (
+            tmp_path,
+            "reuse-artifact",
+            "lease-token",
+            False,
+            {"unattended": True},
+        )
+    ]
+    with pytest.raises(SystemExit, match="2"):
+        wrapper.main(
+            ["push", "--run-token", "lease-token", "--unattended"],
+            root=tmp_path,
+            protector=Protector(),
+        )
+
+
 def test_recover_pending_maps_fixed_inputs_without_exposing_token(
     tmp_path: Path,
     monkeypatch,
