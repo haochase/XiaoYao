@@ -454,3 +454,31 @@ def test_capture_rejects_hardlinked_capture_file(capture) -> None:
             run_token="run-token-1",
             protector=protector,
         )
+
+
+def test_prepared_delete_rejects_same_bytes_replacement_without_deleting_it(
+    capture,
+) -> None:
+    protector = Protector()
+    selected = manifest()
+    capture.capture_document_info(
+        encoded_result("doc_info", document_info()),
+        selected,
+        run_token="run-token-1",
+        protector=protector,
+    )
+    path = capture.document_info_capture_path("project-1")
+    original = path.read_bytes()
+    transaction = capture.prepare_document_info_capture_delete(
+        selected,
+        run_token="run-token-1",
+        protector=protector,
+    )
+    transaction.load()
+    path.unlink()
+    path.write_bytes(original)
+
+    with pytest.raises(ValueError, match="^host_capture_invalid$"):
+        transaction.apply()
+
+    assert path.read_bytes() == original

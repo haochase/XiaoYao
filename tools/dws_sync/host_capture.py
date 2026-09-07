@@ -65,6 +65,193 @@ class DocumentInfoCapture:
     document_info: Mapping[str, object]
 
 
+class DocumentInfoCaptureWrite:
+    def __init__(
+        self,
+        project: DwsProjectManifest,
+        source_id: str,
+        run_token: str,
+        document_info: dict[str, object],
+        protector: ContentProtector,
+        root: Path,
+    ) -> None:
+        self._project = project
+        self._source_id = source_id
+        self._run_token = run_token
+        self._document_info = document_info
+        self._protector = protector
+        self._root = root
+        self._path = document_info_capture_path(project.project_id)
+        self._capture = _document_capture(document_info)
+        self._protected: bytes | None = None
+        self._created = False
+        self._applied = False
+        self._rolled_back = False
+
+    @property
+    def capture(self) -> DocumentInfoCapture:
+        return self._capture
+
+    def apply(self) -> None:
+        if self._applied:
+            raise ValueError("host_capture_invalid")
+        _ensure_capture_root(self._root)
+        with state_lock.acquire_state_lock(
+            self._path,
+            self._project.project_id,
+            root=self._root,
+        ):
+            _ensure_capture_root(self._root)
+            existing = _read_capture(self._path)
+            if existing is None:
+                try:
+                    protected = self._protector.protect(
+                        self._project.project_id,
+                        _capture_payload(
+                            self._project.project_id,
+                            self._source_id,
+                            self._run_token,
+                            self._document_info,
+                        ),
+                    )
+                except Exception:
+                    raise ValueError("host_capture_invalid") from None
+                _write_capture(self._path, protected)
+                self._protected = protected
+                self._created = True
+            else:
+                captured = _load_protected_capture(
+                    existing,
+                    self._project,
+                    self._source_id,
+                    self._run_token,
+                    self._protector,
+                )
+                if _canonical_json(_thaw(captured.document_info)) != _canonical_json(
+                    self._document_info
+                ):
+                    raise ValueError("host_capture_conflict")
+            self._applied = True
+
+    def rollback(self) -> None:
+        if self._rolled_back or not self._applied or not self._created:
+            return
+        protected = self._protected
+        if protected is None:
+            raise ValueError("host_capture_invalid")
+        with state_lock.acquire_state_lock(
+            self._path,
+            self._project.project_id,
+            root=self._root,
+        ):
+            _ensure_capture_root(self._root)
+            current = _read_capture(self._path)
+            if current is not None:
+                if not hmac.compare_digest(current, protected):
+                    raise ValueError("host_capture_invalid")
+                _delete_capture(self._path, expected=protected)
+        self._rolled_back = True
+
+
+class DocumentInfoCaptureDelete:
+    def __init__(
+        self,
+        project: DwsProjectManifest,
+        source_id: str,
+        run_token: str,
+        protector: ContentProtector,
+        root: Path,
+    ) -> None:
+        self._project = project
+        self._source_id = source_id
+        self._run_token = run_token
+        self._protector = protector
+        self._root = root
+        self._path = document_info_capture_path(project.project_id)
+        self._protected: bytes | None = None
+        self._path_info: os.stat_result | None = None
+        self._capture: DocumentInfoCapture | None = None
+        self._delete_attempted = False
+        self._deleted = False
+        self._rolled_back = False
+
+    def load(self) -> DocumentInfoCapture:
+        if self._capture is not None:
+            return self._capture
+        _ensure_capture_root(self._root)
+        with state_lock.acquire_state_lock(
+            self._path,
+            self._project.project_id,
+            root=self._root,
+        ):
+            _ensure_capture_root(self._root)
+            snapshot = _read_capture_snapshot(self._path)
+            if snapshot is None:
+                raise ValueError("host_capture_missing")
+            protected, path_info = snapshot
+            self._capture = _load_protected_capture(
+                protected,
+                self._project,
+                self._source_id,
+                self._run_token,
+                self._protector,
+            )
+            self._protected = protected
+            self._path_info = path_info
+            return self._capture
+
+    def apply(self) -> None:
+        if (
+            self._deleted
+            or self._protected is None
+            or self._path_info is None
+        ):
+            raise ValueError("host_capture_invalid")
+        _ensure_capture_root(self._root)
+        with state_lock.acquire_state_lock(
+            self._path,
+            self._project.project_id,
+            root=self._root,
+        ):
+            _ensure_capture_root(self._root)
+            current = _read_capture(self._path)
+            if current is None or not hmac.compare_digest(
+                current, self._protected
+            ):
+                raise ValueError("host_capture_invalid")
+            self._delete_attempted = True
+            _delete_capture(
+                self._path,
+                expected=self._protected,
+                expected_info=self._path_info,
+            )
+        self._deleted = True
+
+    def rollback(self) -> None:
+        if self._rolled_back or not self._delete_attempted:
+            return
+        protected = self._protected
+        path_info = self._path_info
+        if protected is None or path_info is None:
+            raise ValueError("host_capture_invalid")
+        with state_lock.acquire_state_lock(
+            self._path,
+            self._project.project_id,
+            root=self._root,
+        ):
+            _ensure_capture_root(self._root)
+            current = _read_capture_snapshot(self._path)
+            if current is None:
+                _write_capture(self._path, protected)
+            else:
+                current_bytes, current_info = current
+                if not hmac.compare_digest(
+                    current_bytes, protected
+                ) or not os.path.samestat(current_info, path_info):
+                    raise ValueError("host_capture_invalid")
+        self._rolled_back = True
+
+
 def _binding_key(label: str, value: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError("host_capture_invalid")
@@ -162,7 +349,9 @@ def _ensure_capture_root(root: Path) -> None:
         raise ValueError("host_capture_invalid")
 
 
-def _read_capture(path: Path) -> bytes | None:
+def _read_capture_snapshot(
+    path: Path,
+) -> tuple[bytes, os.stat_result] | None:
     try:
         path_info = path.lstat()
     except FileNotFoundError:
@@ -194,7 +383,38 @@ def _read_capture(path: Path) -> bytes | None:
         or not os.path.samestat(path_info, final_path_info)
     ):
         raise ValueError("host_capture_invalid")
-    return raw
+    return raw, final_path_info
+
+
+def _read_capture(path: Path) -> bytes | None:
+    snapshot = _read_capture_snapshot(path)
+    return None if snapshot is None else snapshot[0]
+
+
+def _delete_capture(
+    path: Path,
+    *,
+    expected: bytes | None = None,
+    expected_info: os.stat_result | None = None,
+) -> bool:
+    current = _read_capture(path)
+    if current is None:
+        return False
+    if expected is not None and not hmac.compare_digest(current, expected):
+        raise ValueError("host_capture_invalid")
+    try:
+        current_info = path.lstat()
+        if not _safe_capture_stat(current_info) or (
+            expected_info is not None
+            and not os.path.samestat(expected_info, current_info)
+        ):
+            raise ValueError("host_capture_invalid")
+        path.unlink()
+    except ValueError:
+        raise
+    except OSError:
+        raise ValueError("host_capture_invalid") from None
+    return True
 
 
 def _write_capture(path: Path, protected: bytes) -> None:
@@ -459,6 +679,28 @@ def _checked_protector(protector: ContentProtector) -> ContentProtector:
     return protector
 
 
+def prepare_document_info_capture(
+    document_info: dict[str, object],
+    project: DwsProjectManifest,
+    *,
+    run_token: str,
+    protector: ContentProtector,
+    root: Path | None = None,
+) -> DocumentInfoCaptureWrite:
+    source_id = _single_document_source(project)
+    normalized = _normalized_document_info(document_info, source_id)
+    selected_root = _capture_root(root)
+    selected_protector = _checked_protector(protector)
+    return DocumentInfoCaptureWrite(
+        project,
+        source_id,
+        run_token,
+        normalized,
+        selected_protector,
+        selected_root,
+    )
+
+
 def capture_document_info(
     raw: bytes,
     project: DwsProjectManifest,
@@ -467,45 +709,32 @@ def capture_document_info(
     protector: ContentProtector,
     root: Path | None = None,
 ) -> DocumentInfoCapture:
-    source_id = _single_document_source(project)
-    document_info = _normalized_document_info(
+    transaction = prepare_document_info_capture(
         decode_host_result(raw, "doc_info"),
-        source_id,
+        project,
+        run_token=run_token,
+        protector=protector,
+        root=root,
     )
-    selected_root = _capture_root(root)
-    selected_protector = _checked_protector(protector)
-    path = document_info_capture_path(project.project_id)
-    _ensure_capture_root(selected_root)
-    with state_lock.acquire_state_lock(path, project.project_id, root=selected_root):
-        _ensure_capture_root(selected_root)
-        existing = _read_capture(path)
-        if existing is None:
-            try:
-                protected = selected_protector.protect(
-                    project.project_id,
-                    _capture_payload(
-                        project.project_id,
-                        source_id,
-                        run_token,
-                        document_info,
-                    ),
-                )
-            except Exception:
-                raise ValueError("host_capture_invalid") from None
-            _write_capture(path, protected)
-            return _document_capture(document_info)
-        captured = _load_protected_capture(
-            existing,
-            project,
-            source_id,
-            run_token,
-            selected_protector,
-        )
-        if _canonical_json(_thaw(captured.document_info)) != _canonical_json(
-            document_info
-        ):
-            raise ValueError("host_capture_conflict")
-        return captured
+    transaction.apply()
+    return transaction.capture
+
+
+def prepare_document_info_capture_delete(
+    project: DwsProjectManifest,
+    *,
+    run_token: str,
+    protector: ContentProtector,
+    root: Path | None = None,
+) -> DocumentInfoCaptureDelete:
+    source_id = _single_document_source(project)
+    return DocumentInfoCaptureDelete(
+        project,
+        source_id,
+        run_token,
+        _checked_protector(protector),
+        _capture_root(root),
+    )
 
 
 def load_document_info_capture(
@@ -570,10 +799,34 @@ def clear_document_info_capture(
         return True
 
 
+def discard_document_info_capture(project_id: str) -> bool:
+    selected_root = _capture_root()
+    path = document_info_capture_path(project_id)
+    _ensure_capture_root(selected_root)
+    with state_lock.acquire_state_lock(path, project_id, root=selected_root):
+        _ensure_capture_root(selected_root)
+        return _delete_capture(path)
+
+
+def document_info_capture_exists(project_id: str) -> bool:
+    selected_root = _capture_root()
+    path = document_info_capture_path(project_id)
+    _ensure_capture_root(selected_root)
+    with state_lock.acquire_state_lock(path, project_id, root=selected_root):
+        _ensure_capture_root(selected_root)
+        return _read_capture(path) is not None
+
+
 __all__ = [
     "DocumentInfoCapture",
+    "DocumentInfoCaptureDelete",
+    "DocumentInfoCaptureWrite",
     "capture_document_info",
     "clear_document_info_capture",
+    "discard_document_info_capture",
     "document_info_capture_path",
+    "document_info_capture_exists",
     "load_document_info_capture",
+    "prepare_document_info_capture",
+    "prepare_document_info_capture_delete",
 ]

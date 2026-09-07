@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Literal
 
@@ -10,7 +11,9 @@ from companion_gateway.project.sync_models import SourceErrorType, SyncSourceTyp
 from tools.dws_sync.adapters import (
     DwsSourceBundle,
     build_source_bundle,
+    document_metadata_contract,
     read_document,
+    unwrap_dws_payload,
 )
 from tools.dws_sync.manifest import DwsProjectManifest
 from tools.dws_sync.runner import DwsReadError
@@ -116,7 +119,11 @@ def _decode_results(raw: bytes, project_id: str) -> tuple[dict[str, object], ...
 
 
 class _CachedDocumentRunner:
-    def __init__(self, source_id: str, responses: tuple[dict[str, object], ...]):
+    def __init__(
+        self,
+        source_id: str,
+        responses: tuple[Mapping[str, object], ...],
+    ):
         self._calls = (
             ("doc", "info", "--node", source_id),
             ("doc", "read", "--node", source_id),
@@ -124,7 +131,7 @@ class _CachedDocumentRunner:
         self._responses = responses
         self._index = 0
 
-    def run(self, args: tuple[str, ...]) -> dict[str, object]:
+    def run(self, args: tuple[str, ...]) -> Mapping[str, object]:
         if self._index >= len(self._calls) or args != self._calls[self._index]:
             raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
         response = self._responses[self._index]
@@ -150,8 +157,50 @@ def import_single_document_bundle(
     ):
         raise ValueError("host_import_invalid")
     responses = _decode_results(raw, project.project_id)
+    return build_single_document_bundle(
+        responses[0],
+        responses[1],
+        project,
+        collected_at=collected_at,
+    )
+
+
+def decode_host_results(
+    raw: bytes,
+    project_id: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    results = _decode_results(raw, project_id)
+    return results[0], results[1]
+
+
+def build_single_document_bundle(
+    document_info: Mapping[str, object],
+    document_read: Mapping[str, object],
+    project: DwsProjectManifest,
+    *,
+    collected_at: datetime,
+) -> DwsSourceBundle:
+    if (
+        len(project.sources) != 1
+        or project.sources[0].source_type is not SyncSourceType.DOCUMENT
+        or collected_at.tzinfo is None
+        or collected_at.utcoffset() is None
+    ):
+        raise ValueError("host_import_invalid")
     spec = project.sources[0]
-    runner = _CachedDocumentRunner(spec.source_id, responses)
+    plain_info = _plain_json_object(document_info)
+    plain_read = _plain_json_object(document_read)
+    read_payload = unwrap_dws_payload(plain_read)
+    if isinstance(read_payload, Mapping):
+        identity_present, identity_matches, _metadata_matches = (
+            document_metadata_contract(read_payload, spec.source_id)
+        )
+        if identity_present and not identity_matches:
+            raise ValueError("host_import_invalid")
+    runner = _CachedDocumentRunner(
+        spec.source_id,
+        (plain_info, plain_read),
+    )
     record = read_document(
         runner,
         spec,
@@ -161,3 +210,25 @@ def import_single_document_bundle(
     )
     runner.assert_complete()
     return build_source_bundle(project, (record,), collected_at=collected_at)
+
+
+def _plain_json_object(value: Mapping[str, object]) -> dict[str, object]:
+    def copy(item: object) -> object:
+        if isinstance(item, Mapping):
+            if any(not isinstance(key, str) for key in item):
+                raise ValueError("host_import_invalid")
+            return {key: copy(child) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [copy(child) for child in item]
+        if item is None or isinstance(item, (str, bool, int, float)):
+            return item
+        raise ValueError("host_import_invalid")
+
+    copied = copy(value)
+    if not isinstance(copied, dict):
+        raise ValueError("host_import_invalid")
+    try:
+        json.dumps(copied, allow_nan=False)
+    except (TypeError, ValueError, RecursionError):
+        raise ValueError("host_import_invalid") from None
+    return copied

@@ -39,6 +39,7 @@ from pydantic import (
 from companion_gateway.project.evidence_validation import validate_sourced_context
 from companion_gateway.project.index import chunk_text
 from companion_gateway.project.models import ProjectContextPackage
+from companion_gateway.project.protection import ContentProtector, WindowsDpapiProtector
 from companion_gateway.project.sync_models import (
     ClaimedRetrievalRequest,
     RetrievalCompletionClaim,
@@ -61,10 +62,13 @@ try:
         collect_sources,
     )
     from tools.dws_sync import lifecycle
+    from tools.dws_sync import host_capture
     from tools.dws_sync.runtime import approved_artifact_path
     from tools.dws_sync.host_bridge import (
         MAX_HOST_IMPORT_BYTES,
-        import_single_document_bundle,
+        build_single_document_bundle,
+        decode_host_result,
+        decode_host_results,
     )
 except ModuleNotFoundError as exc:
     if exc.name != "tools":
@@ -80,10 +84,13 @@ except ModuleNotFoundError as exc:
         collect_sources,
     )
     from dws_sync import lifecycle  # type: ignore[no-redef]
+    from dws_sync import host_capture  # type: ignore[no-redef]
     from dws_sync.runtime import approved_artifact_path  # type: ignore[no-redef]
     from dws_sync.host_bridge import (  # type: ignore[no-redef]
         MAX_HOST_IMPORT_BYTES,
-        import_single_document_bundle,
+        build_single_document_bundle,
+        decode_host_result,
+        decode_host_results,
     )
 
 
@@ -154,6 +161,10 @@ _PUBLIC_ERROR_TYPES = {
     "gateway_invalid",
     "http_error",
     "host_handoff_required",
+    "host_capture_conflict",
+    "host_capture_invalid",
+    "host_capture_missing",
+    "host_capture_remaining",
     "host_import_invalid",
     "invalid_payload",
     "manifest_invalid_json",
@@ -210,6 +221,10 @@ _PUBLIC_ERROR_TYPES = {
     "run_token_invalid",
     "unknown",
 } | _SAFE_GATEWAY_ERROR_TYPES
+
+
+def _host_capture_protector() -> ContentProtector:
+    return WindowsDpapiProtector()
 
 
 def _safe_id(value: str, field_name: str) -> str:
@@ -372,6 +387,19 @@ def _parser() -> argparse.ArgumentParser:
     host_import.add_argument("--project", required=True)
     host_import.add_argument("--output", required=True)
     host_import.add_argument("--run-token", required=True)
+
+    capture_info = commands.add_parser("capture-info", add_help=False)
+    capture_info.add_argument("--manifest", required=True)
+    capture_info.add_argument("--project", required=True)
+    capture_info.add_argument("--run-token", required=True)
+
+    complete_host_import = commands.add_parser(
+        "complete-host-import", add_help=False
+    )
+    complete_host_import.add_argument("--manifest", required=True)
+    complete_host_import.add_argument("--project", required=True)
+    complete_host_import.add_argument("--output", required=True)
+    complete_host_import.add_argument("--run-token", required=True)
 
     pending = commands.add_parser("pending", add_help=False)
     pending.add_argument("--manifest", required=True)
@@ -1270,6 +1298,240 @@ def _collect_command(
     }
 
 
+def _host_import_project(args: argparse.Namespace) -> DwsProjectManifest:
+    try:
+        manifest_path = _absolute_private_path(args.manifest, "manifest")
+        manifest = DwsManifest.load(manifest_path)
+        return _selected_project(manifest, args.project)
+    except Exception:
+        raise ValueError("host_import_invalid") from None
+
+
+def _read_host_input(input_stream: object) -> bytes:
+    read = getattr(input_stream, "read", None)
+    if not callable(read):
+        raise ValueError("host_import_invalid")
+    try:
+        raw = read(MAX_HOST_IMPORT_BYTES + 1)
+    except Exception:
+        raise ValueError("host_import_invalid") from None
+    if not isinstance(raw, bytes) or len(raw) > MAX_HOST_IMPORT_BYTES:
+        raise ValueError("host_import_invalid")
+    return raw
+
+
+def _host_capture_stage(
+    args: argparse.Namespace,
+    *,
+    now: Callable[[], datetime],
+    allow_existing: bool,
+) -> Literal["begun", "host_info"]:
+    try:
+        lifecycle.assert_stage(
+            args.project,
+            args.run_token,
+            expected="begun",
+            root=LIFECYCLE_ROOT,
+            now=now,
+        )
+        return "begun"
+    except ValueError as exc:
+        if not allow_existing or str(exc) != "run_stage_invalid":
+            raise
+    lifecycle.assert_stage(
+        args.project,
+        args.run_token,
+        expected="host_info",
+        root=LIFECYCLE_ROOT,
+        now=now,
+    )
+    return "host_info"
+
+
+def _capture_document_info(
+    project: DwsProjectManifest,
+    run_token: str,
+    document_info: dict[str, object],
+    *,
+    now: Callable[[], datetime],
+) -> None:
+    try:
+        transaction = host_capture.prepare_document_info_capture(
+            document_info,
+            project,
+            run_token=run_token,
+            protector=_host_capture_protector(),
+        )
+    except Exception as exc:
+        if str(exc) in {"host_capture_conflict", "host_capture_invalid"}:
+            raise
+        raise ValueError("host_capture_invalid") from None
+    try:
+        lifecycle.commit_stage(
+            project.project_id,
+            run_token,
+            expected="begun",
+            target="host_info",
+            apply=transaction.apply,
+            rollback=transaction.rollback,
+            root=LIFECYCLE_ROOT,
+            now=now,
+        )
+    except ValueError as exc:
+        if str(exc) != "run_stage_invalid":
+            raise
+        lifecycle.apply_stage(
+            project.project_id,
+            run_token,
+            expected="host_info",
+            apply=transaction.apply,
+            rollback=transaction.rollback,
+            root=LIFECYCLE_ROOT,
+            now=now,
+        )
+
+
+class _HostImportCommit:
+    def __init__(
+        self,
+        output: _RecoverableAtomicWrite,
+        capture: host_capture.DocumentInfoCaptureDelete,
+    ) -> None:
+        self._output = output
+        self._capture = capture
+
+    def apply(self) -> None:
+        self._output.apply()
+        try:
+            self._capture.apply()
+        except BaseException:
+            try:
+                self._output.rollback()
+            except BaseException:
+                raise ValueError("private_file_write_failed") from None
+            raise
+
+    def rollback(self) -> None:
+        capture_error = False
+        try:
+            self._capture.rollback()
+        except BaseException:
+            capture_error = True
+        try:
+            self._output.rollback()
+        except BaseException:
+            raise ValueError("private_file_write_failed") from None
+        if capture_error:
+            raise ValueError("private_file_write_failed")
+
+
+def _complete_host_import(
+    args: argparse.Namespace,
+    project: DwsProjectManifest,
+    document_read: dict[str, object],
+    *,
+    now: Callable[[], datetime],
+) -> dict[str, object]:
+    try:
+        output_path = _absolute_private_path(args.output, "output")
+        capture = host_capture.prepare_document_info_capture_delete(
+            project,
+            run_token=args.run_token,
+            protector=_host_capture_protector(),
+        )
+        document_info = capture.load().document_info
+        source_bundle = build_single_document_bundle(
+            document_info,
+            document_read,
+            project,
+            collected_at=now(),
+        )
+        encoded = _canonical_bytes(source_bundle.model_dump(mode="json"))
+    except ValueError as exc:
+        if str(exc) in {"host_capture_invalid", "host_capture_missing"}:
+            raise
+        raise ValueError("host_import_invalid") from None
+    except Exception:
+        raise ValueError("host_import_invalid") from None
+    if len(encoded) > MAX_PRIVATE_INPUT_BYTES:
+        raise ValueError("host_import_invalid")
+    transaction = _HostImportCommit(
+        _RecoverableAtomicWrite(output_path, encoded),
+        capture,
+    )
+    lifecycle.commit_stage(
+        project.project_id,
+        args.run_token,
+        expected="host_info",
+        target="collected",
+        apply=transaction.apply,
+        rollback=transaction.rollback,
+        root=LIFECYCLE_ROOT,
+        now=now,
+    )
+    return {
+        "status": "collected",
+        "project_id": project.project_id,
+        "source_count": 1,
+        "active_sources": 1,
+        "failed_sources": 0,
+        "content_hash": source_bundle.content_hash,
+        "output_bytes": len(encoded),
+    }
+
+
+def _capture_info_command(
+    args: argparse.Namespace,
+    *,
+    input_stream: object,
+    now: Callable[[], datetime],
+) -> dict[str, object]:
+    project = _host_import_project(args)
+    try:
+        document_info = decode_host_result(
+            _read_host_input(input_stream),
+            "doc_info",
+        )
+    except Exception:
+        raise ValueError("host_import_invalid") from None
+    _capture_document_info(
+        project,
+        args.run_token,
+        document_info,
+        now=now,
+    )
+    return {"status": "host_info_captured", "project_id": project.project_id}
+
+
+def _complete_host_import_command(
+    args: argparse.Namespace,
+    *,
+    input_stream: object,
+    now: Callable[[], datetime],
+) -> dict[str, object]:
+    lifecycle.assert_stage(
+        args.project,
+        args.run_token,
+        expected="host_info",
+        root=LIFECYCLE_ROOT,
+        now=now,
+    )
+    project = _host_import_project(args)
+    try:
+        document_read = decode_host_result(
+            _read_host_input(input_stream),
+            "doc_read",
+        )
+    except Exception:
+        raise ValueError("host_import_invalid") from None
+    return _complete_host_import(
+        args,
+        project,
+        document_read,
+        now=now,
+    )
+
+
 def _host_import_command(
     args: argparse.Namespace,
     *,
@@ -1283,54 +1545,35 @@ def _host_import_command(
         root=LIFECYCLE_ROOT,
         now=now,
     )
+    project = _host_import_project(args)
     try:
-        manifest_path = _absolute_private_path(args.manifest, "manifest")
-        output_path = _absolute_private_path(args.output, "output")
-        manifest = DwsManifest.load(manifest_path)
-        project = _selected_project(manifest, args.project)
-    except Exception:
-        raise ValueError("host_import_invalid") from None
-    read = getattr(input_stream, "read", None)
-    if not callable(read):
-        raise ValueError("host_import_invalid")
-    try:
-        raw = read(MAX_HOST_IMPORT_BYTES + 1)
-    except Exception:
-        raise ValueError("host_import_invalid") from None
-    if not isinstance(raw, bytes) or len(raw) > MAX_HOST_IMPORT_BYTES:
-        raise ValueError("host_import_invalid")
-    collected_at = now()
-    try:
-        source_bundle = import_single_document_bundle(
-            raw,
-            project,
-            collected_at=collected_at,
+        document_info, document_read = decode_host_results(
+            _read_host_input(input_stream),
+            project.project_id,
         )
-        encoded = _canonical_bytes(source_bundle.model_dump(mode="json"))
     except Exception:
         raise ValueError("host_import_invalid") from None
-    if len(encoded) > MAX_PRIVATE_INPUT_BYTES:
-        raise ValueError("host_import_invalid")
-    output_transaction = _RecoverableAtomicWrite(output_path, encoded)
-    lifecycle.commit_stage(
-        project.project_id,
-        args.run_token,
-        expected="begun",
-        target="collected",
-        apply=output_transaction.apply,
-        rollback=output_transaction.rollback,
-        root=LIFECYCLE_ROOT,
+    try:
+        _capture_document_info(
+            project,
+            args.run_token,
+            document_info,
+            now=now,
+        )
+    except ValueError as exc:
+        if str(exc) in {
+            "host_capture_conflict",
+            "host_capture_invalid",
+            "host_capture_missing",
+        }:
+            raise ValueError("host_import_invalid") from None
+        raise
+    return _complete_host_import(
+        args,
+        project,
+        document_read,
         now=now,
     )
-    return {
-        "status": "collected",
-        "project_id": project.project_id,
-        "source_count": 1,
-        "active_sources": 1,
-        "failed_sources": 0,
-        "content_hash": source_bundle.content_hash,
-        "output_bytes": len(encoded),
-    }
 
 
 def _pending_response(
@@ -2461,7 +2704,9 @@ def main(
             "artifact",
             "begin",
             "collect",
+            "capture-info",
             "host-import",
+            "complete-host-import",
             "end",
             "pending",
             "recover-pending",
@@ -2478,7 +2723,9 @@ def main(
                 "commands": [
                     "begin",
                     "collect",
+                    "capture-info",
                     "host-import",
+                    "complete-host-import",
                     "pending",
                     "recover-pending",
                     "reuse-artifact",
@@ -2505,6 +2752,22 @@ def main(
             output = _collect_command(args, runner=runner, now=now)
         elif args.command == "host-import":
             output = _host_import_command(
+                args,
+                input_stream=(
+                    sys.stdin.buffer if input_stream is None else input_stream
+                ),
+                now=now,
+            )
+        elif args.command == "capture-info":
+            output = _capture_info_command(
+                args,
+                input_stream=(
+                    sys.stdin.buffer if input_stream is None else input_stream
+                ),
+                now=now,
+            )
+        elif args.command == "complete-host-import":
+            output = _complete_host_import_command(
                 args,
                 input_stream=(
                     sys.stdin.buffer if input_stream is None else input_stream

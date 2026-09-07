@@ -324,6 +324,36 @@ def commit_stage(
             raise
 
 
+def apply_stage(
+    project_id: str,
+    token: str,
+    *,
+    expected: Stage,
+    apply: Callable[[], None],
+    rollback: Callable[[], None],
+    root: Path = state_lock.PRIVATE_LOCK_ROOT,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> None:
+    with _lock(root, project_id):
+        current = _read_now(now)
+        state = _validated_state(
+            project_state_path(root, project_id),
+            project_id,
+            token,
+            current,
+        )
+        if state["stage"] != expected:
+            raise ValueError("run_stage_invalid")
+        try:
+            apply()
+        except BaseException:
+            try:
+                rollback()
+            except BaseException:
+                raise ValueError("private_file_write_failed") from None
+            raise
+
+
 @contextmanager
 def stage_guard(
     project_id: str,

@@ -54,9 +54,21 @@ SCOPE = "project:project-1"
 
 @pytest.fixture(autouse=True)
 def isolated_lifecycle_root(tmp_path: Path, monkeypatch) -> None:
+    from tools.dws_sync import host_capture
+
     root = tmp_path / "dws-sync-locks"
     monkeypatch.setattr(state_lock, "PRIVATE_LOCK_ROOT", root)
     monkeypatch.setattr(sync_cli, "LIFECYCLE_ROOT", root)
+    monkeypatch.setattr(
+        host_capture,
+        "_TEST_CAPTURE_ROOT",
+        tmp_path / "dws-host-captures",
+    )
+    monkeypatch.setattr(
+        sync_cli,
+        "_host_capture_protector",
+        HostCaptureProtector,
+    )
 
 
 def canonical(payload: object) -> str:
@@ -1248,6 +1260,14 @@ def start_pending_run() -> str:
         "project-1",
         started.run_token,
         expected="begun",
+        target="host_info",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+    lifecycle.advance_run(
+        "project-1",
+        started.run_token,
+        expected="host_info",
         target="collected",
         root=sync_cli.LIFECYCLE_ROOT,
         now=lambda: NOW,
@@ -2182,6 +2202,82 @@ def host_import_args(paths: dict[str, Path], token: str) -> list[str]:
     ]
 
 
+def single_host_result(operation: str, payload: object) -> bytes:
+    encoded = canonical(payload).encode("utf-8")
+    return canonical(
+        {
+            "operation": operation,
+            "encoding": "base64-json",
+            "byte_count": len(encoded),
+            "payload": base64.b64encode(encoded).decode("ascii"),
+        }
+    ).encode("utf-8")
+
+
+def capture_info_args(paths: dict[str, Path], token: str) -> list[str]:
+    return [
+        "capture-info",
+        "--manifest",
+        str(paths["manifest"]),
+        "--project",
+        "project-1",
+        "--run-token",
+        token,
+    ]
+
+
+def complete_host_import_args(paths: dict[str, Path], token: str) -> list[str]:
+    return [
+        "complete-host-import",
+        "--manifest",
+        str(paths["manifest"]),
+        "--project",
+        "project-1",
+        "--output",
+        str(paths["sources"]),
+        "--run-token",
+        token,
+    ]
+
+
+class HostCaptureProtector:
+    def protect(self, _project_id: str, plaintext: bytes) -> bytes:
+        return b"test-capture\0" + plaintext
+
+    def unprotect(self, _project_id: str, protected: bytes) -> bytes:
+        prefix = b"test-capture\0"
+        if not protected.startswith(prefix):
+            raise ValueError("capture protection invalid")
+        return protected[len(prefix) :]
+
+
+def document_info_result() -> dict[str, object]:
+    return {
+        "result": {
+            "nodeId": "doc-1",
+            "contentType": "ALIDOC",
+            "extension": "adoc",
+            "title": "决策文档",
+            "shareUrl": "dingtalk://document/doc-1",
+            "version": "v1",
+            "updatedAt": NOW.isoformat(),
+        }
+    }
+
+
+def configure_host_capture(
+    tmp_path: Path,
+    monkeypatch,
+):  # type: ignore[no-untyped-def]
+    from tools.dws_sync import host_capture
+
+    capture_root = tmp_path / "dws-host-captures"
+    protector = HostCaptureProtector()
+    monkeypatch.setattr(host_capture, "_TEST_CAPTURE_ROOT", capture_root)
+    monkeypatch.setattr(sync_cli, "_host_capture_protector", lambda: protector)
+    return host_capture
+
+
 class FakeDws:
     def run(self, args: tuple[str, ...]) -> dict[str, object]:
         if args[:2] == ("doc", "info"):
@@ -2510,8 +2606,21 @@ def test_production_lifecycle_fences_every_mutating_stage(
     assert begun["status"] == "started"
 
     assert main(
-        collect_args(paths, "--run-token", token),
-        runner=FakeDws(),
+        capture_info_args(paths, token),
+        input_stream=io.BytesIO(
+            single_host_result("doc_info", document_info_result())
+        ),
+        now=lambda: NOW,
+    ) == 0
+    capsys.readouterr()
+    assert main(
+        complete_host_import_args(paths, token),
+        input_stream=io.BytesIO(
+            single_host_result(
+                "doc_read",
+                {"data": {"markdown": "# 决策\n采用方案 B。"}},
+            )
+        ),
         now=lambda: NOW,
     ) == 0
     capsys.readouterr()
@@ -3359,6 +3468,548 @@ def test_host_import_writes_active_bundle_and_sanitized_stdout(
     )
 
 
+def test_capture_info_then_complete_host_import_writes_bundle_atomically(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    paths["sources"].unlink()
+    host_capture = configure_host_capture(tmp_path, monkeypatch)
+
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    assert isinstance(token, str)
+    info = document_info_result()
+
+    assert main(
+        capture_info_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(single_host_result("doc_info", info)),
+    ) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "host_info_captured",
+        "project_id": "project-1",
+    }
+    capture_path = host_capture.document_info_capture_path("project-1")
+    assert capture_path.exists()
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="host_info",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+    private_markdown = "# 决策\n两阶段导入。"
+    assert main(
+        complete_host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result("doc_read", {"data": {"markdown": private_markdown}})
+        ),
+    ) == 0
+
+    public = json.loads(capsys.readouterr().out)
+    assert public == {
+        "status": "collected",
+        "project_id": "project-1",
+        "source_count": 1,
+        "active_sources": 1,
+        "failed_sources": 0,
+        "content_hash": public["content_hash"],
+        "output_bytes": paths["sources"].stat().st_size,
+    }
+    assert private_markdown not in canonical(public)
+    assert not capture_path.exists()
+    written = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    assert written.records[0].content_text == private_markdown
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="collected",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_complete_host_import_rejects_missing_capture_without_changing_state(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original_output = paths["sources"].read_bytes()
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    lifecycle.advance_run(
+        "project-1",
+        token,
+        expected="begun",
+        target="host_info",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+    assert main(
+        complete_host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result("doc_read", {"data": {"markdown": "正文"}})
+        ),
+    ) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "host_capture_missing",
+    }
+    assert paths["sources"].read_bytes() == original_output
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="host_info",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_complete_host_import_rejects_capture_from_another_token(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original_output = paths["sources"].read_bytes()
+    host_capture = configure_host_capture(tmp_path, monkeypatch)
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    host_capture.capture_document_info(
+        single_host_result("doc_info", document_info_result()),
+        project(),
+        run_token="other-private-token",
+        protector=HostCaptureProtector(),
+    )
+    capture_path = host_capture.document_info_capture_path("project-1")
+    original_capture = capture_path.read_bytes()
+    lifecycle.advance_run(
+        "project-1",
+        token,
+        expected="begun",
+        target="host_info",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+    assert main(
+        complete_host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result("doc_read", {"data": {"markdown": "正文"}})
+        ),
+    ) == 1
+
+    public = capsys.readouterr().out
+    assert json.loads(public) == {
+        "status": "error",
+        "error_type": "host_capture_invalid",
+    }
+    assert "other-private-token" not in public
+    assert paths["sources"].read_bytes() == original_output
+    assert capture_path.read_bytes() == original_capture
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="host_info",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_capture_info_is_idempotent_for_same_content_and_rejects_conflict(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original_output = paths["sources"].read_bytes()
+    host_capture = configure_host_capture(tmp_path, monkeypatch)
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    info = document_info_result()
+    capture_args = capture_info_args(paths, token)
+    capture_input = single_host_result("doc_info", info)
+    assert main(
+        capture_args,
+        now=lambda: NOW,
+        input_stream=io.BytesIO(capture_input),
+    ) == 0
+    capsys.readouterr()
+    capture_path = host_capture.document_info_capture_path("project-1")
+    original_capture = capture_path.read_bytes()
+
+    assert main(
+        capture_args,
+        now=lambda: NOW,
+        input_stream=io.BytesIO(capture_input),
+    ) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "host_info_captured",
+        "project_id": "project-1",
+    }
+    assert capture_path.read_bytes() == original_capture
+
+    conflicting = document_info_result()
+    conflicting["result"]["title"] = "另一份私密标题"  # type: ignore[index]
+    assert main(
+        capture_args,
+        now=lambda: NOW,
+        input_stream=io.BytesIO(single_host_result("doc_info", conflicting)),
+    ) == 1
+    public = capsys.readouterr().out
+    assert json.loads(public) == {
+        "status": "error",
+        "error_type": "host_capture_conflict",
+    }
+    assert "另一份私密标题" not in public
+    assert paths["sources"].read_bytes() == original_output
+    assert capture_path.read_bytes() == original_capture
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="host_info",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    "document_read",
+    (
+        {"data": {}},
+        {"data": {"markdown": "   \n\t"}},
+    ),
+    ids=("missing", "blank"),
+)
+def test_complete_host_import_rejects_missing_or_blank_markdown(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    document_read: dict[str, object],
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original_output = paths["sources"].read_bytes()
+    host_capture = configure_host_capture(tmp_path, monkeypatch)
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    assert main(
+        capture_info_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result("doc_info", document_info_result())
+        ),
+    ) == 0
+    capsys.readouterr()
+    capture_path = host_capture.document_info_capture_path("project-1")
+    original_capture = capture_path.read_bytes()
+
+    assert main(
+        complete_host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(single_host_result("doc_read", document_read)),
+    ) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "host_import_invalid",
+    }
+    assert paths["sources"].read_bytes() == original_output
+    assert capture_path.read_bytes() == original_capture
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="host_info",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_complete_host_import_rejects_mismatched_read_identity(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original_output = paths["sources"].read_bytes()
+    host_capture = configure_host_capture(tmp_path, monkeypatch)
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    assert main(
+        capture_info_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result("doc_info", document_info_result())
+        ),
+    ) == 0
+    capsys.readouterr()
+    capture_path = host_capture.document_info_capture_path("project-1")
+    original_capture = capture_path.read_bytes()
+
+    assert main(
+        complete_host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result(
+                "doc_read",
+                {"data": {"nodeId": "other-private-doc", "markdown": "正文"}},
+            )
+        ),
+    ) == 1
+
+    public = capsys.readouterr().out
+    assert json.loads(public) == {
+        "status": "error",
+        "error_type": "host_import_invalid",
+    }
+    assert "other-private-doc" not in public
+    assert paths["sources"].read_bytes() == original_output
+    assert capture_path.read_bytes() == original_capture
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="host_info",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_duplicate_capture_cannot_recreate_capture_after_complete(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    paths["sources"].unlink()
+    host_capture = configure_host_capture(tmp_path, monkeypatch)
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    assert main(
+        capture_info_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result("doc_info", document_info_result())
+        ),
+    ) == 0
+    capsys.readouterr()
+    real_apply_stage = lifecycle.apply_stage
+    duplicate_ready = threading.Barrier(2)
+    release_duplicate = threading.Barrier(2)
+    duplicate_released = threading.Event()
+    duplicate_results: list[int] = []
+
+    def delayed_apply_stage(*args, **kwargs):  # type: ignore[no-untyped-def]
+        duplicate_ready.wait(timeout=1)
+        release_duplicate.wait(timeout=1)
+        duplicate_released.set()
+        return real_apply_stage(*args, **kwargs)
+
+    monkeypatch.setattr(
+        lifecycle,
+        "apply_stage",
+        delayed_apply_stage,
+    )
+    contender = threading.Thread(
+        target=lambda: duplicate_results.append(
+            main(
+                capture_info_args(paths, token),
+                now=lambda: NOW,
+                input_stream=io.BytesIO(
+                    single_host_result("doc_info", document_info_result())
+                ),
+            )
+        )
+    )
+    contender_started = False
+    try:
+        contender.start()
+        contender_started = True
+        duplicate_ready.wait(timeout=1)
+        complete_result = main(
+            complete_host_import_args(paths, token),
+            now=lambda: NOW,
+            input_stream=io.BytesIO(
+                single_host_result("doc_read", {"data": {"markdown": "正文"}})
+            ),
+        )
+        release_duplicate.wait(timeout=1)
+        assert duplicate_released.wait(timeout=1)
+    finally:
+        duplicate_ready.abort()
+        release_duplicate.abort()
+        if contender_started:
+            contender.join(timeout=1)
+
+    assert complete_result == 0
+    assert not contender.is_alive()
+    assert duplicate_results == [1]
+    emitted = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert emitted == [
+        {
+            "status": "collected",
+            "project_id": "project-1",
+            "source_count": 1,
+            "active_sources": 1,
+            "failed_sources": 0,
+            "content_hash": emitted[0]["content_hash"],
+            "output_bytes": paths["sources"].stat().st_size,
+        },
+        {"status": "error", "error_type": "run_stage_invalid"},
+    ]
+    assert not host_capture.document_info_capture_path("project-1").exists()
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="collected",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_complete_host_import_restores_capture_when_unlink_interrupts_after_delete(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original_output = paths["sources"].read_bytes()
+    host_capture = configure_host_capture(tmp_path, monkeypatch)
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    assert main(
+        capture_info_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result("doc_info", document_info_result())
+        ),
+    ) == 0
+    capsys.readouterr()
+    capture_path = host_capture.document_info_capture_path("project-1")
+    original_capture = capture_path.read_bytes()
+    real_unlink = Path.unlink
+    interrupted = False
+
+    def unlink_then_interrupt(path: Path, *args, **kwargs) -> None:
+        nonlocal interrupted
+        real_unlink(path, *args, **kwargs)
+        if path == capture_path and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(Path, "unlink", unlink_then_interrupt)
+
+    assert main(
+        complete_host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result("doc_read", {"data": {"markdown": "新正文"}})
+        ),
+    ) == 1
+
+    assert interrupted is True
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "interrupted",
+    }
+    assert paths["sources"].read_bytes() == original_output
+    assert capture_path.read_bytes() == original_capture
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="host_info",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ("output_apply", "capture_delete", "lifecycle_state"),
+)
+def test_complete_host_import_rolls_back_output_capture_and_stage(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    failure_point: str,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    original_output = paths["sources"].read_bytes()
+    host_capture = configure_host_capture(tmp_path, monkeypatch)
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    assert main(
+        capture_info_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result("doc_info", document_info_result())
+        ),
+    ) == 0
+    capsys.readouterr()
+    capture_path = host_capture.document_info_capture_path("project-1")
+    original_capture = capture_path.read_bytes()
+    triggered: list[str] = []
+
+    if failure_point == "output_apply":
+        real_apply = sync_cli._RecoverableAtomicWrite.apply
+
+        def fail_output(operation) -> None:  # type: ignore[no-untyped-def]
+            real_apply(operation)
+            if operation._path == paths["sources"]:
+                triggered.append(failure_point)
+                raise RuntimeError("output apply failed")
+
+        monkeypatch.setattr(sync_cli._RecoverableAtomicWrite, "apply", fail_output)
+    elif failure_point == "capture_delete":
+        real_delete = host_capture.DocumentInfoCaptureDelete.apply
+
+        def fail_delete(operation) -> None:  # type: ignore[no-untyped-def]
+            real_delete(operation)
+            triggered.append(failure_point)
+            raise RuntimeError("capture delete failed")
+
+        monkeypatch.setattr(
+            host_capture.DocumentInfoCaptureDelete,
+            "apply",
+            fail_delete,
+        )
+    else:
+        real_write_state = lifecycle._write_state
+
+        def fail_state(path, payload) -> None:  # type: ignore[no-untyped-def]
+            real_write_state(path, payload)
+            if payload["stage"] == "collected":
+                triggered.append(failure_point)
+                raise RuntimeError("lifecycle state failed")
+
+        monkeypatch.setattr(lifecycle, "_write_state", fail_state)
+
+    assert main(
+        complete_host_import_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result("doc_read", {"data": {"markdown": "新正文"}})
+        ),
+    ) == 1
+    capsys.readouterr()
+    assert triggered == [failure_point]
+    assert paths["sources"].read_bytes() == original_output
+    assert capture_path.read_bytes() == original_capture
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="host_info",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
 @pytest.mark.parametrize("existing", [False, True])
 def test_host_import_failure_preserves_output_and_begun_stage(
     tmp_path: Path,
@@ -3532,7 +4183,7 @@ def test_host_import_restores_state_and_output_when_state_write_interrupts_after
     lifecycle.assert_stage(
         "project-1",
         token,
-        expected="begun",
+        expected="host_info",
         root=sync_cli.LIFECYCLE_ROOT,
         now=lambda: NOW,
     )
@@ -3551,6 +4202,14 @@ def test_host_import_restores_output_when_apply_is_interrupted_after_replace(
     original = paths["sources"].read_bytes() if existing else None
     assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
     token = json.loads(capsys.readouterr().out)["run_token"]
+    assert main(
+        capture_info_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result("doc_info", document_info_result())
+        ),
+    ) == 0
+    capsys.readouterr()
     real_apply = sync_cli._RecoverableAtomicWrite.apply
 
     def interrupt_after_replace(operation) -> None:  # type: ignore[no-untyped-def]
@@ -3564,9 +4223,11 @@ def test_host_import_restores_output_when_apply_is_interrupted_after_replace(
     )
 
     assert main(
-        host_import_args(paths, token),
+        complete_host_import_args(paths, token),
         now=lambda: NOW,
-        input_stream=io.BytesIO(host_import_payload()),
+        input_stream=io.BytesIO(
+            single_host_result("doc_read", {"data": {"markdown": "正文"}})
+        ),
     ) == 1
 
     assert json.loads(capsys.readouterr().out) == {
@@ -3579,7 +4240,7 @@ def test_host_import_restores_output_when_apply_is_interrupted_after_replace(
     lifecycle.assert_stage(
         "project-1",
         token,
-        expected="begun",
+        expected="host_info",
         root=sync_cli.LIFECYCLE_ROOT,
         now=lambda: NOW,
     )
@@ -3598,6 +4259,14 @@ def test_host_import_apply_failure_rolls_back_without_state_write(
     original = paths["sources"].read_bytes() if existing else None
     assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
     token = json.loads(capsys.readouterr().out)["run_token"]
+    assert main(
+        capture_info_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result("doc_info", document_info_result())
+        ),
+    ) == 0
+    capsys.readouterr()
     real_apply = sync_cli._RecoverableAtomicWrite.apply
     state_write_count = 0
 
@@ -3618,9 +4287,11 @@ def test_host_import_apply_failure_rolls_back_without_state_write(
     monkeypatch.setattr(lifecycle, "_write_state", forbidden_state_write)
 
     assert main(
-        host_import_args(paths, token),
+        complete_host_import_args(paths, token),
         now=lambda: NOW,
-        input_stream=io.BytesIO(host_import_payload()),
+        input_stream=io.BytesIO(
+            single_host_result("doc_read", {"data": {"markdown": "正文"}})
+        ),
     ) == 1
 
     assert json.loads(capsys.readouterr().out) == {
@@ -3634,7 +4305,7 @@ def test_host_import_apply_failure_rolls_back_without_state_write(
     lifecycle.assert_stage(
         "project-1",
         token,
-        expected="begun",
+        expected="host_info",
         root=sync_cli.LIFECYCLE_ROOT,
         now=lambda: NOW,
     )
