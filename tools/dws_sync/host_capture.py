@@ -1,0 +1,579 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
+from types import MappingProxyType
+from typing import cast
+
+from companion_gateway.project.protection import ContentProtector
+from companion_gateway.project.sync_models import SyncSourceType
+from tools.dws_sync import state_lock
+from tools.dws_sync.adapters import document_metadata_contract, unwrap_dws_payload
+from tools.dws_sync.host_bridge import (
+    MAX_RESULT_BYTES,
+    _decode_json,
+    decode_host_result,
+)
+from tools.dws_sync.manifest import DwsProjectManifest
+from tools.dws_sync.runner import DwsReadError
+
+
+MAX_CAPTURE_BYTES = MAX_RESULT_BYTES + 65_536
+_PROJECT_PRIVATE_ROOT = Path(__file__).resolve().parents[2] / ".private"
+_DEFAULT_CAPTURE_ROOT = _PROJECT_PRIVATE_ROOT / "dws-host-captures"
+PRIVATE_CAPTURE_ROOT = _DEFAULT_CAPTURE_ROOT
+_TEST_CAPTURE_ROOT: Path | None = None
+_CAPTURE_SCHEMA_VERSION = 1
+_CAPTURE_KEYS = {
+    "schema_version",
+    "project_key",
+    "source_key",
+    "run_token_key",
+    "document_info",
+}
+_REPARSE_POINT = 0x400
+_MISSING = object()
+_TITLE_FIELDS = ("source_title", "title", "name", "summary", "subject")
+_URL_FIELDS = ("source_url", "url", "link", "shareUrl")
+_VERSION_FIELDS = (
+    "source_version",
+    "version",
+    "revision",
+    "updatedAt",
+    "updateTime",
+)
+_TIME_FIELDS = (
+    "source_time",
+    "updatedAt",
+    "updateTime",
+    "startTime",
+    "createdAt",
+    "createTime",
+)
+
+
+@dataclass(frozen=True)
+class DocumentInfoCapture:
+    document_info: Mapping[str, object]
+
+
+def _binding_key(label: str, value: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("host_capture_invalid")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("host_capture_invalid") from None
+    return hashlib.sha256(
+        b"hui-anchor-host-capture-v1\0" + label.encode("ascii") + b"\0" + encoded
+    ).hexdigest()
+
+
+def _validate_capture_root_path(root: Path) -> None:
+    if (
+        not isinstance(root, Path)
+        or not root.is_absolute()
+        or root.drive.upper() != "E:"
+    ):
+        raise ValueError("host_capture_invalid")
+    text = str(root)
+    if text != os.path.normpath(text):
+        raise ValueError("host_capture_invalid")
+    for component in root.parts[1:]:
+        if (
+            not component
+            or component in {".", ".."}
+            or component.rstrip(" .") != component
+        ):
+            raise ValueError("host_capture_invalid")
+
+
+def _capture_root(root: Path | None = None) -> Path:
+    if root is not None:
+        raise ValueError("host_capture_invalid")
+    if _TEST_CAPTURE_ROOT is not None:
+        selected = _TEST_CAPTURE_ROOT
+    else:
+        if PRIVATE_CAPTURE_ROOT != _DEFAULT_CAPTURE_ROOT:
+            raise ValueError("host_capture_invalid")
+        selected = _DEFAULT_CAPTURE_ROOT
+    _validate_capture_root_path(selected)
+    return selected
+
+
+def document_info_capture_path(
+    project_id: str,
+    *,
+    root: Path | None = None,
+) -> Path:
+    return _capture_root(root) / f"{_binding_key('project', project_id)}.dpapi"
+
+
+def _is_reparse(info: os.stat_result) -> bool:
+    return bool(getattr(info, "st_file_attributes", 0) & _REPARSE_POINT)
+
+
+def _safe_capture_stat(info: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and not _is_reparse(info)
+        and info.st_nlink == 1
+        and 1 <= info.st_size <= MAX_CAPTURE_BYTES
+    )
+
+
+def _ensure_capture_root(root: Path) -> None:
+    _validate_capture_root_path(root)
+    for current in (*reversed(root.parents), root):
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise ValueError("host_capture_invalid") from None
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or _is_reparse(info)
+        ):
+            raise ValueError("host_capture_invalid")
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise ValueError("host_capture_invalid") from None
+    try:
+        info = root.lstat()
+    except OSError:
+        raise ValueError("host_capture_invalid") from None
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or _is_reparse(info)
+    ):
+        raise ValueError("host_capture_invalid")
+
+
+def _read_capture(path: Path) -> bytes | None:
+    try:
+        path_info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ValueError("host_capture_invalid") from None
+    if not _safe_capture_stat(path_info):
+        raise ValueError("host_capture_invalid")
+    try:
+        with path.open("rb") as stream:
+            opened_info = os.fstat(stream.fileno())
+            if (
+                not _safe_capture_stat(opened_info)
+                or not os.path.samestat(path_info, opened_info)
+            ):
+                raise ValueError("host_capture_invalid")
+            raw = stream.read(MAX_CAPTURE_BYTES + 1)
+            final_opened_info = os.fstat(stream.fileno())
+        final_path_info = path.lstat()
+    except ValueError:
+        raise
+    except OSError:
+        raise ValueError("host_capture_invalid") from None
+    if (
+        len(raw) > MAX_CAPTURE_BYTES
+        or not _safe_capture_stat(final_opened_info)
+        or not _safe_capture_stat(final_path_info)
+        or not os.path.samestat(path_info, final_opened_info)
+        or not os.path.samestat(path_info, final_path_info)
+    ):
+        raise ValueError("host_capture_invalid")
+    return raw
+
+
+def _write_capture(path: Path, protected: bytes) -> None:
+    if type(protected) is not bytes or not 1 <= len(protected) <= MAX_CAPTURE_BYTES:
+        raise ValueError("host_capture_invalid")
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        raise ValueError("host_capture_invalid") from None
+    else:
+        raise ValueError("host_capture_invalid")
+
+    temporary: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(protected)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary_info = temporary.lstat()
+        if not _safe_capture_stat(temporary_info):
+            raise ValueError("host_capture_invalid")
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("host_capture_invalid")
+        os.replace(temporary, path)
+        temporary = None
+        final_info = path.lstat()
+        if (
+            not _safe_capture_stat(final_info)
+            or not os.path.samestat(temporary_info, final_info)
+        ):
+            raise ValueError("host_capture_invalid")
+    except ValueError:
+        raise
+    except OSError:
+        raise ValueError("host_capture_invalid") from None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _single_document_source(project: DwsProjectManifest) -> str:
+    if (
+        not isinstance(project, DwsProjectManifest)
+        or len(project.sources) != 1
+        or project.sources[0].source_type is not SyncSourceType.DOCUMENT
+    ):
+        raise ValueError("host_capture_invalid")
+    return project.sources[0].source_id
+
+
+def _metadata_value(
+    metadata: Mapping[str, object],
+    fields: tuple[str, ...],
+) -> object:
+    for field in fields:
+        if field in metadata:
+            return metadata[field]
+    return _MISSING
+
+
+def _normalized_text(value: object, *, max_length: int) -> str | None:
+    if value is _MISSING or value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError("host_capture_invalid")
+    text = str(value)
+    if not text.strip() or len(text) > max_length:
+        raise ValueError("host_capture_invalid")
+    return text
+
+
+def _normalized_time(value: object) -> str | None:
+    if value is _MISSING or value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("host_capture_invalid")
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if abs(timestamp) >= 10_000_000_000:
+            timestamp /= 1000
+        try:
+            parsed = datetime.fromtimestamp(timestamp, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            raise ValueError("host_capture_invalid") from None
+    elif isinstance(value, str):
+        if not value.strip() or len(value) > 128:
+            raise ValueError("host_capture_invalid")
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("host_capture_invalid") from None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("host_capture_invalid")
+    else:
+        raise ValueError("host_capture_invalid")
+    return parsed.astimezone(UTC).isoformat()
+
+
+def _normalized_document_info(
+    document_info: dict[str, object],
+    source_id: str,
+) -> dict[str, object]:
+    try:
+        metadata = unwrap_dws_payload(document_info)
+    except DwsReadError:
+        raise ValueError("host_capture_invalid") from None
+    if not isinstance(metadata, Mapping):
+        raise ValueError("host_capture_invalid")
+    identity_present, identity_matches, metadata_matches = document_metadata_contract(
+        metadata,
+        source_id,
+    )
+    if not identity_present or not identity_matches or not metadata_matches:
+        raise ValueError("host_capture_invalid")
+    result: dict[str, object] = {
+        "nodeId": source_id,
+        "contentType": "ALIDOC",
+        "extension": "adoc",
+    }
+    title = _normalized_text(
+        _metadata_value(metadata, _TITLE_FIELDS),
+        max_length=512,
+    )
+    url = _normalized_text(
+        _metadata_value(metadata, _URL_FIELDS),
+        max_length=2048,
+    )
+    version = _normalized_text(
+        _metadata_value(metadata, _VERSION_FIELDS),
+        max_length=256,
+    )
+    source_time = _normalized_time(_metadata_value(metadata, _TIME_FIELDS))
+    if title is not None:
+        result["title"] = title
+    if url is not None:
+        result["shareUrl"] = url
+    if version is not None:
+        result["source_version"] = version
+    if source_time is not None:
+        result["source_time"] = source_time
+    return {"result": result}
+
+
+def _canonical_json(value: object) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+        raise ValueError("host_capture_invalid") from None
+
+
+def _capture_payload(
+    project_id: str,
+    source_id: str,
+    run_token: str,
+    document_info: dict[str, object],
+) -> bytes:
+    return _canonical_json(
+        {
+            "schema_version": _CAPTURE_SCHEMA_VERSION,
+            "project_key": _binding_key("project", project_id),
+            "source_key": _binding_key("source", source_id),
+            "run_token_key": _binding_key("run-token", run_token),
+            "document_info": document_info,
+        }
+    )
+
+
+def _freeze(value: object) -> object:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _thaw(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    return value
+
+
+def _document_capture(document_info: dict[str, object]) -> DocumentInfoCapture:
+    frozen = _freeze(document_info)
+    if not isinstance(frozen, Mapping):
+        raise AssertionError("document info must be a mapping")
+    return DocumentInfoCapture(cast(Mapping[str, object], frozen))
+
+
+def _load_protected_capture(
+    protected: bytes,
+    project: DwsProjectManifest,
+    source_id: str,
+    run_token: str,
+    protector: ContentProtector,
+) -> DocumentInfoCapture:
+    try:
+        plaintext = protector.unprotect(project.project_id, protected)
+    except Exception:
+        raise ValueError("host_capture_invalid") from None
+    if type(plaintext) is not bytes or not plaintext:
+        raise ValueError("host_capture_invalid")
+    try:
+        payload = _decode_json(plaintext)
+    except ValueError:
+        raise ValueError("host_capture_invalid") from None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _CAPTURE_KEYS
+        or payload["schema_version"] != _CAPTURE_SCHEMA_VERSION
+        or type(payload["schema_version"]) is not int
+        or not isinstance(payload["project_key"], str)
+        or not isinstance(payload["source_key"], str)
+        or not isinstance(payload["run_token_key"], str)
+        or not isinstance(payload["document_info"], dict)
+    ):
+        raise ValueError("host_capture_invalid")
+    expected_keys = (
+        (payload["project_key"], _binding_key("project", project.project_id)),
+        (payload["source_key"], _binding_key("source", source_id)),
+        (payload["run_token_key"], _binding_key("run-token", run_token)),
+    )
+    if any(
+        not hmac.compare_digest(actual, expected)
+        for actual, expected in expected_keys
+    ):
+        raise ValueError("host_capture_invalid")
+    stored_document_info = payload["document_info"]
+    document_info = _normalized_document_info(stored_document_info, source_id)
+    if _canonical_json(stored_document_info) != _canonical_json(document_info):
+        raise ValueError("host_capture_invalid")
+    return _document_capture(document_info)
+
+
+def _checked_protector(protector: ContentProtector) -> ContentProtector:
+    if not callable(getattr(protector, "protect", None)) or not callable(
+        getattr(protector, "unprotect", None)
+    ):
+        raise TypeError("protector must support protect and unprotect")
+    return protector
+
+
+def capture_document_info(
+    raw: bytes,
+    project: DwsProjectManifest,
+    *,
+    run_token: str,
+    protector: ContentProtector,
+    root: Path | None = None,
+) -> DocumentInfoCapture:
+    source_id = _single_document_source(project)
+    document_info = _normalized_document_info(
+        decode_host_result(raw, "doc_info"),
+        source_id,
+    )
+    selected_root = _capture_root(root)
+    selected_protector = _checked_protector(protector)
+    path = document_info_capture_path(project.project_id)
+    _ensure_capture_root(selected_root)
+    with state_lock.acquire_state_lock(path, project.project_id, root=selected_root):
+        _ensure_capture_root(selected_root)
+        existing = _read_capture(path)
+        if existing is None:
+            try:
+                protected = selected_protector.protect(
+                    project.project_id,
+                    _capture_payload(
+                        project.project_id,
+                        source_id,
+                        run_token,
+                        document_info,
+                    ),
+                )
+            except Exception:
+                raise ValueError("host_capture_invalid") from None
+            _write_capture(path, protected)
+            return _document_capture(document_info)
+        captured = _load_protected_capture(
+            existing,
+            project,
+            source_id,
+            run_token,
+            selected_protector,
+        )
+        if _canonical_json(_thaw(captured.document_info)) != _canonical_json(
+            document_info
+        ):
+            raise ValueError("host_capture_conflict")
+        return captured
+
+
+def load_document_info_capture(
+    project: DwsProjectManifest,
+    *,
+    run_token: str,
+    protector: ContentProtector,
+    root: Path | None = None,
+) -> DocumentInfoCapture:
+    source_id = _single_document_source(project)
+    selected_root = _capture_root(root)
+    selected_protector = _checked_protector(protector)
+    path = document_info_capture_path(project.project_id)
+    _ensure_capture_root(selected_root)
+    with state_lock.acquire_state_lock(path, project.project_id, root=selected_root):
+        _ensure_capture_root(selected_root)
+        protected = _read_capture(path)
+        if protected is None:
+            raise ValueError("host_capture_missing")
+        return _load_protected_capture(
+            protected,
+            project,
+            source_id,
+            run_token,
+            selected_protector,
+        )
+
+
+def clear_document_info_capture(
+    project: DwsProjectManifest,
+    *,
+    run_token: str,
+    protector: ContentProtector,
+    root: Path | None = None,
+) -> bool:
+    source_id = _single_document_source(project)
+    selected_root = _capture_root(root)
+    selected_protector = _checked_protector(protector)
+    path = document_info_capture_path(project.project_id)
+    _ensure_capture_root(selected_root)
+    with state_lock.acquire_state_lock(path, project.project_id, root=selected_root):
+        _ensure_capture_root(selected_root)
+        protected = _read_capture(path)
+        if protected is None:
+            return False
+        _load_protected_capture(
+            protected,
+            project,
+            source_id,
+            run_token,
+            selected_protector,
+        )
+        try:
+            current = path.lstat()
+            if not _safe_capture_stat(current):
+                raise ValueError("host_capture_invalid")
+            path.unlink()
+        except ValueError:
+            raise
+        except OSError:
+            raise ValueError("host_capture_invalid") from None
+        return True
+
+
+__all__ = [
+    "DocumentInfoCapture",
+    "capture_document_info",
+    "clear_document_info_capture",
+    "document_info_capture_path",
+    "load_document_info_capture",
+]

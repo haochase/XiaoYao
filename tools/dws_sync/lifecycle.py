@@ -21,8 +21,15 @@ from tools.dws_sync import state_lock
 LEASE_SECONDS = 1800
 MAX_LIFECYCLE_STATE_BYTES = 65_536
 _PROJECT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_STAGES = ("begun", "collected", "pending", "artifact", "pushed")
-Stage = Literal["begun", "collected", "pending", "artifact", "pushed"]
+_STAGES = ("begun", "host_info", "collected", "pending", "artifact", "pushed")
+Stage = Literal[
+    "begun",
+    "host_info",
+    "collected",
+    "pending",
+    "artifact",
+    "pushed",
+]
 
 
 @dataclass(frozen=True)

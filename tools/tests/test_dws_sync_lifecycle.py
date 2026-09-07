@@ -60,7 +60,7 @@ def test_stage_fence_rejects_old_token_after_expired_lease_is_replaced(
             "project-1",
             old.run_token or "",
             expected="begun",
-            target="collected",
+            target="host_info",
             root=tmp_path,
             now=lambda: NOW + timedelta(hours=1),
         )
@@ -71,7 +71,8 @@ def test_end_rotates_token_for_one_coalesced_followup(tmp_path: Path) -> None:
     lifecycle.begin_run("project-1", root=tmp_path, now=lambda: NOW)
     token = first.run_token or ""
     for expected, target in (
-        ("begun", "collected"),
+        ("begun", "host_info"),
+        ("host_info", "collected"),
         ("collected", "pending"),
         ("pending", "artifact"),
         ("artifact", "pushed"),
@@ -144,7 +145,8 @@ def test_coalesced_chain_can_rerun_at_most_once(tmp_path: Path) -> None:
 
     def finish(token: str) -> lifecycle.BeginResult:
         for expected, target in (
-            ("begun", "collected"),
+            ("begun", "host_info"),
+            ("host_info", "collected"),
             ("collected", "pending"),
             ("pending", "artifact"),
             ("artifact", "pushed"),
@@ -189,7 +191,7 @@ def test_commit_stage_rolls_back_apply_failure_and_keeps_stage(
             "project-1",
             started.run_token or "",
             expected="begun",
-            target="collected",
+            target="host_info",
             apply=apply,
             rollback=rollback,
             root=tmp_path,
@@ -219,8 +221,8 @@ def test_commit_stage_rolls_back_state_failure_before_unlocking(
     errors: list[BaseException] = []
     original_write = lifecycle._write_state
 
-    def fail_collected_state(path, payload):  # type: ignore[no-untyped-def]
-        if payload["stage"] == "collected":
+    def fail_host_info_state(path, payload):  # type: ignore[no-untyped-def]
+        if payload["stage"] == "host_info":
             raise ValueError("private_file_write_failed")
         return original_write(path, payload)
 
@@ -234,7 +236,7 @@ def test_commit_stage_rolls_back_state_failure_before_unlocking(
                 "project-1",
                 token,
                 expected="begun",
-                target="collected",
+                target="host_info",
                 apply=lambda: None,
                 rollback=rollback,
                 root=tmp_path,
@@ -248,7 +250,7 @@ def test_commit_stage_rolls_back_state_failure_before_unlocking(
         lifecycle.begin_run("project-1", root=tmp_path, now=lambda: NOW)
         contender_done.set()
 
-    monkeypatch.setattr(lifecycle, "_write_state", fail_collected_state)
+    monkeypatch.setattr(lifecycle, "_write_state", fail_host_info_state)
     commit_thread = threading.Thread(target=commit)
     contender_thread = threading.Thread(target=contend)
     commit_thread.start()
@@ -285,7 +287,7 @@ def test_commit_stage_sanitizes_rollback_failure_and_releases_lock(
             "project-1",
             token,
             expected="begun",
-            target="collected",
+            target="host_info",
             apply=lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
             rollback=lambda: (_ for _ in ()).throw(
                 RuntimeError("private-rollback-detail")
@@ -316,7 +318,7 @@ def test_commit_stage_does_not_rollback_apply_when_state_restore_fails(
         path,
         payload,
     ):  # type: ignore[no-untyped-def]
-        if payload["stage"] == "collected":
+        if payload["stage"] == "host_info":
             original_write(path, payload)
             raise RuntimeError("private-post-commit-detail")
         raise RuntimeError("private-restore-detail")
@@ -336,7 +338,7 @@ def test_commit_stage_does_not_rollback_apply_when_state_restore_fails(
             "project-1",
             token,
             expected="begun",
-            target="collected",
+            target="host_info",
             apply=lambda: None,
             rollback=rollback,
             root=tmp_path,
@@ -347,7 +349,76 @@ def test_commit_stage_does_not_rollback_apply_when_state_restore_fails(
     lifecycle.assert_stage(
         "project-1",
         token,
-        expected="collected",
+        expected="host_info",
         root=tmp_path,
         now=lambda: NOW,
     )
+
+
+def test_host_info_must_precede_collected_and_cannot_be_skipped(
+    tmp_path: Path,
+) -> None:
+    started = lifecycle.begin_run("project-1", root=tmp_path, now=lambda: NOW)
+    token = started.run_token or ""
+
+    with pytest.raises(ValueError, match="^run_stage_invalid$"):
+        lifecycle.advance_run(
+            "project-1",
+            token,
+            expected="begun",
+            target="collected",
+            root=tmp_path,
+            now=lambda: NOW,
+        )
+
+    lifecycle.advance_run(
+        "project-1",
+        token,
+        expected="begun",
+        target="host_info",
+        root=tmp_path,
+        now=lambda: NOW,
+    )
+    lifecycle.advance_run(
+        "project-1",
+        token,
+        expected="host_info",
+        target="collected",
+        root=tmp_path,
+        now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ("begun", "collected", "pending", "artifact", "pushed", "completed", "aborted"),
+)
+def test_legacy_lifecycle_stages_remain_readable(
+    tmp_path: Path,
+    stage: str,
+) -> None:
+    path = lifecycle.project_state_path(tmp_path, "project-1")
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "project_key": lifecycle._project_key("project-1"),
+                "active": stage not in {"completed", "aborted"},
+                "run_token_hash": (
+                    "a" * 64 if stage not in {"completed", "aborted"} else None
+                ),
+                "stage": stage,
+                "lease_expires_at": (
+                    NOW.isoformat()
+                    if stage not in {"completed", "aborted"}
+                    else None
+                ),
+                "coalesced": False,
+            }
+        )
+    )
+
+    loaded = lifecycle._read_state(path, "project-1")
+
+    assert loaded is not None
+    assert loaded["stage"] == stage

@@ -4,6 +4,7 @@ import base64
 import binascii
 import json
 from datetime import datetime
+from typing import Literal
 
 from companion_gateway.project.sync_models import SourceErrorType, SyncSourceType
 from tools.dws_sync.adapters import (
@@ -46,6 +47,47 @@ def _decode_json(raw: bytes) -> object:
         raise ValueError("host_import_invalid") from None
 
 
+def _decode_result(
+    item: object,
+    expected_operation: Literal["doc_info", "doc_read"],
+) -> tuple[dict[str, object], int]:
+    if (
+        not isinstance(item, dict)
+        or set(item) != {"operation", "encoding", "byte_count", "payload"}
+        or item["operation"] != expected_operation
+        or item["encoding"] != "base64-json"
+        or type(item["byte_count"]) is not int
+        or not 1 <= item["byte_count"] <= MAX_RESULT_BYTES
+        or not isinstance(item["payload"], str)
+    ):
+        raise ValueError("host_import_invalid")
+    try:
+        decoded = base64.b64decode(item["payload"], validate=True)
+    except (ValueError, binascii.Error):
+        raise ValueError("host_import_invalid") from None
+    if len(decoded) != item["byte_count"]:
+        raise ValueError("host_import_invalid")
+    if decoded.lstrip().startswith(_PLACEHOLDER_PREFIX):
+        raise ValueError("host_import_invalid")
+    response = _decode_json(decoded)
+    if not isinstance(response, dict):
+        raise ValueError("host_import_invalid")
+    return response, len(decoded)
+
+
+def decode_host_result(
+    raw: bytes,
+    expected_operation: Literal["doc_info", "doc_read"],
+) -> dict[str, object]:
+    if (
+        expected_operation not in _OPERATIONS
+        or not isinstance(raw, bytes)
+        or len(raw) > MAX_HOST_IMPORT_BYTES
+    ):
+        raise ValueError("host_import_invalid")
+    return _decode_result(_decode_json(raw), expected_operation)[0]
+
+
 def _decode_results(raw: bytes, project_id: str) -> tuple[dict[str, object], ...]:
     if not isinstance(raw, bytes) or len(raw) > MAX_HOST_IMPORT_BYTES:
         raise ValueError("host_import_invalid")
@@ -65,29 +107,9 @@ def _decode_results(raw: bytes, project_id: str) -> tuple[dict[str, object], ...
     decoded_results: list[dict[str, object]] = []
     total_bytes = 0
     for expected_operation, item in zip(_OPERATIONS, results, strict=True):
-        if (
-            not isinstance(item, dict)
-            or set(item) != {"operation", "encoding", "byte_count", "payload"}
-            or item["operation"] != expected_operation
-            or item["encoding"] != "base64-json"
-            or type(item["byte_count"]) is not int
-            or not 1 <= item["byte_count"] <= MAX_RESULT_BYTES
-            or not isinstance(item["payload"], str)
-        ):
-            raise ValueError("host_import_invalid")
-        try:
-            decoded = base64.b64decode(item["payload"], validate=True)
-        except (ValueError, binascii.Error):
-            raise ValueError("host_import_invalid") from None
-        if len(decoded) != item["byte_count"]:
-            raise ValueError("host_import_invalid")
-        total_bytes += len(decoded)
+        response, result_bytes = _decode_result(item, expected_operation)
+        total_bytes += result_bytes
         if total_bytes > MAX_TOTAL_RESULT_BYTES:
-            raise ValueError("host_import_invalid")
-        if decoded.lstrip().startswith(_PLACEHOLDER_PREFIX):
-            raise ValueError("host_import_invalid")
-        response = _decode_json(decoded)
-        if not isinstance(response, dict):
             raise ValueError("host_import_invalid")
         decoded_results.append(response)
     return tuple(decoded_results)
