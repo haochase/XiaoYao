@@ -510,3 +510,44 @@ def test_discard_allows_unknown_old_token_but_rejects_invalid_payload(
             protector=protector,
         )
     assert path.read_bytes() == original
+
+
+def test_capture_write_rollback_preserves_same_bytes_replacement_after_publish(
+    capture,
+    monkeypatch,
+) -> None:
+    protector = Protector()
+    selected = manifest()
+    transaction = capture.prepare_document_info_capture(
+        document_info(),
+        selected,
+        run_token="run-token-1",
+        protector=protector,
+    )
+    path = capture.document_info_capture_path("project-1")
+    real_replace = capture.os.replace
+    staged_info = None
+    replacement_bytes = b""
+
+    def replace_then_substitute(source, destination):  # type: ignore[no-untyped-def]
+        nonlocal staged_info, replacement_bytes
+        result = real_replace(source, destination)
+        if Path(destination) == path:
+            replacement_bytes = path.read_bytes()
+            staged_info = path.lstat()
+            replacement = path.with_name("same-bytes-replacement")
+            replacement.write_bytes(replacement_bytes)
+            real_replace(replacement, path)
+            raise KeyboardInterrupt
+        return result
+
+    monkeypatch.setattr(capture.os, "replace", replace_then_substitute)
+
+    with pytest.raises(KeyboardInterrupt):
+        transaction.apply()
+    with pytest.raises(ValueError, match="^host_capture_invalid$"):
+        transaction.rollback()
+
+    assert staged_info is not None
+    assert path.read_bytes() == replacement_bytes
+    assert not os.path.samestat(staged_info, path.lstat())

@@ -32,7 +32,6 @@ from tools.dws_sync.runtime import (
 
 COMMANDS = (
     "begin",
-    "collect",
     "capture-info",
     "host-import",
     "complete-host-import",
@@ -87,6 +86,8 @@ def dispatch(
 ) -> int:
     from tools import dws_project_sync as cli
 
+    if command not in COMMANDS:
+        raise ValueError("runtime_command_invalid")
     if unattended and command != "reuse-artifact":
         raise ValueError("unattended_command_invalid")
     if command in {
@@ -105,7 +106,6 @@ def dispatch(
         argv += ["--run-token", run_token]
     if command in {
         "artifact",
-        "collect",
         "capture-info",
         "host-import",
         "complete-host-import",
@@ -115,9 +115,6 @@ def dispatch(
         "reuse-artifact",
     }:
         argv += ["--manifest", str(config.manifest)]
-    if command == "collect":
-        resolve_dws_launch(config.dws)
-        argv += ["--dws-path", str(config.dws), "--output", str(config.source_bundle)]
     if command in {
         "capture-info",
         "host-import",

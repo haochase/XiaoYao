@@ -3895,6 +3895,153 @@ def test_capture_info_then_complete_host_import_writes_bundle_atomically(
     )
 
 
+def test_capture_info_rolls_back_published_capture_after_replace_interrupt(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    host_capture = configure_host_capture(tmp_path, monkeypatch)
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    assert isinstance(token, str)
+    capture_path = host_capture.document_info_capture_path("project-1")
+    real_replace = host_capture.os.replace
+
+    def replace_then_interrupt(source, destination):  # type: ignore[no-untyped-def]
+        result = real_replace(source, destination)
+        if Path(destination) == capture_path:
+            raise KeyboardInterrupt
+        return result
+
+    monkeypatch.setattr(host_capture.os, "replace", replace_then_interrupt)
+
+    assert main(
+        capture_info_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result("doc_info", document_info_result())
+        ),
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "interrupted",
+    }
+    assert not capture_path.exists()
+    assert list(capture_path.parent.glob(f".{capture_path.name}.*.tmp")) == []
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="begun",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_capture_info_rolls_back_published_capture_after_post_replace_lstat_error(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    host_capture = configure_host_capture(tmp_path, monkeypatch)
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    assert isinstance(token, str)
+    capture_path = host_capture.document_info_capture_path("project-1")
+    real_replace = host_capture.os.replace
+    real_lstat = Path.lstat
+    published = False
+    failed_lstat = False
+
+    def replace_then_mark(source, destination):  # type: ignore[no-untyped-def]
+        nonlocal published
+        result = real_replace(source, destination)
+        if Path(destination) == capture_path:
+            published = True
+        return result
+
+    def lstat_after_publish(path: Path):  # type: ignore[no-untyped-def]
+        nonlocal failed_lstat
+        if published and path == capture_path and not failed_lstat:
+            failed_lstat = True
+            raise OSError("post-replace lstat failure")
+        return real_lstat(path)
+
+    monkeypatch.setattr(host_capture.os, "replace", replace_then_mark)
+    monkeypatch.setattr(host_capture.Path, "lstat", lstat_after_publish)
+
+    assert main(
+        capture_info_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result("doc_info", document_info_result())
+        ),
+    ) == 1
+    assert failed_lstat is True
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "host_capture_invalid",
+    }
+    assert not capture_path.exists()
+    assert list(capture_path.parent.glob(f".{capture_path.name}.*.tmp")) == []
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="begun",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
+def test_complete_host_import_replay_is_rejected_after_collection(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    configure_host_capture(tmp_path, monkeypatch)
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    token = json.loads(capsys.readouterr().out)["run_token"]
+    assert isinstance(token, str)
+    assert main(
+        capture_info_args(paths, token),
+        now=lambda: NOW,
+        input_stream=io.BytesIO(
+            single_host_result("doc_info", document_info_result())
+        ),
+    ) == 0
+    capsys.readouterr()
+    arguments = complete_host_import_args(paths, token)
+    payload = single_host_result("doc_read", {"data": {"markdown": "正文"}})
+
+    assert main(
+        arguments,
+        now=lambda: NOW,
+        input_stream=io.BytesIO(payload),
+    ) == 0
+    capsys.readouterr()
+    original_bundle = paths["sources"].read_bytes()
+
+    assert main(
+        arguments,
+        now=lambda: NOW,
+        input_stream=io.BytesIO(payload),
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "run_stage_invalid",
+    }
+    assert paths["sources"].read_bytes() == original_bundle
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="collected",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    )
+
+
 def test_expired_begin_discards_old_capture_but_coalesced_begin_keeps_it(
     tmp_path: Path,
     capsys,

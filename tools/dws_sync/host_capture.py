@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
@@ -86,7 +86,8 @@ class DocumentInfoCaptureWrite:
         self._path = document_info_capture_path(project.project_id)
         self._capture = _document_capture(document_info)
         self._protected: bytes | None = None
-        self._created = False
+        self._staged_info: os.stat_result | None = None
+        self._publish_attempted = False
         self._applied = False
         self._rolled_back = False
 
@@ -118,9 +119,12 @@ class DocumentInfoCaptureWrite:
                     )
                 except Exception:
                     raise ValueError("host_capture_invalid") from None
-                _write_capture(self._path, protected)
                 self._protected = protected
-                self._created = True
+                _write_capture(
+                    self._path,
+                    protected,
+                    on_publish=self._stage_publish,
+                )
             else:
                 captured = _load_protected_capture(
                     existing,
@@ -135,11 +139,16 @@ class DocumentInfoCaptureWrite:
                     raise ValueError("host_capture_conflict")
             self._applied = True
 
+    def _stage_publish(self, staged_info: os.stat_result) -> None:
+        self._staged_info = staged_info
+        self._publish_attempted = True
+
     def rollback(self) -> None:
-        if self._rolled_back or not self._applied or not self._created:
+        if self._rolled_back or not self._publish_attempted:
             return
         protected = self._protected
-        if protected is None:
+        staged_info = self._staged_info
+        if protected is None or staged_info is None:
             raise ValueError("host_capture_invalid")
         with state_lock.acquire_state_lock(
             self._path,
@@ -147,11 +156,18 @@ class DocumentInfoCaptureWrite:
             root=self._root,
         ):
             _ensure_capture_root(self._root)
-            current = _read_capture(self._path)
-            if current is not None:
-                if not hmac.compare_digest(current, protected):
+            snapshot = _read_capture_snapshot(self._path)
+            if snapshot is not None:
+                current, current_info = snapshot
+                if not hmac.compare_digest(
+                    current, protected
+                ) or not os.path.samestat(current_info, staged_info):
                     raise ValueError("host_capture_invalid")
-                _delete_capture(self._path, expected=protected)
+                _delete_capture(
+                    self._path,
+                    expected=protected,
+                    expected_info=staged_info,
+                )
         self._rolled_back = True
 
 
@@ -419,7 +435,12 @@ def _delete_capture(
     return True
 
 
-def _write_capture(path: Path, protected: bytes) -> None:
+def _write_capture(
+    path: Path,
+    protected: bytes,
+    *,
+    on_publish: Callable[[os.stat_result], None] | None = None,
+) -> None:
     if type(protected) is not bytes or not 1 <= len(protected) <= MAX_CAPTURE_BYTES:
         raise ValueError("host_capture_invalid")
     try:
@@ -452,6 +473,8 @@ def _write_capture(path: Path, protected: bytes) -> None:
             pass
         else:
             raise ValueError("host_capture_invalid")
+        if on_publish is not None:
+            on_publish(temporary_info)
         os.replace(temporary, path)
         temporary = None
         final_info = path.lstat()

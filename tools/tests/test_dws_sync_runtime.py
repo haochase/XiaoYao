@@ -136,13 +136,36 @@ def test_wrapper_injects_token_only_for_network_commands(tmp_path: Path, monkeyp
     observed = []
     monkeypatch.setattr(dws_project_sync, "main", lambda argv, **kwargs: observed.append((argv, kwargs)) or 0)
     monkeypatch.delenv("COMPANION_DWS_SYNC_TOKEN", raising=False)
-    wrapper.dispatch(tmp_path, "collect", "lease", False, Protector())
+    wrapper.dispatch(tmp_path, "artifact", "lease", False, Protector())
     assert "COMPANION_DWS_SYNC_TOKEN" not in observed[-1][1]["environ"]
     wrapper.dispatch(tmp_path, "push", "lease", False, Protector())
     assert observed[-1][1]["environ"]["COMPANION_DWS_SYNC_TOKEN"]
     assert "--gateway" in observed[-1][0]
     assert "127.0.0.1:8731" in " ".join(observed[-1][0])
     assert "COMPANION_DWS_SYNC_TOKEN" not in wrapper.os.environ
+
+
+def test_runtime_collect_is_rejected_before_any_dws_call(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from tools import dws_sync_runtime as wrapper
+
+    monkeypatch.setattr(
+        wrapper,
+        "resolve_dws_launch",
+        lambda *_args: pytest.fail("runtime collect must not reach DWS validation"),
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        wrapper.main(
+            ["collect", "--run-token", "lease-token"],
+            root=tmp_path,
+            protector=Protector(),
+        )
+
+    assert exited.value.code == 2
+    assert "collect" not in wrapper.COMMANDS
 
 
 def test_host_import_maps_fixed_paths_and_does_not_decrypt_credential(
