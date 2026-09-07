@@ -209,51 +209,25 @@ class ProjectMemoryService:
         if pinned_snapshot is None:
             context = self._require_fresh_context(project_id, timestamp)
         else:
-            context = self._require_package_fresh(
-                pinned_snapshot.context,
-                timestamp,
+            snapshot_context = self._require_package_fresh(
+                pinned_snapshot.context, timestamp
             )
+            context = (
+                self._require_fresh_context(project_id, timestamp)
+                if self._repository is not None
+                else snapshot_context
+            )
+            if context.permission_scope != snapshot_context.permission_scope:
+                raise ProjectContextUnavailable("source_unavailable")
         normalized_query = self._normalize(query)
         if not normalized_query:
             raise ProjectContextUnavailable("source_not_found")
-        with self._lock:
-            active_decisions = tuple(
-                item
-                for item in context.active_decisions
-                if item.status is DecisionStatus.ACTIVE
-            )
-            match = next(
-                (
-                    item
-                    for item in active_decisions
-                    if self._matches_exactly(item, normalized_query)
-                ),
-                None,
-            )
-            if match is None and kind in {
-                AnswerKind.DECISION_CHECK,
-                AnswerKind.SUGGESTION,
-            }:
-                scored_matches = tuple(
-                    (score, item)
-                    for item in active_decisions
-                    if (
-                        score := self._fragment_match_score(
-                            item,
-                            normalized_query,
-                        )
-                    )
-                    is not None
-                )
-                if scored_matches:
-                    best_score = max(score for score, _item in scored_matches)
-                    best_matches = tuple(
-                        item
-                        for score, item in scored_matches
-                        if score == best_score
-                    )
-                    if len(best_matches) == 1:
-                        match = best_matches[0]
+        match = self._match_active_decision(
+            context,
+            normalized_query,
+            allow_fragments=kind
+            in {AnswerKind.DECISION_CHECK, AnswerKind.SUGGESTION},
+        )
         if match is None:
             if not self._query_integration_enabled:
                 raise ProjectContextUnavailable("source_not_found")
@@ -498,6 +472,68 @@ class ProjectMemoryService:
             self._conflicts[candidate_id] = stored
             return stored, created
 
+    def propose_conflict_from_statement(
+        self,
+        project_id: str,
+        statement: str,
+        *,
+        proposed_decision_text: str,
+        now: datetime | None = None,
+    ) -> tuple[ConflictCandidate, bool]:
+        timestamp = now or self._clock()
+        if self._query_integration_enabled:
+            assert self._snapshot_reader is not None
+            try:
+                snapshot = self._snapshot_reader.get(project_id)
+            except ProjectSourceUnavailable as exc:
+                label = str(exc)
+                if label in {"source_stale", "clock_untrusted"}:
+                    raise ProjectContextUnavailable("source_stale") from None
+                raise ProjectContextUnavailable("source_unavailable") from None
+            if snapshot is None:
+                raise ProjectContextUnavailable("source_unavailable")
+            snapshot_context = self._require_package_fresh(snapshot.context, timestamp)
+            context = (
+                self._require_fresh_context(project_id, timestamp)
+                if self._repository is not None
+                else snapshot_context
+            )
+            if context.permission_scope != snapshot_context.permission_scope:
+                raise ProjectContextUnavailable("source_unavailable")
+        else:
+            snapshot = None
+            context = self._require_fresh_context(project_id, timestamp)
+        normalized_statement = self._normalize(statement)
+        if not normalized_statement:
+            raise ProjectContextUnavailable("source_not_found")
+        decision = self._match_active_decision(
+            context,
+            normalized_statement,
+            allow_fragments=True,
+        )
+        if decision is None:
+            raise ProjectContextUnavailable("source_not_found")
+        if self._decisions_equivalent(
+            decision.decision_text,
+            proposed_decision_text,
+        ):
+            raise ProjectMemoryError("statement_matches_active_decision")
+        if self._source_policy is not None:
+            self._require_query_sources_fresh(
+                project_id,
+                decision.source_refs,
+                timestamp,
+                snapshot,
+            )
+        return self.propose_conflict(
+            project_id,
+            decision_id=decision.decision_id,
+            observed_text=statement,
+            reason="会议发言可能与当前有效决策不一致",
+            evidence_refs=decision.source_refs,
+            now=timestamp,
+        )
+
     def get_conflict(self, candidate_id: str) -> ConflictCandidate:
         if self._repository is not None:
             candidate = self._repository.get_conflict(candidate_id)
@@ -510,6 +546,33 @@ class ProjectMemoryService:
         if candidate is None:
             raise ProjectMemoryError("conflict_not_found")
         return candidate
+
+    def list_conflicts(
+        self,
+        project_id: str,
+        *,
+        status: ConflictStatus | None = None,
+    ) -> tuple[ConflictCandidate, ...]:
+        self.get_context(project_id)
+        if self._repository is not None:
+            candidates = self._repository.list_conflicts(project_id, status=status)
+            with self._lock:
+                self._conflicts.update(
+                    (candidate.candidate_id, candidate) for candidate in candidates
+                )
+            return tuple(candidates)
+        with self._lock:
+            return tuple(
+                sorted(
+                    (
+                        candidate
+                        for candidate in self._conflicts.values()
+                        if candidate.project_id == project_id
+                        and (status is None or candidate.status is status)
+                    ),
+                    key=lambda candidate: candidate.candidate_id,
+                )
+            )
 
     def review_conflict(
         self,
@@ -700,6 +763,14 @@ class ProjectMemoryService:
     def _normalize(value: str) -> str:
         return "".join(value.split()).casefold()
 
+    @classmethod
+    def _decisions_equivalent(cls, active: str, proposed: str) -> bool:
+        normalized_active = cls._normalize(active)
+        normalized_proposed = cls._normalize(proposed)
+        if not normalized_proposed:
+            raise ValueError("proposed_decision_text must not be blank")
+        return normalized_active == normalized_proposed
+
     @staticmethod
     def _chinese_bigrams(value: str) -> set[str]:
         fragments: set[str] = set()
@@ -727,6 +798,42 @@ class ProjectMemoryService:
             ):
                 return True
         return False
+
+    @classmethod
+    def _match_active_decision(
+        cls,
+        context: ProjectContextPackage,
+        normalized_query: str,
+        *,
+        allow_fragments: bool,
+    ) -> DecisionCard | None:
+        active_decisions = tuple(
+            item
+            for item in context.active_decisions
+            if item.status is DecisionStatus.ACTIVE
+        )
+        match = next(
+            (
+                item
+                for item in active_decisions
+                if cls._matches_exactly(item, normalized_query)
+            ),
+            None,
+        )
+        if match is not None or not allow_fragments:
+            return match
+        scored_matches = tuple(
+            (score, item)
+            for item in active_decisions
+            if (score := cls._fragment_match_score(item, normalized_query)) is not None
+        )
+        if not scored_matches:
+            return None
+        best_score = max(score for score, _item in scored_matches)
+        best_matches = tuple(
+            item for score, item in scored_matches if score == best_score
+        )
+        return best_matches[0] if len(best_matches) == 1 else None
 
     @classmethod
     def _fragment_match_score(

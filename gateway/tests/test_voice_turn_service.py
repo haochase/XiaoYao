@@ -31,6 +31,7 @@ from companion_gateway.domain.tasks import TaskStatus
 from companion_gateway.service import TaskService
 from companion_gateway.storage.sqlite import SQLiteTaskRepository
 from companion_gateway.memory.service import MemoryService
+from companion_gateway.project.service import ProjectMemoryError
 from companion_gateway.voice.delivery import DeviceVoiceDeliveryService
 from companion_gateway.voice.runtime import (
     FakeModelRuntime,
@@ -38,7 +39,7 @@ from companion_gateway.voice.runtime import (
     VoiceAction,
     VoiceIntent,
 )
-from companion_gateway.voice.service import VoiceTurnService
+from companion_gateway.voice.service import VoiceTurn, VoiceTurnService
 
 
 def pcm_frame(*, sample_rate: int, sample_count: int, start: int = 0) -> Pcm16Mono:
@@ -76,13 +77,17 @@ class RecordingTransport:
         self.messages: list[tuple[str, tuple[bytes, ...]]] = []
         self.notification_messages: list[tuple[str, tuple[bytes, ...]]] = []
         self.notification_completion: Future[None] | None = None
+        self.cues: list[str | None] = []
 
     def send_tts_stream(
         self,
         session_id: str,
         opus_frames: tuple[bytes, ...],
+        *,
+        cue: str | None = None,
     ) -> None:
         self.messages.append((session_id, opus_frames))
+        self.cues.append(cue)
 
     def send_notification_tts_stream(
         self,
@@ -1073,6 +1078,180 @@ def test_project_query_intent_uses_project_memory_sources() -> None:
 
     assert unbound_turn is not None
     assert unbound_turn.response_text == "暂时无法确认项目记忆，请稍后再试。"
+
+
+def test_project_conflict_creates_candidate_without_changing_active_decision() -> None:
+    from companion_gateway.project.models import (
+        AnswerKind,
+        ConflictStatus,
+        DecisionCard,
+        DecisionStatus,
+        EvidenceRef,
+        ProjectContextPackage,
+    )
+    from companion_gateway.project.service import ProjectMemoryService
+
+    now = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+    source = EvidenceRef(
+        source_type="meeting_note",
+        source_id="meeting-conflict",
+        source_title="方案评审会",
+        source_url="https://example.invalid/meeting-conflict",
+        source_time=now,
+        excerpt="会议决定采用方案 B。",
+        permission_scope="project:conflict",
+    )
+    project_memory = ProjectMemoryService(clock=lambda: now)
+    project_memory.replace_context(
+        ProjectContextPackage(
+            project_id="project-conflict",
+            project_name="冲突闭环测试项目",
+            generated_at=now,
+            source_refs=(source,),
+            active_decisions=(
+                DecisionCard(
+                    decision_id="decision-terminal",
+                    project_id="project-conflict",
+                    topic="终端方案",
+                    decision_text="采用方案 B",
+                    rationale="交付风险更低",
+                    owner="owner-1",
+                    decided_at=now,
+                    source_refs=(source,),
+                    status=DecisionStatus.ACTIVE,
+                    confidence=0.92,
+                ),
+            ),
+            permission_scope="project:conflict",
+        )
+    )
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    response_pcm = pcm_frame(sample_rate=24_000, sample_count=1_440)
+    bridge = AudioBridge(
+        codec=EchoOpusCodec(input_pcm),
+        model_sample_rate=16_000,
+        response_sample_rate=24_000,
+        queue_capacity=1,
+    )
+    runtime = IntentRuntime(
+        VoiceIntent(
+            type="project_conflict",
+            query="终端方案改成方案 A",
+            proposed_decision_text="采用方案 A",
+        ),
+        response_pcm,
+    )
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=runtime,
+        project_memory=project_memory,
+        project_ids_by_device={"desk-device": "project-conflict"},
+        clock=lambda: now,
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_pending_turn(target_device_id="desk-device")
+
+    assert turn is not None
+    assert turn.response_text == (
+        "检测到这句话可能与当前有效决策不一致，已创建待确认项，请负责人核验。"
+    )
+    assert turn.device_cue == "conflict"
+    assert turn.conflict_candidate_id is not None
+    candidate = project_memory.get_conflict(turn.conflict_candidate_id)
+    assert candidate.status is ConflictStatus.PROPOSED
+    assert candidate.observed_text == "终端方案改成方案 A"
+    assert project_memory.answer(
+        "project-conflict",
+        "终端方案",
+        kind=AnswerKind.DECISION_CHECK,
+        now=now,
+    ).text == "当前有效决策：采用方案 B"
+
+    project_memory.review_conflict(
+        candidate.candidate_id,
+        reviewer_id="owner-1",
+        action="reject",
+        change_reason="保留当前方案",
+        now=now,
+    )
+    bridge.decode_uplink(b"input-opus")
+    repeated_turn = service.process_pending_turn(target_device_id="desk-device")
+
+    assert repeated_turn is not None
+    assert repeated_turn.response_text == "这条待确认项已经处理，当前有效决策未改变。"
+    assert repeated_turn.device_cue is None
+    assert repeated_turn.conflict_candidate_id is None
+
+
+def test_project_conflict_does_not_flag_a_statement_matching_active_decision() -> None:
+    class MatchingProjectMemory:
+        def propose_conflict_from_statement(self, *args, **kwargs):
+            raise ProjectMemoryError("statement_matches_active_decision")
+
+    input_pcm = pcm_frame(sample_rate=16_000, sample_count=960)
+    response_pcm = pcm_frame(sample_rate=24_000, sample_count=1_440)
+    bridge = AudioBridge(
+        codec=EchoOpusCodec(input_pcm),
+        model_sample_rate=16_000,
+        response_sample_rate=24_000,
+        queue_capacity=1,
+    )
+    service = VoiceTurnService(
+        audio_bridge=bridge,
+        model_runtime=IntentRuntime(
+            VoiceIntent(
+                type="project_conflict",
+                query="终端方案继续采用方案 B",
+                proposed_decision_text="采用方案 B",
+            ),
+            response_pcm,
+        ),
+        project_memory=MatchingProjectMemory(),
+        project_ids_by_device={"desk-device": "project-1"},
+    )
+    bridge.decode_uplink(b"input-opus")
+
+    turn = service.process_pending_turn(target_device_id="desk-device")
+
+    assert turn is not None
+    assert turn.response_text == "这句话与当前有效决策一致，无需创建待确认项。"
+    assert turn.device_cue is None
+    assert turn.conflict_candidate_id is None
+
+
+def test_project_conflict_delivery_marks_the_tts_with_conflict_cue() -> None:
+    class ConflictTurnService:
+        def process_pending_turn(self, **kwargs):
+            return VoiceTurn(
+                input_metrics=pcm_frame(
+                    sample_rate=16_000,
+                    sample_count=1,
+                ).metrics,
+                response_text="待确认",
+                response_metrics=pcm_frame(
+                    sample_rate=24_000,
+                    sample_count=1,
+                ).metrics,
+                device_opus_frames=(b"conflict-opus",) * 129,
+                device_cue="conflict",
+                conflict_candidate_id="conflict-1",
+            )
+
+    transport = RecordingTransport()
+    delivery = DeviceVoiceDeliveryService(
+        voice_turn_service=ConflictTurnService(),
+        device_transport=transport,
+    )
+
+    turn = delivery.process_and_send(
+        session_id="session-conflict",
+        target_device_id="desk-device",
+    )
+
+    assert turn is not None
+    assert [len(message[1]) for message in transport.messages] == [128, 1]
+    assert transport.cues == ["conflict", "conflict"]
 
 
 def test_project_query_intent_fails_closed_without_project_memory() -> None:

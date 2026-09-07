@@ -202,6 +202,39 @@ def test_project_conflict_review_accepts_new_decision_and_returns_version(
     assert answer.json()["answer"]["text"] == "当前有效决策：采用方案 A"
 
 
+def test_project_conflicts_can_be_listed_for_human_review(client: TestClient) -> None:
+    client.post(
+        "/v1/projects/project-1/context", json=context(), headers=OWNER_HEADERS
+    )
+    proposal = client.post(
+        "/v1/projects/project-1/conflicts",
+        json={
+            "decision_id": "decision-1",
+            "observed_text": "终端方案改成方案 A",
+            "reason": "会议发言可能与当前有效决策不一致",
+            "evidence_refs": [source()],
+        },
+        headers=OWNER_HEADERS,
+    )
+
+    response = client.get(
+        "/v1/projects/project-1/conflicts",
+        params={"status": "proposed"},
+        headers=OWNER_HEADERS,
+    )
+    forbidden = client.get(
+        "/v1/projects/project-1/conflicts",
+        params={"status": "proposed"},
+        headers={"Authorization": f"Bearer {VIEWER_TOKEN}"},
+    )
+
+    assert proposal.status_code == 201
+    assert response.status_code == 200
+    assert response.json()["conflicts"] == [proposal.json()["candidate"]]
+    assert forbidden.status_code == 403
+    assert forbidden.json()["detail"] == "project_review_denied"
+
+
 def test_project_conflict_rejects_foreign_source_scope(client: TestClient) -> None:
     client.post(
         "/v1/projects/project-1/context", json=context(), headers=OWNER_HEADERS

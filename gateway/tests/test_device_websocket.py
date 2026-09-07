@@ -385,6 +385,35 @@ def test_notification_tts_keeps_control_connection_open(
         assert app.state.device_sessions.get(DEVICE_ID) is not None
 
 
+def test_conflict_tts_start_includes_device_cue(
+    client: TestClient,
+    app_and_sink,
+) -> None:
+    app, _ = app_and_sink
+
+    with client.websocket_connect(
+        "/v1/devices/ws",
+        headers=websocket_headers(),
+    ) as websocket:
+        websocket.send_json(hello_payload())
+        server_hello = websocket.receive_json()
+        app.state.device_transport.send_tts_stream(
+            server_hello["session_id"],
+            (b"conflict-opus",),
+            cue="conflict",
+        )
+
+        assert websocket.receive_json() == {
+            "type": "tts",
+            "state": "start",
+            "purpose": "conversation",
+            "session_id": server_hello["session_id"],
+            "cue": "conflict",
+        }
+        assert websocket.receive_bytes() == b"conflict-opus"
+        assert websocket.receive_json()["state"] == "stop"
+
+
 def test_notification_rejects_done_before_audio_and_stop(
     client: TestClient,
     app_and_sink,

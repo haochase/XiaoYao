@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
-from typing import Protocol
+from typing import Literal, Protocol
 
 from companion_gateway.device.transport import MAX_TTS_FRAMES
 from companion_gateway.domain.executor import TaskExecutor
@@ -20,6 +20,8 @@ class TtsTransport(Protocol):
         self,
         session_id: str,
         opus_frames: tuple[bytes, ...],
+        *,
+        cue: Literal["conflict"] | None = None,
     ) -> None: ...
 
     def send_notification_tts_stream(
@@ -60,6 +62,7 @@ class DeviceVoiceDeliveryService:
         self._send_tts_frames(
             session_id=session_id,
             opus_frames=turn.device_opus_frames,
+            cue=turn.device_cue,
         )
         return turn
 
@@ -149,9 +152,11 @@ class DeviceVoiceDeliveryService:
         *,
         session_id: str,
         opus_frames: tuple[bytes, ...],
+        cue: Literal["conflict"] | None = None,
     ) -> None:
         for offset in range(0, len(opus_frames), MAX_TTS_FRAMES):
             self._device_transport.send_tts_stream(
                 session_id,
                 opus_frames[offset : offset + MAX_TTS_FRAMES],
+                cue=cue,
             )

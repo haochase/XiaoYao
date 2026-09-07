@@ -15,6 +15,7 @@ from companion_gateway.project.models import (
     ProjectContextPackage,
 )
 from companion_gateway.project.repository import ProjectMemoryRepository
+from companion_gateway.project.service import ProjectMemoryService
 from companion_gateway.project.sync_models import (
     EvidenceChunk,
     RetrievalRequest,
@@ -884,6 +885,51 @@ def test_greater_cursor_with_same_hash_refreshes_without_new_generation(
     assert retried.outcome == "unchanged"
 
 
+def test_reviewed_decision_survives_an_unchanged_source_renewal(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(sync_commit(cursor=1))
+    memory = ProjectMemoryService(
+        repository=ProjectMemoryRepository(tmp_path / "project-memory.db"),
+        clock=lambda: NOW,
+    )
+    candidate, _ = memory.propose_conflict_from_statement(
+        "project-1",
+        "发布方案改成方案 A",
+        proposed_decision_text="采用方案 A",
+        now=NOW,
+    )
+    memory.review_conflict(
+        candidate.candidate_id,
+        reviewer_id="owner-1",
+        action="accept",
+        change_reason="供应风险变化",
+        new_decision_text="采用方案 A",
+        evidence_refs=(evidence_ref(),),
+        now=NOW,
+    )
+
+    result = repository.commit(
+        sync_commit(
+            cursor=2,
+            content_hash=HASH_A,
+            outcome="unchanged",
+            states=(
+                source_state(
+                    last_attempt_at=NOW + timedelta(minutes=1),
+                    last_success_at=NOW + timedelta(minutes=1),
+                ),
+            ),
+        )
+    )
+
+    stored = repository.load_active_generation("project-1")
+    assert result.outcome == "unchanged"
+    assert stored is not None
+    assert stored.context.active_decisions[0].decision_text == "采用方案 A"
+
 @pytest.mark.parametrize(
     ("package", "message"),
     [
@@ -973,7 +1019,7 @@ def test_commit_allows_first_sourced_decision_after_failed_only_history(
         assert connection.execute(
             "SELECT COUNT(*) FROM project_versions WHERE project_id = ?",
             ("project-1",),
-        ).fetchone() == (0,)
+        ).fetchone() == (1,)
         assert connection.execute(
             "SELECT COUNT(*) FROM project_conflicts",
         ).fetchone() == (0,)

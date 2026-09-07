@@ -52,6 +52,13 @@ _DEFAULT_SYSTEM_PROMPT = (
     "return intent {\"type\":\"project_query\",\"query\":\"the user's focused "
     "project question\"} and an empty reply; the gateway will ground the answer "
     "from authorized project sources."
+    " If the user makes a meeting statement that proposes or reports a new project "
+    "decision which may replace an existing decision, return intent "
+    "{\"type\":\"project_conflict\",\"query\":\"the user's focused statement\","
+    "\"proposed_decision_text\":\"the explicit proposed decision\"} "
+    "and an empty reply. Use project_conflict only for assertions, never for "
+    "questions. The gateway will create a pending human review candidate and must "
+    "not change the active decision before approval."
 )
 _MEMORY_PROPOSAL_PROMPT = (
     " Optionally return memory_proposals as a list only when the user explicitly "

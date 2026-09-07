@@ -71,6 +71,23 @@ def test_project_query_intent_requires_a_query() -> None:
         VoiceIntent(type="project_query")
 
 
+def test_project_conflict_intent_requires_the_observed_statement() -> None:
+    intent = VoiceIntent(
+        type="project_conflict",
+        query="终端方案改成方案 A",
+        proposed_decision_text="采用方案 A",
+    )
+
+    assert intent.type == "project_conflict"
+    assert intent.query == "终端方案改成方案 A"
+
+    with pytest.raises(ValueError, match="query"):
+        VoiceIntent(type="project_conflict", proposed_decision_text="采用方案 A")
+
+    with pytest.raises(ValueError, match="proposed_decision_text"):
+        VoiceIntent(type="project_conflict", query="终端方案改成方案 A")
+
+
 def test_non_project_intent_rejects_a_project_query_field() -> None:
-    with pytest.raises(ValueError, match="query only"):
+    with pytest.raises(ValueError, match="project fields only"):
         VoiceIntent(type="next_meeting", query="终端方案")

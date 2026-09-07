@@ -47,6 +47,7 @@ class OutboundTts:
     session_id: str
     opus_frames: tuple[bytes, ...]
     purpose: Literal["conversation", "notification"] = "conversation"
+    cue: Literal["conflict"] | None = None
     delivery_completion: Future[None] | None = None
 
 
@@ -165,11 +166,14 @@ class DeviceTransport:
         self,
         session_id: str,
         opus_frames: tuple[bytes, ...],
+        *,
+        cue: Literal["conflict"] | None = None,
     ) -> None:
         self._send_tts_stream(
             session_id,
             opus_frames,
             purpose="conversation",
+            cue=cue,
         )
 
     def send_notification_tts_stream(
@@ -181,6 +185,7 @@ class DeviceTransport:
             session_id,
             opus_frames,
             purpose="notification",
+            cue=None,
         )
         if completion is None:
             raise RuntimeError("notification delivery completion is unavailable")
@@ -192,6 +197,7 @@ class DeviceTransport:
         opus_frames: tuple[bytes, ...],
         *,
         purpose: Literal["conversation", "notification"],
+        cue: Literal["conflict"] | None,
     ) -> Future[None] | None:
         frames = tuple(bytes(frame) for frame in opus_frames)
         if not frames:
@@ -214,6 +220,7 @@ class DeviceTransport:
             session_id=session_id,
             opus_frames=frames,
             purpose=purpose,
+            cue=cue,
             delivery_completion=delivery_completion,
         )
         try:

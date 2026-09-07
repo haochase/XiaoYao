@@ -13,6 +13,7 @@ from companion_gateway.project.models import (
 )
 from companion_gateway.project.service import (
     ProjectContextUnavailable,
+    ProjectMemoryError,
     ProjectMemoryService,
 )
 
@@ -216,6 +217,63 @@ def test_conflict_candidate_is_idempotent_and_starts_proposed() -> None:
     assert first == second
     assert first.status is ConflictStatus.PROPOSED
     assert first.project_id == "project-1"
+
+
+def test_conflict_statement_matching_the_active_decision_is_rejected() -> None:
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(decision(),)))
+
+    with pytest.raises(ProjectMemoryError, match="statement_matches_active_decision"):
+        service.propose_conflict_from_statement(
+            "project-1",
+            "终端方案继续采用方案 B",
+            proposed_decision_text="采用方案 B",
+            now=NOW,
+        )
+
+
+def test_conflict_uses_the_explicit_proposal_instead_of_sentence_markers() -> None:
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(decision(),)))
+
+    candidate, created = service.propose_conflict_from_statement(
+        "project-1",
+        "终端方案继续用方案 A",
+        proposed_decision_text="采用方案 A",
+        now=NOW,
+    )
+
+    assert created is True
+    assert candidate.status is ConflictStatus.PROPOSED
+
+    with pytest.raises(ProjectMemoryError, match="statement_matches_active_decision"):
+        service.propose_conflict_from_statement(
+            "project-1",
+            "不要改为方案 A，继续采用方案 B",
+            proposed_decision_text="采用方案 B",
+            now=NOW,
+        )
+
+
+@pytest.mark.parametrize(
+    "proposed_decision_text",
+    ("不采用方案 B", "采用方案 B 并增加离线推理"),
+)
+def test_conflict_does_not_treat_negation_or_added_constraints_as_equivalent(
+    proposed_decision_text: str,
+) -> None:
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(decision(),)))
+
+    candidate, created = service.propose_conflict_from_statement(
+        "project-1",
+        proposed_decision_text,
+        proposed_decision_text=proposed_decision_text,
+        now=NOW,
+    )
+
+    assert created is True
+    assert candidate.status is ConflictStatus.PROPOSED
 
 
 def test_rejecting_conflict_keeps_current_decision_active() -> None:

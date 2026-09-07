@@ -14,6 +14,7 @@ from companion_gateway.audio.bridge import Pcm16Mono
 from companion_gateway.domain.memory import MemoryCategory
 from companion_gateway.voice import mimo_v25
 from companion_gateway.voice.mimo_v25 import MimoV25Runtime, ModelRuntimeError
+from companion_gateway.voice.runtime import VoiceIntent
 
 
 class FakeResponse:
@@ -179,6 +180,40 @@ def test_mimo_runtime_exposes_grounded_project_query_intent(monkeypatch) -> None
     assert "project_query" in system_prompt
     assert '"query"' in system_prompt
     assert "gateway will ground" in system_prompt
+
+
+def test_mimo_runtime_exposes_project_conflict_intent(monkeypatch) -> None:
+    requests: list[dict[str, object]] = []
+
+    def fake_urlopen(request, *, timeout):
+        requests.append(json.loads(request.data))
+        return FakeResponse(
+            chat_payload(
+                '{"reply":"","task":null,"action":null,'
+                '"intent":{"type":"project_conflict",'
+                '"query":"终端方案改成方案 A",'
+                '"proposed_decision_text":"采用方案 A"}}'
+            )
+        )
+
+    monkeypatch.setattr(mimo_v25, "urlopen", fake_urlopen)
+    runtime = MimoV25Runtime(
+        openai_base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        api_key="example-token",
+    )
+
+    response = runtime.respond(input_pcm())
+
+    assert response.intent == VoiceIntent(
+        type="project_conflict",
+        query="终端方案改成方案 A",
+        proposed_decision_text="采用方案 A",
+    )
+    assert response.pcm is None
+    system_prompt = requests[0]["messages"][0]["content"]
+    assert "project_conflict" in system_prompt
+    assert "proposed_decision_text" in system_prompt
+    assert "pending human review" in system_prompt
 
 
 @pytest.mark.parametrize("reply_fragment", ["", '"reply":"",'])

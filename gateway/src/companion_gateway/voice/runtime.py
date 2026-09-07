@@ -42,16 +42,32 @@ class VoiceIntent(BaseModel):
         "reminder_status",
         "next_meeting",
         "project_query",
+        "project_conflict",
     ]
     query: str | None = None
+    proposed_decision_text: str | None = None
 
     @model_validator(mode="after")
     def validate_project_query(self) -> "VoiceIntent":
         if self.type == "project_query":
             if self.query is None or not self.query.strip():
                 raise ValueError("project_query requires query")
-        elif self.query is not None:
-            raise ValueError("query only applies to project_query")
+            if self.proposed_decision_text is not None:
+                raise ValueError(
+                    "proposed_decision_text only applies to project_conflict"
+                )
+        elif self.type == "project_conflict":
+            if self.query is None or not self.query.strip():
+                raise ValueError("project_conflict requires query")
+            if (
+                self.proposed_decision_text is None
+                or not self.proposed_decision_text.strip()
+            ):
+                raise ValueError(
+                    "project_conflict requires proposed_decision_text"
+                )
+        elif self.query is not None or self.proposed_decision_text is not None:
+            raise ValueError("project fields only apply to project intents")
         return self
 
 

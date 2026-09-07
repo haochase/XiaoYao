@@ -340,6 +340,95 @@ _TTS_STATE_PROFILE = _TTS_STATE_CONTINUOUS_PROFILE.replace(
     "                            SetDeviceState(kDeviceStateIdle);\n"
     "                        }\n",
 )
+_TTS_STATE_CONFLICT_PROFILE = _TTS_STATE_PROFILE.replace(
+    "                bool notification = cJSON_IsString(purpose) &&\n"
+    "                    strcmp(purpose->valuestring, \"notification\") == 0;\n",
+    "                bool notification = cJSON_IsString(purpose) &&\n"
+    "                    strcmp(purpose->valuestring, \"notification\") == 0;\n"
+    "                auto cue = cJSON_GetObjectItem(root, \"cue\");\n"
+    "                bool conflict_cue = cJSON_IsString(cue) &&\n"
+    "                    strcmp(cue->valuestring, \"conflict\") == 0;\n",
+).replace(
+    "                Schedule([this, notification]() {\n",
+    "                Schedule([this, notification, conflict_cue]() {\n",
+).replace(
+    "                    notification_stop_received_ = false;\n",
+    "                    notification_stop_received_ = false;\n"
+    "                    conflict_cue_active_ = conflict_cue;\n",
+).replace(
+    "            } else if (strcmp(state->valuestring, \"stop\") == 0) {\n"
+    "                Schedule([this]() {\n"
+    "                    if (GetDeviceState() == kDeviceStateSpeaking) {\n",
+    "            } else if (strcmp(state->valuestring, \"stop\") == 0) {\n"
+    "                Schedule([this]() {\n"
+    "                    conflict_cue_active_ = false;\n"
+    "                    if (GetDeviceState() == kDeviceStateSpeaking) {\n",
+)
+_AUDIO_CHANNEL_CLOSED_ANCHOR = (
+    "    protocol_->OnAudioChannelClosed([this, &board]() {\n"
+    "        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);\n"
+    "        Schedule([this]() {\n"
+    "            auto display = Board::GetInstance().GetDisplay();\n"
+    "            display->SetChatMessage(\"system\", \"\");\n"
+    "            SetDeviceState(kDeviceStateIdle);\n"
+    "        });\n"
+    "    });\n"
+)
+_AUDIO_CHANNEL_CLOSED_PROFILE = _AUDIO_CHANNEL_CLOSED_ANCHOR.replace(
+    "            SetDeviceState(kDeviceStateIdle);\n",
+    "            conflict_cue_active_ = false;\n"
+    "            SetDeviceState(kDeviceStateIdle);\n",
+)
+_STATE_CUE_CLEAR_ANCHOR = "    clock_ticks_ = 0;\n"
+_STATE_CUE_CLEAR_PROFILE = _STATE_CUE_CLEAR_ANCHOR + (
+    "    if (new_state != kDeviceStateSpeaking) {\n"
+    "        conflict_cue_active_ = false;\n"
+    "    }\n"
+)
+_STATE_LED_ANCHOR = "    led->OnStateChanged();\n"
+_STATE_LED_PROFILE = (
+    _STATE_LED_ANCHOR
+    + "    if (conflict_cue_active_) {\n"
+    "        led->ShowConflictCue();\n"
+    "    }\n"
+)
+_LED_INTERFACE_ANCHOR = "    virtual void OnStateChanged() = 0;\n"
+_LED_INTERFACE_PROFILE = _LED_INTERFACE_ANCHOR + (
+    "    virtual void ShowConflictCue() {}\n"
+)
+_SINGLE_LED_HEADER_ANCHOR = "    void OnStateChanged() override;\n"
+_SINGLE_LED_HEADER_PROFILE = _SINGLE_LED_HEADER_ANCHOR + (
+    "    void ShowConflictCue() override;\n"
+)
+_SINGLE_LED_SOURCE_ANCHOR = (
+    "void SingleLed::SetColor(uint8_t r, uint8_t g, uint8_t b) {\n"
+    "    r_ = r;\n"
+    "    g_ = g;\n"
+    "    b_ = b;\n"
+    "}\n"
+)
+_SINGLE_LED_SOURCE_PROFILE = _SINGLE_LED_SOURCE_ANCHOR + (
+    "\nvoid SingleLed::ShowConflictCue() {\n"
+    "    SetColor(DEFAULT_BRIGHTNESS, DEFAULT_BRIGHTNESS, 0);\n"
+    "    TurnOn();\n"
+    "}\n"
+)
+_CIRCULAR_LED_HEADER_ANCHOR = "    void OnStateChanged() override;\n"
+_CIRCULAR_LED_HEADER_PROFILE = _CIRCULAR_LED_HEADER_ANCHOR + (
+    "    void ShowConflictCue() override;\n"
+)
+_CIRCULAR_LED_SOURCE_ANCHOR = (
+    "        default:\n"
+    "            ESP_LOGW(TAG, \"Unknown led strip event: %d\", device_state);\n"
+    "            return;\n"
+    "    }\n"
+    "}\n"
+)
+_CIRCULAR_LED_SOURCE_PROFILE = _CIRCULAR_LED_SOURCE_ANCHOR + (
+    "\nvoid CircularStrip::ShowConflictCue() {\n"
+    "    SetAllColor({default_brightness_, default_brightness_, 0});\n"
+    "}\n"
+)
 _APP_FIELDS_ANCHOR = (
     "    bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)\n"
     "    int clock_ticks_ = 0;\n"
@@ -354,6 +443,11 @@ _APP_FIELDS_PROFILE = _APP_FIELDS_READY_PROFILE.replace(
     "    bool notification_tts_ = false;\n",
     "    bool notification_tts_ = false;\n"
     "    bool notification_stop_received_ = false;\n",
+)
+_APP_FIELDS_CONFLICT_PROFILE = _APP_FIELDS_PROFILE.replace(
+    "    bool notification_stop_received_ = false;\n",
+    "    bool notification_stop_received_ = false;\n"
+    "    bool conflict_cue_active_ = false;\n",
 )
 _APP_METHODS_ANCHOR = (
     "    void ContinueOpenAudioChannel(ListeningMode mode);\n"
@@ -491,6 +585,11 @@ def apply_vendor_profile(source_root: Path) -> None:
     )
     _apply_exact_profile(
         source_root / "main" / "application.cc",
+        _AUDIO_CHANNEL_CLOSED_ANCHOR,
+        _AUDIO_CHANNEL_CLOSED_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.cc",
         _CLOCK_TICK_ANCHOR,
         _CLOCK_TICK_PROFILE,
     )
@@ -512,12 +611,23 @@ def apply_vendor_profile(source_root: Path) -> None:
     _apply_exact_profile(
         source_root / "main" / "application.cc",
         _TTS_STATE_ANCHOR,
-        _TTS_STATE_PROFILE,
+        _TTS_STATE_CONFLICT_PROFILE,
         previous_profiles=(
             _TTS_STATE_READY_PROFILE,
             _TTS_STATE_IMMEDIATE_DONE_PROFILE,
             _TTS_STATE_CONTINUOUS_PROFILE,
+            _TTS_STATE_PROFILE,
         ),
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.cc",
+        _STATE_CUE_CLEAR_ANCHOR,
+        _STATE_CUE_CLEAR_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.cc",
+        _STATE_LED_ANCHOR,
+        _STATE_LED_PROFILE,
     )
     _apply_exact_profile(
         source_root / "main" / "application.cc",
@@ -532,8 +642,8 @@ def apply_vendor_profile(source_root: Path) -> None:
     _apply_exact_profile(
         source_root / "main" / "application.h",
         _APP_FIELDS_ANCHOR,
-        _APP_FIELDS_PROFILE,
-        previous_profiles=(_APP_FIELDS_READY_PROFILE,),
+        _APP_FIELDS_CONFLICT_PROFILE,
+        previous_profiles=(_APP_FIELDS_READY_PROFILE, _APP_FIELDS_PROFILE),
     )
     _apply_exact_profile(
         source_root / "main" / "application.h",
@@ -563,6 +673,31 @@ def apply_vendor_profile(source_root: Path) -> None:
         source_root / "main" / "protocols" / "websocket_protocol.cc",
         _WEBSOCKET_FEATURE_ANCHOR,
         _WEBSOCKET_FEATURE_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "led" / "led.h",
+        _LED_INTERFACE_ANCHOR,
+        _LED_INTERFACE_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "led" / "single_led.h",
+        _SINGLE_LED_HEADER_ANCHOR,
+        _SINGLE_LED_HEADER_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "led" / "single_led.cc",
+        _SINGLE_LED_SOURCE_ANCHOR,
+        _SINGLE_LED_SOURCE_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "led" / "circular_strip.h",
+        _CIRCULAR_LED_HEADER_ANCHOR,
+        _CIRCULAR_LED_HEADER_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "led" / "circular_strip.cc",
+        _CIRCULAR_LED_SOURCE_ANCHOR,
+        _CIRCULAR_LED_SOURCE_PROFILE,
     )
     _apply_exact_profile(
         source_root / "scripts" / "build.py",

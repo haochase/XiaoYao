@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import RLock
+from typing import Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -61,12 +62,21 @@ class VoiceTurn:
     device_opus_frames: tuple[bytes, ...]
     task: TaskRecord | None = None
     memory_proposal_ids: tuple[str, ...] = ()
+    device_cue: Literal["conflict"] | None = None
+    conflict_candidate_id: str | None = None
 
     @property
     def device_opus_frame(self) -> bytes:
         if len(self.device_opus_frames) != 1:
             raise ValueError("voice turn contains more than one Opus frame")
         return self.device_opus_frames[0]
+
+
+@dataclass(frozen=True)
+class ResolvedVoiceIntent:
+    text: str
+    device_cue: Literal["conflict"] | None = None
+    conflict_candidate_id: str | None = None
 
 
 class VoiceTurnService:
@@ -187,11 +197,16 @@ class VoiceTurnService:
         response = self._model_runtime.respond(input_pcm)
         response_text = response.text
         response_pcm = response.pcm
+        device_cue = None
+        conflict_candidate_id = None
         if response.intent is not None:
-            response_text = self._resolve_intent(
+            resolved_intent = self._resolve_intent(
                 response.intent,
                 target_device_id=target_device_id,
             )
+            response_text = resolved_intent.text
+            device_cue = resolved_intent.device_cue
+            conflict_candidate_id = resolved_intent.conflict_candidate_id
             response_pcm = self._synthesize(response_text)
         if response_pcm is None:
             raise RuntimeError("voice response audio is required")
@@ -233,6 +248,8 @@ class VoiceTurnService:
             device_opus_frames=device_opus_frames,
             task=task,
             memory_proposal_ids=memory_proposal_ids,
+            device_cue=device_cue,
+            conflict_candidate_id=conflict_candidate_id,
         )
 
     def _resolve_intent(
@@ -240,14 +257,14 @@ class VoiceTurnService:
         intent: VoiceIntent,
         *,
         target_device_id: str | None,
-    ) -> str:
+    ) -> "ResolvedVoiceIntent":
         now = self._clock().astimezone(_SHANGHAI_TIMEZONE)
         if intent.type == "current_time":
-            return f"现在是{now.hour}点{now.minute:02d}分。"
+            return ResolvedVoiceIntent(f"现在是{now.hour}点{now.minute:02d}分。")
         if intent.type == "current_date":
-            return f"今天是{now.year}年{now.month}月{now.day}日。"
+            return ResolvedVoiceIntent(f"今天是{now.year}年{now.month}月{now.day}日。")
         if intent.type == "current_datetime":
-            return (
+            return ResolvedVoiceIntent(
                 f"现在是{now.year}年{now.month}月{now.day}日"
                 f"{now.hour}点{now.minute:02d}分。"
             )
@@ -255,17 +272,17 @@ class VoiceTurnService:
             if self._meeting_context is None or not self._meeting_context.is_fresh(
                 now=now
             ):
-                return "暂时无法读取飞书日历，请稍后再试。"
+                return ResolvedVoiceIntent("暂时无法读取飞书日历，请稍后再试。")
             meeting = self._meeting_context.next_meeting(now=now)
             if meeting is None:
-                return "未来24小时没有查到会议。"
+                return ResolvedVoiceIntent("未来24小时没有查到会议。")
             local = meeting.start_at.astimezone(_SHANGHAI_TIMEZONE)
             location = f"，地点是{meeting.location}" if meeting.location else ""
-            return (
+            return ResolvedVoiceIntent(
                 f"下一场会议是{meeting.summary}，{local.hour}点"
                 f"{local.minute:02d}分开始{location}。"
             )
-        if intent.type == "project_query":
+        if intent.type in {"project_query", "project_conflict"}:
             project_id = (
                 self._project_ids_by_device.get(target_device_id)
                 if target_device_id is not None
@@ -275,9 +292,38 @@ class VoiceTurnService:
                 self._project_memory is None
                 or project_id is None
                 or intent.query is None
+                or (
+                    intent.type == "project_conflict"
+                    and intent.proposed_decision_text is None
+                )
             ):
-                return "暂时无法确认项目记忆，请稍后再试。"
+                return ResolvedVoiceIntent("暂时无法确认项目记忆，请稍后再试。")
             try:
+                if intent.type == "project_conflict":
+                    candidate, created = (
+                        self._project_memory.propose_conflict_from_statement(
+                            project_id,
+                            intent.query,
+                            proposed_decision_text=intent.proposed_decision_text,
+                            now=self._clock(),
+                        )
+                    )
+                    if candidate.status.value != "proposed":
+                        return ResolvedVoiceIntent(
+                            "这条待确认项已经处理，当前有效决策未改变。"
+                        )
+                    if not created:
+                        return ResolvedVoiceIntent(
+                            "这句话已有待确认项，请负责人核验。",
+                            device_cue="conflict",
+                            conflict_candidate_id=candidate.candidate_id,
+                        )
+                    return ResolvedVoiceIntent(
+                        "检测到这句话可能与当前有效决策不一致，"
+                        "已创建待确认项，请负责人核验。",
+                        device_cue="conflict",
+                        conflict_candidate_id=candidate.candidate_id,
+                    )
                 answer = self._project_memory.answer(
                     project_id,
                     intent.query,
@@ -286,23 +332,31 @@ class VoiceTurnService:
                 )
             except ProjectContextUnavailable as exc:
                 if str(exc) == "source_stale":
-                    return "相关项目资料已过期，请先同步。"
+                    return ResolvedVoiceIntent("相关项目资料已过期，请先同步。")
                 if str(exc) == "evidence_pending":
-                    return "后台正在同步补充证据，请稍后再试。"
-                return "暂时无法确认项目记忆，请稍后再试。"
-            except (ProjectMemoryError, ValueError):
-                return "暂时无法确认项目记忆，请稍后再试。"
-            return answer.text
+                    return ResolvedVoiceIntent(
+                        "后台正在同步补充证据，请稍后再试。"
+                    )
+                return ResolvedVoiceIntent("暂时无法确认项目记忆，请稍后再试。")
+            except (ProjectMemoryError, ValueError) as exc:
+                if str(exc) == "statement_matches_active_decision":
+                    return ResolvedVoiceIntent(
+                        "这句话与当前有效决策一致，无需创建待确认项。"
+                    )
+                return ResolvedVoiceIntent("暂时无法确认项目记忆，请稍后再试。")
+            return ResolvedVoiceIntent(answer.text)
         if self._task_service is None or target_device_id is None:
-            return "目前没有找到提醒。"
+            return ResolvedVoiceIntent("目前没有找到提醒。")
         task = self._task_service.get_latest_reminder(
             actor_id=self._actor_id,
             target_device_id=target_device_id,
         )
         if task is None:
-            return "目前没有找到提醒。"
+            return ResolvedVoiceIntent("目前没有找到提醒。")
         status = _TASK_STATUS_LABELS[task.status]
-        return f"最近的提醒“{task.payload.text}”当前状态是{status}。"
+        return ResolvedVoiceIntent(
+            f"最近的提醒“{task.payload.text}”当前状态是{status}。"
+        )
 
     def _synthesize(self, text: str) -> Pcm16Mono:
         synthesize = getattr(self._model_runtime, "synthesize", None)

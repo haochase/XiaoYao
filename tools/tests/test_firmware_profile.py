@@ -28,6 +28,8 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     scripts.mkdir()
     protocols = main / "protocols"
     protocols.mkdir()
+    led = main / "led"
+    led.mkdir()
     kconfig_path = main / "Kconfig.projbuild"
     application_path = main / "application.cc"
     application_header_path = main / "application.h"
@@ -35,6 +37,32 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     protocol_source_path = protocols / "protocol.cc"
     websocket_source_path = protocols / "websocket_protocol.cc"
     build_path = scripts / "build.py"
+    (led / "led.h").write_text(
+        "class Led {\npublic:\n"
+        + firmware_profile._LED_INTERFACE_ANCHOR
+        + "};\n",
+        encoding="utf-8",
+    )
+    (led / "single_led.h").write_text(
+        "class SingleLed {\npublic:\n"
+        + firmware_profile._SINGLE_LED_HEADER_ANCHOR
+        + "};\n",
+        encoding="utf-8",
+    )
+    (led / "single_led.cc").write_text(
+        firmware_profile._SINGLE_LED_SOURCE_ANCHOR,
+        encoding="utf-8",
+    )
+    (led / "circular_strip.h").write_text(
+        "class CircularStrip {\npublic:\n"
+        + firmware_profile._CIRCULAR_LED_HEADER_ANCHOR
+        + "};\n",
+        encoding="utf-8",
+    )
+    (led / "circular_strip.cc").write_text(
+        firmware_profile._CIRCULAR_LED_SOURCE_ANCHOR,
+        encoding="utf-8",
+    )
     kconfig_path.write_text(
         "menu \"Xiaozhi Assistant\"\n\n"
         "config OTA_URL\n"
@@ -56,7 +84,8 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
         "}\n"
         "\n"
         "void Application::InitializeProtocol() {\n"
-        "    if (ota_->HasMqttConfig()) {\n"
+        + firmware_profile._AUDIO_CHANNEL_CLOSED_ANCHOR
+        + "    if (ota_->HasMqttConfig()) {\n"
         "        protocol_ = std::make_unique<MqttProtocol>();\n"
         "    } else if (ota_->HasWebsocketConfig()) {\n"
         "        protocol_ = std::make_unique<WebsocketProtocol>();\n"
@@ -67,7 +96,13 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
         "}\n"
         "\n"
         "void Application::HandleStateChangedEvent() {\n"
-        "    switch (GetDeviceState()) {\n"
+        "    DeviceState new_state = state_machine_.GetState();\n"
+        + firmware_profile._STATE_CUE_CLEAR_ANCHOR
+        + "    auto& board = Board::GetInstance();\n"
+        "    auto display = board.GetDisplay();\n"
+        "    auto led = board.GetLed();\n"
+        + firmware_profile._STATE_LED_ANCHOR
+        + "    switch (GetDeviceState()) {\n"
         "        case kDeviceStateSpeaking:\n"
         "            if (listening_mode_ != kListeningModeRealtime) {\n"
         "                audio_service_.EnableVoiceProcessing(false);\n"
@@ -162,10 +197,14 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     assert "audio_service_.IsPlaybackIdle()" in application
     assert "notification_stop_received_ = true;" in application
     assert "Return to wake-word standby after each conversation turn." in application
+    assert "conflict_cue_active_ = conflict_cue;" in application
+    assert "led->ShowConflictCue();" in application
+    assert "conflict_cue_active_ = false;" in application
     assert "SetDeviceState(kDeviceStateListening);" not in application
     application_header = application_header_path.read_text(encoding="utf-8")
     assert "bool network_connected_ = false;" in application_header
     assert "bool notification_stop_received_ = false;" in application_header
+    assert "bool conflict_cue_active_ = false;" in application_header
     assert "void EnsureIdleControlChannel();" in application_header
     assert "void FinishNotificationIfPlaybackDrained();" in application_header
     protocol_header = protocol_header_path.read_text(encoding="utf-8")
@@ -182,6 +221,11 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     build_source = build_path.read_text(encoding="utf-8")
     assert 'os.environ.get("XIAOYAO_IDF_SCRIPT")' in build_source
     assert "[sys.executable, idf_script]" in build_source
+    assert "virtual void ShowConflictCue()" in (led / "led.h").read_text()
+    assert "SingleLed::ShowConflictCue()" in (led / "single_led.cc").read_text()
+    assert "CircularStrip::ShowConflictCue()" in (
+        led / "circular_strip.cc"
+    ).read_text()
 
 
 def test_public_xiaoyao_profile_selects_an_esp32s3_chinese_multinet_model() -> None:

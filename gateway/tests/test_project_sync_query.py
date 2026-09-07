@@ -18,6 +18,7 @@ from companion_gateway.project.models import (
     EvidenceRef,
     ProjectContextPackage,
 )
+from companion_gateway.project.repository import ProjectMemoryRepository
 from companion_gateway.project.service import (
     ProjectContextUnavailable,
     ProjectMemoryService,
@@ -279,6 +280,49 @@ def test_realistic_decision_fragments_win_before_evidence_fallback(
     assert answer.text == "当前有效决策：采用方案 B"
     assert answer.source_refs == decision.source_refs
     assert policy.calls == [(PROJECT_ID, decision.source_refs, NOW)]
+
+
+def test_reviewed_decision_overrides_the_cached_sync_snapshot(tmp_path: Path) -> None:
+    document = evidence_source("document-reviewed")
+    decision = decision_for(document)
+    snapshot = project_snapshot(sources=(document,), chunks=(), decision=decision)
+    registry = ProjectSnapshotRegistry()
+    registry.swap(PROJECT_ID, snapshot)
+    repository = ProjectMemoryRepository(tmp_path / "reviewed-query.db")
+    repository.initialize()
+    policy = RecordingSourcePolicy()
+    service = ProjectMemoryService(
+        repository=repository,
+        clock=lambda: NOW,
+        source_policy=policy,
+        snapshot_reader=registry,
+        retrieval_writer=repository_at(tmp_path),
+    )
+    service.replace_context(snapshot.context)
+    candidate, _ = service.propose_conflict_from_statement(
+        PROJECT_ID,
+        "终端方案改成方案 A",
+        proposed_decision_text="采用方案 A",
+        now=NOW,
+    )
+    service.review_conflict(
+        candidate.candidate_id,
+        reviewer_id="owner-1",
+        action="accept",
+        change_reason="供应风险变化",
+        new_decision_text="采用方案 A",
+        evidence_refs=decision.source_refs,
+        now=NOW,
+    )
+
+    answer = service.answer(
+        PROJECT_ID,
+        "终端方案",
+        kind=AnswerKind.DECISION_CHECK,
+        now=NOW,
+    )
+
+    assert answer.text == "当前有效决策：采用方案 A"
 
 
 def test_fragment_match_requires_a_topic_fragment() -> None:

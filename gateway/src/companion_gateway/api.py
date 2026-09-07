@@ -111,6 +111,7 @@ from companion_gateway.project.auth import (
 )
 from companion_gateway.project.models import (
     AnswerKind,
+    ConflictStatus,
     EvidenceRef,
     ProjectContextPackage,
 )
@@ -821,6 +822,19 @@ def create_app(
             content={"created": created, "candidate": jsonable_encoder(candidate)},
         )
 
+    @app.get("/v1/projects/{project_id}/conflicts")
+    def list_project_conflicts(
+        request: Request,
+        project_id: str,
+        status: ConflictStatus | None = Query(default=None),
+    ) -> dict[str, object]:
+        authorize_project_context(request, project_id, require_review=True)
+        try:
+            conflicts = project_memory.list_conflicts(project_id, status=status)
+        except ProjectContextUnavailable as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"conflicts": jsonable_encoder(conflicts)}
+
     @app.post("/v1/projects/conflicts/{candidate_id}/review")
     def review_project_conflict(
         request: Request,
@@ -1171,14 +1185,15 @@ def create_app(
                             notification_done.clear()
                             notification_early_done = False
                             notification_waiting_for = "ready"
-                        await websocket.send_json(
-                            {
-                                "type": "tts",
-                                "state": "start",
-                                "purpose": message.purpose,
-                                "session_id": message.session_id,
-                            }
-                        )
+                        tts_start = {
+                            "type": "tts",
+                            "state": "start",
+                            "purpose": message.purpose,
+                            "session_id": message.session_id,
+                        }
+                        if message.cue is not None:
+                            tts_start["cue"] = message.cue
+                        await websocket.send_json(tts_start)
                         if message.purpose == "notification":
                             await _wait_for_notification_signal(
                                 notification_ready,

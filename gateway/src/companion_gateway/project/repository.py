@@ -225,6 +225,27 @@ class ProjectMemoryRepository:
             else None
         )
 
+    def list_conflicts(
+        self,
+        project_id: str,
+        *,
+        status: ConflictStatus | None = None,
+    ) -> list[ConflictCandidate]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload_json FROM project_conflicts ORDER BY candidate_id"
+            ).fetchall()
+        candidates = (
+            ConflictCandidate.model_validate_json(row["payload_json"])
+            for row in rows
+        )
+        return [
+            candidate
+            for candidate in candidates
+            if candidate.project_id == project_id
+            and (status is None or candidate.status is status)
+        ]
+
     def commit_conflict_review(
         self,
         *,

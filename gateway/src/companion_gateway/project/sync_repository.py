@@ -11,7 +11,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
-from companion_gateway.project.models import ProjectContextPackage
+from companion_gateway.project.models import (
+    DecisionStatus,
+    DecisionVersion,
+    ProjectContextPackage,
+)
 from companion_gateway.project.repository import ProjectMemoryRepository
 from companion_gateway.project.sync_models import (
     ClaimedRetrievalRequest,
@@ -470,6 +474,15 @@ class ProjectSyncRepository:
                 """,
                 (_SCHEMA_VERSION,),
             )
+            context_rows = connection.execute(
+                "SELECT project_id, payload_json FROM project_contexts"
+            ).fetchall()
+            for row in context_rows:
+                self._ensure_initial_decision_versions(
+                    connection,
+                    str(row["project_id"]),
+                    ProjectContextPackage.model_validate_json(row["payload_json"]),
+                )
 
     def project_requires_clock_resync(self, project_id: str) -> bool:
         with self._connect() as connection:
@@ -829,6 +842,14 @@ class ProjectSyncRepository:
             self._assert_protection_access(connection)
             active = self._load_active_row(connection, envelope.project_id)
             stored_context = self._load_context(connection, envelope.project_id)
+            reviewed_decision_ids = self._reviewed_decision_ids(
+                connection, envelope.project_id
+            )
+            effective_context = self._preserve_reviewed_decisions(
+                stored_context,
+                envelope.context,
+                reviewed_decision_ids,
+            )
             if active is not None:
                 active_cursor = int(active["source_cursor"])
                 active_hash = str(active["content_hash"])
@@ -837,7 +858,7 @@ class ProjectSyncRepository:
                 self._validate_source_heads(connection, candidate)
                 self._check_context_conflicts(
                     stored_context,
-                    envelope.context,
+                    effective_context,
                     envelope.tombstones,
                     allow_initial_decisions=(
                         envelope.source_cursor > active_cursor
@@ -865,12 +886,17 @@ class ProjectSyncRepository:
                     return stored_result
                 if envelope.content_hash == active_hash:
                     self._validate_audit(candidate, "unchanged")
-                    return self._commit_unchanged(connection, candidate, active)
+                    return self._commit_unchanged(
+                        connection,
+                        candidate,
+                        active,
+                        effective_context,
+                    )
 
             if active is None:
                 self._check_context_conflicts(
                     stored_context,
-                    envelope.context,
+                    effective_context,
                     envelope.tombstones,
                 )
                 self._validate_source_heads(connection, candidate)
@@ -883,6 +909,11 @@ class ProjectSyncRepository:
                 else "applied"
             )
             self._validate_audit(candidate, outcome)
+            self._ensure_initial_decision_versions(
+                connection,
+                envelope.project_id,
+                effective_context,
+            )
             prior_generation_id = (
                 str(active["generation_id"]) if active is not None else None
             )
@@ -918,7 +949,7 @@ class ProjectSyncRepository:
                 ON CONFLICT(project_id) DO UPDATE SET
                     payload_json = excluded.payload_json
                 """,
-                (envelope.project_id, envelope.context.model_dump_json()),
+                (envelope.project_id, effective_context.model_dump_json()),
             )
             connection.execute(
                 """
@@ -935,7 +966,7 @@ class ProjectSyncRepository:
                     envelope.source_cursor,
                     envelope.content_hash,
                     _completion_claims_hash(envelope),
-                    _canonical_json(envelope.context.model_dump(mode="json")),
+                    _canonical_json(effective_context.model_dump(mode="json")),
                     outcome,
                     _datetime_text(candidate.audit.finished_at),
                 ),
@@ -1357,6 +1388,100 @@ class ProjectSyncRepository:
         return updated.rowcount == 1
 
     @staticmethod
+    def _reviewed_decision_ids(
+        connection: sqlite3.Connection,
+        project_id: str,
+    ) -> frozenset[str]:
+        rows = connection.execute(
+            """
+            SELECT payload_json FROM project_versions
+            WHERE project_id = ?
+            ORDER BY decision_id, version
+            """,
+            (project_id,),
+        ).fetchall()
+        latest: dict[str, DecisionVersion] = {}
+        for row in rows:
+            version = DecisionVersion.model_validate_json(row["payload_json"])
+            latest[version.decision_id] = version
+        return frozenset(
+            decision_id
+            for decision_id, version in latest.items()
+            if version.version > 1 and version.status is DecisionStatus.ACTIVE
+        )
+
+    @staticmethod
+    def _preserve_reviewed_decisions(
+        stored: ProjectContextPackage | None,
+        candidate: ProjectContextPackage,
+        reviewed_decision_ids: frozenset[str],
+    ) -> ProjectContextPackage:
+        if stored is None or not reviewed_decision_ids:
+            return candidate
+        reviewed = {
+            decision.decision_id: decision
+            for decision in stored.active_decisions
+            if decision.decision_id in reviewed_decision_ids
+        }
+        if not reviewed:
+            return candidate
+        candidate_ids = {
+            decision.decision_id for decision in candidate.active_decisions
+        }
+        active_decisions = tuple(
+            reviewed.get(decision.decision_id, decision)
+            for decision in candidate.active_decisions
+        ) + tuple(
+            decision
+            for decision in stored.active_decisions
+            if decision.decision_id in reviewed
+            and decision.decision_id not in candidate_ids
+        )
+        return candidate.model_copy(update={"active_decisions": active_decisions})
+
+    @staticmethod
+    def _ensure_initial_decision_versions(
+        connection: sqlite3.Connection,
+        project_id: str,
+        context: ProjectContextPackage,
+    ) -> None:
+        for decision in context.active_decisions:
+            exists = connection.execute(
+                """
+                SELECT 1 FROM project_versions
+                WHERE project_id = ? AND decision_id = ?
+                LIMIT 1
+                """,
+                (project_id, decision.decision_id),
+            ).fetchone()
+            if exists is not None:
+                continue
+            version = DecisionVersion(
+                decision_id=decision.decision_id,
+                version=1,
+                change_reason="初始项目决策",
+                decision_text=decision.decision_text,
+                proposed_by=decision.owner,
+                approved_by=decision.owner,
+                approved_at=decision.decided_at,
+                status=DecisionStatus.ACTIVE,
+                evidence_refs=decision.source_refs,
+            )
+            connection.execute(
+                """
+                INSERT INTO project_versions(
+                    project_id, decision_id, version, payload_json
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    version.decision_id,
+                    version.version,
+                    version.model_dump_json(),
+                ),
+            )
+
+    @staticmethod
     def _load_active_row(
         connection: sqlite3.Connection,
         project_id: str,
@@ -1746,6 +1871,7 @@ class ProjectSyncRepository:
         connection: sqlite3.Connection,
         candidate: SyncCommit,
         active: sqlite3.Row,
+        effective_context: ProjectContextPackage,
     ) -> SyncCommitResult:
         project_id = candidate.envelope.project_id
         generation_id = str(active["generation_id"])
@@ -1784,7 +1910,7 @@ class ProjectSyncRepository:
             WHERE project_id = ?
             """,
             (
-                candidate.envelope.context.model_dump_json(),
+                effective_context.model_dump_json(),
                 project_id,
             ),
         )
@@ -1798,7 +1924,7 @@ class ProjectSyncRepository:
                 candidate.envelope.source_cursor,
                 _completion_claims_hash(candidate.envelope),
                 _canonical_json(
-                    candidate.envelope.context.model_dump(mode="json")
+                    effective_context.model_dump(mode="json")
                 ),
                 project_id,
                 generation_id,
