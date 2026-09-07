@@ -28,6 +28,19 @@ $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 See [`gateway/README.md`](gateway/README.md) for device authentication,
 WebSocket controls, and local server setup.
 
+## XiaoQian project memory assistant
+
+XiaoQian (小千) is the project-memory desktop meeting assistant built on this
+shared XiaoYao gateway. It uses QwenWork and allowlisted DWS sources to maintain
+source-backed project decisions, then lets an ESP32 voice terminal query the
+current decision without storing project documents or model credentials on the
+device. Stale, unauthorized, or unsupported facts fail closed instead of being
+guessed.
+
+The existing `hui-anchor` branch, project IDs, and
+`hui-anchor-dws-project-context-v1` Skill ID remain compatibility identifiers;
+XiaoQian is the product display name.
+
 ## Private DWS project synchronization
 
 The optional DWS workflow keeps connector credentials and its resource

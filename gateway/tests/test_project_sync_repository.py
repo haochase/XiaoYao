@@ -84,7 +84,7 @@ def context(**updates: object) -> ProjectContextPackage:
     )
     values: dict[str, object] = {
         "project_id": "project-1",
-        "project_name": "会锚项目",
+        "project_name": "小千项目",
         "generated_at": NOW,
         "source_refs": (reference,),
         "active_decisions": (decision,),

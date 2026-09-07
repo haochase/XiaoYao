@@ -7,6 +7,32 @@ import pytest
 from tools.package_dws_context_skill import package_skill
 
 
+def test_skill_uses_xiaoqian_display_brand_and_keeps_compatibility_id() -> None:
+    skill = (
+        Path(__file__).resolve().parents[2]
+        / "skills"
+        / "hui-anchor-dws-project-context-v1"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    assert "name: hui-anchor-dws-project-context-v1" in skill
+    assert "name_en: XiaoQian Project Context" in skill
+    assert "name_zh: 小千项目上下文" in skill
+    assert "# XiaoQian Project Context" in skill
+    assert "Hui Anchor Project Context" not in skill
+    assert "会锚项目上下文" not in skill
+
+
+def test_repository_readme_introduces_xiaoqian_product_layer() -> None:
+    readme = (Path(__file__).resolve().parents[2] / "README.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "## XiaoQian project memory assistant" in readme
+    assert "XiaoQian (小千)" in readme
+    assert "hui-anchor-dws-project-context-v1" in readme
+
+
 def test_package_contains_only_public_self_contained_skill(tmp_path: Path) -> None:
     target = tmp_path / "context-skill.zip"
     package_skill(target)

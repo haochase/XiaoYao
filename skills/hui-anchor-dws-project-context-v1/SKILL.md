@@ -1,17 +1,17 @@
 ---
 name: hui-anchor-dws-project-context-v1
-name_en: Hui Anchor Project Context
-name_zh: 会锚项目上下文
-description: Use when the Hui Anchor DWS sync workflow supplies a validated DwsSourceBundle for project context generation.
-description_en: Use when the Hui Anchor DWS sync workflow supplies a validated DwsSourceBundle for project context generation.
-description_zh: 在会锚 DWS 同步流程提供经过校验的 DwsSourceBundle、需要生成有证据的项目上下文时使用。
+name_en: XiaoQian Project Context
+name_zh: 小千项目上下文
+description: Use when the XiaoQian DWS sync workflow supplies a validated DwsSourceBundle for project context generation.
+description_en: Use when the XiaoQian DWS sync workflow supplies a validated DwsSourceBundle for project context generation.
+description_zh: 在小千 DWS 同步流程提供经过校验的 DwsSourceBundle、需要生成有证据的项目上下文时使用。
 argument-hint: Supply the validated source bundle from the sync workflow
 argument-hint-en: Supply the validated source bundle from the sync workflow
 argument-hint-zh: 提供同步流程已经校验的资料包
 user-invocable: true
 ---
 
-# Hui Anchor Project Context
+# XiaoQian Project Context
 
 Produce one `QwenProjectContextArtifact` JSON object in memory from the supplied
 `DwsSourceBundle`. Read [contract.md](contract.md) for the exact output shape.

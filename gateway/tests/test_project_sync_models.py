@@ -34,7 +34,7 @@ HASH_D = "d" * 64
 def context(**updates: object) -> ProjectContextPackage:
     values: dict[str, object] = {
         "project_id": "project-demo",
-        "project_name": "会锚项目",
+        "project_name": "小千项目",
         "generated_at": NOW,
         "permission_scope": "project:demo",
     }

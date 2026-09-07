@@ -125,7 +125,7 @@ def project_snapshot(
     refs = tuple(source_ref(source) for source in sources)
     context = ProjectContextPackage(
         project_id=PROJECT_ID,
-        project_name="会锚项目",
+        project_name="小千项目",
         generated_at=NOW,
         source_refs=refs,
         active_decisions=(decision,) if decision is not None else (),
