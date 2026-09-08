@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from companion_gateway.project.sync_models import SourceErrorType, SyncSourceType
+from tools.dws_sync import core_trust
 from tools.dws_sync.adapters import (
     DwsSourceBundle,
     DwsSourceRecord,
@@ -274,6 +275,117 @@ def test_normal_runner_constructor_rejects_internal_launch_overrides(
             _launch_path=tmp_path / "untrusted.exe",
             _launch_env={"COMPANION_DWS_SYNC_TOKEN": "secret"},
         )
+
+
+@pytest.mark.parametrize("change", ["binary", "version", "approval", "signature"])
+def test_official_core_runner_revalidates_each_document_call(
+    tmp_path: Path, change: str
+) -> None:
+    installation, wrapper, core, approvals = official_installation(tmp_path)
+    write_approval(approvals, core)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    signatures: list[Path] = []
+    signature_status = "Valid"
+
+    def signature_reader(path: Path) -> AuthenticodeDescriptor:
+        signatures.append(path)
+        return AuthenticodeDescriptor(
+            signature_status, "BRIGHT ZENITH PRIVATE LIMITED", "D" * 40
+        )
+
+    popen = RecordingPopen(FakeProcess(b'{"success":true}'))
+    runner = DwsCommandRunner.from_official_core(
+        wrapper,
+        runtime_root=runtime,
+        profile="corp:user",
+        popen=popen,
+        _official_bin=installation,
+        _processor_architecture="AMD64",
+        _approvals_path=approvals,
+        _signature_reader=signature_reader,
+    )
+    runner.run(("doc", "info", "--node", "doc-1"))
+    assert signatures == [core, core]
+    popen.calls.clear()
+    popen.process = FakeProcess(b'{"success":true}')
+    signatures.clear()
+    if change == "binary":
+        replacement = core.with_suffix(".replacement")
+        replacement.write_bytes(b"upgraded-core")
+        replacement.replace(core)
+    elif change == "version":
+        (core.parent / ".dws-version").write_text("1.0.62\n", encoding="ascii")
+    elif change == "approval":
+        approvals.write_text("{}", encoding="utf-8")
+    else:
+        signature_status = "NotSigned"
+
+    with pytest.raises(ValueError, match="^dws_core_changed_requires_approval$"):
+        runner.run(("doc", "content", "--node", "doc-1"))
+    assert popen.calls == []
+    if change == "signature":
+        assert signatures == [core]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file sharing contract")
+@pytest.mark.parametrize("operation", ["write", "replace", "delete"])
+def test_official_core_stays_locked_from_signature_until_process_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    installation, wrapper, core, approvals = official_installation(tmp_path)
+    write_approval(approvals, core)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    replacement = tmp_path / "replacement.exe"
+    replacement.write_bytes(b"upgraded-core")
+    original = core.read_bytes()
+    checked: list[str] = []
+
+    def attempt_mutation(stage: str) -> None:
+        with pytest.raises(PermissionError):
+            if operation == "write":
+                core.write_bytes(b"tampered-core")
+            elif operation == "replace":
+                replacement.replace(core)
+            else:
+                core.unlink()
+        assert core.read_bytes() == original
+        checked.append(stage)
+
+    real_hash = core_trust._sha256_regular_file
+
+    def hash_core(path: Path) -> str:
+        attempt_mutation("hash")
+        return real_hash(path)
+
+    monkeypatch.setattr(core_trust, "_sha256_regular_file", hash_core)
+
+    def signature_reader(path: Path) -> AuthenticodeDescriptor:
+        attempt_mutation("signature")
+        return AuthenticodeDescriptor(
+            "Valid", "BRIGHT ZENITH PRIVATE LIMITED", "D" * 40
+        )
+
+    def popen(*args, **kwargs):
+        attempt_mutation("popen")
+        return FakeProcess(b'{"success":true}')
+
+    runner = DwsCommandRunner.from_official_core(
+        wrapper,
+        runtime_root=runtime,
+        profile="corp:user",
+        popen=popen,
+        _official_bin=installation,
+        _processor_architecture="AMD64",
+        _approvals_path=approvals,
+        _signature_reader=signature_reader,
+    )
+    checked.clear()
+    runner.run(("doc", "info", "--node", "doc-1"))
+    assert checked == ["hash", "signature", "hash", "popen"]
+    replacement.replace(core)
+    assert core.read_bytes() == b"upgraded-core"
 
 
 @pytest.mark.parametrize("failure", ["approval", "signature"])

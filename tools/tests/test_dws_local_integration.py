@@ -376,6 +376,7 @@ def _run_direct_runtime_process(
     allow_credential_decrypt: bool,
 ) -> tuple[int, dict[str, object]]:
     code = """
+from contextlib import nullcontext
 from pathlib import Path
 import sys
 
@@ -413,12 +414,12 @@ runner_module._CORE_ENV_ALLOWLIST = runner_module._CORE_ENV_ALLOWLIST | {
     "PATHEXT",
     "SYSTEMROOT",
 }
-runner_module.resolve_trusted_dws_core = lambda *_args, **_kwargs: TrustedDwsCore(
+runner_module.hold_trusted_dws_core = lambda *_args, **_kwargs: nullcontext(TrustedDwsCore(
     path=core,
     version="1.0.61",
     sha256="a" * 64,
     architecture="AMD64",
-)
+))
 raise SystemExit(runtime.main(sys.argv[5:], root=root))
 """
     completed = subprocess.run(

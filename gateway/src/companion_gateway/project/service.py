@@ -245,10 +245,10 @@ class ProjectMemoryService:
                 pinned_snapshot,
             )
 
-        if self._source_policy is not None and match.approval_ref is None:
+        if self._source_policy is not None:
             self._require_query_sources_fresh(
                 project_id,
-                match.source_refs,
+                () if match.approval_ref is not None else match.source_refs,
                 timestamp,
                 pinned_snapshot,
             )
@@ -533,10 +533,10 @@ class ProjectMemoryService:
             proposed_decision_text,
         ):
             raise ProjectMemoryError("statement_matches_active_decision")
-        if self._source_policy is not None and decision.approval_ref is None:
+        if self._source_policy is not None:
             self._require_query_sources_fresh(
                 project_id,
-                decision.source_refs,
+                () if decision.approval_ref is not None else decision.source_refs,
                 timestamp,
                 snapshot,
             )

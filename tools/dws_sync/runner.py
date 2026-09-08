@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
+from functools import partial
 import os
 from pathlib import Path
 import subprocess
@@ -13,9 +15,10 @@ from typing import Any
 from companion_gateway.project.sync_models import SourceErrorType
 from tools.dws_sync.core_trust import (
     AuthenticodeDescriptor,
+    TrustedDwsCore,
+    hold_trusted_dws_core,
     prepare_core_temp_directory,
     read_authenticode,
-    resolve_trusted_dws_core,
 )
 from tools.dws_sync.launch import resolve_dws_launch
 
@@ -226,6 +229,9 @@ class DwsCommandRunner:
         self._profile = profile
         self._timeout_seconds = timeout_seconds
         self._popen = popen
+        self._core_launch: (
+            Callable[[], AbstractContextManager[TrustedDwsCore]] | None
+        ) = None
 
     @classmethod
     def from_official_core(
@@ -242,7 +248,8 @@ class DwsCommandRunner:
         _signature_reader: Callable[[Path], AuthenticodeDescriptor] | None = None,
     ) -> DwsCommandRunner:
         environ = dict(os.environ)
-        trusted = resolve_trusted_dws_core(
+        core_launch = partial(
+            hold_trusted_dws_core,
             dws_path,
             environ=environ,
             official_bin=_official_bin,
@@ -250,18 +257,20 @@ class DwsCommandRunner:
             approvals_path=_approvals_path,
             signature_reader=_signature_reader or read_authenticode,
         )
-        launch_env = _minimal_core_environment(
-            environ,
-            runtime_root=runtime_root,
-        )
-        runner = cls.__new__(cls)
-        runner.__initialize(
-            trusted.path,
-            launch_env,
-            profile=profile,
-            timeout_seconds=timeout_seconds,
-            popen=popen,
-        )
+        with core_launch() as trusted:
+            launch_env = _minimal_core_environment(
+                environ,
+                runtime_root=runtime_root,
+            )
+            runner = cls.__new__(cls)
+            runner.__initialize(
+                trusted.path,
+                launch_env,
+                profile=profile,
+                timeout_seconds=timeout_seconds,
+                popen=popen,
+            )
+        runner._core_launch = core_launch
         return runner
 
     def run(self, args: tuple[str, ...]) -> dict[str, object]:
@@ -289,7 +298,12 @@ class DwsCommandRunner:
             }
             if self._launch_env is not None:
                 popen_options["env"] = self._launch_env
-            process = self._popen(command, **popen_options)
+            if self._core_launch is None:
+                process = self._popen(command, **popen_options)
+            else:
+                with self._core_launch() as trusted:
+                    command[0] = str(trusted.path)
+                    process = self._popen(command, **popen_options)
         except (OSError, subprocess.SubprocessError):
             run_error = DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, False)
         if run_error is not None:

@@ -323,7 +323,17 @@ def test_reviewed_decision_overrides_the_cached_sync_snapshot(tmp_path: Path) ->
     assert answer.text == "当前有效决策：采用方案 A"
     assert answer.source_refs == ()
     assert answer.approval_ref.candidate_id == candidate.candidate_id
-    assert policy.calls == [(PROJECT_ID, decision.source_refs, NOW)]
+    assert policy.calls == [
+        (PROJECT_ID, decision.source_refs, NOW),
+        (PROJECT_ID, (), NOW),
+    ]
+    service.propose_conflict_from_statement(
+        PROJECT_ID,
+        "终端方案改成方案 C",
+        proposed_decision_text="采用方案 C",
+        now=NOW,
+    )
+    assert policy.calls[-1] == (PROJECT_ID, (), NOW)
     with pytest.raises(ProjectContextUnavailable, match="context_expired"):
         service.answer(PROJECT_ID, "终端方案", kind=AnswerKind.CURRENT_STATE, now=NOW + timedelta(minutes=6))
 

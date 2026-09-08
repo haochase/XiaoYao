@@ -65,6 +65,32 @@ def test_resolver_returns_only_pinned_official_sibling_core(tmp_path: Path) -> N
     assert selected.architecture == "AMD64"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows file sharing contract")
+def test_resolver_rejects_core_with_existing_writer(tmp_path: Path) -> None:
+    installation, wrapper, core, approvals = official_installation(tmp_path)
+    write_approval(approvals, core)
+
+    with core.open("r+b"):
+        with pytest.raises(ValueError, match=TRUST_ERROR):
+            resolve_fixture(installation, wrapper, approvals)
+
+    assert resolve_fixture(installation, wrapper, approvals).path == core
+
+
+def test_resolver_releases_lock_after_signature_failure(tmp_path: Path) -> None:
+    installation, wrapper, core, approvals = official_installation(tmp_path)
+    write_approval(approvals, core)
+
+    def failed_signature(_path: Path) -> AuthenticodeDescriptor:
+        raise RuntimeError("signature failure")
+
+    with pytest.raises(ValueError, match=TRUST_ERROR):
+        resolve_fixture(
+            installation, wrapper, approvals, signature_reader=failed_signature
+        )
+    core.write_bytes(b"replacement after failed verification")
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

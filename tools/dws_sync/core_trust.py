@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass
 import hashlib
@@ -378,6 +379,77 @@ def resolve_trusted_dws_core(
     approvals_path: Path | None = None,
     signature_reader: Callable[[Path], AuthenticodeDescriptor] = read_authenticode,
 ) -> TrustedDwsCore:
+    with hold_trusted_dws_core(
+        dws_path,
+        environ=environ,
+        official_bin=official_bin,
+        processor_architecture=processor_architecture,
+        approvals_path=approvals_path,
+        signature_reader=signature_reader,
+    ) as trusted:
+        return trusted
+
+
+def _open_core_read_lock(path: Path) -> int:
+    if os.name != "nt":
+        raise ValueError(CORE_TRUST_ERROR)
+
+    import msvcrt
+
+    before = _regular_file_details(path)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    # Readers (including Authenticode and CreateProcess) may share this file;
+    # writers and replacements must wait until process creation completes.
+    handle = create_file(str(path), 0x80000000, 0x1, None, 3, 0x00200000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ValueError(CORE_TRUST_ERROR)
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_int
+        close_handle(handle)
+        raise
+    try:
+        opened = os.fstat(descriptor)
+        after = _regular_file_details(path)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _is_reparse(opened)
+            or opened.st_nlink != 1
+            or not os.path.samestat(before, opened)
+            or not os.path.samestat(opened, after)
+        ):
+            raise ValueError(CORE_TRUST_ERROR)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+@contextmanager
+def hold_trusted_dws_core(
+    dws_path: Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+    official_bin: Path | None = None,
+    processor_architecture: str | None = None,
+    approvals_path: Path | None = None,
+    signature_reader: Callable[[Path], AuthenticodeDescriptor] = read_authenticode,
+) -> Iterator[TrustedDwsCore]:
+    descriptor: int | None = None
     try:
         expected_bin = official_bin or (Path.home() / ".qwenworkcn" / "bin")
         wrapper = expected_bin / "dws"
@@ -399,6 +471,7 @@ def resolve_trusted_dws_core(
             raise ValueError(CORE_TRUST_ERROR)
         _regular_file_details(shim)
         core = shim.parent / _core_name(architecture)
+        descriptor = _open_core_read_lock(core)
         catalog = _read_approvals(
             approvals_path or Path(__file__).with_name(CORE_APPROVALS_FILE)
         )
@@ -422,9 +495,17 @@ def resolve_trusted_dws_core(
             )
         ):
             raise ValueError(CORE_TRUST_ERROR)
-        return TrustedDwsCore(core, version, actual_hash, architecture)
-    except Exception:
-        raise ValueError(CORE_TRUST_ERROR) from None
+        trusted = TrustedDwsCore(core, version, actual_hash, architecture)
+    except BaseException as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        if isinstance(exc, Exception):
+            raise ValueError(CORE_TRUST_ERROR) from None
+        raise
+    try:
+        yield trusted
+    finally:
+        os.close(descriptor)
 
 
 def _directory_details(path: Path) -> os.stat_result:

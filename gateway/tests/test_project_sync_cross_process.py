@@ -14,9 +14,15 @@ from companion_gateway.api import create_app
 from companion_gateway.project.auth import ProjectApiPrincipal
 from companion_gateway.project.index import ProjectSnapshotRegistry
 from companion_gateway.project.models import (
+    AnswerKind,
     DecisionCard,
     EvidenceRef,
     ProjectContextPackage,
+)
+from companion_gateway.project.repository import ProjectMemoryRepository
+from companion_gateway.project.service import (
+    ProjectContextUnavailable,
+    ProjectMemoryService,
 )
 from companion_gateway.project.sync_models import (
     EvidenceChunk,
@@ -471,6 +477,78 @@ def test_device_query_never_falls_back_when_active_ciphertext_cannot_decrypt(
     assert response.status_code == 404
     assert response.json()["detail"] == "source_unavailable"
     assert "private-decryption-detail" not in response.text
+
+
+@pytest.mark.parametrize("clock_event", ["rollback", "resume"])
+@pytest.mark.parametrize("operation", ["answer", "propose"])
+def test_approved_decision_obeys_shared_clock_recovery(
+    tmp_path: Path, clock_event: str, operation: str
+) -> None:
+    database_path = tmp_path / "approved-clock.db"
+    sync_repository = ProjectSyncRepository(database_path)
+    sync_repository.initialize()
+    sync_repository.configure_protection(
+        digest("test-user"), ReversibleProtector.protector_version
+    )
+    writer = ProjectSyncService(
+        sync_repository,
+        ReversibleProtector(),
+        ProjectSnapshotRegistry(),
+        monotonic=lambda: 50.0,
+    )
+    writer.apply(envelope(1, NOW), principal=principal(), now=NOW)
+    wall = {"value": NOW + timedelta(seconds=500)}
+    monotonic = {"value": 100.0}
+    facade = RepositoryBackedProjectQueryFacade(
+        ProjectSyncRepository(database_path),
+        ReversibleProtector(),
+        identity_digest=lambda: digest("test-user"),
+        source_freshness_seconds=600,
+        clock=lambda: wall["value"],
+        monotonic=lambda: monotonic["value"],
+    )
+    memory = ProjectMemoryRepository(database_path)
+    memory.initialize()
+    service = ProjectMemoryService(
+        repository=memory,
+        clock=lambda: wall["value"],
+        source_policy=facade,
+        snapshot_reader=facade,
+        retrieval_writer=facade,
+    )
+    candidate, _ = service.propose_conflict_from_statement(
+        PROJECT_ID, "terminal plan", proposed_decision_text="Use plan A"
+    )
+    service.review_conflict(
+        candidate.candidate_id,
+        reviewer_id="owner",
+        action="accept",
+        change_reason="Approved change",
+    )
+    assert service.get_context(PROJECT_ID).generated_at == NOW
+    approved = service.answer(
+        PROJECT_ID, "terminal plan", kind=AnswerKind.DECISION_CHECK
+    )
+    assert approved.approval_ref is not None
+    assert approved.source_refs == ()
+
+    wall["value"] = NOW + timedelta(
+        seconds=100 if clock_event == "rollback" else 1101
+    )
+    monotonic["value"] = 101.0
+    with pytest.raises(ProjectContextUnavailable, match="^source_stale$"):
+        if operation == "answer":
+            service.answer(
+                PROJECT_ID, "terminal plan", kind=AnswerKind.DECISION_CHECK
+            )
+        else:
+            service.propose_conflict_from_statement(
+                PROJECT_ID, "terminal plan", proposed_decision_text="Use plan C"
+            )
+    state = sync_repository.load_clock_state()
+    assert state.clock_untrusted is (clock_event == "rollback")
+    assert state.needs_sync
+    assert service.get_context(PROJECT_ID).generated_at == NOW
 
 
 @pytest.mark.parametrize("clock_event", ["rollback", "resume"])
