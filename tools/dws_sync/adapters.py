@@ -661,7 +661,10 @@ def _active_record(
     time_value = _metadata_value(metadata, _TIME_ALIASES)
     source_title = _optional_text(title_value)
     source_url = _optional_text(url_value)
-    source_version = _optional_text(version_value)
+    source_version = _content_bound_version(
+        _optional_text(version_value),
+        content_hash,
+    )
     source_time = _optional_datetime(time_value)
     return _build_record(
         source_type=spec.source_type,
@@ -672,7 +675,7 @@ def _active_record(
         source_title=source_title or f"{spec.source_type.value}:{spec.source_id}",
         source_url=source_url
         or f"dingtalk://{spec.source_type.value}/{_sha256(spec.source_id)}",
-        source_version=source_version or content_hash,
+        source_version=source_version,
         source_time=source_time or fetched_at,
         content_text=content_text,
         attributes_json=_canonical_json(attributes),
@@ -811,6 +814,17 @@ def _sha256(value: str) -> str:
     if encoding_failed:
         raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _content_bound_version(
+    metadata_version: str | None,
+    content_hash: str,
+) -> str:
+    if metadata_version is None:
+        return content_hash
+    return _sha256(
+        f"dws-source-version-v1\0{metadata_version}\0{content_hash}"
+    )
 
 
 def _build_record(**values: object) -> DwsSourceRecord:

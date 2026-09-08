@@ -621,6 +621,64 @@ def test_document_adapter_uses_fixed_arguments_and_validates_adoc() -> None:
     assert invalid.calls == [("doc", "info", "--node", "doc-001")]
 
 
+def test_document_source_version_is_bound_to_content_hash() -> None:
+    info = {
+        "nodeId": "doc-001",
+        "contentType": "ALIDOC",
+        "extension": "adoc",
+        "updateTime": 1_788_588_000_000,
+    }
+
+    first = read_document(
+        RecordingRunner([info, {"markdown": "# 方案\n采用方案 A"}]),
+        source("document", "doc-001"),
+        permission_scope="project:project-1",
+        clock=lambda: NOW,
+    )
+    repeated = read_document(
+        RecordingRunner([info, {"markdown": "# 方案\n采用方案 A"}]),
+        source("document", "doc-001"),
+        permission_scope="project:project-1",
+        clock=lambda: NOW,
+    )
+    changed = read_document(
+        RecordingRunner([info, {"markdown": "# 方案\n采用方案 B"}]),
+        source("document", "doc-001"),
+        permission_scope="project:project-1",
+        clock=lambda: NOW,
+    )
+
+    assert first.source_version == repeated.source_version
+    assert changed.source_version != first.source_version
+    assert first.source_version == hashlib.sha256(
+        (
+            "dws-source-version-v1\0"
+            f"{info['updateTime']}\0{first.content_hash}"
+        ).encode("utf-8")
+    ).hexdigest()
+    assert len(first.source_version) == 64
+
+
+def test_document_source_version_falls_back_to_content_hash() -> None:
+    record = read_document(
+        RecordingRunner(
+            [
+                {
+                    "nodeId": "doc-001",
+                    "contentType": "ALIDOC",
+                    "extension": "adoc",
+                },
+                {"markdown": "# 方案\n采用方案 A"},
+            ]
+        ),
+        source("document", "doc-001"),
+        permission_scope="project:project-1",
+        clock=lambda: NOW,
+    )
+
+    assert record.source_version == record.content_hash
+
+
 def test_meeting_adapter_reads_all_parts_and_pages_until_token_is_empty() -> None:
     info = {"taskUuid": "abc123", "title": "评审会"}
     summary = {"markdown": "结论"}
