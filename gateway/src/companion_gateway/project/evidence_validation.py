@@ -18,6 +18,7 @@ def validate_sourced_context(
     context: ProjectContextPackage,
     sources: Iterable[SourceSnapshot],
 ) -> None:
+    reject_external_approvals(context)
     if (
         context.open_actions
         or context.current_risks
@@ -67,3 +68,8 @@ def validate_sourced_context(
         excerpt = _normalized_text(reference.excerpt)
         if not source_text or excerpt not in source_text:
             raise ValueError("source_excerpt_mismatch")
+
+
+def reject_external_approvals(context: ProjectContextPackage) -> None:
+    if any(decision.approval_ref is not None for decision in context.active_decisions):
+        raise ValueError("external_approval_forbidden")

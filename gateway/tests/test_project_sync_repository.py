@@ -885,8 +885,11 @@ def test_greater_cursor_with_same_hash_refreshes_without_new_generation(
     assert retried.outcome == "unchanged"
 
 
+@pytest.mark.parametrize("outcome,next_hash", [("unchanged", HASH_A), ("applied", HASH_B)])
 def test_reviewed_decision_survives_an_unchanged_source_renewal(
     tmp_path: Path,
+    outcome: str,
+    next_hash: str,
 ) -> None:
     repository = repository_at(tmp_path)
     repository.initialize()
@@ -901,21 +904,19 @@ def test_reviewed_decision_survives_an_unchanged_source_renewal(
         proposed_decision_text="采用方案 A",
         now=NOW,
     )
-    memory.review_conflict(
+    _, version = memory.review_conflict(
         candidate.candidate_id,
         reviewer_id="owner-1",
         action="accept",
         change_reason="供应风险变化",
-        new_decision_text="采用方案 A",
-        evidence_refs=(evidence_ref(),),
         now=NOW,
     )
 
     result = repository.commit(
         sync_commit(
             cursor=2,
-            content_hash=HASH_A,
-            outcome="unchanged",
+            content_hash=next_hash,
+            outcome=outcome,
             states=(
                 source_state(
                     last_attempt_at=NOW + timedelta(minutes=1),
@@ -926,9 +927,74 @@ def test_reviewed_decision_survives_an_unchanged_source_renewal(
     )
 
     stored = repository.load_active_generation("project-1")
-    assert result.outcome == "unchanged"
+    assert result.outcome == outcome
     assert stored is not None
     assert stored.context.active_decisions[0].decision_text == "采用方案 A"
+    assert stored.context.active_decisions[0].source_refs == ()
+    assert stored.context.active_decisions[0].approval_ref == version.approval_ref
+
+
+def test_sync_commit_rejects_external_approval_before_overlay(tmp_path: Path) -> None:
+    from companion_gateway.project.models import HumanApprovalRef
+
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    original = sync_commit(cursor=1)
+    decision = original.envelope.context.active_decisions[0]
+    approval = HumanApprovalRef(
+        candidate_id="fake", reviewer_id="fake", approved_at=NOW,
+        reason="fake", decision_text=decision.decision_text,
+        permission_scope=original.envelope.context.permission_scope,
+    )
+    forged = original.envelope.context.model_copy(update={"active_decisions": (
+        decision.model_copy(update={"approval_ref": approval}),
+    )})
+    with pytest.raises(ValueError, match="external_approval_forbidden"):
+        repository.commit(replace(original, envelope=original.envelope.model_copy(update={"context": forged})))
+    assert repository.load_active_generation("project-1") is None
+
+
+def test_review_interleaved_with_sync_preserves_refreshed_context(tmp_path: Path, monkeypatch) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    initial = context()
+    another = initial.active_decisions[0].model_copy(
+        update={"decision_id": "decision-2", "topic": "预算方案"}
+    )
+    initial = initial.model_copy(update={"active_decisions": (*initial.active_decisions, another)})
+    repository.commit(sync_commit(cursor=1, package=initial))
+    memory_repository = ProjectMemoryRepository(tmp_path / "project-memory.db")
+    memory = ProjectMemoryService(repository=memory_repository, clock=lambda: NOW)
+    candidate, _ = memory.propose_conflict_from_statement(
+        "project-1", "发布方案改成方案 A", proposed_decision_text="采用方案 A", now=NOW,
+    )
+    refreshed_at = NOW + timedelta(minutes=1)
+    refreshed = initial.model_copy(update={
+        "project_name": "最新项目名称", "generated_at": refreshed_at,
+        "freshness_seconds": 900,
+    })
+    commit = memory_repository.commit_conflict_review
+
+    def refresh_before_commit(**kwargs):
+        result = repository.commit(sync_commit(
+            cursor=2, content_hash=HASH_B, package=refreshed,
+            states=(source_state(last_attempt_at=refreshed_at, last_success_at=refreshed_at),),
+        ))
+        assert result.outcome == "applied"
+        return commit(**kwargs)
+
+    monkeypatch.setattr(memory_repository, "commit_conflict_review", refresh_before_commit)
+    _, version = memory.review_conflict(
+        candidate.candidate_id, reviewer_id="owner-1", action="accept",
+        change_reason="负责人确认", now=refreshed_at,
+    )
+    stored = memory_repository.get_context("project-1")
+    assert stored.project_name == refreshed.project_name
+    assert stored.generated_at == refreshed_at
+    assert stored.freshness_seconds == 900
+    assert stored.active_decisions[1] == another
+    assert stored.active_decisions[0].approval_ref == version.approval_ref
+    assert stored.active_decisions[0].source_refs == ()
 
 @pytest.mark.parametrize(
     ("package", "message"),

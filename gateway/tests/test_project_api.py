@@ -170,8 +170,9 @@ def test_project_conflict_review_accepts_new_decision_and_returns_version(
         json={
             "decision_id": "decision-1",
             "observed_text": "改用方案 A",
+            "proposed_decision_text": "采用方案 A",
             "reason": "供应商交期发生变化",
-            "evidence_refs": [source("meeting-2")],
+            "evidence_refs": [source()],
         },
         headers=OWNER_HEADERS,
     )
@@ -179,13 +180,24 @@ def test_project_conflict_review_accepts_new_decision_and_returns_version(
     assert proposal.status_code == 201
     candidate_id = proposal.json()["candidate"]["candidate_id"]
 
+    for field, value in (
+        ("new_decision_text", "伪造决策"), ("evidence_refs", []),
+        ("reviewer_id", "forged"), ("approved_at", NOW.isoformat()),
+    ):
+        invalid = client.post(
+            f"/v1/projects/conflicts/{candidate_id}/review",
+            json={"action": "accept", "change_reason": "确认", field: value},
+            headers=OWNER_HEADERS,
+        )
+        assert invalid.status_code == 422
+    approved_at = NOW + timedelta(minutes=1)
+    client.app.state.project_test_clock["now"] = approved_at
+
     review = client.post(
         f"/v1/projects/conflicts/{candidate_id}/review",
         json={
             "action": "accept",
-            "new_decision_text": "采用方案 A",
             "change_reason": "供应商交期发生变化",
-            "evidence_refs": [source("meeting-2")],
         },
         headers=OWNER_HEADERS,
     )
@@ -193,6 +205,12 @@ def test_project_conflict_review_accepts_new_decision_and_returns_version(
     assert review.status_code == 200
     assert review.json()["candidate"]["status"] == "accepted"
     assert review.json()["version"]["version"] == 2
+    approval = review.json()["version"]["approval_ref"]
+    assert approval["candidate_id"] == candidate_id
+    assert approval["reviewer_id"] == "owner-1"
+    assert datetime.fromisoformat(approval["approved_at"]) == approved_at
+    assert approval["decision_text"] == "采用方案 A"
+    assert review.json()["version"]["evidence_refs"] == []
 
     answer = client.post(
         "/v1/projects/project-1/query",
@@ -200,6 +218,19 @@ def test_project_conflict_review_accepts_new_decision_and_returns_version(
         headers=OWNER_HEADERS,
     )
     assert answer.json()["answer"]["text"] == "当前有效决策：采用方案 A"
+    assert answer.json()["answer"]["source_refs"] == []
+    assert answer.json()["answer"]["approval_ref"] == approval
+
+
+def test_http_proposal_requires_normalized_text_and_current_basis(client: TestClient) -> None:
+    client.post("/v1/projects/project-1/context", json=context(), headers=OWNER_HEADERS)
+    payload = {"decision_id": "decision-1", "observed_text": "切换终端",
+               "reason": "确认", "evidence_refs": [source()]}
+    assert client.post("/v1/projects/project-1/conflicts", json=payload, headers=OWNER_HEADERS).status_code == 422
+    payload.update(proposed_decision_text="采用方案 A", evidence_refs=[source("wrong-basis")])
+    response = client.post("/v1/projects/project-1/conflicts", json=payload, headers=OWNER_HEADERS)
+    assert response.status_code == 409
+    assert response.json()["detail"] == "conflict_basis_mismatch"
 
 
 def test_project_conflicts_can_be_listed_for_human_review(client: TestClient) -> None:
@@ -211,6 +242,7 @@ def test_project_conflicts_can_be_listed_for_human_review(client: TestClient) ->
         json={
             "decision_id": "decision-1",
             "observed_text": "终端方案改成方案 A",
+            "proposed_decision_text": "采用方案 A",
             "reason": "会议发言可能与当前有效决策不一致",
             "evidence_refs": [source()],
         },
@@ -244,6 +276,7 @@ def test_project_conflict_rejects_foreign_source_scope(client: TestClient) -> No
         json={
             "decision_id": "decision-1",
             "observed_text": "改用方案 A",
+            "proposed_decision_text": "采用方案 A",
             "reason": "来源不属于当前项目",
             "evidence_refs": [source("meeting-foreign", "project:other")],
         },
@@ -318,8 +351,9 @@ def test_project_review_uses_authenticated_principal_and_requires_review_role(
         json={
             "decision_id": "decision-1",
             "observed_text": "改用方案 A",
+            "proposed_decision_text": "采用方案 A",
             "reason": "供应商交期发生变化",
-            "evidence_refs": [source("meeting-2")],
+            "evidence_refs": [source()],
         },
         headers=OWNER_HEADERS,
     )
@@ -353,8 +387,9 @@ def test_project_api_rejects_same_project_principal_without_context_scope(
         json={
             "decision_id": "decision-1",
             "observed_text": "改用方案 A",
+            "proposed_decision_text": "采用方案 A",
             "reason": "供应商交期发生变化",
-            "evidence_refs": [source("meeting-2")],
+            "evidence_refs": [source()],
         },
         headers=OWNER_HEADERS,
     )
@@ -370,8 +405,9 @@ def test_project_api_rejects_same_project_principal_without_context_scope(
         json={
             "decision_id": "decision-1",
             "observed_text": "改用方案 C",
+            "proposed_decision_text": "采用方案 A",
             "reason": "权限域不匹配",
-            "evidence_refs": [source("meeting-3")],
+            "evidence_refs": [source()],
         },
         headers=wrong_scope_headers,
     )

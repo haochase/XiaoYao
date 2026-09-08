@@ -19,6 +19,7 @@ class ConflictStatus(StrEnum):
     PROPOSED = "proposed"
     ACCEPTED = "accepted"
     REJECTED = "rejected"
+    INVALIDATED = "invalidated"
 
 
 class AnswerKind(StrEnum):
@@ -82,6 +83,26 @@ class SourcedFact(BaseModel):
     )
 
 
+class HumanApprovalRef(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    candidate_id: str = Field(min_length=1, max_length=128)
+    reviewer_id: str = Field(min_length=1, max_length=256)
+    approved_at: datetime
+    reason: str = Field(min_length=1, max_length=2000)
+    decision_text: str = Field(min_length=1, max_length=2000)
+    permission_scope: str = Field(min_length=1, max_length=256)
+
+    @field_validator("candidate_id", "reviewer_id", "reason", "decision_text", "permission_scope")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _require_non_blank(value, "approval field")
+
+    _approved_at = field_validator("approved_at")(
+        lambda value: _require_aware(value, "approved_at")
+    )
+
+
 class DecisionCard(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -92,7 +113,8 @@ class DecisionCard(BaseModel):
     rationale: str = Field(min_length=1, max_length=2000)
     owner: str = Field(min_length=1, max_length=256)
     decided_at: datetime
-    source_refs: tuple[EvidenceRef, ...] = Field(min_length=1)
+    source_refs: tuple[EvidenceRef, ...] = ()
+    approval_ref: HumanApprovalRef | None = None
     status: DecisionStatus = DecisionStatus.PROPOSED
     confidence: float = Field(ge=0.0, le=1.0)
 
@@ -118,6 +140,14 @@ class DecisionCard(BaseModel):
         lambda value: _require_aware(value, "decided_at")
     )
 
+    @model_validator(mode="after")
+    def validate_decision_evidence(self) -> "DecisionCard":
+        if not self.source_refs and self.approval_ref is None:
+            raise ValueError("decision requires source_refs or approval_ref")
+        if self.approval_ref is not None and self.approval_ref.decision_text != self.decision_text:
+            raise ValueError("approval decision text mismatch")
+        return self
+
 
 class DecisionVersion(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -131,7 +161,8 @@ class DecisionVersion(BaseModel):
     approved_by: str | None = Field(default=None, max_length=256)
     approved_at: datetime | None = None
     status: DecisionStatus = DecisionStatus.PROPOSED
-    evidence_refs: tuple[EvidenceRef, ...] = Field(min_length=1)
+    evidence_refs: tuple[EvidenceRef, ...] = ()
+    approval_ref: HumanApprovalRef | None = None
 
     _decision_id = field_validator("decision_id")(
         lambda value: _require_non_blank(value, "decision_id")
@@ -160,6 +191,15 @@ class DecisionVersion(BaseModel):
 
     @model_validator(mode="after")
     def validate_active_approval(self) -> "DecisionVersion":
+        if not self.evidence_refs and self.approval_ref is None:
+            raise ValueError("decision version requires evidence_refs or approval_ref")
+        if self.approval_ref is not None and (
+            self.approval_ref.reviewer_id != self.approved_by
+            or self.approval_ref.approved_at != self.approved_at
+            or self.approval_ref.reason != self.change_reason
+            or self.approval_ref.decision_text != self.decision_text
+        ):
+            raise ValueError("approval fields mismatch")
         if self.status is DecisionStatus.ACTIVE:
             if self.approved_by is None or self.approved_at is None:
                 raise ValueError("active decision version requires approved fields")
@@ -209,6 +249,8 @@ class ProjectContextPackage(BaseModel):
     @model_validator(mode="after")
     def validate_project_scope(self) -> "ProjectContextPackage":
         for decision in self.active_decisions:
+            if decision.approval_ref is not None and decision.approval_ref.permission_scope != self.permission_scope:
+                raise ValueError("approval permission scope mismatch")
             if decision.project_id != self.project_id:
                 raise ValueError("all decisions must belong to the same project")
             if any(
@@ -241,6 +283,7 @@ class ProjectAnswer(BaseModel):
     kind: AnswerKind
     text: str = Field(min_length=1, max_length=4000)
     source_refs: tuple[EvidenceRef, ...] = ()
+    approval_ref: HumanApprovalRef | None = None
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
     _text = field_validator("text")(
@@ -254,8 +297,8 @@ class ProjectAnswer(BaseModel):
             AnswerKind.CURRENT_STATE,
             AnswerKind.DECISION_CHECK,
         }
-        if self.kind in requires_sources and not self.source_refs:
-            raise ValueError("factual answers require source_refs")
+        if self.kind in requires_sources and not self.source_refs and self.approval_ref is None:
+            raise ValueError("factual answers require source_refs or approval_ref")
         return self
 
 
@@ -267,9 +310,11 @@ class ConflictCandidate(BaseModel):
     decision_id: str = Field(min_length=1, max_length=128)
     base_version: int = Field(default=1, ge=1)
     observed_text: str = Field(min_length=1, max_length=2000)
+    proposed_decision_text: str = Field(min_length=1, max_length=2000)
     active_decision_text: str = Field(min_length=1, max_length=2000)
     reason: str = Field(min_length=1, max_length=2000)
-    source_refs: tuple[EvidenceRef, ...] = Field(min_length=1)
+    source_refs: tuple[EvidenceRef, ...] = ()
+    active_approval_ref: HumanApprovalRef | None = None
     status: ConflictStatus = ConflictStatus.PROPOSED
     created_at: datetime
     reviewed_by: str | None = Field(default=None, max_length=256)
@@ -287,6 +332,9 @@ class ConflictCandidate(BaseModel):
     )
     _observed_text = field_validator("observed_text")(
         lambda value: _require_non_blank(value, "observed_text")
+    )
+    _proposed_decision_text = field_validator("proposed_decision_text")(
+        lambda value: _require_non_blank(value, "proposed_decision_text")
     )
     _active_decision_text = field_validator("active_decision_text")(
         lambda value: _require_non_blank(value, "active_decision_text")
@@ -315,7 +363,11 @@ class ConflictCandidate(BaseModel):
 
     @model_validator(mode="after")
     def validate_review_fields(self) -> "ConflictCandidate":
-        terminal = {ConflictStatus.ACCEPTED, ConflictStatus.REJECTED}
+        if bool(self.source_refs) == (self.active_approval_ref is not None):
+            raise ValueError("conflict requires exactly one active decision basis")
+        if self.active_approval_ref is not None and self.active_approval_ref.decision_text != self.active_decision_text:
+            raise ValueError("conflict approval decision text mismatch")
+        terminal = {ConflictStatus.ACCEPTED, ConflictStatus.REJECTED, ConflictStatus.INVALIDATED}
         if self.status in terminal and (
             self.reviewed_by is None or self.reviewed_at is None
         ):

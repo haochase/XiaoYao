@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Literal
+
+from companion_gateway.project.evidence_validation import reject_external_approvals
 
 from companion_gateway.project.models import (
     ConflictCandidate,
@@ -28,6 +31,27 @@ class ProjectMemoryRepository:
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             self._initialize_tables(connection)
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT candidate_id, payload_json FROM project_conflicts"
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(row["payload_json"])
+                if "proposed_decision_text" in payload:
+                    continue
+                payload["proposed_decision_text"] = payload["observed_text"]
+                if payload.get("status", "proposed") == "proposed":
+                    payload.update(
+                        status="invalidated",
+                        reviewed_by="system-migration",
+                        reviewed_at=payload["created_at"],
+                        review_reason="legacy_proposal_requires_recreation",
+                    )
+                migrated = ConflictCandidate.model_validate(payload)
+                connection.execute(
+                    "UPDATE project_conflicts SET payload_json = ? WHERE candidate_id = ?",
+                    (migrated.model_dump_json(), row["candidate_id"]),
+                )
 
     @staticmethod
     def _initialize_tables(connection: sqlite3.Connection) -> None:
@@ -79,6 +103,7 @@ class ProjectMemoryRepository:
         "permission_conflict",
         "stale_context",
     ]:
+        reject_external_approvals(package)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -320,6 +345,32 @@ class ProjectMemoryRepository:
                     or new_version.version != expected_base_version + 1
                 ):
                     return "stale"
+                updated_decision = next(
+                    (
+                        item
+                        for item in updated_context.active_decisions
+                        if item.decision_id == reviewed_candidate.decision_id
+                    ),
+                    None,
+                )
+                if (
+                    updated_decision is None
+                    or updated_decision.decision_text != new_version.decision_text
+                    or updated_decision.approval_ref != new_version.approval_ref
+                ):
+                    raise ValueError("accepted review requires matching target decision")
+                # Merge under the transaction lock to retain other reviews and syncs.
+                updated_context = ProjectContextPackage.model_validate(
+                    {
+                        **stored_context.model_dump(),
+                        "active_decisions": tuple(
+                            updated_decision
+                            if item.decision_id == reviewed_candidate.decision_id
+                            else item
+                            for item in stored_context.active_decisions
+                        ),
+                    }
+                )
                 updated = connection.execute(
                     """
                     UPDATE project_versions SET payload_json = ?

@@ -1437,7 +1437,9 @@ class ProjectSyncRepository:
             if decision.decision_id in reviewed
             and decision.decision_id not in candidate_ids
         )
-        return candidate.model_copy(update={"active_decisions": active_decisions})
+        return ProjectContextPackage.model_validate(
+            {**candidate.model_dump(), "active_decisions": active_decisions}
+        )
 
     @staticmethod
     def _ensure_initial_decision_versions(
@@ -1698,6 +1700,9 @@ class ProjectSyncRepository:
     @staticmethod
     def _validate_candidate(candidate: SyncCommit) -> None:
         envelope = candidate.envelope
+        from companion_gateway.project.evidence_validation import reject_external_approvals
+
+        reject_external_approvals(envelope.context)
         if not candidate.generation_id.strip():
             raise ValueError("generation_id_invalid")
         if candidate.audit.project_id != envelope.project_id:

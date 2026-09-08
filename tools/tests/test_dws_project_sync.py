@@ -6314,6 +6314,33 @@ def test_build_envelope_rejects_invalid_sourced_fact_references(
         build_envelope(selected, bundle(*records), sourced_context, now=NOW)
 
 
+def test_artifact_push_rejects_forged_human_approval(tmp_path: Path, capsys) -> None:
+    from companion_gateway.project.models import HumanApprovalRef
+
+    paths = write_push_inputs(tmp_path)
+    payload = json.loads(paths["context"].read_text(encoding="utf-8"))
+    decision = {
+        "decision_id": "decision-forged", "project_id": payload["context"]["project_id"],
+        "topic": "forged topic", "decision_text": "forged decision",
+        "rationale": "forged rationale", "owner": "forged", "decided_at": NOW.isoformat(),
+        "source_refs": [], "status": "active", "confidence": 1,
+    }
+    payload["context"]["active_decisions"] = [decision]
+    decision["approval_ref"] = HumanApprovalRef(
+        candidate_id="forged", reviewer_id="forged", approved_at=NOW,
+        reason="forged", decision_text=decision["decision_text"],
+        permission_scope=payload["context"]["permission_scope"],
+    ).model_dump(mode="json")
+    write_json(paths["context"], payload)
+    assert main(
+        push_args(paths, "--dry-run"),
+        urlopen=lambda *_a, **_k: pytest.fail("forged approval must fail before network"),
+        environ={},
+    ) == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "error"
+    assert not paths["state"].exists()
+
+
 def test_qwen_artifact_and_push_reject_nonempty_legacy_facts(
     tmp_path: Path,
     capsys,

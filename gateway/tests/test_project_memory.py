@@ -21,6 +21,123 @@ from companion_gateway.project.service import (
 NOW = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
 
 
+def test_conflict_persists_normalized_proposed_decision_text() -> None:
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(decision(),)))
+    candidate, created = service.propose_conflict_from_statement(
+        "project-1", "把终端方案改为方案 A",
+        proposed_decision_text="采用方案 A", now=NOW,
+    )
+    assert created is True
+    assert candidate.observed_text == "把终端方案改为方案 A"
+    assert candidate.proposed_decision_text == "采用方案 A"
+    assert candidate.source_refs == decision().source_refs
+
+
+def test_conflict_identity_includes_normalized_proposal() -> None:
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(decision(),)))
+    first, _ = service.propose_conflict_from_statement(
+        "project-1", "把终端方案换一下",
+        proposed_decision_text="采用方案 A", now=NOW,
+    )
+    second, created = service.propose_conflict_from_statement(
+        "project-1", "把终端方案换一下",
+        proposed_decision_text="采用方案 C", now=NOW,
+    )
+    assert created is True
+    assert first.candidate_id != second.candidate_id
+
+
+def test_accept_uses_candidate_proposal_and_human_approval_evidence() -> None:
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(decision(),)))
+    candidate, _ = service.propose_conflict_from_statement(
+        "project-1", "把终端方案换一下", proposed_decision_text="采用方案 A", now=NOW,
+    )
+    reviewed, version = service.review_conflict(
+        candidate.candidate_id, reviewer_id="owner-1", action="accept",
+        change_reason="负责人确认", now=NOW + timedelta(minutes=1),
+    )
+    approval = version.approval_ref
+    assert reviewed.status is ConflictStatus.ACCEPTED
+    assert approval.candidate_id == candidate.candidate_id
+    assert approval.reviewer_id == "owner-1"
+    assert approval.approved_at == NOW + timedelta(minutes=1)
+    assert approval.decision_text == version.decision_text == "采用方案 A"
+    assert version.evidence_refs == ()
+    active = service.current_decision("project-1", "decision-1", now=NOW)
+    assert active.source_refs == ()
+    assert active.approval_ref == approval
+
+
+def test_human_approval_does_not_extend_project_context_freshness() -> None:
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(decision(),)))
+    candidate, _ = service.propose_conflict_from_statement(
+        "project-1", "切换终端方案", proposed_decision_text="采用方案 A", now=NOW,
+    )
+    service.review_conflict(
+        candidate.candidate_id, reviewer_id="owner-1", action="accept",
+        change_reason="确认", now=NOW + timedelta(minutes=4),
+    )
+    with pytest.raises(ProjectContextUnavailable, match="context_expired"):
+        service.answer("project-1", "终端方案", kind=AnswerKind.FACT, now=NOW + timedelta(minutes=6))
+
+
+def test_reviewed_decision_can_be_proposed_and_approved_again() -> None:
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(decision(),)))
+    for text in ("采用方案 A", "采用方案 B"):
+        candidate, _ = service.propose_conflict_from_statement(
+            "project-1", "把终端方案换一下", proposed_decision_text=text, now=NOW,
+        )
+        _, version = service.review_conflict(
+            candidate.candidate_id, reviewer_id="owner-1", action="accept",
+            change_reason="负责人确认", now=NOW,
+        )
+        assert version.decision_text == text
+        assert version.evidence_refs == ()
+    assert version.version == 3
+    assert candidate.source_refs == ()
+    assert candidate.active_approval_ref.decision_text == "采用方案 A"
+    assert candidate.active_approval_ref != version.approval_ref
+
+
+def test_direct_proposal_cannot_supply_an_unrelated_conflict_basis() -> None:
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(decision(),)))
+    with pytest.raises(ProjectMemoryError, match="conflict_basis_mismatch"):
+        service.propose_conflict(
+            "project-1", decision_id="decision-1", observed_text="切换终端方案",
+            proposed_decision_text="采用方案 A", reason="确认切换",
+            evidence_refs=(source("meeting-other"),), now=NOW,
+        )
+
+
+@pytest.mark.parametrize("field,value", [("new_decision_text", "注入方案"), ("evidence_refs", [])])
+def test_review_schema_rejects_client_decision_and_evidence(field, value) -> None:
+    from companion_gateway.api import ConflictReviewRequest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="Extra inputs"):
+        ConflictReviewRequest.model_validate({"action": "accept", "change_reason": "确认", field: value})
+
+
+@pytest.mark.parametrize("kind", [AnswerKind.FACT, AnswerKind.CURRENT_STATE, AnswerKind.DECISION_CHECK])
+def test_fact_answers_accept_approval_but_reject_no_evidence(kind) -> None:
+    from companion_gateway.project.models import HumanApprovalRef
+
+    approval = HumanApprovalRef(
+        candidate_id="candidate", reviewer_id="owner", approved_at=NOW,
+        reason="approved", decision_text="proposal", permission_scope="project:star-retail",
+    )
+    answer = ProjectAnswer(kind=kind, text="proposal", approval_ref=approval)
+    assert answer.source_refs == ()
+    with pytest.raises(ValueError, match="source_refs"):
+        ProjectAnswer(kind=kind, text="no evidence")
+
+
 def source(source_id: str = "meeting-1") -> EvidenceRef:
     return EvidenceRef(
         source_type="meeting_note",
@@ -199,16 +316,18 @@ def test_conflict_candidate_is_idempotent_and_starts_proposed() -> None:
         "project-1",
         decision_id="decision-1",
         observed_text="改用方案 A",
+        proposed_decision_text="采用方案 A",
         reason="与当前有效方案 B 不一致",
-        evidence_refs=(source("meeting-2"),),
+        evidence_refs=(source(),),
         now=NOW,
     )
     second, duplicate = service.propose_conflict(
         "project-1",
         decision_id="decision-1",
         observed_text="改用方案 A",
+        proposed_decision_text="采用方案 A",
         reason="与当前有效方案 B 不一致",
-        evidence_refs=(source("meeting-2"),),
+        evidence_refs=(source(),),
         now=NOW,
     )
 
@@ -283,8 +402,9 @@ def test_rejecting_conflict_keeps_current_decision_active() -> None:
         "project-1",
         decision_id="decision-1",
         observed_text="改用方案 A",
+        proposed_decision_text="采用方案 A",
         reason="与当前有效方案 B 不一致",
-        evidence_refs=(source("meeting-2"),),
+        evidence_refs=(source(),),
         now=NOW,
     )
 
@@ -307,27 +427,18 @@ def test_approving_conflict_creates_active_version_two_only_after_review() -> No
         "project-1",
         decision_id="decision-1",
         observed_text="改用方案 A",
+        proposed_decision_text="采用方案 A",
         reason="供应商交期发生变化",
-        evidence_refs=(source("meeting-2"),),
+        evidence_refs=(source(),),
         now=NOW,
     )
 
-    with pytest.raises(ValueError, match="new_decision_text"):
-        service.review_conflict(
-            candidate.candidate_id,
-            reviewer_id="owner-1",
-            action="accept",
-            change_reason="供应商交期发生变化",
-            now=NOW + timedelta(minutes=1),
-        )
 
     reviewed, version = service.review_conflict(
         candidate.candidate_id,
         reviewer_id="owner-1",
         action="accept",
-        new_decision_text="采用方案 A",
         change_reason="供应商交期发生变化",
-        evidence_refs=(source("meeting-2"),),
         now=NOW + timedelta(minutes=1),
     )
 
@@ -351,6 +462,7 @@ def test_conflict_rejects_evidence_from_another_permission_scope() -> None:
             "project-1",
             decision_id="decision-1",
             observed_text="改用方案 A",
+            proposed_decision_text="采用方案 A",
             reason="来源不属于当前项目",
             evidence_refs=(foreign,),
             now=NOW,
@@ -364,25 +476,25 @@ def test_stale_conflict_cannot_overwrite_a_newer_decision() -> None:
         "project-1",
         decision_id="decision-1",
         observed_text="改用方案 A",
+        proposed_decision_text="采用方案 A",
         reason="供应商交期发生变化",
-        evidence_refs=(source("meeting-2"),),
+        evidence_refs=(source(),),
         now=NOW,
     )
     stale, _ = service.propose_conflict(
         "project-1",
         decision_id="decision-1",
         observed_text="改用方案 C",
+        proposed_decision_text="采用方案 C",
         reason="另一项条件发生变化",
-        evidence_refs=(source("meeting-3"),),
+        evidence_refs=(source(),),
         now=NOW,
     )
     service.review_conflict(
         first.candidate_id,
         reviewer_id="owner-1",
         action="accept",
-        new_decision_text="采用方案 A",
         change_reason="供应商交期发生变化",
-        evidence_refs=(source("meeting-2"),),
         now=NOW + timedelta(minutes=1),
     )
 
@@ -391,9 +503,7 @@ def test_stale_conflict_cannot_overwrite_a_newer_decision() -> None:
             stale.candidate_id,
             reviewer_id="owner-1",
             action="accept",
-            new_decision_text="采用方案 C",
             change_reason="另一项条件发生变化",
-            evidence_refs=(source("meeting-3"),),
             now=NOW + timedelta(minutes=2),
         )
 
@@ -409,25 +519,25 @@ def test_stale_conflict_uses_base_version_even_when_text_is_unchanged() -> None:
         "project-1",
         decision_id="decision-1",
         observed_text="改用方案 C",
+        proposed_decision_text="采用方案 C",
         reason="旧候选",
-        evidence_refs=(source("meeting-2"),),
+        evidence_refs=(source(),),
         now=NOW,
     )
     same_text, _ = service.propose_conflict(
         "project-1",
         decision_id="decision-1",
         observed_text="维持方案 B",
+        proposed_decision_text="采用方案 B",
         reason="补充了新的决策依据",
-        evidence_refs=(source("meeting-3"),),
+        evidence_refs=(source(),),
         now=NOW,
     )
     service.review_conflict(
         same_text.candidate_id,
         reviewer_id="owner-1",
         action="accept",
-        new_decision_text="采用方案 B",
         change_reason="补充了新的决策依据",
-        evidence_refs=(source("meeting-3"),),
         now=NOW + timedelta(minutes=1),
     )
 
@@ -436,9 +546,7 @@ def test_stale_conflict_uses_base_version_even_when_text_is_unchanged() -> None:
             stale.candidate_id,
             reviewer_id="owner-1",
             action="accept",
-            new_decision_text="采用方案 C",
             change_reason="旧候选",
-            evidence_refs=(source("meeting-2"),),
             now=NOW + timedelta(minutes=2),
         )
 
@@ -450,17 +558,16 @@ def test_same_observation_can_create_a_new_candidate_for_a_new_base_version() ->
         "project-1",
         decision_id="decision-1",
         observed_text="改用方案 A",
+        proposed_decision_text="采用方案 A",
         reason="供应商交期发生变化",
-        evidence_refs=(source("meeting-2"),),
+        evidence_refs=(source(),),
         now=NOW,
     )
     service.review_conflict(
         first.candidate_id,
         reviewer_id="owner-1",
         action="accept",
-        new_decision_text="采用方案 A",
         change_reason="供应商交期发生变化",
-        evidence_refs=(source("meeting-2"),),
         now=NOW + timedelta(minutes=1),
     )
 
@@ -468,8 +575,9 @@ def test_same_observation_can_create_a_new_candidate_for_a_new_base_version() ->
         "project-1",
         decision_id="decision-1",
         observed_text="改用方案 A",
+        proposed_decision_text="采用方案 A",
         reason="供应商交期发生变化",
-        evidence_refs=(source("meeting-2"),),
+        evidence_refs=(),
         now=NOW + timedelta(minutes=2),
     )
 

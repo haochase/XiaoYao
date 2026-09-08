@@ -10,6 +10,7 @@ from companion_gateway.project.index import (
     EvidenceSource,
     ProjectRuntimeSnapshot,
 )
+from companion_gateway.project.evidence_validation import reject_external_approvals
 
 from companion_gateway.project.models import (
     AnswerKind,
@@ -19,6 +20,7 @@ from companion_gateway.project.models import (
     DecisionStatus,
     DecisionVersion,
     EvidenceRef,
+    HumanApprovalRef,
     ProjectAnswer,
     ProjectContextPackage,
 )
@@ -110,6 +112,10 @@ class ProjectMemoryService:
         *,
         expected_permission_scope: str | None = None,
     ) -> None:
+        try:
+            reject_external_approvals(package)
+        except ValueError as exc:
+            raise ProjectMemoryError(str(exc)) from None
         with self._lock:
             timestamp = self._clock()
             if package.generated_at > timestamp + timedelta(seconds=30):
@@ -239,7 +245,7 @@ class ProjectMemoryService:
                 pinned_snapshot,
             )
 
-        if self._source_policy is not None:
+        if self._source_policy is not None and match.approval_ref is None:
             self._require_query_sources_fresh(
                 project_id,
                 match.source_refs,
@@ -257,6 +263,7 @@ class ProjectMemoryService:
             kind=kind,
             text=text,
             source_refs=match.source_refs,
+            approval_ref=match.approval_ref,
             confidence=match.confidence,
         )
 
@@ -427,6 +434,7 @@ class ProjectMemoryService:
         *,
         decision_id: str,
         observed_text: str,
+        proposed_decision_text: str,
         reason: str,
         evidence_refs: tuple[EvidenceRef, ...],
         now: datetime | None = None,
@@ -437,7 +445,10 @@ class ProjectMemoryService:
             raise ValueError("observed_text must not be blank")
         if not reason.strip():
             raise ValueError("reason must not be blank")
-        self._require_source_scope(context, evidence_refs)
+        if evidence_refs or active.approval_ref is None:
+            self._require_source_scope(context, evidence_refs)
+        if evidence_refs != active.source_refs:
+            raise ProjectMemoryError("conflict_basis_mismatch")
         timestamp = now or self._clock()
         with self._lock:
             versions = self._decision_versions(project_id, active)
@@ -447,8 +458,10 @@ class ProjectMemoryService:
                 decision_id,
                 base_version,
                 observed_text,
+                proposed_decision_text,
                 reason,
                 evidence_refs,
+                active.approval_ref,
             )
             if self._repository is None:
                 existing = self._conflicts.get(candidate_id)
@@ -460,9 +473,11 @@ class ProjectMemoryService:
                 decision_id=decision_id,
                 base_version=base_version,
                 observed_text=observed_text,
+                proposed_decision_text=proposed_decision_text,
                 active_decision_text=active.decision_text,
                 reason=reason,
                 source_refs=evidence_refs,
+                active_approval_ref=active.approval_ref,
                 created_at=timestamp,
             )
             if self._repository is not None:
@@ -518,7 +533,7 @@ class ProjectMemoryService:
             proposed_decision_text,
         ):
             raise ProjectMemoryError("statement_matches_active_decision")
-        if self._source_policy is not None:
+        if self._source_policy is not None and decision.approval_ref is None:
             self._require_query_sources_fresh(
                 project_id,
                 decision.source_refs,
@@ -529,6 +544,7 @@ class ProjectMemoryService:
             project_id,
             decision_id=decision.decision_id,
             observed_text=statement,
+            proposed_decision_text=proposed_decision_text,
             reason="会议发言可能与当前有效决策不一致",
             evidence_refs=decision.source_refs,
             now=timestamp,
@@ -581,8 +597,6 @@ class ProjectMemoryService:
         reviewer_id: str,
         action: Literal["accept", "reject"],
         change_reason: str,
-        new_decision_text: str | None = None,
-        evidence_refs: tuple[EvidenceRef, ...] = (),
         now: datetime | None = None,
     ) -> ConflictCandidate | tuple[ConflictCandidate, DecisionVersion]:
         timestamp = now or self._clock()
@@ -618,11 +632,15 @@ class ProjectMemoryService:
 
             if action != "accept":
                 raise ValueError("action must be accept or reject")
-            if not new_decision_text or not new_decision_text.strip():
-                raise ValueError("new_decision_text is required")
-            if not evidence_refs:
-                raise ValueError("evidence_refs is required")
-            self._require_source_scope(context, evidence_refs)
+            new_decision_text = candidate.proposed_decision_text
+            approval = HumanApprovalRef(
+                candidate_id=candidate.candidate_id,
+                reviewer_id=reviewer_id,
+                approved_at=timestamp,
+                reason=change_reason,
+                decision_text=new_decision_text,
+                permission_scope=context.permission_scope,
+            )
             active = self.current_decision(
                 candidate.project_id, candidate.decision_id, now=timestamp
             )
@@ -650,14 +668,16 @@ class ProjectMemoryService:
                 approved_by=reviewer_id,
                 approved_at=timestamp,
                 status=DecisionStatus.ACTIVE,
-                evidence_refs=evidence_refs,
+                evidence_refs=(),
+                approval_ref=approval,
             )
             updated_decision = active.model_copy(
                 update={
                     "decision_text": new_decision_text,
                     "rationale": change_reason,
                     "decided_at": timestamp,
-                    "source_refs": evidence_refs,
+                    "source_refs": (),
+                    "approval_ref": approval,
                     "confidence": min(active.confidence, 1.0),
                 }
             )
@@ -671,7 +691,6 @@ class ProjectMemoryService:
                 {
                     **context.model_dump(),
                     "active_decisions": updated_decisions,
-                    "generated_at": timestamp,
                 }
             )
             reviewed = candidate.model_copy(
@@ -870,16 +889,20 @@ class ProjectMemoryService:
         decision_id: str,
         base_version: int,
         observed_text: str,
+        proposed_decision_text: str,
         reason: str,
         evidence_refs: tuple[EvidenceRef, ...],
+        active_approval_ref: HumanApprovalRef | None,
     ) -> str:
         payload = {
             "project_id": project_id,
             "decision_id": decision_id,
             "base_version": base_version,
             "observed_text": observed_text.strip(),
+            "proposed_decision_text": proposed_decision_text,
             "reason": reason.strip(),
-            "source_ids": sorted(item.source_id for item in evidence_refs),
+            "source_refs": [item.model_dump(mode="json") for item in evidence_refs],
+            "active_approval_ref": active_approval_ref.model_dump(mode="json") if active_approval_ref else None,
         }
         digest = hashlib.sha256(
             json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")

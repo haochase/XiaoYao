@@ -223,6 +223,7 @@ class ConflictProposalRequest(BaseModel):
 
     decision_id: ProjectIdentifier
     observed_text: ProjectQueryText
+    proposed_decision_text: ProjectQueryText
     reason: ProjectQueryText
     evidence_refs: tuple[EvidenceRef, ...]
 
@@ -232,8 +233,6 @@ class ConflictReviewRequest(BaseModel):
 
     action: Literal["accept", "reject"]
     change_reason: ProjectQueryText
-    new_decision_text: ProjectQueryText | None = None
-    evidence_refs: tuple[EvidenceRef, ...] = ()
 
 
 class UnsupportedDeviceControl(ValueError):
@@ -805,6 +804,7 @@ def create_app(
                 project_id,
                 decision_id=body.decision_id,
                 observed_text=body.observed_text,
+                proposed_decision_text=body.proposed_decision_text,
                 reason=body.reason,
                 evidence_refs=body.evidence_refs,
                 now=project_clock(),
@@ -863,8 +863,6 @@ def create_app(
                 reviewer_id=principal.principal_id,
                 action=body.action,
                 change_reason=body.change_reason,
-                new_decision_text=body.new_decision_text,
-                evidence_refs=body.evidence_refs,
                 now=project_clock(),
             )
         except ProjectContextUnavailable as exc:
