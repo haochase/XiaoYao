@@ -54,18 +54,47 @@ def _decode_result(
     item: object,
     expected_operation: Literal["doc_info", "doc_read"],
 ) -> tuple[dict[str, object], int]:
+    if not isinstance(item, dict):
+        raise ValueError("host_import_invalid")
+    keys = set(item)
+    string_payload = keys == {
+        "operation",
+        "encoding",
+        "byte_count",
+        "payload",
+    }
+    chunked_payload = keys == {
+        "operation",
+        "encoding",
+        "byte_count",
+        "payload_chunks",
+    }
     if (
-        not isinstance(item, dict)
-        or set(item) != {"operation", "encoding", "byte_count", "payload"}
+        not (string_payload or chunked_payload)
         or item["operation"] != expected_operation
         or item["encoding"] != "base64-json"
         or type(item["byte_count"]) is not int
         or not 1 <= item["byte_count"] <= MAX_RESULT_BYTES
-        or not isinstance(item["payload"], str)
     ):
         raise ValueError("host_import_invalid")
+    if string_payload:
+        payload = item["payload"]
+        if not isinstance(payload, str):
+            raise ValueError("host_import_invalid")
+    else:
+        chunks = item["payload_chunks"]
+        if (
+            not isinstance(chunks, list)
+            or not chunks
+            or any(
+                not isinstance(chunk, str) or not 1 <= len(chunk) <= 64
+                for chunk in chunks
+            )
+        ):
+            raise ValueError("host_import_invalid")
+        payload = "".join(chunks)
     try:
-        decoded = base64.b64decode(item["payload"], validate=True)
+        decoded = base64.b64decode(payload, validate=True)
     except (ValueError, binascii.Error):
         raise ValueError("host_import_invalid") from None
     if len(decoded) != item["byte_count"]:

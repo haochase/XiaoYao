@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import pytest
 
 from companion_gateway.project.sync_models import SourceErrorType
-from tools.dws_sync.host_bridge import import_single_document_bundle
+from tools.dws_sync.host_bridge import decode_host_result, import_single_document_bundle
 from tools.dws_sync.manifest import DwsProjectManifest, DwsSourceSpec
 from tools.dws_sync.runner import DwsReadError
 
@@ -40,6 +40,53 @@ def result(operation: str, payload: object) -> dict[str, object]:
         "byte_count": len(raw),
         "payload": base64.b64encode(raw).decode("ascii"),
     }
+
+
+def chunked_result(operation: str, payload: object) -> dict[str, object]:
+    item = result(operation, payload)
+    encoded = item.pop("payload")
+    assert isinstance(encoded, str)
+    item["payload_chunks"] = [
+        encoded[offset : offset + 64]
+        for offset in range(0, len(encoded), 64)
+    ]
+    return item
+
+
+def test_decode_host_result_accepts_bounded_base64_chunks() -> None:
+    payload = {
+        "result": {
+            "nodeId": "doc-1",
+            "contentType": "ALIDOC",
+            "extension": "adoc",
+        }
+    }
+    raw = json.dumps(
+        chunked_result("doc_info", payload),
+        indent=2,
+    ).encode()
+
+    assert b"\n" in raw
+
+    assert decode_host_result(raw, "doc_info") == payload
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    (
+        [],
+        ["A" * 65],
+        ["valid", 1],
+        ["not base64!"],
+    ),
+)
+def test_decode_host_result_rejects_invalid_base64_chunks(chunks) -> None:
+    item = result("doc_info", {"success": True})
+    item.pop("payload")
+    item["payload_chunks"] = chunks
+
+    with pytest.raises(ValueError, match="^host_import_invalid$"):
+        decode_host_result(json.dumps(item).encode(), "doc_info")
 
 
 def host_input(

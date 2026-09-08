@@ -100,10 +100,11 @@ push 错误不得再次 push。
    只取项目键精确匹配且来源恰好为一个 document 的项目，并只在任务内保存它的 profile 和
    source ID。进行第一个独立工具调用：使用千问办公原生 Bash 执行固定 DWS `doc info` 命令。
    同一次调用的宿主 PostToolUse 必须只从真实 `dws_tool_result` 运行以下 jq，让结果直接包含固定
-   `operation=doc_info`，不得由 Agent 补写任何键：
+   `operation=doc_info`，并把 Base64 切成每段最多 64 个字符，避免宿主 `content` 通道在长字符串中
+   插入换行；不得由 Agent 补写任何键：
 
    ```bash
-   dws doc info --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq 'tojson as $raw | {operation:"doc_info",encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}'
+   dws doc info --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq 'tojson as $raw | ($raw|@base64) as $b | {operation:"doc_info",encoding:"base64-json",byte_count:($raw|utf8bytelength),payload_chunks:[range(0;($b|length);64) as $i|$b[$i:$i+64]]}'
    ```
 
    发起调用前必须逐项确认 `--profile`、`--format json`、`--node`、`--jq` 四个参数。
@@ -111,23 +112,26 @@ push 错误不得再次 push。
    参数；不得依赖 shell 环境变量，残留任何 `<LITERAL>` 占位符时不得执行。结果为
    `pending-post-tool-use` 占位符、缺失、超限或 jq 失败时立即停止。
 3. 进行下一次独立 CLI 工具调用：运行
-   `python tools/dws_sync_runtime.py capture-info --run-token TOKEN`，只把步骤 2 同一次原生 Bash 返回的
-   完整 envelope 原样交给 stdin。不得使用普通 stdout、历史结果或 pending placeholder，不得复制
-   Base64，不得写临时文件，也不得增加外层 object、数组或其他字段。成功状态必须为
+   `python tools/dws_sync_runtime.py capture-info --run-token TOKEN`。步骤 2 的宿主结果根对象必须严格为
+   `type/content` 两个键且 `type=dws_tool_result`；只取 `content` 字符串值，在内存中严格解析为键集合
+   `operation/encoding/byte_count/payload_chunks` 的 JSON object，再将该 object 序列化为 UTF-8 JSON
+   交给 stdin。不得把 `type/content` 外层包装交给 stdin，不得使用普通 stdout、历史结果或 pending
+   placeholder，不得手工复制或拼接 Base64 分片，不得写临时文件，也不得增加其他字段。成功状态必须为
    `host_info_captured`。
 4. 进行第三个独立工具调用：以相同 dws、profile、JSON 格式和 source ID 执行固定 DWS
    `doc read`。同一次宿主 jq 直接加入固定 `operation=doc_read`：
 
    ```bash
-   dws doc read --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq 'tojson as $raw | {operation:"doc_read",encoding:"base64-json",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}'
+   dws doc read --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq 'tojson as $raw | ($raw|@base64) as $b | {operation:"doc_read",encoding:"base64-json",byte_count:($raw|utf8bytelength),payload_chunks:[range(0;($b|length);64) as $i|$b[$i:$i+64]]}'
    ```
 
    两次 DWS 调用不得合并。再次逐项确认四个参数；不得使用管道，不得使用命令替换，不得使用
    Popen、重定向或临时文件。结果只接受同一次真实 `dws_tool_result` 通道生成的完整 envelope。
 5. 进行下一次独立 CLI 工具调用：运行
    `python tools/dws_sync_runtime.py complete-host-import --run-token TOKEN`，只把步骤 4 同一次原生 Bash
-   返回的完整 envelope 原样交给 stdin。不得由 Agent 增加 operation、合并两次结果、构造外层
-   object 或复制 Base64。成功状态必须为 `collected`。complete 事务失败会先恢复 capture、output 和
+   返回的 `dws_tool_result` 按步骤 3 的相同规则只取并严格解析 `content`，再把内层 envelope 交给
+   stdin。不得把 `type/content` 外层包装交给 stdin，不得由 Agent 增加 operation、合并两次结果、
+   构造外层 object 或手工复制、拼接 Base64 分片。成功状态必须为 `collected`。complete 事务失败会先恢复 capture、output 和
    `host_info`，随后 finally 使用同一 token abort，abort 随后按设计清理 capture；
    不承诺 abort 后保留诊断文件，也不得为了诊断跳过 abort 或另存 capture。
 6. 两阶段导入成功后，使用参数数组运行 `python tools/dws_sync_runtime.py pending --run-token TOKEN`。

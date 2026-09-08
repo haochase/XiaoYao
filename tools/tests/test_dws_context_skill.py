@@ -76,7 +76,8 @@ def test_unattended_prompt_uses_two_phase_host_envelopes_without_model_artifact(
     for block in bash_blocks:
         assert "encoding:\"base64-json\"" in block
         assert "byte_count:($raw|utf8bytelength)" in block
-        assert "payload:($raw|@base64)" in block
+        assert "payload_chunks:" in block
+        assert "range(0;($b|length);64)" in block
     expected_flow = (
         "python tools/dws_sync_runtime.py begin",
         "dws doc info",

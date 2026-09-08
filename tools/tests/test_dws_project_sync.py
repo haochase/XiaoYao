@@ -7078,8 +7078,9 @@ def test_qwen_prompt_uses_independent_two_phase_host_collection_calls() -> None:
     assert "不得使用命令替换" in normalized
     assert "不得使用 Popen" in normalized
     assert "不得写临时文件" in normalized
-    assert "完整 envelope 原样交给 stdin" in normalized
-    assert "不得复制 Base64" in normalized
+    assert "只取 content 字符串值" in normalized
+    assert "payload_chunks" in normalized
+    assert "不得把 type/content 外层包装交给 stdin" in normalized
 
 
 def test_qwen_prompt_forbids_host_import_outer_contract() -> None:
@@ -7095,7 +7096,8 @@ def test_qwen_prompt_forbids_host_import_outer_contract() -> None:
     assert '"results"' not in prompt
     assert "python tools/dws_sync_runtime.py host-import" not in normalized
     assert "不得由 Agent 增加 operation" in normalized
-    assert "不得由 Agent 增加 operation、合并两次结果、构造外层 object" in normalized
+    assert "不得由 Agent 增加 operation、合并两次结果" in normalized
+    assert "构造外层 object" in normalized
     assert normalized.index("capture-info") < normalized.index("complete-host-import")
 
 
@@ -7106,8 +7108,8 @@ def test_qwen_prompt_embeds_jq_in_each_exact_dws_command_template() -> None:
         / "qwenwork-dws-project-sync.md"
     ).read_text(encoding="utf-8")
     bash_blocks = re.findall(r"```bash\s*(.*?)\s*```", prompt, re.DOTALL)
-    jq_info = "tojson as $raw | {operation:\"doc_info\",encoding:\"base64-json\",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}"
-    jq_read = "tojson as $raw | {operation:\"doc_read\",encoding:\"base64-json\",byte_count:($raw|utf8bytelength),payload:($raw|@base64)}"
+    jq_info = "tojson as $raw | ($raw|@base64) as $b | {operation:\"doc_info\",encoding:\"base64-json\",byte_count:($raw|utf8bytelength),payload_chunks:[range(0;($b|length);64) as $i|$b[$i:$i+64]]}"
+    jq_read = "tojson as $raw | ($raw|@base64) as $b | {operation:\"doc_read\",encoding:\"base64-json\",byte_count:($raw|utf8bytelength),payload_chunks:[range(0;($b|length);64) as $i|$b[$i:$i+64]]}"
     normalized = " ".join(prompt.replace("`", "").split())
     compact = "".join(prompt.replace("`", "").split())
 
