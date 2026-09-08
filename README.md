@@ -91,6 +91,24 @@ retrieval completion from a query hash alone.
 For protected local setup, use `python tools/dws_sync_runtime.py --help` and
 the [runtime setup section](gateway/README.md#protected-runtime-setup).
 
+Conflict acceptance and rejection use the separate fixed-boundary reviewer
+client. It reads only `principal.json` and the CurrentUser-DPAPI protected
+`credential.dpapi` from `E:\haochase\xiaoqian\.private\project-review`, contacts only
+`http://127.0.0.1:8724`, and proceeds only when the fixed project has exactly
+one proposed candidate. The client accepts no endpoint, project, candidate,
+reviewer, or token override:
+
+```powershell
+python tools/project_conflict_review.py list
+python tools/project_conflict_review.py accept --reason '负责人确认采用会议候选方案'
+python tools/project_conflict_review.py reject --reason '保留现有正式决策'
+```
+
+Review output is deliberately redacted: it reports only readiness or terminal
+status, never the token, candidate identifier, decision text, or source details.
+The gateway derives reviewer identity, decision text, evidence, and review time
+from the authenticated principal and stored candidate rather than client input.
+
 See [the gateway DWS runbook](gateway/README.md#private-dws-project-synchronization)
 for the sanitized manifest schema, required environment-variable names, the
 manual `collect` compatibility command, the production direct-Core flow, and
