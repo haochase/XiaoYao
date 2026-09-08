@@ -69,11 +69,25 @@ def tts_payload(audio: bytes = b"\x02\x00" * 1_440) -> bytes:
     ).encode()
 
 
+def repair_payload(*, safe_to_speak: bool = True) -> bytes:
+    return chat_payload(
+        json.dumps(
+            {"intent": None, "safe_to_speak": safe_to_speak},
+            ensure_ascii=False,
+        )
+    )
+
+
+def is_repair_request(body: dict[str, object]) -> bool:
+    return "Classify the audio only" in body["messages"][0]["content"]
+
+
 def test_mimo_runtime_sends_audio_to_chat_then_tts(monkeypatch) -> None:
     requests: list[dict[str, object]] = []
     responses = iter(
         [
             FakeResponse(chat_payload('{"reply":"MiMo 在这里。","task":null}')),
+            FakeResponse(repair_payload()),
             FakeResponse(tts_payload()),
         ]
     )
@@ -103,6 +117,7 @@ def test_mimo_runtime_sends_audio_to_chat_then_tts(monkeypatch) -> None:
     assert [request["url"] for request in requests] == [
         "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
         "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
+        "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
     ]
     assert all(request["api_key"] == "example-token" for request in requests)
     audio_part = requests[0]["body"]["messages"][1]["content"][0]
@@ -113,8 +128,9 @@ def test_mimo_runtime_sends_audio_to_chat_then_tts(monkeypatch) -> None:
         assert wav.getframerate() == 16_000
         assert wav.getnchannels() == 1
         assert wav.getsampwidth() == 2
-    assert requests[1]["body"]["model"] == "mimo-v2.5-tts"
-    assert requests[1]["body"]["audio"] == {
+    assert "Classify the audio only" in requests[1]["body"]["messages"][0]["content"]
+    assert requests[2]["body"]["model"] == "mimo-v2.5-tts"
+    assert requests[2]["body"]["audio"] == {
         "format": "pcm16",
         "voice": "mimo_default",
     }
@@ -216,6 +232,101 @@ def test_mimo_runtime_exposes_project_conflict_intent(monkeypatch) -> None:
     assert "pending human review" in system_prompt
 
 
+def test_mimo_runtime_repairs_an_unsafe_project_mutation_reply(monkeypatch) -> None:
+    requests: list[dict[str, object]] = []
+    responses = iter(
+        [
+            FakeResponse(
+                chat_payload(
+                    '{"reply":"已将终端设备切换为树莓派","task":null,'
+                    '"action":null,"intent":null}'
+                )
+            ),
+            FakeResponse(
+                chat_payload(
+                    '{"intent":{"type":"project_conflict",'
+                    '"query":"终端方案改成树莓派",'
+                    '"proposed_decision_text":"终端方案改成树莓派"},'
+                    '"safe_to_speak":false}'
+                )
+            ),
+        ]
+    )
+
+    def fake_urlopen(request, *, timeout):
+        requests.append(json.loads(request.data))
+        return next(responses)
+
+    monkeypatch.setattr(mimo_v25, "urlopen", fake_urlopen)
+    runtime = MimoV25Runtime(
+        openai_base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        api_key="example-token",
+    )
+
+    response = runtime.respond(input_pcm())
+
+    assert response.intent == VoiceIntent(
+        type="project_conflict",
+        query="终端方案改成树莓派",
+        proposed_decision_text="终端方案改成树莓派",
+    )
+    assert response.pcm is None
+    assert len(requests) == 2
+    assert "Classify the audio only" in requests[1]["messages"][0]["content"]
+    assert requests[1]["model"] == "mimo-v2.5"
+
+
+def test_mimo_runtime_neutralizes_an_unsafe_reply_when_repair_has_no_intent(
+    monkeypatch,
+) -> None:
+    requests: list[dict[str, object]] = []
+    responses = iter(
+        [
+            FakeResponse(
+                chat_payload(
+                    '{"reply":"已将终端设备切换为树莓派","task":null,'
+                    '"action":null,"intent":null}'
+                )
+            ),
+            FakeResponse(repair_payload(safe_to_speak=False)),
+            FakeResponse(tts_payload()),
+        ]
+    )
+
+    def fake_urlopen(request, *, timeout):
+        requests.append(json.loads(request.data))
+        return next(responses)
+
+    monkeypatch.setattr(mimo_v25, "urlopen", fake_urlopen)
+    runtime = MimoV25Runtime(
+        openai_base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        api_key="example-token",
+    )
+
+    response = runtime.respond(input_pcm())
+
+    assert response.intent is None
+    assert response.text == "该内容需要人工确认，当前有效决策尚未更新。"
+    assert response.pcm is not None
+    assert "已将终端设备切换为树莓派" in requests[1]["messages"][1]["content"][1][
+        "text"
+    ]
+    assert requests[2]["messages"][0]["content"] == response.text
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"intent": None},
+        {"intent": None, "safe_to_speak": True, "extra": "forbidden"},
+        {"intent": None, "safe_to_speak": "yes"},
+    ),
+)
+def test_project_repair_parser_requires_the_exact_schema(payload) -> None:
+    with pytest.raises(ModelRuntimeError, match="repair response is invalid"):
+        mimo_v25._decode_project_repair_intent(json.dumps(payload))
+
+
 @pytest.mark.parametrize("reply_fragment", ["", '"reply":"",'])
 def test_mimo_runtime_accepts_intent_without_model_reply(
     monkeypatch,
@@ -273,6 +384,8 @@ def test_mimo_runtime_injects_current_shanghai_time(monkeypatch) -> None:
     def fake_urlopen(request, *, timeout):
         body = json.loads(request.data)
         requests.append(body)
+        if is_repair_request(body):
+            return FakeResponse(repair_payload())
         if body["model"] == "mimo-v2.5":
             return FakeResponse(chat_payload('{"reply":"ok","task":null}'))
         return FakeResponse(tts_payload())
@@ -297,11 +410,12 @@ def test_mimo_runtime_logs_stage_durations_without_content(monkeypatch) -> None:
     responses = iter(
         [
             FakeResponse(chat_payload('{"reply":"private reply","task":null}')),
+            FakeResponse(repair_payload()),
             FakeResponse(tts_payload()),
         ]
     )
     log_messages: list[str] = []
-    timestamps = iter([10.0, 12.5, 12.5, 14.0])
+    timestamps = iter([10.0, 12.5, 12.5, 13.5, 13.5, 15.0])
 
     monkeypatch.setattr(
         mimo_v25,
@@ -323,8 +437,9 @@ def test_mimo_runtime_logs_stage_durations_without_content(monkeypatch) -> None:
     runtime.respond(input_pcm())
 
     assert log_messages == [
-        "mimo_voice_turn_completed model=mimo-v2.5 chat_duration_ms=2500 "
-        "tts_duration_ms=1500 total_duration_ms=4000 output_audio_ms=60"
+        "mimo_voice_turn_completed model=mimo-v2.5 chat_duration_ms=3500 "
+        "tts_duration_ms=1500 total_duration_ms=5000 output_audio_ms=60 "
+        "repair_attempted=True repair_duration_ms=1000"
     ]
     assert "private reply" not in log_messages[0]
 
@@ -369,9 +484,15 @@ def test_mimo_runtime_extracts_validated_task(monkeypatch) -> None:
         mimo_v25,
         "urlopen",
         lambda request, *, timeout: (
-            FakeResponse(chat_payload(json.dumps({"reply": "好的。", "task": task})))
-            if json.loads(request.data)["model"] == "mimo-v2.5"
-            else FakeResponse(tts_payload())
+            FakeResponse(repair_payload())
+            if is_repair_request(json.loads(request.data))
+            else (
+                FakeResponse(
+                    chat_payload(json.dumps({"reply": "好的。", "task": task}))
+                )
+                if json.loads(request.data)["model"] == "mimo-v2.5"
+                else FakeResponse(tts_payload())
+            )
         ),
     )
     runtime = MimoV25Runtime(
@@ -390,8 +511,11 @@ def test_mimo_runtime_extracts_validated_medication_action(monkeypatch) -> None:
         mimo_v25,
         "urlopen",
         lambda request, *, timeout: (
-            FakeResponse(
-                chat_payload(
+            FakeResponse(repair_payload())
+            if is_repair_request(json.loads(request.data))
+            else (
+                FakeResponse(
+                    chat_payload(
                     json.dumps(
                         {
                             "reply": "好的，已记录。",
@@ -403,10 +527,11 @@ def test_mimo_runtime_extracts_validated_medication_action(monkeypatch) -> None:
                         },
                         ensure_ascii=False,
                     )
+                    )
                 )
+                if json.loads(request.data)["model"] == "mimo-v2.5"
+                else FakeResponse(tts_payload())
             )
-            if json.loads(request.data)["model"] == "mimo-v2.5"
-            else FakeResponse(tts_payload())
         ),
     )
     runtime = MimoV25Runtime(
@@ -439,9 +564,13 @@ def test_mimo_runtime_extracts_valid_memory_proposals_and_ignores_invalid_items(
         mimo_v25,
         "urlopen",
         lambda request, *, timeout: (
-            FakeResponse(chat_payload(json.dumps(payload)))
-            if json.loads(request.data)["model"] == "mimo-v2.5"
-            else FakeResponse(tts_payload())
+            FakeResponse(repair_payload())
+            if is_repair_request(json.loads(request.data))
+            else (
+                FakeResponse(chat_payload(json.dumps(payload)))
+                if json.loads(request.data)["model"] == "mimo-v2.5"
+                else FakeResponse(tts_payload())
+            )
         ),
     )
     runtime = MimoV25Runtime(
@@ -466,6 +595,8 @@ def test_mimo_runtime_preserves_empty_context_and_appends_bounded_context(
     def fake_urlopen(request, *, timeout):
         body = json.loads(request.data)
         requests.append(body)
+        if is_repair_request(body):
+            return FakeResponse(repair_payload())
         if body["model"] == "mimo-v2.5":
             return FakeResponse(chat_payload('{"reply":"ok","task":null}'))
         return FakeResponse(tts_payload())
@@ -508,6 +639,8 @@ def test_mimo_memory_proposal_prompt_is_opt_in(monkeypatch) -> None:
     def fake_urlopen(request, *, timeout):
         body = json.loads(request.data)
         requests.append(body)
+        if is_repair_request(body):
+            return FakeResponse(repair_payload())
         if body["model"] == "mimo-v2.5":
             return FakeResponse(chat_payload('{"reply":"ok","task":null}'))
         return FakeResponse(tts_payload())
@@ -596,6 +729,7 @@ def test_mimo_runtime_retries_429_and_5xx_with_exponential_backoff(
             ),
             FakeResponse(b"", status=503),
             FakeResponse(chat_payload('{"reply":"retry ok","task":null}')),
+            FakeResponse(repair_payload()),
             FakeResponse(tts_payload()),
         ]
     )
@@ -621,7 +755,7 @@ def test_mimo_runtime_retries_429_and_5xx_with_exponential_backoff(
     response = runtime.respond(input_pcm())
 
     assert response.text == "retry ok"
-    assert len(requests) == 4
+    assert len(requests) == 5
     assert delays == [0.25, 0.5]
 
 
@@ -677,6 +811,7 @@ def test_mimo_runtime_disables_reasoning_for_voice_chat(monkeypatch) -> None:
     responses = iter(
         [
             FakeResponse(chat_payload('{"reply":"voice ok","task":null}')),
+            FakeResponse(repair_payload()),
             FakeResponse(tts_payload()),
         ]
     )

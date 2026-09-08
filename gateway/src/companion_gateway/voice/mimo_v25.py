@@ -30,6 +30,16 @@ _OUTPUT_SAMPLE_RATE = 24_000
 _RETRYABLE_STATUS_MIN = 500
 _RETRYABLE_STATUS_MAX = 599
 _MAX_MEMORY_PROPOSALS = 3
+_PROJECT_MUTATION_REPAIR_PROMPT = (
+    "Classify the audio only and audit the candidate reply. Return exactly one "
+    "JSON object with keys intent and safe_to_speak. If the user proposes or "
+    "reports changing a project decision, intent "
+    "must be {\"type\":\"project_conflict\",\"query\":\"the user's focused "
+    "statement\",\"proposed_decision_text\":\"the explicit proposed decision\"}. "
+    "Otherwise intent must be null. safe_to_speak must be false whenever the "
+    "candidate reply claims that a project change was applied, or when safety is "
+    "uncertain; it may be true only when the candidate reply is safe to speak."
+)
 _DEFAULT_SYSTEM_PROMPT = (
     "You are the XiaoYao voice companion. Reply in Chinese when the user speaks "
     "Chinese. Return exactly one JSON object with keys reply, task, action, and intent. "
@@ -176,6 +186,34 @@ def _decode_json_response(
     return reply, task, action, intent, tuple(proposals)
 
 
+def _decode_project_repair_intent(text: str) -> tuple[VoiceIntent | None, bool]:
+    candidate = text.strip()
+    if candidate.startswith("```") and candidate.endswith("```"):
+        candidate = candidate.split("\n", 1)[-1][:-3].strip()
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise ModelRuntimeError("MiMo project repair response is invalid") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "intent",
+        "safe_to_speak",
+    }:
+        raise ModelRuntimeError("MiMo project repair response is invalid")
+    safe_to_speak = payload["safe_to_speak"]
+    if not isinstance(safe_to_speak, bool):
+        raise ModelRuntimeError("MiMo project repair response is invalid")
+    raw_intent = payload["intent"]
+    if raw_intent is None:
+        return None, safe_to_speak
+    try:
+        intent = VoiceIntent.model_validate(raw_intent)
+    except ValidationError as exc:
+        raise ModelRuntimeError("MiMo project repair intent is invalid") from exc
+    if intent.type != "project_conflict":
+        raise ModelRuntimeError("MiMo project repair intent is invalid")
+    return intent, safe_to_speak
+
+
 class MimoV25Runtime:
     """MiMo-V2.5 audio-understanding plus MiMo TTS runtime."""
 
@@ -309,6 +347,63 @@ class MimoV25Runtime:
         reply, task, action, intent, memory_proposals = _decode_json_response(
             _text_content(chat_message)
         )
+        repair_attempted = intent is None
+        repair_duration_ms = 0
+        if repair_attempted:
+            repair_started_at = time.perf_counter()
+            repaired_message = self._request(
+                {
+                    "model": self._model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": _PROJECT_MUTATION_REPAIR_PROMPT,
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_audio",
+                                    "input_audio": {
+                                        "data": _pcm_to_wav_data_url(pcm),
+                                        "format": "wav",
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Classify this audio only. Candidate reply "
+                                        "from the first pass: "
+                                        + json.dumps(reply, ensure_ascii=False)
+                                    ),
+                                },
+                            ],
+                        },
+                    ],
+                    "max_completion_tokens": 512,
+                    "thinking": {"type": "disabled"},
+                    "stream": False,
+                }
+            )
+            repair_finished_at = time.perf_counter()
+            repair_duration_ms = round(
+                (repair_finished_at - repair_started_at) * 1_000
+            )
+            chat_finished_at = repair_finished_at
+            repaired_intent, safe_to_speak = _decode_project_repair_intent(
+                _text_content(repaired_message)
+            )
+            if repaired_intent is not None:
+                reply = ""
+                task = None
+                action = None
+                intent = repaired_intent
+                memory_proposals = ()
+            elif not safe_to_speak:
+                reply = "该内容需要人工确认，当前有效决策尚未更新。"
+                task = None
+                action = None
+                memory_proposals = ()
         if intent is None:
             tts_started_at = time.perf_counter()
             response_pcm = self.synthesize(reply)
@@ -319,12 +414,15 @@ class MimoV25Runtime:
             finished_at = chat_finished_at
         logger.info(
             "mimo_voice_turn_completed model=%s chat_duration_ms=%s "
-            "tts_duration_ms=%s total_duration_ms=%s output_audio_ms=%s",
+            "tts_duration_ms=%s total_duration_ms=%s output_audio_ms=%s "
+            "repair_attempted=%s repair_duration_ms=%s",
             self._model,
             round((chat_finished_at - started_at) * 1_000),
             round((finished_at - tts_started_at) * 1_000),
             round((finished_at - started_at) * 1_000),
             round(response_pcm.duration_ms) if response_pcm is not None else 0,
+            repair_attempted,
+            repair_duration_ms,
         )
         return ModelResponse(
             text=reply,
