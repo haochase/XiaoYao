@@ -31,6 +31,7 @@ from tools.dws_sync.runner import (
     DwsCommandRunner,
     DwsReadError,
     HostHandoffRequired,
+    _minimal_core_environment,
 )
 from tools.tests.dws_core_fixtures import official_installation, write_approval
 
@@ -75,8 +76,11 @@ class RecordingStdout:
 
 
 class FakeProcess:
-    def __init__(self, stdout: bytes, *, returncode: int = 0) -> None:
+    def __init__(
+        self, stdout: bytes, *, returncode: int = 0, stderr: bytes = b""
+    ) -> None:
         self.stdout = RecordingStdout(stdout)
+        self.stderr = RecordingStdout(stderr)
         self.returncode = returncode
         self.killed = False
         self.wait_calls: list[float | None] = []
@@ -186,7 +190,7 @@ def test_runner_injects_fixed_profile_json_format_and_safe_subprocess(
     ]
     assert options["shell"] is False
     assert options["stdout"] is subprocess.PIPE
-    assert options["stderr"] is subprocess.DEVNULL
+    assert options["stderr"] is subprocess.PIPE
     assert "COMPANION_DWS_SYNC_TOKEN" not in options["env"]
     assert process.stdout.read_sizes == [MAX_DWS_STDOUT_BYTES + 1]
     assert len(process.wait_calls) == 1
@@ -240,7 +244,7 @@ def test_official_core_runner_uses_minimal_environment_and_real_json(
     assert options["env"]["TEMP"] == str(runtime_root / "tmp")
     assert options["env"]["TMP"] == str(runtime_root / "tmp")
     allowlist = {
-        "SystemRoot",
+        "SYSTEMROOT",
         "WINDIR",
         "COMSPEC",
         "USERPROFILE",
@@ -255,11 +259,141 @@ def test_official_core_runner_uses_minimal_environment_and_real_json(
         "NUMBER_OF_PROCESSORS",
     }
     expected_keys = {
-        key
+        key.upper()
         for key, value in os.environ.items()
-        if key in allowlist - {"TEMP", "TMP"} and value
+        if key.upper() in allowlist - {"TEMP", "TMP"} and value
     } | {"TEMP", "TMP"}
     assert set(options["env"]) == expected_keys
+
+
+@pytest.mark.parametrize("key", ["SystemRoot", "SYSTEMROOT", "systemroot"])
+def test_core_environment_preserves_case_insensitive_windows_keys(
+    tmp_path: Path, key: str
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    selected = _minimal_core_environment(
+        {key: r"C:\Windows", "appdata": "profile-data", "openai_api_key": "secret"},
+        runtime_root=runtime,
+    )
+    assert selected == {
+        "SYSTEMROOT": r"C:\Windows",
+        "APPDATA": "profile-data",
+        "TEMP": str(runtime / "tmp"),
+        "TMP": str(runtime / "tmp"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "returncode", "expected"),
+    [
+        (
+            b"",
+            b'{"server_error_code":"CLI_ORG_NOT_AUTHORIZED","message":"secret"}',
+            1,
+            "authentication_failed",
+        ),
+        (
+            b"",
+            b'{"error":{"code":"Forbidden",'
+            b'"server_error_code":"CLI_ORG_NOT_AUTHORIZED","message":"secret"}}',
+            1,
+            "authentication_failed",
+        ),
+        (
+            b"",
+            b'{"error":{"code":"DNS_LOOKUP_FAILED","message":"secret"}}',
+            1,
+            "provider_unavailable",
+        ),
+        (
+            b"",
+            b'{"error":{"code":"NETWORK_TIMEOUT","message":"secret"}}',
+            1,
+            "network_timeout",
+        ),
+        (
+            b'{"error_type":"rate_limited"}',
+            b'{"error_type":"authentication_failed"}',
+            1,
+            "rate_limited",
+        ),
+        (b"", b'{"success":true}', 0, "invalid_payload"),
+        (
+            b"",
+            b'prefix {"error_type":"authentication_failed"}',
+            1,
+            "provider_unavailable",
+        ),
+        (
+            b"",
+            b'{"error_type":"authentication_failed","value":NaN}',
+            1,
+            "provider_unavailable",
+        ),
+        (
+            b"",
+            b'[{"error_type":"authentication_failed"}]',
+            1,
+            "provider_unavailable",
+        ),
+    ],
+)
+def test_runner_structured_stderr_is_bounded_normalized_and_private(
+    tmp_path: Path, stdout: bytes, stderr: bytes, returncode: int, expected: str
+) -> None:
+    process = FakeProcess(stdout, returncode=returncode, stderr=stderr)
+    runner, _ = make_official_core_runner(tmp_path, process)
+    with pytest.raises(DwsReadError) as error:
+        runner.run(("doc", "info"))
+    assert str(error.value) == expected
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+    assert process.stderr.read_sizes == [65_537]
+    assert process.stdout.closed and process.stderr.closed
+
+
+def test_runner_stderr_overflow_kills_process_and_closes_both_streams(
+    tmp_path: Path,
+) -> None:
+    process = FakeProcess(b"{}", stderr=b"secret" * 20_000)
+    runner, _ = make_official_core_runner(tmp_path, process)
+    with pytest.raises(DwsReadError, match="^invalid_payload$"):
+        runner.run(("doc", "info"))
+    assert process.killed
+    assert process.stderr.read_sizes == [65_537]
+    assert process.stdout.closed and process.stderr.closed
+
+
+def test_runner_reads_stderr_concurrently_with_blocked_stdout(tmp_path: Path) -> None:
+    process = BlockingProcess()
+
+    class ReleasingStderr(RecordingStdout):
+        def read(self, size: int) -> bytes:
+            process.stdout.released.set()
+            return super().read(size)
+
+    process.stderr = ReleasingStderr(b"private diagnostic")
+    runner, _ = make_official_core_runner(tmp_path, process, timeout_seconds=0.1)
+    assert runner.run(("doc", "info")) == {}
+    assert not process.killed
+    assert process.stderr.closed
+
+
+def test_runner_blocked_stderr_uses_shared_timeout_and_cleanup(tmp_path: Path) -> None:
+    process = FakeProcess(b"{}")
+    process.stderr = BlockingStdout()
+
+    def kill() -> None:
+        process.killed = True
+        process.stderr.released.set()
+
+    process.kill = kill
+    runner, _ = make_official_core_runner(tmp_path, process, timeout_seconds=0.01)
+    with pytest.raises(DwsReadError, match="^network_timeout$"):
+        runner.run(("doc", "info"))
+    assert process.killed
+    assert process.stdout.closed and process.stderr.closed
 
 
 def test_normal_runner_constructor_rejects_internal_launch_overrides(

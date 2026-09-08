@@ -4457,14 +4457,19 @@ def test_direct_collection_restores_old_bundle_when_state_commit_fails(
     )
 
 
+@pytest.mark.parametrize(
+    "error_type",
+    [SourceErrorType.PROVIDER_UNAVAILABLE, SourceErrorType.AUTHENTICATION_FAILED],
+)
 def test_direct_collection_provider_failure_keeps_bundle_and_begun_lease(
     tmp_path: Path,
     monkeypatch,
     capsys,
+    error_type: SourceErrorType,
 ) -> None:
     class ProviderFailure:
         def run(self, _args):
-            raise DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, True)
+            raise DwsReadError(error_type, False)
 
     paths = write_push_inputs(tmp_path)
     old_bundle = paths["sources"].read_bytes()
@@ -4486,7 +4491,7 @@ def test_direct_collection_provider_failure_keeps_bundle_and_begun_lease(
 
     assert json.loads(capsys.readouterr().out) == {
         "status": "error",
-        "error_type": "sync_failed",
+        "error_type": error_type.value,
     }
     assert paths["sources"].read_bytes() == old_bundle
     lifecycle.assert_stage(
@@ -4501,6 +4506,54 @@ def test_direct_collection_provider_failure_keeps_bundle_and_begun_lease(
         token,
         root=lifecycle_root,
         now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize("failure", ["mixed", "unknown", "core_changed"])
+def test_direct_collection_failure_fallback_and_core_trust_preserve_state(
+    tmp_path: Path, monkeypatch, capsys, failure: str
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    write_manifest(
+        paths["manifest"],
+        project(sources=(source_spec("task", "task-1"), source_spec("task", "task-2"))),
+    )
+    old_bundle = paths["sources"].read_bytes()
+    lifecycle_root = tmp_path / "lifecycle"
+    monkeypatch.setattr(sync_cli, "LIFECYCLE_ROOT", lifecycle_root)
+    started = lifecycle.begin_run("project-1", root=lifecycle_root, now=lambda: NOW)
+    token = started.run_token or ""
+
+    class FailedRunner:
+        def run(self, args):
+            if failure == "core_changed":
+                raise ValueError("dws_core_changed_requires_approval")
+            if failure == "unknown":
+                raise DwsReadError("secret-provider-code", False)
+            error_type = (
+                SourceErrorType.AUTHENTICATION_FAILED
+                if args[-1] == "task-1"
+                else SourceErrorType.PROVIDER_UNAVAILABLE
+            )
+            raise DwsReadError(error_type, False)
+
+    assert main(
+        collect_args(paths, "--run-token", token),
+        runner=FailedRunner(),
+        now=lambda: NOW,
+        direct_collection=True,
+    ) == 1
+    expected = (
+        "dws_core_changed_requires_approval"
+        if failure == "core_changed"
+        else "sync_failed"
+    )
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error", "error_type": expected
+    }
+    assert paths["sources"].read_bytes() == old_bundle
+    lifecycle.assert_stage(
+        "project-1", token, expected="begun", root=lifecycle_root, now=lambda: NOW
     )
 
 

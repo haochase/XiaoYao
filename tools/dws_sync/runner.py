@@ -7,6 +7,7 @@ from contextlib import AbstractContextManager
 from functools import partial
 import os
 from pathlib import Path
+import queue
 import subprocess
 import threading
 import time
@@ -24,6 +25,7 @@ from tools.dws_sync.launch import resolve_dws_launch
 
 
 MAX_DWS_STDOUT_BYTES = 2_097_152
+MAX_DWS_STDERR_BYTES = 65_536
 _PROCESS_CLEANUP_TIMEOUT_SECONDS = 1.0
 _FORBIDDEN_FLAGS = {
     "--client-id",
@@ -50,7 +52,7 @@ _SHELL_COMPONENTS = {
 }
 _CORE_ENV_ALLOWLIST = frozenset(
     {
-        "SystemRoot",
+        "SYSTEMROOT",
         "WINDIR",
         "COMSPEC",
         "USERPROFILE",
@@ -116,6 +118,8 @@ def normalized_read_error(
     error_value = response.get("error")
     error = error_value if isinstance(error_value, Mapping) else response
     candidates = (
+        error.get("server_error_code"),
+        response.get("server_error_code"),
         error.get("error_type"),
         error.get("errorType"),
         error.get("reason"),
@@ -175,9 +179,9 @@ def _minimal_core_environment(
     runtime_root: Path,
 ) -> dict[str, str]:
     selected = {
-        key: value
+        key.upper(): value
         for key, value in environ.items()
-        if key in _CORE_ENV_ALLOWLIST - {"TEMP", "TMP"}
+        if key.upper() in _CORE_ENV_ALLOWLIST - {"TEMP", "TMP"}
         and isinstance(value, str)
         and value
     }
@@ -294,7 +298,7 @@ class DwsCommandRunner:
             popen_options = {
                 "shell": False,
                 "stdout": subprocess.PIPE,
-                "stderr": subprocess.DEVNULL,
+                "stderr": subprocess.PIPE,
             }
             if self._launch_env is not None:
                 popen_options["env"] = self._launch_env
@@ -309,7 +313,7 @@ class DwsCommandRunner:
         if run_error is not None:
             raise run_error
 
-        stdout, returncode = _bounded_process_output(
+        stdout, stderr, returncode = _bounded_process_streams(
             process,
             timeout_seconds=self._timeout_seconds,
         )
@@ -320,6 +324,8 @@ class DwsCommandRunner:
             if payload is None:
                 raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
             return payload
+        if payload is None:
+            payload = _parse_json_object(stderr)
         if payload is not None:
             raise normalized_read_error(
                 payload,
@@ -333,37 +339,59 @@ def _bounded_process_output(
     *,
     timeout_seconds: float,
 ) -> tuple[bytes, int]:
-    stream = getattr(process, "stdout", None)
-    output: list[bytes] = []
-    read_failed = threading.Event()
-    reader: threading.Thread | None = None
+    stdout, _stderr, returncode = _bounded_process_streams(
+        process, timeout_seconds=timeout_seconds, capture_stderr=False
+    )
+    return stdout, returncode
 
-    def read_stdout() -> None:
+
+def _bounded_process_streams(
+    process: Any,
+    *,
+    timeout_seconds: float,
+    capture_stderr: bool = True,
+) -> tuple[bytes, bytes, int]:
+    streams = (getattr(process, "stdout", None),)
+    if capture_stderr:
+        streams += (getattr(process, "stderr", None),)
+    limits = (MAX_DWS_STDOUT_BYTES, MAX_DWS_STDERR_BYTES)
+    output: list[bytes] = [b"", b""]
+    completed: queue.Queue[tuple[int, bytes | None]] = queue.Queue()
+    readers: list[threading.Thread] = []
+
+    def read_stream(index: int) -> None:
         try:
-            value = stream.read(MAX_DWS_STDOUT_BYTES + 1)
+            value = streams[index].read(limits[index] + 1)
         except Exception:
-            read_failed.set()
-            return
-        if isinstance(value, bytes):
-            output.append(value)
-        else:
-            read_failed.set()
+            value = None
+        completed.put((index, value if isinstance(value, bytes) else None))
 
     try:
-        if stream is None or not callable(getattr(stream, "read", None)):
+        if any(not callable(getattr(stream, "read", None)) for stream in streams):
             raise DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, False)
-        started_at = time.monotonic()
-        reader = threading.Thread(target=read_stdout, daemon=True)
-        reader.start()
-        reader.join(timeout_seconds)
-        if reader.is_alive():
-            raise DwsReadError(SourceErrorType.NETWORK_TIMEOUT, True)
-        if read_failed.is_set() or not output:
-            raise DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, False)
-        if len(output[0]) > MAX_DWS_STDOUT_BYTES:
-            raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
+        deadline = time.monotonic() + timeout_seconds
+        for index in range(len(streams)):
+            reader = threading.Thread(target=read_stream, args=(index,), daemon=True)
+            reader.start()
+            readers.append(reader)
+        for _ in streams:
+            read_result = None
+            try:
+                read_result = completed.get(
+                    timeout=max(0.0, deadline - time.monotonic())
+                )
+            except queue.Empty:
+                pass
+            if read_result is None:
+                raise DwsReadError(SourceErrorType.NETWORK_TIMEOUT, True)
+            index, value = read_result
+            if value is None:
+                raise DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, False)
+            if len(value) > limits[index]:
+                raise DwsReadError(SourceErrorType.INVALID_PAYLOAD, False)
+            output[index] = value
 
-        remaining = max(0.0, timeout_seconds - (time.monotonic() - started_at))
+        remaining = max(0.0, deadline - time.monotonic())
         wait_error: DwsReadError | None = None
         try:
             returncode = process.wait(timeout=remaining)
@@ -379,18 +407,20 @@ def _bounded_process_output(
         if isinstance(returncode, bool) or not isinstance(returncode, int):
             raise DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, False)
     except BaseException:
-        _terminate_process(process, stream=stream, reader=reader)
+        _terminate_process(process, streams=streams, readers=readers)
         raise
-    _close_stdout(stream)
-    return output[0], returncode
+    for stream in streams:
+        _close_stream(stream)
+    return output[0], output[1], returncode
 
 
 def _terminate_process(
     process: Any,
     *,
-    stream: Any,
-    reader: threading.Thread | None,
+    streams: tuple[Any, ...],
+    readers: list[threading.Thread],
 ) -> None:
+    deadline = time.monotonic() + _PROCESS_CLEANUP_TIMEOUT_SECONDS
     try:
         process.kill()
     except (OSError, subprocess.SubprocessError):
@@ -399,16 +429,18 @@ def _terminate_process(
         process.wait(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS)
     except (OSError, subprocess.SubprocessError):
         pass
-    if reader is not None and reader.is_alive():
-        try:
-            reader.join(_PROCESS_CLEANUP_TIMEOUT_SECONDS)
-        except (KeyboardInterrupt, RuntimeError):
-            pass
-    if reader is None or not reader.is_alive():
-        _close_stdout(stream)
+    for index, stream in enumerate(streams):
+        reader = readers[index] if index < len(readers) else None
+        if reader is not None and reader.is_alive():
+            try:
+                reader.join(max(0.0, deadline - time.monotonic()))
+            except (KeyboardInterrupt, RuntimeError):
+                pass
+        if reader is None or not reader.is_alive():
+            _close_stream(stream)
 
 
-def _close_stdout(stream: Any) -> None:
+def _close_stream(stream: Any) -> None:
     close = getattr(stream, "close", None)
     if not callable(close):
         return

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -258,6 +259,33 @@ def _free_loopback_port() -> int:
         return int(listener.getsockname()[1])
 
 
+def _sync_port_is_in_use(error: OSError) -> bool:
+    return error.errno in {errno.EADDRINUSE, 10048} or getattr(
+        error, "winerror", None
+    ) == 10048
+
+
+def test_sync_port_error_classifier_accepts_only_address_in_use() -> None:
+    assert _sync_port_is_in_use(OSError(errno.EADDRINUSE, "occupied")) is True
+    assert _sync_port_is_in_use(OSError(10048, "occupied")) is True
+    windows_error = OSError(0, "occupied")
+    windows_error.winerror = 10048
+    assert _sync_port_is_in_use(windows_error) is True
+    assert _sync_port_is_in_use(OSError(errno.EINVAL, "invalid")) is False
+
+
+def _require_unused_sync_port() -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        try:
+            listener.bind(("127.0.0.1", 8731))
+        except OSError as error:
+            if _sync_port_is_in_use(error):
+                pytest.skip("local sync listener port 8731 is already in use")
+            raise
+
+
 def _run_sync_cli(
     arguments: list[str],
     environment: dict[str, str],
@@ -281,7 +309,10 @@ def _run_sync_cli(
                 "'protect':lambda self,_project,plain:b'test-capture\\0'+plain,"
                 "'unprotect':lambda self,_project,protected:protected[len(b'test-capture\\0'):]})(); "
                 "cli._host_capture_protector=lambda:protector; "
-                "lock.PRIVATE_LOCK_ROOT=root; raise SystemExit(cli.main(sys.argv[2:]))"
+                "lock.PRIVATE_LOCK_ROOT=root; "
+                "from urllib.request import ProxyHandler, build_opener; "
+                "raise SystemExit(cli.main(sys.argv[2:], "
+                "urlopen=build_opener(ProxyHandler({})).open))"
             ),
             str(Path(environment["TEMP"]) / "dws-sync-locks"),
             *arguments,
@@ -561,8 +592,14 @@ def _lifecycle_root(environment: dict[str, str]) -> Path:
 
 def _push(paths: dict[str, Path], environment: dict[str, str]) -> dict[str, object]:
     token = _begin(environment)
+    lifecycle.commit_direct_collection(
+        PROJECT_ID,
+        token,
+        apply=lambda: None,
+        rollback=lambda: None,
+        root=_lifecycle_root(environment),
+    )
     for expected, target in (
-        ("begun", "collected"),
         ("collected", "pending"),
         ("pending", "artifact"),
     ):
@@ -612,11 +649,11 @@ def _pending(
     environment: dict[str, str],
 ) -> dict[str, object]:
     token = _begin(environment)
-    lifecycle.advance_run(
+    lifecycle.commit_direct_collection(
         PROJECT_ID,
         token,
-        expected="begun",
-        target="collected",
+        apply=lambda: None,
+        rollback=lambda: None,
         root=_lifecycle_root(environment),
     )
     try:
@@ -650,6 +687,16 @@ def _start_listener(
     return subprocess.Popen(
         [
             str(PYTHON),
+            "-c",
+            (
+                "import runpy,sys; from pathlib import Path; "
+                "sys.path.insert(0,str(Path.cwd() / 'gateway' / 'src')); "
+                "sys.path.insert(0,str(Path.cwd() / 'scripts')); "
+                "import companion_gateway.settings as settings; "
+                "settings.load_environment_file=lambda _path:set(); "
+                "sys.argv=sys.argv[1:]; "
+                "runpy.run_path(sys.argv[0],run_name='__main__')"
+            ),
             str(ROOT / "scripts" / script_name),
             "--gateway-root",
             str(ROOT / "gateway"),
@@ -794,7 +841,7 @@ def test_runtime_subprocess_direct_failure_preserves_bundle_then_aborts(
     )
 
     assert collect_code == 1
-    assert failed == {"status": "error", "error_type": "sync_failed"}
+    assert failed == {"status": "error", "error_type": "provider_unavailable"}
     assert bundle_path.read_bytes() == old_bundle
     lifecycle.assert_stage(
         PROJECT_ID,
@@ -981,25 +1028,12 @@ def test_two_runtime_subprocesses_complete_host_import_and_abort_crash_capture(
     reason="requires explicit same-user Windows DPAPI and local listener run",
 )
 def test_live_cli_to_sync_listener_applied_then_unchanged(tmp_path: Path) -> None:
+    _require_unused_sync_port()
     assert tmp_path.drive.upper() == "E:"
     database_path = tmp_path / "live-sync.db"
     paths = _write_private_inputs(tmp_path)
     environment = _environment(tmp_path, database_path)
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    server = subprocess.Popen(
-        [
-            str(PYTHON),
-            str(ROOT / "scripts" / "run_xiaoyao_sync.py"),
-            "--gateway-root",
-            str(ROOT / "gateway"),
-        ],
-        cwd=ROOT,
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=creation_flags,
-    )
+    server = _start_listener("run_xiaoyao_sync.py", environment)
     try:
         _wait_http(server, "http://127.0.0.1:8731/ready")
         first = _push(paths, environment)
@@ -1044,6 +1078,7 @@ def test_live_cli_to_sync_listener_applied_then_unchanged(tmp_path: Path) -> Non
 def test_live_device_and_sync_processes_share_authoritative_sqlite(
     tmp_path: Path,
 ) -> None:
+    _require_unused_sync_port()
     assert tmp_path.drive.upper() == "E:"
     database_path = tmp_path / "live-shared.db"
     paths = _write_private_inputs(tmp_path)

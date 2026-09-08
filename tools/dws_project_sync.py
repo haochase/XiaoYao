@@ -44,6 +44,7 @@ from companion_gateway.project.sync_models import (
     ClaimedRetrievalRequest,
     RetrievalCompletionClaim,
     RetrievalRequestStatus,
+    SourceErrorType,
     SourceSnapshot,
     SourceTombstone,
     SyncEnvelope,
@@ -150,6 +151,7 @@ _PUBLIC_ERROR_TYPES = {
     "approved_artifact_unavailable",
     "approved_restore_denied",
     "authentication_failed",
+    "dws_core_changed_requires_approval",
     "context_collection_mismatch",
     "context_file_invalid",
     "context_file_not_absolute",
@@ -1350,10 +1352,21 @@ def _collect_command(
     if actual_runner is None:
         actual_runner = DwsCommandRunner(dws_path, profile=project.profile)
     source_bundle = collect_sources(project, actual_runner, clock=now)
-    if direct_collection and any(
-        record.status == "failed" for record in source_bundle.records
-    ):
-        raise ValueError("direct_collection_failed")
+    if direct_collection:
+        failed_types = {
+            record.error_type
+            for record in source_bundle.records
+            if record.status == "failed"
+        }
+        if failed_types:
+            if len(failed_types) == 1:
+                error_type = next(iter(failed_types))
+                if (
+                    isinstance(error_type, SourceErrorType)
+                    and error_type is not SourceErrorType.UNKNOWN
+                ):
+                    raise ValueError(error_type.value)
+            raise ValueError("sync_failed")
     encoded = _canonical_bytes(source_bundle.model_dump(mode="json"))
     if len(encoded) > MAX_PRIVATE_INPUT_BYTES:
         raise ValueError("sources_file_too_large")
