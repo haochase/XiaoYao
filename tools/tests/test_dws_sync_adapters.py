@@ -22,13 +22,16 @@ from tools.dws_sync.adapters import (
     read_task,
     unwrap_dws_payload,
 )
+from tools.dws_sync.core_trust import AuthenticodeDescriptor
 from tools.dws_sync.manifest import DwsProjectManifest, DwsSourceSpec
 from tools.dws_sync.launch import resolve_dws_launch
 from tools.dws_sync.runner import (
     MAX_DWS_STDOUT_BYTES,
     DwsCommandRunner,
     DwsReadError,
+    HostHandoffRequired,
 )
+from tools.tests.dws_core_fixtures import official_installation, write_approval
 
 
 NOW = datetime(2026, 9, 5, 4, tzinfo=UTC)
@@ -186,6 +189,255 @@ def test_runner_injects_fixed_profile_json_format_and_safe_subprocess(
     assert "COMPANION_DWS_SYNC_TOKEN" not in options["env"]
     assert process.stdout.read_sizes == [MAX_DWS_STDOUT_BYTES + 1]
     assert len(process.wait_calls) == 1
+
+
+def test_official_core_runner_uses_minimal_environment_and_real_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installation, wrapper, core, approvals = official_installation(tmp_path)
+    write_approval(approvals, core)
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    process = FakeProcess(b'{"success":true,"value":1}')
+    popen = RecordingPopen(process)
+    monkeypatch.setenv("COMPANION_DWS_SYNC_TOKEN", "must-not-leak")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "must-not-leak")
+    monkeypatch.setenv("MIMO_API_KEY", "must-not-leak")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
+    monkeypatch.setenv("PATH", "must-not-leak")
+
+    runner = DwsCommandRunner.from_official_core(
+        wrapper,
+        runtime_root=runtime_root,
+        profile="corp:user",
+        popen=popen,
+        _official_bin=installation,
+        _processor_architecture="AMD64",
+        _approvals_path=approvals,
+        _signature_reader=lambda _path: AuthenticodeDescriptor(
+            status="Valid",
+            publisher_name="BRIGHT ZENITH PRIVATE LIMITED",
+            signer_thumbprint="D" * 40,
+        ),
+    )
+
+    assert runner.run(("doc", "info", "--node", "doc-1"))["success"] is True
+    command, options = popen.calls[0]
+    assert command == [
+        str(core),
+        "--profile",
+        "corp:user",
+        "doc",
+        "info",
+        "--node",
+        "doc-1",
+        "--format",
+        "json",
+    ]
+    assert options["shell"] is False
+    assert options["env"]["TEMP"] == str(runtime_root / "tmp")
+    assert options["env"]["TMP"] == str(runtime_root / "tmp")
+    allowlist = {
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMDATA",
+        "TEMP",
+        "TMP",
+        "PROCESSOR_ARCHITECTURE",
+        "NUMBER_OF_PROCESSORS",
+    }
+    expected_keys = {
+        key
+        for key, value in os.environ.items()
+        if key in allowlist - {"TEMP", "TMP"} and value
+    } | {"TEMP", "TMP"}
+    assert set(options["env"]) == expected_keys
+
+
+def test_normal_runner_constructor_rejects_internal_launch_overrides(
+    tmp_path: Path,
+) -> None:
+    dws_path = tmp_path / "dws.exe"
+    dws_path.write_bytes(b"native")
+
+    with pytest.raises(TypeError):
+        DwsCommandRunner(
+            dws_path,
+            profile="corp:user",
+            _launch_path=tmp_path / "untrusted.exe",
+            _launch_env={"COMPANION_DWS_SYNC_TOKEN": "secret"},
+        )
+
+
+@pytest.mark.parametrize("failure", ["approval", "signature"])
+def test_official_core_runner_trust_failure_does_not_start_process(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    installation, wrapper, core, approvals = official_installation(tmp_path)
+    write_approval(approvals, core)
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    popen = RecordingPopen(FakeProcess(b"{}"))
+    signature = AuthenticodeDescriptor(
+        status="Valid",
+        publisher_name="BRIGHT ZENITH PRIVATE LIMITED",
+        signer_thumbprint="D" * 40,
+    )
+    if failure == "approval":
+        payload = json.loads(approvals.read_text(encoding="utf-8"))
+        payload["cores"][0]["core_sha256"] = "0" * 64
+        approvals.write_text(json.dumps(payload), encoding="utf-8")
+    else:
+        signature = AuthenticodeDescriptor(
+            status="NotSigned",
+            publisher_name="BRIGHT ZENITH PRIVATE LIMITED",
+            signer_thumbprint="D" * 40,
+        )
+
+    with pytest.raises(ValueError, match="^dws_core_changed_requires_approval$"):
+        DwsCommandRunner.from_official_core(
+            wrapper,
+            runtime_root=runtime_root,
+            profile="corp:user",
+            popen=popen,
+            _official_bin=installation,
+            _processor_architecture="AMD64",
+            _approvals_path=approvals,
+            _signature_reader=lambda _path: signature,
+        )
+
+    assert popen.calls == []
+
+
+def make_official_core_runner(
+    tmp_path: Path,
+    process: FakeProcess,
+    *,
+    timeout_seconds: float = 30.0,
+) -> tuple[DwsCommandRunner, RecordingPopen]:
+    installation, wrapper, core, approvals = official_installation(tmp_path)
+    write_approval(approvals, core)
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    popen = RecordingPopen(process)
+    runner = DwsCommandRunner.from_official_core(
+        wrapper,
+        runtime_root=runtime_root,
+        profile="corp:user",
+        timeout_seconds=timeout_seconds,
+        popen=popen,
+        _official_bin=installation,
+        _processor_architecture="AMD64",
+        _approvals_path=approvals,
+        _signature_reader=lambda _path: AuthenticodeDescriptor(
+            status="Valid",
+            publisher_name="BRIGHT ZENITH PRIVATE LIMITED",
+            signer_thumbprint="D" * 40,
+        ),
+    )
+    return runner, popen
+
+
+def test_official_core_runner_rejects_pending_host_handoff(
+    tmp_path: Path,
+) -> None:
+    runner, _popen = make_official_core_runner(
+        tmp_path,
+        FakeProcess(b"[dws-bash:pending-post-tool-use]:private"),
+    )
+
+    with pytest.raises(HostHandoffRequired, match="^host_handoff_required$"):
+        runner.run(("doc", "info"))
+
+
+def test_official_core_runner_rejects_oversized_stdout(tmp_path: Path) -> None:
+    process = FakeProcess(b"x" * (MAX_DWS_STDOUT_BYTES + 1))
+    runner, _popen = make_official_core_runner(tmp_path, process)
+
+    with pytest.raises(DwsReadError) as error:
+        runner.run(("doc", "info"))
+
+    assert error.value.error_type is SourceErrorType.INVALID_PAYLOAD
+    assert process.killed is True
+
+
+def test_official_core_runner_normalizes_timeout(tmp_path: Path) -> None:
+    process = BlockingProcess()
+    runner, _popen = make_official_core_runner(
+        tmp_path,
+        process,
+        timeout_seconds=0.01,
+    )
+
+    with pytest.raises(DwsReadError) as error:
+        runner.run(("doc", "info"))
+
+    assert error.value.error_type is SourceErrorType.NETWORK_TIMEOUT
+    assert error.value.retryable is True
+    assert process.killed is True
+
+
+@pytest.mark.parametrize("stdout", [b"[]", b"null"])
+def test_official_core_runner_rejects_non_object_json(
+    tmp_path: Path,
+    stdout: bytes,
+) -> None:
+    runner, _popen = make_official_core_runner(tmp_path, FakeProcess(stdout))
+
+    with pytest.raises(DwsReadError) as error:
+        runner.run(("doc", "info"))
+
+    assert error.value.error_type is SourceErrorType.INVALID_PAYLOAD
+
+
+def test_official_core_runner_normalizes_nonzero_error(tmp_path: Path) -> None:
+    process = FakeProcess(
+        b'{"error":{"error_type":"permission_denied",'
+        b'"retryable":false,"message":"private stdout"}}',
+        returncode=1,
+    )
+    runner, _popen = make_official_core_runner(tmp_path, process)
+
+    with pytest.raises(DwsReadError) as error:
+        runner.run(("doc", "info"))
+
+    assert error.value.error_type is SourceErrorType.PERMISSION_DENIED
+    assert error.value.retryable is False
+    assert "private" not in str(error.value)
+
+
+def test_official_core_runner_rejects_non_e_runtime_without_starting_process(
+    tmp_path: Path,
+) -> None:
+    installation, wrapper, core, approvals = official_installation(tmp_path)
+    write_approval(approvals, core)
+    popen = RecordingPopen(FakeProcess(b"{}"))
+
+    with pytest.raises(ValueError, match="^dws_core_environment_invalid$"):
+        DwsCommandRunner.from_official_core(
+            wrapper,
+            runtime_root=Path(r"C:\private\dws-runtime"),
+            profile="corp:user",
+            popen=popen,
+            _official_bin=installation,
+            _processor_architecture="AMD64",
+            _approvals_path=approvals,
+            _signature_reader=lambda _path: AuthenticodeDescriptor(
+                status="Valid",
+                publisher_name="BRIGHT ZENITH PRIVATE LIMITED",
+                signer_thumbprint="D" * 40,
+            ),
+        )
+
+    assert popen.calls == []
 
 
 OFFICIAL_DWS_WRAPPER = """#!/bin/sh

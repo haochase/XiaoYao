@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Callable, Mapping
+import os
 from pathlib import Path
 import subprocess
 import threading
@@ -10,6 +11,12 @@ import time
 from typing import Any
 
 from companion_gateway.project.sync_models import SourceErrorType
+from tools.dws_sync.core_trust import (
+    AuthenticodeDescriptor,
+    prepare_core_temp_directory,
+    read_authenticode,
+    resolve_trusted_dws_core,
+)
 from tools.dws_sync.launch import resolve_dws_launch
 
 
@@ -38,6 +45,23 @@ _SHELL_COMPONENTS = {
     "2>",
     "2>&1",
 }
+_CORE_ENV_ALLOWLIST = frozenset(
+    {
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMDATA",
+        "TEMP",
+        "TMP",
+        "PROCESSOR_ARCHITECTURE",
+        "NUMBER_OF_PROCESSORS",
+    }
+)
 
 
 def _is_forbidden_flag(value: str) -> bool:
@@ -142,6 +166,24 @@ def _map_error_type(value: object) -> SourceErrorType | None:
     return None
 
 
+def _minimal_core_environment(
+    environ: Mapping[str, str],
+    *,
+    runtime_root: Path,
+) -> dict[str, str]:
+    selected = {
+        key: value
+        for key, value in environ.items()
+        if key in _CORE_ENV_ALLOWLIST - {"TEMP", "TMP"}
+        and isinstance(value, str)
+        and value
+    }
+    temp_root = prepare_core_temp_directory(runtime_root)
+    selected["TEMP"] = str(temp_root)
+    selected["TMP"] = str(temp_root)
+    return selected
+
+
 class DwsCommandRunner:
     def __init__(
         self,
@@ -158,15 +200,69 @@ class DwsCommandRunner:
             official_bin=_official_bin,
             processor_architecture=_processor_architecture,
         )
+        self.__initialize(
+            launch_path,
+            launch_env,
+            profile=profile,
+            timeout_seconds=timeout_seconds,
+            popen=popen,
+        )
+
+    def __initialize(
+        self,
+        launch_path: Path,
+        launch_env: Mapping[str, str] | None,
+        *,
+        profile: str,
+        timeout_seconds: float,
+        popen: Callable[..., Any],
+    ) -> None:
         if not profile.strip():
             raise ValueError("dws_profile_invalid")
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("dws_timeout_invalid")
         self._dws_path = launch_path
-        self._launch_env = launch_env
+        self._launch_env = dict(launch_env) if launch_env is not None else None
         self._profile = profile
         self._timeout_seconds = timeout_seconds
         self._popen = popen
+
+    @classmethod
+    def from_official_core(
+        cls,
+        dws_path: Path,
+        *,
+        runtime_root: Path,
+        profile: str,
+        timeout_seconds: float = 30.0,
+        popen: Callable[..., Any] = subprocess.Popen,
+        _official_bin: Path | None = None,
+        _processor_architecture: str | None = None,
+        _approvals_path: Path | None = None,
+        _signature_reader: Callable[[Path], AuthenticodeDescriptor] | None = None,
+    ) -> DwsCommandRunner:
+        environ = dict(os.environ)
+        trusted = resolve_trusted_dws_core(
+            dws_path,
+            environ=environ,
+            official_bin=_official_bin,
+            processor_architecture=_processor_architecture,
+            approvals_path=_approvals_path,
+            signature_reader=_signature_reader or read_authenticode,
+        )
+        launch_env = _minimal_core_environment(
+            environ,
+            runtime_root=runtime_root,
+        )
+        runner = cls.__new__(cls)
+        runner.__initialize(
+            trusted.path,
+            launch_env,
+            profile=profile,
+            timeout_seconds=timeout_seconds,
+            popen=popen,
+        )
+        return runner
 
     def run(self, args: tuple[str, ...]) -> dict[str, object]:
         if (
