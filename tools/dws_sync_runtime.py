@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -17,10 +18,13 @@ if __name__ == "__main__":
 from companion_gateway.project.auth import ProjectApiPrincipal
 from companion_gateway.project.protection import ContentProtector, WindowsDpapiProtector
 from companion_gateway.settings import Settings
+from tools.dws_sync.core_trust import resolve_trusted_dws_core
 from tools.dws_sync.launch import resolve_dws_launch
 from tools.dws_sync.manifest import DwsManifest, DwsProjectManifest
+from tools.dws_sync.runner import DwsCommandRunner
 from tools.dws_sync.runtime import (
     CONFIG_NAME,
+    RUNTIME_NAME,
     TaskConfig,
     load_runtime,
     prepare_runtime,
@@ -32,6 +36,7 @@ from tools.dws_sync.runtime import (
 
 COMMANDS = (
     "begin",
+    "collect-direct",
     "capture-info",
     "host-import",
     "complete-host-import",
@@ -44,6 +49,19 @@ COMMANDS = (
     "end",
     "abort",
 )
+
+
+def _profile_store_present() -> bool:
+    profile_store = Path.home() / ".dws"
+    try:
+        info = profile_store.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and not getattr(info, "st_file_attributes", 0) & 1024
+    )
 
 
 def _load_host_import_config(
@@ -75,6 +93,18 @@ def _load_host_import_config(
     return config, matches[0]
 
 
+def _core_runner(
+    root: Path,
+    config: TaskConfig,
+    project: DwsProjectManifest,
+) -> DwsCommandRunner:
+    return DwsCommandRunner.from_official_core(
+        config.dws,
+        runtime_root=root / RUNTIME_NAME,
+        profile=project.profile,
+    )
+
+
 def dispatch(
     root: Path,
     command: str,
@@ -91,6 +121,30 @@ def dispatch(
         raise ValueError("runtime_command_invalid")
     if unattended and command != "reuse-artifact":
         raise ValueError("unattended_command_invalid")
+    if command == "collect-direct":
+        config, project = _load_host_import_config(root)
+        runner = _core_runner(root, config, project)
+        argv = [
+            "collect",
+            "--project",
+            config.project,
+            "--run-token",
+            run_token,
+            "--manifest",
+            str(config.manifest),
+            "--dws-path",
+            str(config.dws),
+            "--output",
+            str(config.source_bundle),
+        ]
+        environment = dict(os.environ)
+        environment.pop("COMPANION_DWS_SYNC_TOKEN", None)
+        return cli.main(
+            argv,
+            runner=runner,
+            environ=environment,
+            direct_collection=True,
+        )
     if command in {
         "artifact",
         "capture-info",
@@ -208,6 +262,7 @@ def main(
     prepare.add_argument("--project", required=True)
     prepare.add_argument("--dws", type=Path, required=True)
     commands.add_parser("check")
+    commands.add_parser("check-core")
     commands.add_parser("serve")
     for command in COMMANDS:
         sub = commands.add_parser(command)
@@ -236,6 +291,14 @@ def main(
                 "qwen_session_present": bool(os.environ.get("QODERWORK_SOURCE_CHAT_ID")),
                 "skill_registration": "not_checked",
                 "gateway_listening": "not_checked",
+            }
+        elif args.command == "check-core":
+            config, _project = _load_host_import_config(root)
+            resolve_trusted_dws_core(config.dws)
+            result = {
+                "status": "core_trusted",
+                "core_trusted": True,
+                "profile_store_present": _profile_store_present(),
             }
         elif args.command == "serve":
             import uvicorn

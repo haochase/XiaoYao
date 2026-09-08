@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+from tools.dws_sync import DwsSourceBundle, lifecycle
+from tools.dws_sync.core_trust import TrustedDwsCore
 from tools.dws_sync.runtime import (
     TaskConfig,
     approved_artifact_path,
@@ -22,6 +24,30 @@ class Protector:
         if not raw.startswith(prefix):
             raise ValueError("private-detail")
         return raw[len(prefix):]
+
+
+class ExplodingProtector(Protector):
+    def unprotect(self, project_id: str, protected: bytes) -> bytes:
+        pytest.fail("direct core commands must not decrypt the gateway credential")
+
+
+class DirectDocumentRunner:
+    def run(self, args: tuple[str, ...]) -> dict[str, object]:
+        if args == ("doc", "info", "--node", "doc-1"):
+            return {
+                "result": {
+                    "nodeId": "doc-1",
+                    "contentType": "ALIDOC",
+                    "extension": "adoc",
+                    "title": "Direct document",
+                    "shareUrl": "dingtalk://doc/doc-1",
+                    "version": "v-direct",
+                    "updatedAt": "2026-09-08T12:00:00+08:00",
+                }
+            }
+        if args == ("doc", "read", "--node", "doc-1"):
+            return {"data": {"markdown": "# Direct\nTrusted core content."}}
+        raise AssertionError(f"unexpected DWS arguments: {args!r}")
 
 
 def inputs(tmp_path: Path) -> tuple[Path, Path]:
@@ -166,6 +192,321 @@ def test_runtime_collect_is_rejected_before_any_dws_call(
 
     assert exited.value.code == 2
     assert "collect" not in wrapper.COMMANDS
+
+
+def test_check_core_never_loads_gateway_credential(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from tools import dws_sync_runtime as wrapper
+
+    manifest, dws = inputs(tmp_path)
+    prepare_runtime(tmp_path, manifest, "project-1", dws, Protector())
+
+    def fail_if_called(*_args, **_kwargs):
+        pytest.fail("check-core must not call load_runtime")
+
+    monkeypatch.setattr(wrapper, "load_runtime", fail_if_called)
+    monkeypatch.setattr(
+        wrapper,
+        "resolve_trusted_dws_core",
+        lambda *_args, **_kwargs: TrustedDwsCore(
+            path=dws,
+            version="1.0.61",
+            sha256="a" * 64,
+            architecture="AMD64",
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_profile_store_present",
+        lambda: True,
+        raising=False,
+    )
+
+    assert wrapper.main(
+        ["check-core"],
+        root=tmp_path,
+        protector=ExplodingProtector(),
+    ) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "core_trusted",
+        "core_trusted": True,
+        "profile_store_present": True,
+    }
+
+
+def test_collect_direct_binds_trusted_runner_to_current_lease(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from tools import dws_project_sync
+    from tools import dws_sync_runtime as wrapper
+
+    manifest, dws = inputs(tmp_path)
+    prepare_runtime(tmp_path, manifest, "project-1", dws, Protector())
+    observed = {}
+    direct_runner = object()
+
+    class DirectRunnerFactory:
+        @classmethod
+        def from_official_core(cls, *args, **kwargs):
+            return direct_runner
+
+    monkeypatch.setattr(
+        wrapper,
+        "DwsCommandRunner",
+        DirectRunnerFactory,
+        raising=False,
+    )
+
+    def record_main(argv, **kwargs):
+        observed["argv"] = argv
+        observed.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(dws_project_sync, "main", record_main)
+    monkeypatch.setattr(
+        wrapper,
+        "load_runtime",
+        lambda *_args, **_kwargs: pytest.fail(
+            "collect-direct must not call load_runtime"
+        ),
+    )
+
+    assert wrapper.dispatch(
+        tmp_path,
+        "collect-direct",
+        "lease-token",
+        False,
+        ExplodingProtector(),
+    ) == 0
+    assert observed["argv"] == [
+        "collect",
+        "--project",
+        "project-1",
+        "--run-token",
+        "lease-token",
+        "--manifest",
+        str(manifest),
+        "--dws-path",
+        str(dws),
+        "--output",
+        str(tmp_path / ".private/dws-runtime/source-bundle.json"),
+    ]
+    assert observed["runner"] is direct_runner
+    assert observed["environ"].get("COMPANION_DWS_SYNC_TOKEN") is None
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ["collect-direct"],
+        ["collect-direct", "--run-token", "lease-token", "--dry-run"],
+        ["collect-direct", "--run-token", "lease-token", "--unattended"],
+        ["collect-direct", "--run-token", "lease-token", "--core", "dws.exe"],
+        ["collect-direct", "--run-token", "lease-token", "--profile", "p"],
+        ["collect-direct", "--run-token", "lease-token", "--source-id", "doc-1"],
+        ["collect-direct", "--run-token", "lease-token", "--manifest", "m.json"],
+        ["collect-direct", "--run-token", "lease-token", "--output", "out.json"],
+        ["check-core", "--dws-path", "dws.exe"],
+    ),
+)
+def test_direct_runtime_parser_rejects_missing_token_and_arbitrary_inputs(
+    tmp_path: Path,
+    argv: list[str],
+) -> None:
+    from tools import dws_sync_runtime as wrapper
+
+    with pytest.raises(SystemExit) as exited:
+        wrapper.main(argv, root=tmp_path, protector=ExplodingProtector())
+
+    assert exited.value.code == 2
+
+
+def test_collect_direct_success_advances_only_current_begun_lease(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from tools import dws_project_sync
+    from tools import dws_sync_runtime as wrapper
+
+    manifest, dws = inputs(tmp_path)
+    prepare_runtime(tmp_path, manifest, "project-1", dws, Protector())
+    lifecycle_root = tmp_path / "lifecycle"
+    monkeypatch.setattr(dws_project_sync, "LIFECYCLE_ROOT", lifecycle_root)
+    monkeypatch.setattr(
+        wrapper,
+        "_core_runner",
+        lambda *_args, **_kwargs: DirectDocumentRunner(),
+    )
+    started = lifecycle.begin_run("project-1", root=lifecycle_root)
+    assert started.run_token is not None
+
+    assert wrapper.dispatch(
+        tmp_path,
+        "collect-direct",
+        started.run_token,
+        False,
+        ExplodingProtector(),
+    ) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "collected"
+    assert output["active_sources"] == 1
+    assert output["failed_sources"] == 0
+    bundle_path = tmp_path / ".private/dws-runtime/source-bundle.json"
+    DwsSourceBundle.model_validate_json(bundle_path.read_bytes())
+    lifecycle.assert_stage(
+        "project-1",
+        started.run_token,
+        expected="collected",
+        root=lifecycle_root,
+    )
+
+
+def test_collect_direct_untrusted_core_keeps_begun_lease_and_credential_closed(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from tools import dws_project_sync
+    from tools import dws_sync_runtime as wrapper
+
+    manifest, dws = inputs(tmp_path)
+    prepare_runtime(tmp_path, manifest, "project-1", dws, Protector())
+    lifecycle_root = tmp_path / "lifecycle"
+    monkeypatch.setattr(dws_project_sync, "LIFECYCLE_ROOT", lifecycle_root)
+    monkeypatch.setattr(
+        wrapper,
+        "_core_runner",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("dws_core_changed_requires_approval")
+        ),
+    )
+    started = lifecycle.begin_run("project-1", root=lifecycle_root)
+    assert started.run_token is not None
+
+    assert wrapper.main(
+        ["collect-direct", "--run-token", started.run_token],
+        root=tmp_path,
+        protector=ExplodingProtector(),
+    ) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "blocked",
+        "error_type": "runtime_not_ready",
+    }
+    lifecycle.assert_stage(
+        "project-1",
+        started.run_token,
+        expected="begun",
+        root=lifecycle_root,
+    )
+    lifecycle.abort_run("project-1", started.run_token, root=lifecycle_root)
+
+
+def test_collect_direct_wrong_stage_never_calls_runner_or_decrypts_credential(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from tools import dws_project_sync
+    from tools import dws_sync_runtime as wrapper
+
+    class NeverRun:
+        def run(self, _args):
+            pytest.fail("wrong-stage collect must not call DWS")
+
+    manifest, dws = inputs(tmp_path)
+    prepare_runtime(tmp_path, manifest, "project-1", dws, Protector())
+    lifecycle_root = tmp_path / "lifecycle"
+    monkeypatch.setattr(dws_project_sync, "LIFECYCLE_ROOT", lifecycle_root)
+    monkeypatch.setattr(wrapper, "_core_runner", lambda *_args: NeverRun())
+    started = lifecycle.begin_run("project-1", root=lifecycle_root)
+    assert started.run_token is not None
+    lifecycle.advance_run(
+        "project-1",
+        started.run_token,
+        expected="begun",
+        target="host_info",
+        root=lifecycle_root,
+    )
+
+    assert wrapper.dispatch(
+        tmp_path,
+        "collect-direct",
+        started.run_token,
+        False,
+        ExplodingProtector(),
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "run_stage_invalid",
+    }
+    lifecycle.assert_stage(
+        "project-1",
+        started.run_token,
+        expected="host_info",
+        root=lifecycle_root,
+    )
+    lifecycle.abort_run("project-1", started.run_token, root=lifecycle_root)
+
+
+@pytest.mark.parametrize("failure", ("collect", "atomic_write"))
+def test_collect_direct_failure_preserves_old_bundle_and_begun_lease(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    failure: str,
+) -> None:
+    from tools import dws_project_sync
+    from tools import dws_sync_runtime as wrapper
+
+    class FailingRunner:
+        def run(self, _args):
+            raise RuntimeError("private direct failure")
+
+    manifest, dws = inputs(tmp_path)
+    prepare_runtime(tmp_path, manifest, "project-1", dws, Protector())
+    lifecycle_root = tmp_path / "lifecycle"
+    monkeypatch.setattr(dws_project_sync, "LIFECYCLE_ROOT", lifecycle_root)
+    runner = FailingRunner() if failure == "collect" else DirectDocumentRunner()
+    monkeypatch.setattr(wrapper, "_core_runner", lambda *_args: runner)
+    if failure == "atomic_write":
+        monkeypatch.setattr(
+            dws_project_sync,
+            "_atomic_write",
+            lambda *_args: (_ for _ in ()).throw(
+                ValueError("private_file_write_failed")
+            ),
+        )
+    bundle_path = tmp_path / ".private/dws-runtime/source-bundle.json"
+    old_bundle = b"previous-good-bundle"
+    bundle_path.write_bytes(old_bundle)
+    started = lifecycle.begin_run("project-1", root=lifecycle_root)
+    assert started.run_token is not None
+
+    assert wrapper.dispatch(
+        tmp_path,
+        "collect-direct",
+        started.run_token,
+        False,
+        ExplodingProtector(),
+    ) == 1
+
+    assert json.loads(capsys.readouterr().out)["status"] == "error"
+    assert bundle_path.read_bytes() == old_bundle
+    lifecycle.assert_stage(
+        "project-1",
+        started.run_token,
+        expected="begun",
+        root=lifecycle_root,
+    )
+    lifecycle.abort_run("project-1", started.run_token, root=lifecycle_root)
 
 
 def test_host_import_maps_fixed_paths_and_does_not_decrypt_credential(

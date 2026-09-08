@@ -31,6 +31,7 @@ from tools.dws_sync import (
 )
 from tools.dws_sync import lifecycle
 from tools.dws_sync.runtime import prepare_runtime
+from tools.tests.dws_core_fixtures import official_installation
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -365,6 +366,134 @@ raise SystemExit(cli.main(argv))
     return json.loads(completed.stdout)
 
 
+def _run_direct_runtime_process(
+    root: Path,
+    lifecycle_root: Path,
+    core: Path,
+    arguments: list[str],
+    environment: dict[str, str],
+    *,
+    allow_credential_decrypt: bool,
+) -> tuple[int, dict[str, object]]:
+    code = """
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path.cwd() / "gateway" / "src"))
+
+from tools import dws_project_sync as cli
+from tools import dws_sync_runtime as runtime
+from tools.dws_sync import host_capture, state_lock
+from tools.dws_sync.core_trust import TrustedDwsCore
+from tools.dws_sync import runner as runner_module
+
+
+class RuntimeProtector:
+    def protect(self, _project_id, plaintext):
+        return b"runtime-test\\0" + plaintext
+
+    def unprotect(self, _project_id, protected):
+        if sys.argv[4] != "1":
+            raise AssertionError("credential decrypt forbidden")
+        prefix = b"runtime-test\\0"
+        if not protected.startswith(prefix):
+            raise ValueError("runtime test protection invalid")
+        return protected[len(prefix):]
+
+
+root = Path(sys.argv[1])
+lifecycle_root = Path(sys.argv[2])
+core = Path(sys.argv[3])
+cli.LIFECYCLE_ROOT = lifecycle_root
+state_lock.PRIVATE_LOCK_ROOT = lifecycle_root
+runtime.WindowsDpapiProtector = lambda: RuntimeProtector()
+cli._host_capture_protector = lambda: RuntimeProtector()
+host_capture._TEST_CAPTURE_ROOT = root / ".private" / "dws-runtime" / "host-captures"
+runner_module._CORE_ENV_ALLOWLIST = runner_module._CORE_ENV_ALLOWLIST | {
+    "PATHEXT",
+    "SYSTEMROOT",
+}
+runner_module.resolve_trusted_dws_core = lambda *_args, **_kwargs: TrustedDwsCore(
+    path=core,
+    version="1.0.61",
+    sha256="a" * 64,
+    architecture="AMD64",
+)
+raise SystemExit(runtime.main(sys.argv[5:], root=root))
+"""
+    completed = subprocess.run(
+        [
+            str(PYTHON),
+            "-c",
+            code,
+            str(root),
+            str(lifecycle_root),
+            str(core),
+            "1" if allow_credential_decrypt else "0",
+            *arguments,
+        ],
+        cwd=ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        timeout=40,
+    )
+    assert completed.stderr == b""
+    output = json.loads(completed.stdout)
+    assert isinstance(output, dict)
+    return completed.returncode, output
+
+
+def _write_fake_direct_core(
+    tmp_path: Path,
+    *,
+    fail: bool,
+) -> tuple[Path, Path]:
+    _installation, wrapper, _core, _approvals = official_installation(
+        tmp_path / ".qwenworkcn"
+    )
+    launcher = tmp_path / ("fake-core-error.cmd" if fail else "fake-core.cmd")
+    info_result = (
+        '{"error":{"error_type":"provider_unavailable","retryable":false}}'
+        if fail
+        else (
+            '{"result":{"nodeId":"document-local-1","contentType":"ALIDOC",'
+            '"extension":"adoc","title":"Direct document",'
+            '"shareUrl":"dingtalk://doc/document-local-1",'
+            '"version":"v-direct",'
+            '"updatedAt":"2026-09-08T12:00:00+08:00"}}'
+        )
+    )
+    info_exit = 2 if fail else 0
+    launcher.write_text(
+        "\n".join(
+            (
+                "@echo off",
+                '@if not "%1"=="--profile" exit /b 9',
+                '@if not "%2"=="local-test-profile" exit /b 9',
+                '@if not "%3"=="doc" exit /b 9',
+                '@if not "%5"=="--node" exit /b 9',
+                '@if not "%6"=="document-local-1" exit /b 9',
+                '@if not "%7"=="--format" exit /b 9',
+                '@if not "%8"=="json" exit /b 9',
+                '@if "%4"=="info" goto info',
+                '@if "%4"=="read" goto read',
+                "@exit /b 9",
+                ":info",
+                f"@echo {info_result}",
+                f"@exit /b {info_exit}",
+                ":read",
+                '@echo {"data":{"markdown":"Direct core content."}}',
+                "@exit /b 0",
+                "",
+            )
+        ),
+        encoding="ascii",
+        newline="\r\n",
+    )
+    return wrapper, launcher
+
+
 def _host_result(operation: str, payload: object) -> bytes:
     encoded = _canonical(payload)
     return _canonical(
@@ -551,6 +680,138 @@ def test_pending_recovery_sqlite_authorizer_denies_write_opcodes(
     assert sync_cli._recovery_sqlite_authorizer(
         opcode, "table", "column", None, None
     ) == sqlite3.SQLITE_DENY
+
+
+class DirectRuntimeProtector:
+    def protect(self, _project_id: str, plaintext: bytes) -> bytes:
+        return b"runtime-test\0" + plaintext
+
+    def unprotect(self, _project_id: str, protected: bytes) -> bytes:
+        prefix = b"runtime-test\0"
+        if not protected.startswith(prefix):
+            raise ValueError("runtime test protection invalid")
+        return protected[len(prefix) :]
+
+
+def test_runtime_subprocess_collects_direct_from_fixed_fake_core(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    paths = _write_private_inputs(tmp_path)
+    wrapper, core = _write_fake_direct_core(tmp_path, fail=False)
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    prepare_runtime(
+        tmp_path,
+        paths["manifest"],
+        PROJECT_ID,
+        wrapper,
+        DirectRuntimeProtector(),
+    )
+    environment = _environment(tmp_path, tmp_path / "unused.db")
+    environment["USERPROFILE"] = str(tmp_path)
+    system_root = environment.pop("SYSTEMROOT", environment.get("SystemRoot", ""))
+    environment["SystemRoot"] = system_root
+    lifecycle_root = tmp_path / "runtime-lifecycle"
+
+    begin_code, begun = _run_direct_runtime_process(
+        tmp_path,
+        lifecycle_root,
+        core,
+        ["begin"],
+        environment,
+        allow_credential_decrypt=True,
+    )
+    assert begin_code == 0, begun
+    assert begun["status"] == "started"
+    token = begun["run_token"]
+    assert isinstance(token, str)
+
+    collect_code, collected = _run_direct_runtime_process(
+        tmp_path,
+        lifecycle_root,
+        core,
+        ["collect-direct", "--run-token", token],
+        environment,
+        allow_credential_decrypt=False,
+    )
+
+    assert collect_code == 0, collected
+    assert collected["status"] == "collected"
+    assert collected["active_sources"] == 1
+    assert collected["failed_sources"] == 0
+    bundle_path = tmp_path / ".private/dws-runtime/source-bundle.json"
+    DwsSourceBundle.model_validate_json(bundle_path.read_bytes())
+    lifecycle.assert_stage(
+        PROJECT_ID,
+        token,
+        expected="collected",
+        root=lifecycle_root,
+    )
+
+
+def test_runtime_subprocess_direct_failure_preserves_bundle_then_aborts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    paths = _write_private_inputs(tmp_path)
+    wrapper, core = _write_fake_direct_core(tmp_path, fail=True)
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    prepare_runtime(
+        tmp_path,
+        paths["manifest"],
+        PROJECT_ID,
+        wrapper,
+        DirectRuntimeProtector(),
+    )
+    environment = _environment(tmp_path, tmp_path / "unused.db")
+    environment["USERPROFILE"] = str(tmp_path)
+    system_root = environment.pop("SYSTEMROOT", environment.get("SystemRoot", ""))
+    environment["SystemRoot"] = system_root
+    lifecycle_root = tmp_path / "runtime-lifecycle"
+    bundle_path = tmp_path / ".private/dws-runtime/source-bundle.json"
+    old_bundle = b"previous-good-bundle"
+    bundle_path.write_bytes(old_bundle)
+    begin_code, begun = _run_direct_runtime_process(
+        tmp_path,
+        lifecycle_root,
+        core,
+        ["begin"],
+        environment,
+        allow_credential_decrypt=True,
+    )
+    assert begin_code == 0, begun
+    token = begun["run_token"]
+    assert isinstance(token, str)
+
+    collect_code, failed = _run_direct_runtime_process(
+        tmp_path,
+        lifecycle_root,
+        core,
+        ["collect-direct", "--run-token", token],
+        environment,
+        allow_credential_decrypt=False,
+    )
+
+    assert collect_code == 1
+    assert failed == {"status": "error", "error_type": "sync_failed"}
+    assert bundle_path.read_bytes() == old_bundle
+    lifecycle.assert_stage(
+        PROJECT_ID,
+        token,
+        expected="begun",
+        root=lifecycle_root,
+    )
+
+    abort_code, aborted = _run_direct_runtime_process(
+        tmp_path,
+        lifecycle_root,
+        core,
+        ["abort", "--run-token", token],
+        environment,
+        allow_credential_decrypt=True,
+    )
+    assert abort_code == 0
+    assert aborted == {"status": "aborted", "project_id": PROJECT_ID}
 
 
 def test_host_import_subprocess_fixture_preserves_unicode(

@@ -322,7 +322,7 @@ def advance_run(
         _write_state(path, state)
 
 
-def commit_stage(
+def _commit_stage_transition(
     project_id: str,
     token: str,
     *,
@@ -333,8 +333,6 @@ def commit_stage(
     root: Path = state_lock.PRIVATE_LOCK_ROOT,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> None:
-    if _STAGES.index(target) != _STAGES.index(expected) + 1:
-        raise ValueError("run_stage_invalid")
     with _lock(root, project_id):
         current = _read_now(now)
         path = project_state_path(root, project_id)
@@ -360,6 +358,52 @@ def commit_stage(
             except BaseException:
                 raise ValueError("private_file_write_failed") from None
             raise
+
+
+def commit_stage(
+    project_id: str,
+    token: str,
+    *,
+    expected: Stage,
+    target: Stage,
+    apply: Callable[[], None],
+    rollback: Callable[[], None],
+    root: Path = state_lock.PRIVATE_LOCK_ROOT,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> None:
+    if _STAGES.index(target) != _STAGES.index(expected) + 1:
+        raise ValueError("run_stage_invalid")
+    _commit_stage_transition(
+        project_id,
+        token,
+        expected=expected,
+        target=target,
+        apply=apply,
+        rollback=rollback,
+        root=root,
+        now=now,
+    )
+
+
+def commit_direct_collection(
+    project_id: str,
+    token: str,
+    *,
+    apply: Callable[[], None],
+    rollback: Callable[[], None],
+    root: Path = state_lock.PRIVATE_LOCK_ROOT,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> None:
+    _commit_stage_transition(
+        project_id,
+        token,
+        expected="begun",
+        target="collected",
+        apply=apply,
+        rollback=rollback,
+        root=root,
+        now=now,
+    )
 
 
 def apply_stage(

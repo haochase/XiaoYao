@@ -37,6 +37,7 @@ from tools.dws_project_sync import (
     source_bundle_semantic_hash,
 )
 from tools.dws_sync import (
+    DwsReadError,
     DwsProjectManifest,
     DwsRetrievalRequest,
     DwsRetrievalSource,
@@ -4333,6 +4334,210 @@ def test_collect_never_prints_business_content(tmp_path: Path, capsys) -> None:
     assert private == canonical(json.loads(private)).encode("utf-8")
     assert "采用方案" not in canonical(public)
     assert "private-profile" not in canonical(public)
+
+
+def test_only_direct_collection_mode_commits_begun_to_collected(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    paths["sources"].unlink()
+    lifecycle_root = tmp_path / "lifecycle"
+    monkeypatch.setattr(sync_cli, "LIFECYCLE_ROOT", lifecycle_root)
+    started = lifecycle.begin_run(
+        "project-1",
+        root=lifecycle_root,
+        now=lambda: NOW,
+    )
+    token = started.run_token or ""
+
+    assert main(
+        collect_args(paths, "--run-token", token),
+        runner=FakeDws(),
+        now=lambda: NOW,
+        direct_collection=True,
+    ) == 0
+
+    assert json.loads(capsys.readouterr().out)["status"] == "collected"
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="collected",
+        root=lifecycle_root,
+        now=lambda: NOW,
+    )
+    DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+
+
+def test_direct_collection_requires_trusted_runner_instead_of_constructing_one(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    old_bundle = paths["sources"].read_bytes()
+    lifecycle_root = tmp_path / "lifecycle"
+    monkeypatch.setattr(sync_cli, "LIFECYCLE_ROOT", lifecycle_root)
+    started = lifecycle.begin_run(
+        "project-1",
+        root=lifecycle_root,
+        now=lambda: NOW,
+    )
+    token = started.run_token or ""
+
+    class UnexpectedRunnerConstruction:
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("direct mode must receive a trusted runner")
+
+    monkeypatch.setattr(sync_cli, "DwsCommandRunner", UnexpectedRunnerConstruction)
+
+    assert main(
+        collect_args(paths, "--run-token", token),
+        runner=None,
+        now=lambda: NOW,
+        direct_collection=True,
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "arguments_invalid",
+    }
+    assert paths["sources"].read_bytes() == old_bundle
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="begun",
+        root=lifecycle_root,
+        now=lambda: NOW,
+    )
+
+
+def test_direct_collection_restores_old_bundle_when_state_commit_fails(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    old_bundle = paths["sources"].read_bytes()
+    lifecycle_root = tmp_path / "lifecycle"
+    monkeypatch.setattr(sync_cli, "LIFECYCLE_ROOT", lifecycle_root)
+    started = lifecycle.begin_run(
+        "project-1",
+        root=lifecycle_root,
+        now=lambda: NOW,
+    )
+    token = started.run_token or ""
+    original_write = lifecycle._write_state
+
+    def fail_after_collected_write(path, payload):  # type: ignore[no-untyped-def]
+        original_write(path, payload)
+        if payload["stage"] == "collected":
+            raise RuntimeError("private state detail")
+
+    monkeypatch.setattr(lifecycle, "_write_state", fail_after_collected_write)
+
+    assert main(
+        collect_args(paths, "--run-token", token),
+        runner=FakeDws(),
+        now=lambda: NOW,
+        direct_collection=True,
+    ) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "sync_failed",
+    }
+    assert paths["sources"].read_bytes() == old_bundle
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="begun",
+        root=lifecycle_root,
+        now=lambda: NOW,
+    )
+
+
+def test_direct_collection_provider_failure_keeps_bundle_and_begun_lease(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    class ProviderFailure:
+        def run(self, _args):
+            raise DwsReadError(SourceErrorType.PROVIDER_UNAVAILABLE, True)
+
+    paths = write_push_inputs(tmp_path)
+    old_bundle = paths["sources"].read_bytes()
+    lifecycle_root = tmp_path / "lifecycle"
+    monkeypatch.setattr(sync_cli, "LIFECYCLE_ROOT", lifecycle_root)
+    started = lifecycle.begin_run(
+        "project-1",
+        root=lifecycle_root,
+        now=lambda: NOW,
+    )
+    token = started.run_token or ""
+
+    assert main(
+        collect_args(paths, "--run-token", token),
+        runner=ProviderFailure(),
+        now=lambda: NOW,
+        direct_collection=True,
+    ) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "sync_failed",
+    }
+    assert paths["sources"].read_bytes() == old_bundle
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="begun",
+        root=lifecycle_root,
+        now=lambda: NOW,
+    )
+    lifecycle.abort_run(
+        "project-1",
+        token,
+        root=lifecycle_root,
+        now=lambda: NOW,
+    )
+
+
+def test_non_direct_collect_keeps_host_info_fence(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    old_bundle = paths["sources"].read_bytes()
+    lifecycle_root = tmp_path / "lifecycle"
+    monkeypatch.setattr(sync_cli, "LIFECYCLE_ROOT", lifecycle_root)
+    started = lifecycle.begin_run(
+        "project-1",
+        root=lifecycle_root,
+        now=lambda: NOW,
+    )
+    token = started.run_token or ""
+
+    assert main(
+        collect_args(paths, "--run-token", token),
+        runner=FakeDws(),
+        now=lambda: NOW,
+    ) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "run_stage_invalid",
+    }
+    assert paths["sources"].read_bytes() == old_bundle
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="begun",
+        root=lifecycle_root,
+        now=lambda: NOW,
+    )
 
 
 def test_collect_rejects_oversized_bundle_before_atomic_write(

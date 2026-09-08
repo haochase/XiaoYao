@@ -389,6 +389,132 @@ def test_host_info_must_precede_collected_and_cannot_be_skipped(
     )
 
 
+def test_commit_direct_collection_applies_and_skips_only_host_info(
+    tmp_path: Path,
+) -> None:
+    started = lifecycle.begin_run("project-1", root=tmp_path, now=lambda: NOW)
+    calls: list[str] = []
+
+    lifecycle.commit_direct_collection(
+        "project-1",
+        started.run_token or "",
+        apply=lambda: calls.append("apply"),
+        rollback=lambda: calls.append("rollback"),
+        root=tmp_path,
+        now=lambda: NOW,
+    )
+
+    assert calls == ["apply"]
+    lifecycle.assert_stage(
+        "project-1",
+        started.run_token or "",
+        expected="collected",
+        root=tmp_path,
+        now=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize("failure", ("wrong_token", "wrong_stage"))
+def test_commit_direct_collection_rejects_wrong_token_or_stage_before_apply(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    started = lifecycle.begin_run("project-1", root=tmp_path, now=lambda: NOW)
+    token = started.run_token or ""
+    if failure == "wrong_stage":
+        lifecycle.advance_run(
+            "project-1",
+            token,
+            expected="begun",
+            target="host_info",
+            root=tmp_path,
+            now=lambda: NOW,
+        )
+    calls: list[str] = []
+
+    with pytest.raises(
+        ValueError,
+        match=("^run_token_invalid$" if failure == "wrong_token" else "^run_stage_invalid$"),
+    ):
+        lifecycle.commit_direct_collection(
+            "project-1",
+            "x" * 64 if failure == "wrong_token" else token,
+            apply=lambda: calls.append("apply"),
+            rollback=lambda: calls.append("rollback"),
+            root=tmp_path,
+            now=lambda: NOW,
+        )
+
+    assert calls == []
+
+
+def test_commit_direct_collection_rolls_back_apply_failure_and_keeps_begun(
+    tmp_path: Path,
+) -> None:
+    started = lifecycle.begin_run("project-1", root=tmp_path, now=lambda: NOW)
+    token = started.run_token or ""
+    calls: list[str] = []
+
+    def apply() -> None:
+        calls.append("apply")
+        raise RuntimeError("private apply detail")
+
+    with pytest.raises(RuntimeError, match="private apply detail"):
+        lifecycle.commit_direct_collection(
+            "project-1",
+            token,
+            apply=apply,
+            rollback=lambda: calls.append("rollback"),
+            root=tmp_path,
+            now=lambda: NOW,
+        )
+
+    assert calls == ["apply", "rollback"]
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="begun",
+        root=tmp_path,
+        now=lambda: NOW,
+    )
+
+
+def test_commit_direct_collection_restores_state_and_apply_on_state_write_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    started = lifecycle.begin_run("project-1", root=tmp_path, now=lambda: NOW)
+    token = started.run_token or ""
+    calls: list[str] = []
+    original_write = lifecycle._write_state
+
+    def fail_after_collected_write(path, payload):  # type: ignore[no-untyped-def]
+        original_write(path, payload)
+        if payload["stage"] == "collected":
+            raise RuntimeError("private state detail")
+
+    monkeypatch.setattr(lifecycle, "_write_state", fail_after_collected_write)
+
+    with pytest.raises(RuntimeError, match="private state detail"):
+        lifecycle.commit_direct_collection(
+            "project-1",
+            token,
+            apply=lambda: calls.append("apply"),
+            rollback=lambda: calls.append("rollback"),
+            root=tmp_path,
+            now=lambda: NOW,
+        )
+
+    assert calls == ["apply", "rollback"]
+    lifecycle.assert_stage(
+        "project-1",
+        token,
+        expected="begun",
+        root=tmp_path,
+        now=lambda: NOW,
+    )
+
+
 @pytest.mark.parametrize(
     "stage",
     ("begun", "collected", "pending", "artifact", "pushed", "completed", "aborted"),

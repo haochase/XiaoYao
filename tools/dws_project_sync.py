@@ -1325,10 +1325,13 @@ def _collect_command(
     *,
     runner: object | None,
     now: Callable[[], datetime],
+    direct_collection: bool = False,
 ) -> dict[str, object]:
     manifest_path = _absolute_private_path(args.manifest, "manifest")
     output_path = _absolute_private_path(args.output, "output")
     dws_path = Path(args.dws_path)
+    if direct_collection and runner is None:
+        raise ValueError("arguments_invalid")
     manifest = DwsManifest.load(manifest_path)
     project = _selected_project(manifest, args.project)
     if args.run_token:
@@ -1347,25 +1350,42 @@ def _collect_command(
     if actual_runner is None:
         actual_runner = DwsCommandRunner(dws_path, profile=project.profile)
     source_bundle = collect_sources(project, actual_runner, clock=now)
+    if direct_collection and any(
+        record.status == "failed" for record in source_bundle.records
+    ):
+        raise ValueError("direct_collection_failed")
     encoded = _canonical_bytes(source_bundle.model_dump(mode="json"))
     if len(encoded) > MAX_PRIVATE_INPUT_BYTES:
         raise ValueError("sources_file_too_large")
-    guard = (
-        lifecycle.stage_guard(
+    if direct_collection:
+        if not args.run_token:
+            raise ValueError("arguments_invalid")
+        transaction = _RecoverableAtomicWrite(output_path, encoded)
+        lifecycle.commit_direct_collection(
             project.project_id,
             args.run_token,
-            expected="begun",
-            target="collected",
+            apply=transaction.apply,
+            rollback=transaction.rollback,
             root=LIFECYCLE_ROOT,
             now=now,
         )
-        if args.run_token
-        else lifecycle.manual_guard(
-            project.project_id, root=LIFECYCLE_ROOT, now=now
+    else:
+        guard = (
+            lifecycle.stage_guard(
+                project.project_id,
+                args.run_token,
+                expected="begun",
+                target="collected",
+                root=LIFECYCLE_ROOT,
+                now=now,
+            )
+            if args.run_token
+            else lifecycle.manual_guard(
+                project.project_id, root=LIFECYCLE_ROOT, now=now
+            )
         )
-    )
-    with guard:
-        _atomic_write(output_path, encoded)
+        with guard:
+            _atomic_write(output_path, encoded)
     return {
         "status": "collected",
         "project_id": project.project_id,
@@ -2966,6 +2986,7 @@ def main(
     monotonic: Callable[[], float] = time.perf_counter,
     sleep: Callable[[float], None] = time.sleep,
     input_stream: object | None = None,
+    direct_collection: bool = False,
 ) -> int:
     actual_argv = list(sys.argv[1:] if argv is None else argv)
     if "--help" in actual_argv or "-h" in actual_argv:
@@ -3011,10 +3032,17 @@ def main(
         return 0
     try:
         args = _parser().parse_args(actual_argv)
+        if direct_collection and args.command != "collect":
+            raise ValueError("arguments_invalid")
         if args.command == "begin":
             output = _begin_command(args, now=now)
         elif args.command == "collect":
-            output = _collect_command(args, runner=runner, now=now)
+            output = _collect_command(
+                args,
+                runner=runner,
+                now=now,
+                direct_collection=direct_collection,
+            )
         elif args.command == "host-import":
             output = _host_import_command(
                 args,
