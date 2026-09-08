@@ -7401,6 +7401,21 @@ def test_manual_prompt_aborts_every_post_begin_failure_and_never_falls_back() ->
     assert "禁止自动 fallback" in normalized
 
 
+def test_manual_prompt_uses_the_local_dry_run_response_contract() -> None:
+    prompt = read_prompt("qwenwork-dws-project-manual-refresh.md")
+    normalized = " ".join(prompt.replace("`", "").split())
+    dry_run = normalized[
+        normalized.index("6. artifact_written") :
+        normalized.index("7. 运行 python tools/dws_sync_runtime.py push")
+    ]
+
+    assert "ready" in dry_run
+    assert "source_count=1" in dry_run
+    assert "accepted_sources=1" not in dry_run
+    assert "failed_sources=0" not in dry_run
+    assert "不得要求" in dry_run
+
+
 def test_manual_prompt_aborts_end_rerun_token_without_automatic_rerun() -> None:
     prompt = read_prompt("qwenwork-dws-project-manual-refresh.md")
     normalized = " ".join(prompt.replace("`", "").split())

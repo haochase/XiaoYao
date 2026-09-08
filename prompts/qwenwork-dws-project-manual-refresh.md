@@ -53,8 +53,9 @@ runtime 固定实现一致。不得读取其他项目、其他来源、历史 ar
    为 UTF-8 JSON，仅经 stdin 传给
    `python tools/dws_sync_runtime.py artifact --run-token TOKEN`。不得写临时 artifact 或旁路文件。
 6. artifact_written 后运行
-   `python tools/dws_sync_runtime.py push --dry-run --run-token TOKEN`。只有 ready、
-   `accepted_sources=1` 且 `failed_sources=0` 才能继续；否则 abort。
+   `python tools/dws_sync_runtime.py push --dry-run --run-token TOKEN`。本地 dry-run 不访问网关；只有
+   ready 且 `source_count=1` 才能继续。dry-run 不返回 `accepted_sources` 或 `failed_sources`，不得要求
+   这些网关响应字段；其他状态必须 abort。
 7. 运行 `python tools/dws_sync_runtime.py push --run-token TOKEN`。只有 outcome 为 applied 或 unchanged、
    `project_status=healthy`、`accepted_sources=1` 且 `failed_sources=0` 才能继续。若返回
    `decision_change_requires_review`，以同一 token abort 并只报告“同步决策冲突”。不得创建或宣称
