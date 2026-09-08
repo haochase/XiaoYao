@@ -1,5 +1,4 @@
 from pathlib import Path
-import re
 from zipfile import ZipFile
 
 import pytest
@@ -61,29 +60,32 @@ def test_package_rejects_c_drive_output() -> None:
         package_skill(Path("C:/forbidden-context-skill.zip"))
 
 
-def test_unattended_prompt_uses_two_phase_host_envelopes_without_model_artifact() -> None:
-    prompt = (
-        Path(__file__).resolve().parents[2]
-        / "prompts"
-        / "qwenwork-dws-project-sync.md"
+def read_prompt(name: str) -> str:
+    return (
+        Path(__file__).resolve().parents[2] / "prompts" / name
     ).read_text(encoding="utf-8")
-    normalized = " ".join(prompt.replace("`", "").split())
-    bash_blocks = re.findall(r"```bash\s*(.*?)\s*```", prompt, re.DOTALL)
 
-    assert len(bash_blocks) == 2
-    assert 'operation:"doc_info"' in bash_blocks[0]
-    assert 'operation:"doc_read"' in bash_blocks[1]
-    for block in bash_blocks:
-        assert "encoding:\"base64-json\"" in block
-        assert "byte_count:($raw|utf8bytelength)" in block
-        assert "payload_chunks:" in block
-        assert "range(0;($b|length);64)" in block
-    expected_flow = (
-        "python tools/dws_sync_runtime.py begin",
+
+def test_unattended_prompt_uses_direct_core_without_host_payload() -> None:
+    prompt = read_prompt("qwenwork-dws-project-sync.md")
+    normalized = " ".join(prompt.replace("`", "").split())
+
+    assert "python tools/dws_sync_runtime.py check-core" in normalized
+    assert "python tools/dws_sync_runtime.py collect-direct" in normalized
+    for forbidden in (
         "dws doc info",
-        "python tools/dws_sync_runtime.py capture-info",
         "dws doc read",
-        "python tools/dws_sync_runtime.py complete-host-import",
+        "payload_chunks",
+        "capture-info",
+        "complete-host-import",
+        "pending-post-tool-use",
+    ):
+        assert forbidden not in prompt
+    expected_flow = (
+        "python tools/dws_sync_runtime.py check",
+        "python tools/dws_sync_runtime.py check-core",
+        "python tools/dws_sync_runtime.py begin",
+        "python tools/dws_sync_runtime.py collect-direct",
         "python tools/dws_sync_runtime.py pending",
         "python tools/dws_sync_runtime.py reuse-artifact --unattended",
         "python tools/dws_sync_runtime.py push",
@@ -91,9 +93,6 @@ def test_unattended_prompt_uses_two_phase_host_envelopes_without_model_artifact(
     )
     positions = [normalized.index(item) for item in expected_flow]
     assert positions == sorted(positions)
-    assert "host-import-construction" not in prompt
-    assert "outer =" not in prompt
-    assert '"results"' not in prompt
     assert "hui-anchor-dws-project-context-v1" not in prompt
     assert "python tools/dws_sync_runtime.py artifact" not in normalized
     assert "--dry-run" not in prompt
@@ -116,10 +115,7 @@ def test_unattended_prompt_aborts_manual_refresh_and_reruns_same_path() -> None:
 
     rerun_at = normalized.index("返回 rerun 时")
     rerun_flow = (
-        "dws doc info",
-        "capture-info",
-        "dws doc read",
-        "complete-host-import",
+        "collect-direct",
         "pending",
         "reuse-artifact --unattended",
         "push",
@@ -133,25 +129,27 @@ def test_unattended_prompt_aborts_manual_refresh_and_reruns_same_path() -> None:
     assert rerun_positions == sorted(rerun_positions)
 
 
-def test_unattended_prompt_authorizes_only_cli_managed_host_capture_files() -> None:
-    prompt = (
-        Path(__file__).resolve().parents[2]
-        / "prompts"
-        / "qwenwork-dws-project-sync.md"
-    ).read_text(encoding="utf-8")
+def test_manual_prompt_generates_new_artifact_for_changed_source() -> None:
+    prompt = read_prompt("qwenwork-dws-project-manual-refresh.md")
     normalized = " ".join(prompt.replace("`", "").split())
 
-    capture_command_at = normalized.index(
-        "python tools/dws_sync_runtime.py capture-info"
-    )
-    capture_root_at = normalized.index(".private/dws-host-captures")
-    assert capture_command_at < capture_root_at
-    assert "只有受信 CLI 可以管理" in normalized[capture_root_at - 40 :]
-    assert "digest 命名的 capture 文件及相关锁" in normalized
-    for operation in ("读取", "复制", "修改", "另存", "删除"):
-        assert f"Agent 不得直接{operation}" in normalized
-    assert "complete 事务失败会先恢复 capture" in normalized
-    assert "finally 使用同一 token abort" in normalized
-    assert "abort 随后按设计清理 capture" in normalized
-    assert "不承诺 abort 后保留诊断文件" in normalized
-    assert "保留 capture 以供独立人工刷新诊断" not in normalized
+    assert "hui-anchor-dws-project-context-v1" in prompt
+    assert "QwenProjectContextArtifact.model_validate" in prompt
+    assert "python tools/dws_sync_runtime.py artifact" in prompt
+    assert "python tools/dws_sync_runtime.py push --dry-run" in prompt
+    assert "decision_change_requires_review" in prompt
+    assert "reuse-artifact --unattended" not in prompt
+    assert "dws doc read" not in prompt
+    for fixed_value in (
+        "generated_at = collected_at",
+        "freshness_seconds = 1800",
+        "open_actions = []",
+        "current_risks = []",
+        "next_meeting = null",
+        "completed_retrieval_request_ids = []",
+    ):
+        assert fixed_value in prompt
+    assert "单个 active 来源" in normalized
+    assert "连续非标题正文 excerpt" in normalized
+    assert "最长 150 字" in normalized
+    assert "不得拼接" in normalized

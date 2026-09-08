@@ -7149,6 +7149,12 @@ def test_help_outputs_exactly_one_json_object(
     assert output.out.count("\n") == 1
 
 
+def read_prompt(name: str = "qwenwork-dws-project-sync.md") -> str:
+    return (
+        Path(__file__).resolve().parents[2] / "prompts" / name
+    ).read_text(encoding="utf-8")
+
+
 def test_qwen_prompt_requires_manual_refresh_for_retrieval_requests() -> None:
     prompt = (
         Path(__file__).resolve().parents[2]
@@ -7162,9 +7168,7 @@ def test_qwen_prompt_requires_manual_refresh_for_retrieval_requests() -> None:
     assert "manual_refresh_required" in normalized
     assert "completed_retrieval_request_ids" not in normalized
     assert "completed_retrieval_claims" not in normalized
-    collect_at = normalized.index(
-        "python tools/dws_sync_runtime.py complete-host-import"
-    )
+    collect_at = normalized.index("python tools/dws_sync_runtime.py collect-direct")
     pending_at = normalized.index("python tools/dws_sync_runtime.py pending")
     reuse_at = normalized.index(
         "python tools/dws_sync_runtime.py reuse-artifact --unattended",
@@ -7186,8 +7190,7 @@ def test_qwen_prompt_fences_full_lifecycle_and_always_releases() -> None:
 
     for command in (
         "begin",
-        "capture-info",
-        "complete-host-import",
+        "collect-direct",
         "pending",
         "reuse-artifact",
         "push",
@@ -7202,14 +7205,11 @@ def test_qwen_prompt_fences_full_lifecycle_and_always_releases() -> None:
     assert "--unattended" in normalized
 
     begin_at = normalized.index("python tools/dws_sync_runtime.py begin")
-    capture_at = normalized.index("python tools/dws_sync_runtime.py capture-info")
-    complete_at = normalized.index(
-        "python tools/dws_sync_runtime.py complete-host-import"
-    )
+    collect_at = normalized.index("python tools/dws_sync_runtime.py collect-direct")
     reuse_at = normalized.index("python tools/dws_sync_runtime.py reuse-artifact")
     push_at = normalized.index("python tools/dws_sync_runtime.py push")
     end_at = normalized.index("python tools/dws_sync_runtime.py end")
-    assert begin_at < capture_at < complete_at < reuse_at < push_at < end_at
+    assert begin_at < collect_at < reuse_at < push_at < end_at
 
 
 def test_qwen_prompt_uses_protected_runtime_entrypoints() -> None:
@@ -7219,14 +7219,15 @@ def test_qwen_prompt_uses_protected_runtime_entrypoints() -> None:
         / "qwenwork-dws-project-sync.md"
     ).read_text(encoding="utf-8")
 
-    assert "python tools/dws_sync_runtime.py capture-info" in prompt
-    assert "python tools/dws_sync_runtime.py complete-host-import" in prompt
+    assert "python tools/dws_sync_runtime.py check-core" in prompt
+    assert "python tools/dws_sync_runtime.py collect-direct" in prompt
     assert "python tools/dws_sync_runtime.py reuse-artifact --unattended" in prompt
     assert "python tools/dws_sync_runtime.py push" in prompt
     assert "credential.dpapi" in prompt
     assert "python tools/dws_sync_runtime.py host-import" not in prompt
     assert "python tools/dws_sync_runtime.py artifact" not in prompt
-    assert "python tools/dws_sync_runtime.py collect" not in prompt
+    assert "python tools/dws_sync_runtime.py capture-info" not in prompt
+    assert "python tools/dws_sync_runtime.py complete-host-import" not in prompt
     assert "tools/dws_project_sync.py collect" not in prompt
     assert "tools/dws_project_sync.py push" not in prompt
 
@@ -7244,14 +7245,13 @@ def test_qwen_prompt_uses_fixed_fast_runtime_without_discovery() -> None:
         "feishu-desk-assistant\\Scripts\\python.exe"
     ) in prompt
     assert "每个Pythonruntime工具调用" in compact
-    assert "DWS原生命令必须以固定字面量dws作为argv[0]" in compact
-    assert "配置中的dws绝对路径只用于本地可信入口校验" in compact
+    assert "受信官方Core" in compact
+    assert "配置中的dws绝对路径" in compact
     assert "不得搜索或枚举其他Python解释器" in compact
     assert "不得检查实现源码或测试文件" in compact
     assert "不得使用cd&&" in compact
     assert "不得创建辅助脚本、候选文件或旁路产物" in compact
-    assert "允许校验DWSwrapper和原生shim" in compact
-    assert "begin前的预检或check失败" in compact
+    assert "begin前的预检、check或check-core失败" in compact
     assert "不调用abort" in compact
     arrays = [
         json.loads(value)
@@ -7262,9 +7262,14 @@ def test_qwen_prompt_uses_fixed_fast_runtime_without_discovery() -> None:
         "tools/dws_sync_runtime.py",
         "check",
     ] in arrays
+    assert [
+        r"E:\hackasons\MiniCPM_Ascend\.worktrees\.venvs\feishu-desk-assistant\Scripts\python.exe",
+        "tools/dws_sync_runtime.py",
+        "check-core",
+    ] in arrays
 
 
-def test_qwen_prompt_uses_independent_two_phase_host_collection_calls() -> None:
+def test_qwen_prompt_uses_direct_core_without_host_payload() -> None:
     prompt = (
         Path(__file__).resolve().parents[2]
         / "prompts"
@@ -7272,23 +7277,23 @@ def test_qwen_prompt_uses_independent_two_phase_host_collection_calls() -> None:
     ).read_text(encoding="utf-8")
     normalized = " ".join(prompt.replace("`", "").split())
 
-    assert "doc info" in normalized
-    assert "doc read" in normalized
-    assert "--format json" in normalized
-    assert 'operation:"doc_info"' in prompt
-    assert 'operation:"doc_read"' in prompt
-    assert "python tools/dws_sync_runtime.py capture-info" in normalized
-    assert "python tools/dws_sync_runtime.py complete-host-import" in normalized
-    assert "不得使用管道" in normalized
-    assert "不得使用命令替换" in normalized
-    assert "不得使用 Popen" in normalized
-    assert "不得写临时文件" in normalized
-    assert "只取 content 字符串值" in normalized
-    assert "payload_chunks" in normalized
-    assert "不得把 type/content 外层包装交给 stdin" in normalized
+    assert "python tools/dws_sync_runtime.py check-core" in normalized
+    assert "python tools/dws_sync_runtime.py collect-direct" in normalized
+    for forbidden in (
+        "dws doc info",
+        "dws doc read",
+        "payload_chunks",
+        "capture-info",
+        "complete-host-import",
+        "pending-post-tool-use",
+    ):
+        assert forbidden not in prompt
+    flow = ("check-core", "begin", "collect-direct", "pending")
+    positions = [normalized.index(item) for item in flow]
+    assert positions == sorted(positions)
 
 
-def test_qwen_prompt_forbids_host_import_outer_contract() -> None:
+def test_qwen_prompt_forbids_every_legacy_host_collection_path() -> None:
     prompt = (
         Path(__file__).resolve().parents[2]
         / "prompts"
@@ -7296,55 +7301,93 @@ def test_qwen_prompt_forbids_host_import_outer_contract() -> None:
     ).read_text(encoding="utf-8")
     normalized = " ".join(prompt.replace("`", "").split())
 
-    assert "host-import-construction" not in prompt
-    assert "outer =" not in prompt
-    assert '"results"' not in prompt
-    assert "python tools/dws_sync_runtime.py host-import" not in normalized
-    assert "不得由 Agent 增加 operation" in normalized
-    assert "不得由 Agent 增加 operation、合并两次结果" in normalized
-    assert "构造外层 object" in normalized
-    assert normalized.index("capture-info") < normalized.index("complete-host-import")
+    assert "不得回退" in normalized
+    for forbidden in (
+        "原生 Bash",
+        "PostToolUse",
+        "stdin 正文",
+        "Base64",
+        "文件投递",
+        "host-import",
+    ):
+        assert forbidden in normalized
 
 
-def test_qwen_prompt_embeds_jq_in_each_exact_dws_command_template() -> None:
-    prompt = (
-        Path(__file__).resolve().parents[2]
-        / "prompts"
-        / "qwenwork-dws-project-sync.md"
-    ).read_text(encoding="utf-8")
-    bash_blocks = re.findall(r"```bash\s*(.*?)\s*```", prompt, re.DOTALL)
-    jq_info = "tojson as $raw | ($raw|@base64) as $b | {operation:\"doc_info\",encoding:\"base64-json\",byte_count:($raw|utf8bytelength),payload_chunks:[range(0;($b|length);64) as $i|$b[$i:$i+64]]}"
-    jq_read = "tojson as $raw | ($raw|@base64) as $b | {operation:\"doc_read\",encoding:\"base64-json\",byte_count:($raw|utf8bytelength),payload_chunks:[range(0;($b|length);64) as $i|$b[$i:$i+64]]}"
+def test_manual_prompt_generates_new_artifact_and_fails_closed_on_conflict() -> None:
+    prompt = read_prompt("qwenwork-dws-project-manual-refresh.md")
     normalized = " ".join(prompt.replace("`", "").split())
-    compact = "".join(prompt.replace("`", "").split())
 
-    expected = [
-        f"dws doc info --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq '{jq_info}'",
-        f"dws doc read --profile '<PROFILE_LITERAL>' --format json --node '<SOURCE_ID_LITERAL>' --jq '{jq_read}'",
+    cursor = 0
+    for item in (
+        "check",
+        "check-core",
+        "begin",
+        "collect-direct",
+        "pending",
+        "hui-anchor-dws-project-context-v1",
+        "QwenProjectContextArtifact.model_validate",
+        "artifact",
+        "push --dry-run",
+        "push --run-token",
+        "end",
+    ):
+        cursor = normalized.index(item, cursor) + len(item)
+    assert "decision_change_requires_review" in prompt
+    assert "不得宣称" in prompt
+    assert "project_conflicts" in prompt
+    assert "abort" in prompt
+    assert "reuse-artifact --unattended" not in prompt
+    assert "host-import" not in prompt
+
+
+def test_manual_prompt_aborts_every_post_begin_failure_and_never_falls_back() -> None:
+    prompt = read_prompt("qwenwork-dws-project-manual-refresh.md")
+    normalized = " ".join(prompt.replace("`", "").split())
+
+    assert "任务必须全程保持暂停" in normalized
+    assert "try/finally" in normalized
+    assert "同一 token" in normalized
+    failure_boundary = normalized[
+        normalized.index("begin 成功后立即进入 try/finally") :
+        normalized.index("2. 运行 python tools/dws_sync_runtime.py collect-direct")
     ]
-    assert [" ".join(block.split()) for block in bash_blocks] == expected
-    for command, jq in zip(expected, (jq_info, jq_read), strict=True):
-        assert command.count("--jq") == 1
-        shell = command.replace(jq, "")
-        for placeholder in (
-            "<PROFILE_LITERAL>",
-            "<SOURCE_ID_LITERAL>",
-        ):
-            shell = shell.replace(placeholder, "")
-        assert "|" not in shell
-        assert ">" not in shell
-    assert "发起调用前必须逐项确认" in compact
-    for option in ("--profile", "--formatjson", "--node", "--jq"):
-        assert option in compact
-    assert "DWS_PATH_LITERAL" not in prompt
-    assert "必须使用PATH-based字面命令dws" in compact
-    assert "平台托管命令令牌" in compact
-    assert "真实dws_tool_result通道结果" in compact
-    assert "普通shellstdout" in compact
-    assert "非dws_tool_result来源都必须abort并结束" in compact
-    assert "不得依赖shell环境变量" in compact
-    assert "残留任何<LITERAL>占位符时不得执行" in compact
-    assert "pending-post-tool-use" in normalized
+    for stage in (
+        "collect-direct",
+        "pending",
+        "Skill",
+        "artifact",
+        "push --dry-run",
+        "真实 push",
+        "普通 end",
+    ):
+        assert stage in failure_boundary
+    assert "任一失败" in failure_boundary
+    assert "python tools/dws_sync_runtime.py abort --run-token TOKEN" in normalized
+    for forbidden_path in (
+        "原生 Bash",
+        "PostToolUse",
+        "Base64",
+        "文件投递",
+        "host 兼容链",
+    ):
+        assert forbidden_path in normalized
+    assert "禁止自动 fallback" in normalized
+
+
+def test_manual_prompt_aborts_end_rerun_token_without_automatic_rerun() -> None:
+    prompt = read_prompt("qwenwork-dws-project-manual-refresh.md")
+    normalized = " ".join(prompt.replace("`", "").split())
+
+    end_at = normalized.index("python tools/dws_sync_runtime.py end --run-token TOKEN")
+    rerun_at = normalized.index("rerun", end_at)
+    new_token_at = normalized.index("新 token", rerun_at)
+    abort_at = normalized.index(
+        "python tools/dws_sync_runtime.py abort --run-token NEW_TOKEN",
+        new_token_at,
+    )
+    stop_at = normalized.index("停止", abort_at)
+    assert end_at < rerun_at < new_token_at < abort_at < stop_at
+    assert "不得自动重跑" in normalized[rerun_at:]
 
 
 def test_qwen_prompt_defines_fixed_strict_private_task_config() -> None:
@@ -7470,14 +7513,15 @@ def test_qwen_prompt_stops_after_failures_and_only_reruns_after_end() -> None:
     no_begin_at = compact.index("abort后不得begin", return_at)
     rerun_only_at = compact.index("只有end=rerun", no_begin_at)
     full_rerun_at = compact.index("完整重跑", rerun_only_at)
-    recollect_at = compact.index("每轮必须重新执行两次DWS和两阶段导入", full_rerun_at)
+    recollect_at = compact.index("每轮必须重新执行collect-direct", full_rerun_at)
     replay_ban_at = compact.index(
-        "禁止读取或回放context_artifact",
+        "禁止Agent直接读取或手工回放context_artifact",
         recollect_at,
     )
+    trusted_reuse_at = compact.index("仅允许受信runtime通过reuse-artifact", replay_ban_at)
     retry_ban_at = compact.index(
         "确定性push错误不得再次push",
-        replay_ban_at,
+        trusted_reuse_at,
     )
     numbered_flow_at = compact.index(
         "1.使用参数数组运行pythontools/dws_sync_runtime.pybegin",
@@ -7486,14 +7530,15 @@ def test_qwen_prompt_stops_after_failures_and_only_reruns_after_end() -> None:
     assert begin_once_at < failure_at < save_error_at < abort_at
     assert abort_at < output_at < return_at < no_begin_at
     assert no_begin_at < rerun_only_at < full_rerun_at < recollect_at
-    assert recollect_at < replay_ban_at < retry_ban_at < numbered_flow_at
+    assert recollect_at < replay_ban_at < trusted_reuse_at < retry_ban_at
+    assert retry_ban_at < numbered_flow_at
 
     end_step_at = normalized.index(
-        "9. push 成功后，以同一 token 运行 python tools/dws_sync_runtime.py end"
+        "6. push 成功后，以同一 token 运行 python tools/dws_sync_runtime.py end"
     )
     rerun_response_at = normalized.index("返回 rerun 时", end_step_at)
     rerun_chain_at = normalized.index(
-        "依次完整重做 dws doc info -> capture-info -> dws doc read -> complete-host-import -> pending -> reuse-artifact --unattended -> push -> end",
+        "依次完整重做 collect-direct -> pending -> reuse-artifact --unattended -> push -> end",
         rerun_response_at,
     )
     final_abort_at = normalized.index("任何未成功 end 的路径", rerun_chain_at)
@@ -7541,3 +7586,27 @@ def test_private_task_config_is_ignored_and_documented_publicly() -> None:
     for document in (readme, gateway_readme):
         assert ".private/qwenwork-dws-project-sync.json" in document
         assert "hui-anchor-dws-project-context-v1" in document
+        assert "collect-direct" in document
+        assert "automatic fallback" in document
+        assert "stays paused" in document
+        assert "Git" in document and "approval" in document
+
+
+def test_gateway_runbook_separates_unattended_reuse_from_manual_skill() -> None:
+    gateway_readme = (
+        Path(__file__).resolve().parents[2] / "gateway" / "README.md"
+    ).read_text(encoding="utf-8")
+    scheduled = gateway_readme[
+        gateway_readme.index("The scheduled task reads") :
+        gateway_readme.index("The synchronization listener and", 140)
+    ]
+    scheduled = " ".join(scheduled.split())
+
+    assert "trusted runtime reuses the approved artifact" in scheduled
+    assert "does not invoke the Skill" in scheduled
+    assert "QwenWork must invoke" not in scheduled
+    assert (
+        "# QwenWork now follows prompts/qwenwork-dws-project-sync.md and writes"
+        not in gateway_readme
+    )
+    assert "prompts/qwenwork-dws-project-manual-refresh.md" in gateway_readme

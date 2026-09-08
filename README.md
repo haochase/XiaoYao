@@ -57,13 +57,15 @@ python -m tools.dws_project_sync --help
 ```
 
 Individual `collect`, `pending`, and `push` commands remain available for an
-approved manual run when no project lifecycle is active. Production QwenWork
-tasks collect the single allowlisted document through two independent host DWS
-calls, then pass their bounded base64-JSON envelopes through stdin to
-`host-import`. They pass the lifecycle token through `host-import`, `pending`,
-`artifact`, and `push`, then call `end`; their `finally` path must call `abort`.
-The host envelopes, source content, profile, source ID, and token are never
-printed or written to an intermediate file.
+approved manual run when no project lifecycle is active. The current production
+QwenWork path validates the Git-tracked official DWS Core approval, then runs
+`check`, `check-core`, `begin`, `collect-direct`, `pending`,
+`reuse-artifact --unattended`, `push`, and `end`; every post-begin failure calls
+`abort`. An approved manual refresh instead generates and validates a new
+artifact, performs a dry-run push, then performs the real push. The older host-import
+implementation remains compatibility code for one version and is never an
+automatic fallback. A Core version, hash, publisher, or signing-certificate
+change requires an explicit user-approved update to the Git approval catalog.
 The project-keyed lease lives under the repository's ignored
 `.private/dws-sync-locks` directory, so alternate state-file paths cannot run
 the same project concurrently. Concurrent schedule triggers are coalesced into
@@ -74,6 +76,11 @@ Scheduled QwenWork runs use the fixed ignored task configuration at
 `manifest`, `project`, `dws`, `source_bundle`, `context_artifact`, and `state`;
 real values remain outside Git. The context conversion Skill has the fixed name
 `hui-anchor-dws-project-context-v1`.
+
+The five-minute QwenWork task stays paused by default. Neither the unattended
+nor manual prompt enables it. Keep the DWS profile, source text, private
+configuration, credentials, generated artifacts, and verification records out
+of Git.
 
 Its public source lives in `skills/hui-anchor-dws-project-context-v1`.
 Package it with `python -m tools.package_dws_context_skill --output E:\path\context.zip`,
@@ -86,8 +93,8 @@ the [runtime setup section](gateway/README.md#protected-runtime-setup).
 
 See [the gateway DWS runbook](gateway/README.md#private-dws-project-synchronization)
 for the sanitized manifest schema, required environment-variable names, the
-manual `collect` compatibility command, the production host-import flow, and
-the five-minute QwenWork schedule. A failed
+manual `collect` compatibility command, the production direct-Core flow, and
+the paused five-minute QwenWork task. A failed
 or overdue source does not have its freshness renewed; answers that depend on
 that source remain unavailable until a successful allowed-source refresh.
 

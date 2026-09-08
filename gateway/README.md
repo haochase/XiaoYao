@@ -112,14 +112,18 @@ running the task. Keep the app's existing storage policy when choosing an instal
 location; package generation itself never writes to C:.
 
 The production prompt `prompts/qwenwork-dws-project-sync.md` uses
-`tools/dws_sync_runtime.py begin/host-import/pending/artifact/push/end/abort`.
-The host runs `doc info` and `doc read` as two independent native DWS calls,
-then sends their exact bounded base64-JSON envelopes to `host-import` over
-stdin as a third independent call. No envelope or source content is written to
-an intermediate file. Only the lease token is passed as a CLI argument.
-`host-import` does not decrypt the gateway credential; pending and push decrypt
-it within their wrapper process and supply it only to authenticated gateway
-operations. DWS retains the QwenWork session's connector environment.
+`tools/dws_sync_runtime.py check/check-core/begin/collect-direct/pending/`
+`reuse-artifact/push/end/abort`. The manual refresh prompt replaces artifact
+reuse with the fixed context Skill, strict artifact validation, a dry-run push,
+and the real push. `collect-direct` launches only the currently approved official
+DWS Core with a minimal environment. The older host-import path remains
+compatibility code for one version and is not an automatic fallback.
+
+Any Core version, hash, publisher, or signing-certificate change must stop the
+run until the Git-tracked approval catalog is updated with explicit user
+approval. The five-minute QwenWork task stays paused by default; neither prompt
+enables it. Never commit the DWS profile, source text, private configuration,
+credentials, generated artifacts, or verification records.
 
 Version 1 of the context Skill deliberately leaves retrieval completion empty:
 a query hash with no question or baseline cannot establish that a request is
@@ -137,9 +141,10 @@ The scheduled task reads only the fixed ignored repository-local configuration
 `.private/qwenwork-dws-project-sync.json`. It is a strict schema-version-1 object
 with exactly these private value fields: `manifest`, `project`, `dws`,
 `source_bundle`, `context_artifact`, and `state`. The committed prompt contains
-the field schema but no real values. QwenWork must invoke the fixed
-`hui-anchor-dws-project-context-v1` Skill to convert `DwsSourceBundle` into
-`QwenProjectContextArtifact`.
+the field schema but no real values. In unattended runs, the trusted runtime
+reuses the approved artifact and does not invoke the Skill. Only a manual refresh
+after a source change invokes `hui-anchor-dws-project-context-v1` to convert the
+current `DwsSourceBundle` into a new `QwenProjectContextArtifact`.
 
 The synchronization listener and the QwenWork task must run as the same fixed
 Windows user. Evidence is protected with CurrentUser DPAPI, so another user or
@@ -231,8 +236,9 @@ python -m tools.dws_project_sync pending `
   --sources-file 'E:\private\dws-source-bundle.json' `
   --gateway 'http://127.0.0.1:8731'
 
-# QwenWork now follows prompts/qwenwork-dws-project-sync.md and writes the
-# validated QwenProjectContextArtifact to the private context path.
+# For a changed source, QwenWork follows
+# prompts/qwenwork-dws-project-manual-refresh.md to generate and validate a new
+# QwenProjectContextArtifact at the private context path.
 
 python -m tools.dws_project_sync push `
   --manifest 'E:\private\dws-projects.json' `
@@ -245,35 +251,35 @@ python -m tools.dws_project_sync push `
 ```
 
 `collect` remains a separate compatibility entry point for an explicitly
-approved manual run. Production uses the prompt's fixed host collection and
-`host-import` path: results must be ordered `doc_info`, then `doc_read`, use
-`encoding=base64-json`, match their decoded UTF-8 byte counts, and contain no
-extra fields. The importer accepts exactly one manifest document, reuses the
-normal document identity/ALIDOC/adoc/markdown validation, and advances the run
-from `begun` to `collected` only after an atomic bundle write. `pending` claims only project-local pending
-requests and maps their source hashes back to the manifest whitelist inside the
-private source bundle. The QwenWork Skill must cite only active collected sources
-and omit unsupported facts. `push --dry-run` validates the
-artifact and reports only status, counts, payload size, and a content hash; it
-does not call the gateway. Remove `--dry-run` only after explicit approval for
-a real synchronization.
+approved low-level manual run. Production uses the fixed `collect-direct` path,
+which revalidates the official Core before collecting the single manifest
+document. There is no host-result or host-import fallback. `pending` claims only
+project-local pending requests and maps their source hashes back to the manifest
+whitelist inside the private source bundle. During a manual refresh, the
+QwenWork Skill must cite only the current active source and omit unsupported
+facts. `push --dry-run` validates the artifact and reports only status, counts,
+payload size, and a content hash; it does not call the gateway. The manual prompt
+performs the real push only after that validation succeeds.
 
 These individual module commands remain compatible with approved manual runs
-when that project has no active lifecycle lease. A production task must use the
-complete `begin -> host DWS doc_info -> host DWS doc_read -> host-import -> pending -> artifact -> push -> end` lifecycle,
-pass the same run token to every mutating command, and call `abort` from its
-`finally` path on any failure. The project-keyed lease and lock are stored under
+when that project has no active lifecycle lease. An unattended production run
+must use `check -> check-core -> begin -> collect-direct -> pending ->
+reuse-artifact --unattended -> push -> end`. A manual refresh replaces artifact
+reuse with the Skill, `artifact`, `push --dry-run`, and the real `push`. Both
+paths pass the same run token to every post-begin command and call `abort` on any
+failure. The project-keyed lease and lock are stored under
 the repository's ignored `.private/dws-sync-locks` directory; alternate state
 paths cannot bypass them, and concurrent triggers coalesce into at most one
 immediate follow-up run.
 
-Create the QwenWork schedule only after one approved manual run. Use the full
-contents of `prompts/qwenwork-dws-project-sync.md`, run it every five minutes in
-this repository root, keep it disabled until its first manual run succeeds, and
-coalesce missed intervals into one recovery run. Any host DWS, `host-import`, `pending`, Skill, or
-`push` failure stops that run. Failed sources do not renew freshness, and facts
-depending on a source older than 30 minutes remain closed until that source is
-successfully refreshed.
+The existing five-minute QwenWork task remains paused until the user explicitly
+approves enabling it after a successful manual refresh. Use the full contents of
+`prompts/qwenwork-dws-project-sync.md` for an unattended run and
+`prompts/qwenwork-dws-project-manual-refresh.md` for that manual refresh.
+Core validation, direct collection, pending, artifact, or push failure stops the
+run without fallback. Failed sources do not renew freshness, and facts depending
+on a source older than 30 minutes remain closed until that source is successfully
+refreshed.
 
 ## Bootstrap a Xiaozhi device
 
