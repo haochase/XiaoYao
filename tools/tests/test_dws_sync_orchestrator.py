@@ -301,3 +301,19 @@ def test_run_once_aborts_after_interrupt() -> None:
         ("collect-direct", "private-token"),
         ("abort", "private-token"),
     ]
+
+
+@pytest.mark.parametrize("payload", (None, object()))
+def test_run_once_aborts_when_stage_payload_is_malformed(payload: object) -> None:
+    output, observed = run_with(
+        [
+            result("started", run_token="private-token"),
+            CommandResult(0, payload),  # type: ignore[arg-type]
+            result("aborted"),
+        ]
+    )
+
+    assert output.status == "failed"
+    assert output.stage == "collect-direct"
+    assert output.error_type == "sync_failed"
+    assert observed[-1][:3] == ("abort", "private-token", False)

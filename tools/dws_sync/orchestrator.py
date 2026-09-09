@@ -225,9 +225,27 @@ def _run_round(
                 None,
             )
 
-        payload = dispatched.payload
-        details = _details(payload, details)
-        status = _text(payload, "status")
+        try:
+            payload = dispatched.payload
+            if not isinstance(payload, Mapping):
+                raise TypeError("command_payload_invalid")
+            details = _details(payload, details)
+            status = _text(payload, "status")
+        except Exception:
+            return (
+                _failure(
+                    dispatch,
+                    root,
+                    run_token,
+                    protector,
+                    command,
+                    details,
+                    "sync_failed",
+                    rerun_count,
+                ),
+                details,
+                None,
+            )
         if dispatched.exit_code != 0:
             return (
                 _failure(
