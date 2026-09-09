@@ -18,6 +18,7 @@ if __name__ == "__main__":
 from companion_gateway.project.auth import ProjectApiPrincipal
 from companion_gateway.project.protection import ContentProtector, WindowsDpapiProtector
 from companion_gateway.settings import Settings
+from tools.dws_project_sync import CommandResult
 from tools.dws_sync.core_trust import resolve_trusted_dws_core
 from tools.dws_sync.launch import resolve_dws_launch
 from tools.dws_sync.manifest import DwsManifest, DwsProjectManifest
@@ -116,7 +117,7 @@ def dispatch_result(
     input_stream: object | None = None,
     unattended: bool = False,
     confirm: str | None = None,
-) -> "cli.CommandResult":
+) -> CommandResult:
     from tools import dws_project_sync as cli
 
     if command not in COMMANDS:

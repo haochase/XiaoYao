@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 
@@ -1118,3 +1119,12 @@ def test_dispatch_emits_dispatch_result_payload_once(tmp_path: Path, monkeypatch
 
     assert wrapper.dispatch(tmp_path, "begin", None, False, Protector()) == 1
     assert json.loads(capsys.readouterr().out) == dict(expected.payload)
+
+
+def test_dispatch_result_return_annotation_resolves_at_runtime() -> None:
+    from tools import dws_project_sync
+    from tools import dws_sync_runtime as wrapper
+
+    assert get_type_hints(wrapper.dispatch_result)["return"] is (
+        dws_project_sync.CommandResult
+    )
