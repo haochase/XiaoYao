@@ -23,6 +23,10 @@ class ClockCheckResult:
     reason: Literal["normal", "resume_detected", "clock_rollback"]
 
 
+class _AwakeTimeUnavailable(RuntimeError):
+    pass
+
+
 class ProjectClockGuard:
     def __init__(
         self,
@@ -46,7 +50,11 @@ class ProjectClockGuard:
         self._repository = repository
         self._sync_interval_seconds = float(sync_interval_seconds)
         self._monotonic = monotonic
-        self._awake_time = awake_time or _system_awake_time
+        self._awake_time, self._initial_awake_sample = (
+            (awake_time, None)
+            if awake_time is not None
+            else _select_system_awake_time()
+        )
         self._last_wall: datetime | None = None
         self._last_monotonic: float | None = None
         self._last_awake: float | None = None
@@ -74,14 +82,9 @@ class ProjectClockGuard:
         ] = "normal"
 
         with self._lock:
-            if (
-                self._last_wall is not None
-                and self._last_monotonic is not None
-                and self._last_awake is not None
-            ):
+            if self._last_wall is not None and self._last_monotonic is not None:
                 wall_elapsed = (wall_now - self._last_wall).total_seconds()
                 monotonic_elapsed = sample - self._last_monotonic
-                awake_elapsed = awake_sample - self._last_awake
                 elapsed = max(wall_elapsed, monotonic_elapsed)
                 recently_synced = (
                     shared.trusted_wall_at is not None
@@ -95,8 +98,10 @@ class ProjectClockGuard:
                     detected_reason = "clock_rollback"
                 elif (
                     not recently_synced
+                    and awake_sample is not None
+                    and self._last_awake is not None
                     and elapsed > 2 * self._sync_interval_seconds
-                    and awake_elapsed
+                    and awake_sample - self._last_awake
                     < elapsed - self._sync_interval_seconds
                 ):
                     detected_sync = True
@@ -153,23 +158,39 @@ class ProjectClockGuard:
             self._monotonic() if value is None else value
         )
 
-    def _read_awake(self, value: float | None) -> float:
-        return _validate_awake(
-            self._awake_time() if value is None else value
-        )
-
-
-def _system_awake_time() -> float:
-    if sys.platform == "win32":
+    def _read_awake(self, value: float | None) -> float | None:
+        if value is not None:
+            return _validate_awake(value)
+        with self._lock:
+            if self._initial_awake_sample is not None:
+                sample = self._initial_awake_sample
+                self._initial_awake_sample = None
+                return sample
         try:
-            elapsed_100ns = ctypes.c_ulonglong()
-            if ctypes.windll.kernel32.QueryUnbiasedInterruptTime(
-                ctypes.byref(elapsed_100ns)
-            ):
-                return elapsed_100ns.value / 10_000_000
-        except (AttributeError, OSError):
-            pass
-    return time.monotonic()
+            return _validate_awake(self._awake_time())
+        except _AwakeTimeUnavailable:
+            return None
+
+
+def _select_system_awake_time() -> tuple[Callable[[], float], float | None]:
+    if sys.platform != "win32":
+        return time.monotonic, None
+    try:
+        return _windows_awake_time, _windows_awake_time()
+    except _AwakeTimeUnavailable:
+        return time.monotonic, None
+
+
+def _windows_awake_time() -> float:
+    try:
+        elapsed_100ns = ctypes.c_ulonglong()
+        if ctypes.windll.kernel32.QueryUnbiasedInterruptTime(
+            ctypes.byref(elapsed_100ns)
+        ):
+            return elapsed_100ns.value / 10_000_000
+    except (AttributeError, OSError):
+        pass
+    raise _AwakeTimeUnavailable()
 
 
 def _require_aware(value: datetime) -> None:
