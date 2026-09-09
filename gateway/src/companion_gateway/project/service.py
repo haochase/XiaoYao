@@ -282,7 +282,7 @@ class ProjectMemoryService:
         if snapshot is None:
             raise ProjectContextUnavailable("source_not_found")
 
-        source_refs_by_hash = self._usable_evidence_sources(
+        source_refs_by_hash, has_expired_source = self._usable_evidence_sources(
             project_id,
             snapshot,
             timestamp,
@@ -319,13 +319,8 @@ class ProjectMemoryService:
 
         source_hashes = tuple(sorted(source_refs_by_hash))
         if not source_hashes:
-            has_queryable_source = any(
-                source.source_type
-                in {SyncSourceType.DOCUMENT, SyncSourceType.MEETING_NOTE}
-                for source in snapshot.sources
-            )
             raise ProjectContextUnavailable(
-                "source_expired" if has_queryable_source else "source_unavailable"
+                "source_expired" if has_expired_source else "source_unavailable"
             )
         query_hash = hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()
         request_material = "\0".join(
@@ -360,8 +355,9 @@ class ProjectMemoryService:
         project_id: str,
         snapshot: ProjectRuntimeSnapshot,
         timestamp: datetime,
-    ) -> dict[str, EvidenceRef]:
+    ) -> tuple[dict[str, EvidenceRef], bool]:
         source_refs_by_hash: dict[str, EvidenceRef] = {}
+        has_expired_source = False
         for source in snapshot.sources:
             if source.source_type not in {
                 SyncSourceType.DOCUMENT,
@@ -381,11 +377,14 @@ class ProjectMemoryService:
                     snapshot,
                 )
             except ProjectContextUnavailable as exc:
-                if str(exc) in {"clock_resync_required", "clock_untrusted"}:
+                label = str(exc)
+                if label in {"clock_resync_required", "clock_untrusted"}:
                     raise
+                if label == "source_expired":
+                    has_expired_source = True
                 continue
             source_refs_by_hash[source.source_id_hash] = source_ref
-        return source_refs_by_hash
+        return source_refs_by_hash, has_expired_source
 
     @staticmethod
     def _evidence_ref(

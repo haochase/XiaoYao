@@ -576,6 +576,30 @@ def test_missing_evidence_without_usable_document_source_reports_expired(
     assert repository.list_retrieval_requests(PROJECT_ID) == ()
 
 
+def test_missing_evidence_with_unavailable_document_source_stays_unavailable(
+    tmp_path: Path,
+) -> None:
+    document = evidence_source("document-unavailable")
+    snapshot = project_snapshot(
+        sources=(document,),
+        chunks=(),
+        source_statuses={document.source_id: SourceSyncStatus.FAILED},
+    )
+    repository = repository_at(tmp_path)
+    service = integrated_service(
+        snapshot,
+        policy=RecordingSourcePolicy(
+            errors={document.source_id: "source_unavailable"}
+        ),
+        retrieval_writer=repository,
+    )
+
+    with pytest.raises(ProjectContextUnavailable, match="source_unavailable"):
+        service.answer(PROJECT_ID, "为什么选择方案B", kind=AnswerKind.FACT)
+
+    assert repository.list_retrieval_requests(PROJECT_ID) == ()
+
+
 def test_query_pins_snapshot_when_generation_swaps_during_validation() -> None:
     document = evidence_source("document-1")
     chunk = evidence_chunk(document, "Pinned generation A evidence.")
