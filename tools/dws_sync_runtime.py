@@ -106,7 +106,7 @@ def _core_runner(
     )
 
 
-def dispatch(
+def dispatch_result(
     root: Path,
     command: str,
     run_token: str | None,
@@ -116,7 +116,7 @@ def dispatch(
     input_stream: object | None = None,
     unattended: bool = False,
     confirm: str | None = None,
-) -> int:
+) -> "cli.CommandResult":
     from tools import dws_project_sync as cli
 
     if command not in COMMANDS:
@@ -143,7 +143,7 @@ def dispatch(
         ]
         environment = dict(os.environ)
         environment.pop("COMPANION_DWS_SYNC_TOKEN", None)
-        return cli.main(
+        return cli.execute(
             argv,
             runner=runner,
             environ=environment,
@@ -242,7 +242,34 @@ def dispatch(
         kwargs["input_stream"] = (
             sys.stdin.buffer if input_stream is None else input_stream
         )
-    return cli.main(argv, **kwargs)
+    return cli.execute(argv, **kwargs)
+
+
+def dispatch(
+    root: Path,
+    command: str,
+    run_token: str | None,
+    dry_run: bool,
+    protector: ContentProtector,
+    *,
+    input_stream: object | None = None,
+    unattended: bool = False,
+    confirm: str | None = None,
+) -> int:
+    from tools import dws_project_sync as cli
+
+    result = dispatch_result(
+        root,
+        command,
+        run_token,
+        dry_run,
+        protector,
+        input_stream=input_stream,
+        unattended=unattended,
+        confirm=confirm,
+    )
+    cli._emit(result.payload)
+    return result.exit_code
 
 
 def build_app(root: Path, protector: ContentProtector):

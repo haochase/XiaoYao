@@ -160,7 +160,12 @@ def test_wrapper_injects_token_only_for_network_commands(tmp_path: Path, monkeyp
     manifest, dws = inputs(tmp_path)
     prepare_runtime(tmp_path, manifest, "project-1", dws, Protector())
     observed = []
-    monkeypatch.setattr(dws_project_sync, "main", lambda argv, **kwargs: observed.append((argv, kwargs)) or 0)
+    monkeypatch.setattr(
+        dws_project_sync,
+        "execute",
+        lambda argv, **kwargs: observed.append((argv, kwargs))
+        or dws_project_sync.CommandResult(0, {"status": "ok"}),
+    )
     monkeypatch.delenv("COMPANION_DWS_SYNC_TOKEN", raising=False)
     wrapper.dispatch(tmp_path, "artifact", "lease", False, Protector())
     assert "COMPANION_DWS_SYNC_TOKEN" not in observed[-1][1]["environ"]
@@ -262,12 +267,12 @@ def test_collect_direct_binds_trusted_runner_to_current_lease(
         raising=False,
     )
 
-    def record_main(argv, **kwargs):
+    def record_execute(argv, **kwargs):
         observed["argv"] = argv
         observed.update(kwargs)
-        return 0
+        return dws_project_sync.CommandResult(0, {"status": "ok"})
 
-    monkeypatch.setattr(dws_project_sync, "main", record_main)
+    monkeypatch.setattr(dws_project_sync, "execute", record_execute)
     monkeypatch.setattr(
         wrapper,
         "load_runtime",
@@ -526,8 +531,9 @@ def test_host_import_maps_fixed_paths_and_does_not_decrypt_credential(
     stdin = object()
     monkeypatch.setattr(
         dws_project_sync,
-        "main",
-        lambda argv, **kwargs: observed.append((argv, kwargs)) or 0,
+        "execute",
+        lambda argv, **kwargs: observed.append((argv, kwargs))
+        or dws_project_sync.CommandResult(0, {"status": "ok"}),
     )
 
     assert wrapper.dispatch(
@@ -580,8 +586,9 @@ def test_two_phase_host_commands_map_fixed_paths_without_decrypting_credential(
     stdin = object()
     monkeypatch.setattr(
         dws_project_sync,
-        "main",
-        lambda argv, **kwargs: observed.append((argv, kwargs)) or 0,
+        "execute",
+        lambda argv, **kwargs: observed.append((argv, kwargs))
+        or dws_project_sync.CommandResult(0, {"status": "ok"}),
     )
     monkeypatch.setenv("COMPANION_DWS_SYNC_TOKEN", "ambient-secret")
 
@@ -630,8 +637,9 @@ def test_artifact_maps_fixed_inputs_and_does_not_decrypt_credential(
     stdin = object()
     monkeypatch.setattr(
         dws_project_sync,
-        "main",
-        lambda argv, **kwargs: observed.append((argv, kwargs)) or 0,
+        "execute",
+        lambda argv, **kwargs: observed.append((argv, kwargs))
+        or dws_project_sync.CommandResult(0, {"status": "ok"}),
     )
 
     assert wrapper.dispatch(
@@ -679,8 +687,9 @@ def test_reuse_artifact_maps_fixed_inputs_without_decrypting_credential(
     observed = []
     monkeypatch.setattr(
         dws_project_sync,
-        "main",
-        lambda argv, **kwargs: observed.append((argv, kwargs)) or 0,
+        "execute",
+        lambda argv, **kwargs: observed.append((argv, kwargs))
+        or dws_project_sync.CommandResult(0, {"status": "ok"}),
     )
 
     assert wrapper.dispatch(
@@ -726,8 +735,9 @@ def test_restore_approved_maps_fixed_inputs_without_decrypting_credential(
     observed = []
     monkeypatch.setattr(
         dws_project_sync,
-        "main",
-        lambda argv, **kwargs: observed.append((argv, kwargs)) or 0,
+        "execute",
+        lambda argv, **kwargs: observed.append((argv, kwargs))
+        or dws_project_sync.CommandResult(0, {"status": "ok"}),
     )
     monkeypatch.setenv("COMPANION_DWS_SYNC_TOKEN", "ambient-secret")
 
@@ -771,8 +781,9 @@ def test_unattended_flag_is_mapped_only_for_reuse_artifact(
     observed = []
     monkeypatch.setattr(
         dws_project_sync,
-        "main",
-        lambda argv, **kwargs: observed.append((argv, kwargs)) or 0,
+        "execute",
+        lambda argv, **kwargs: observed.append((argv, kwargs))
+        or dws_project_sync.CommandResult(0, {"status": "ok"}),
     )
 
     assert wrapper.dispatch(
@@ -845,8 +856,9 @@ def test_recover_pending_maps_fixed_inputs_without_exposing_token(
     observed = []
     monkeypatch.setattr(
         dws_project_sync,
-        "main",
-        lambda argv, **kwargs: observed.append((argv, kwargs)) or 0,
+        "execute",
+        lambda argv, **kwargs: observed.append((argv, kwargs))
+        or dws_project_sync.CommandResult(0, {"status": "ok"}),
     )
     monkeypatch.setenv("COMPANION_DWS_SYNC_TOKEN", "ambient-secret")
 
@@ -910,8 +922,9 @@ def test_discard_rejected_pending_maps_fixed_inputs_without_exposing_token(
     observed = []
     monkeypatch.setattr(
         dws_project_sync,
-        "main",
-        lambda argv, **kwargs: observed.append((argv, kwargs)) or 0,
+        "execute",
+        lambda argv, **kwargs: observed.append((argv, kwargs))
+        or dws_project_sync.CommandResult(0, {"status": "ok"}),
     )
     monkeypatch.setenv("COMPANION_DWS_SYNC_TOKEN", "ambient-secret")
 
@@ -1047,3 +1060,61 @@ def test_real_dpapi_runtime_roundtrip(tmp_path: Path) -> None:
         assert client.get("/health").status_code == 200
         assert client.get("/ready").status_code == 200
         assert client.get("/v1/projects/project-1/sync/status").status_code == 401
+
+
+def test_dispatch_result_uses_fixed_pending_inputs_without_stdout(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from tools import dws_project_sync
+    from tools import dws_sync_runtime as wrapper
+
+    manifest, dws = inputs(tmp_path)
+    prepare_runtime(tmp_path, manifest, "project-1", dws, Protector())
+    observed = []
+
+    def fake_execute(argv, **kwargs):  # type: ignore[no-untyped-def]
+        observed.append((argv, kwargs))
+        return dws_project_sync.CommandResult(
+            exit_code=0, payload={"status": "pending"}
+        )
+
+    monkeypatch.setattr(dws_project_sync, "execute", fake_execute)
+    monkeypatch.setenv("COMPANION_DWS_SYNC_TOKEN", "ambient-secret")
+
+    result = wrapper.dispatch_result(
+        tmp_path, "pending", "lease-token", False, Protector()
+    )
+
+    assert result.exit_code == 0
+    assert result.payload == {"status": "pending"}
+    assert capsys.readouterr().out == ""
+    argv, kwargs = observed[0]
+    assert argv == [
+        "pending",
+        "--project",
+        "project-1",
+        "--run-token",
+        "lease-token",
+        "--manifest",
+        str(manifest),
+        "--sources-file",
+        str(tmp_path / ".private/dws-runtime/source-bundle.json"),
+        "--gateway",
+        "http://127.0.0.1:8731",
+    ]
+    assert kwargs["environ"]["COMPANION_DWS_SYNC_TOKEN"] != "ambient-secret"
+
+
+def test_dispatch_emits_dispatch_result_payload_once(tmp_path: Path, monkeypatch, capsys) -> None:
+    from tools import dws_project_sync
+    from tools import dws_sync_runtime as wrapper
+
+    expected = dws_project_sync.CommandResult(
+        exit_code=1, payload={"status": "error", "error_type": "sync_failed"}
+    )
+    monkeypatch.setattr(wrapper, "dispatch_result", lambda *_args, **_kwargs: expected)
+
+    assert wrapper.dispatch(tmp_path, "begin", None, False, Protector()) == 1
+    assert json.loads(capsys.readouterr().out) == dict(expected.payload)

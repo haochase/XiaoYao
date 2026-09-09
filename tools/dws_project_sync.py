@@ -14,6 +14,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -225,6 +226,12 @@ _PUBLIC_ERROR_TYPES = {
     "run_token_invalid",
     "unknown",
 } | _SAFE_GATEWAY_ERROR_TYPES
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    exit_code: int
+    payload: Mapping[str, object]
 
 
 def _host_capture_protector() -> ContentProtector:
@@ -3238,7 +3245,7 @@ def _abort_command(
     return {"status": "aborted", "project_id": args.project}
 
 
-def main(
+def execute(
     argv: Sequence[str] | None = None,
     *,
     runner: object | None = None,
@@ -3249,7 +3256,7 @@ def main(
     sleep: Callable[[float], None] = time.sleep,
     input_stream: object | None = None,
     direct_collection: bool = False,
-) -> int:
+) -> CommandResult:
     actual_argv = list(sys.argv[1:] if argv is None else argv)
     if "--help" in actual_argv or "-h" in actual_argv:
         if actual_argv and actual_argv[0] in {
@@ -3292,8 +3299,7 @@ def main(
                     "abort",
                 ],
             }
-        _emit(output)
-        return 0
+        return CommandResult(exit_code=0, payload=output)
     try:
         args = _parser().parse_args(actual_argv)
         if direct_collection and args.command != "collect":
@@ -3380,8 +3386,34 @@ def main(
         result = 1
     else:
         result = 0
-    _emit(output)
-    return result
+    return CommandResult(exit_code=result, payload=output)
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    runner: object | None = None,
+    urlopen: Callable[..., object] = _direct_urlopen,
+    environ: Mapping[str, str] | None = None,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    monotonic: Callable[[], float] = time.perf_counter,
+    sleep: Callable[[float], None] = time.sleep,
+    input_stream: object | None = None,
+    direct_collection: bool = False,
+) -> int:
+    result = execute(
+        argv,
+        runner=runner,
+        urlopen=urlopen,
+        environ=environ,
+        now=now,
+        monotonic=monotonic,
+        sleep=sleep,
+        input_stream=input_stream,
+        direct_collection=direct_collection,
+    )
+    _emit(result.payload)
+    return result.exit_code
 
 
 if __name__ == "__main__":

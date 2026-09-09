@@ -8225,6 +8225,48 @@ def test_private_task_config_is_ignored_and_documented_publicly() -> None:
         assert "Git" in document and "approval" in document
 
 
+def test_execute_begin_returns_run_token_without_writing_stdout(capsys) -> None:
+    result = sync_cli.execute(
+        ["begin", "--project", "project-1"], now=lambda: NOW
+    )
+
+    assert result.exit_code == 0
+    assert result.payload["status"] == "started"
+    assert isinstance(result.payload["run_token"], str)
+    assert capsys.readouterr().out == ""
+
+    assert main(["begin", "--project", "project-1"], now=lambda: NOW) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "coalesced"
+    assert output["run_token"] is None
+
+
+@pytest.mark.parametrize(
+    ("failure", "error_type"),
+    [
+        (ValueError("manifest_not_found"), "manifest_not_found"),
+        (RuntimeError("private execution detail"), "sync_failed"),
+        (KeyboardInterrupt(), "interrupted"),
+    ],
+)
+def test_execute_sanitizes_failures_without_writing_stdout(
+    monkeypatch,
+    capsys,
+    failure: BaseException,
+    error_type: str,
+) -> None:
+    def fail_begin(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise failure
+
+    monkeypatch.setattr(sync_cli, "_begin_command", fail_begin)
+
+    result = sync_cli.execute(["begin", "--project", "project-1"])
+
+    assert result.exit_code == 1
+    assert result.payload == {"status": "error", "error_type": error_type}
+    assert capsys.readouterr().out == ""
+
+
 def test_gateway_runbook_separates_unattended_reuse_from_manual_skill() -> None:
     gateway_readme = (
         Path(__file__).resolve().parents[2] / "gateway" / "README.md"
