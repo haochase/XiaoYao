@@ -186,6 +186,7 @@ _PUBLIC_ERROR_TYPES = {
     "output_not_absolute",
     "output_parent_invalid",
     "payload_too_large",
+    "pending_discard_denied",
     "pending_sync_conflict",
     "pending_recovery_denied",
     "permission_denied",
@@ -501,6 +502,15 @@ def _parser() -> argparse.ArgumentParser:
     recover_pending.add_argument("--context-file", required=True)
     recover_pending.add_argument("--state-file", required=True)
     recover_pending.add_argument("--database-file", required=True)
+
+    discard_pending = commands.add_parser(
+        "discard-rejected-pending", add_help=False
+    )
+    discard_pending.add_argument("--manifest", required=True)
+    discard_pending.add_argument("--project", required=True)
+    discard_pending.add_argument("--state-file", required=True)
+    discard_pending.add_argument("--database-file", required=True)
+    discard_pending.add_argument("--confirm", required=True)
 
     begin = commands.add_parser("begin", add_help=False)
     begin.add_argument("--project", required=True)
@@ -2782,6 +2792,125 @@ def _recover_pending_command(
             raise
 
 
+def _pending_discard_denied() -> None:
+    raise ValueError("pending_discard_denied")
+
+
+def _discard_rejected_pending_inner(
+    args: argparse.Namespace,
+    database_path: Path,
+    database_handle: int,
+    manifest_path: Path,
+    state_path: Path,
+) -> dict[str, object]:
+    manifest = DwsManifest.load(manifest_path)
+    project = _selected_project(manifest, args.project)
+    state = _load_recovery_state(state_path, project.project_id)
+    pending = state.pending
+    if pending is None or state.last_cursor < 1:
+        _pending_discard_denied()
+
+    database_snapshot = _recovery_database_snapshot(
+        database_path, database_handle
+    )
+    uri = f"{database_path.as_uri()}?mode=ro"
+    try:
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            connection.set_authorizer(_recovery_sqlite_authorizer)
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            active_rows = connection.execute(
+                """
+                SELECT generation.source_cursor, generation.content_hash,
+                       generation.sync_id
+                FROM project_active_generations AS active
+                JOIN project_sync_generations AS generation
+                  ON generation.project_id = active.project_id
+                 AND generation.generation_id = active.generation_id
+                WHERE active.project_id = ?
+                """,
+                (project.project_id,),
+            ).fetchall()
+            if active_rows != [
+                (
+                    state.last_cursor,
+                    state.last_content_hash,
+                    state.last_sync_id,
+                )
+            ]:
+                _pending_discard_denied()
+            generation_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM project_sync_generations
+                WHERE sync_id = ? OR (project_id = ? AND source_cursor = ?)
+                """,
+                (pending.sync_id, project.project_id, pending.source_cursor),
+            ).fetchone()
+            audit_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM project_sync_audits
+                WHERE sync_id = ?
+                """,
+                (pending.sync_id,),
+            ).fetchone()
+            if generation_count != (0,) or audit_count != (0,):
+                _pending_discard_denied()
+    except ValueError:
+        raise
+    except (OSError, sqlite3.Error):
+        _pending_discard_denied()
+
+    if (
+        _recovery_database_snapshot(database_path, database_handle)
+        != database_snapshot
+    ):
+        _pending_discard_denied()
+    promoted = state.model_copy(update={"pending": None})
+    _atomic_write(state_path, _canonical_bytes(promoted.model_dump()))
+    return {
+        "status": "pending_discarded",
+        "project_id": project.project_id,
+        "abandoned_pending_cursor": pending.source_cursor,
+    }
+
+
+def _discard_rejected_pending_command(
+    args: argparse.Namespace,
+    *,
+    now: Callable[[], datetime],
+) -> dict[str, object]:
+    try:
+        if args.confirm != "sync_conflict":
+            _pending_discard_denied()
+        with lifecycle.manual_guard(
+            args.project,
+            root=LIFECYCLE_ROOT,
+            now=now,
+            timeout=SYNC_LOCK_TIMEOUT_SECONDS,
+        ):
+            manifest_path = _absolute_private_path(args.manifest, "manifest")
+            state_path = _absolute_private_path(args.state_file, "state_file")
+            _validate_distinct_private_paths((manifest_path, state_path))
+            database_path = _recovery_database_path(
+                args.database_file,
+                (manifest_path, state_path),
+            )
+            with _recovery_database_guard(database_path) as database_handle:
+                return _discard_rejected_pending_inner(
+                    args,
+                    database_path,
+                    database_handle,
+                    manifest_path,
+                    state_path,
+                )
+    except ValueError as exc:
+        if str(exc) == "private_file_write_failed":
+            raise
+        _pending_discard_denied()
+    except Exception:
+        _pending_discard_denied()
+
+
 def _push_command(
     args: argparse.Namespace,
     *,
@@ -3080,6 +3209,7 @@ def main(
             "complete-host-import",
             "end",
             "pending",
+            "discard-rejected-pending",
             "recover-pending",
             "reuse-artifact",
             "restore-approved",
@@ -3099,6 +3229,7 @@ def main(
                     "host-import",
                     "complete-host-import",
                     "pending",
+                    "discard-rejected-pending",
                     "recover-pending",
                     "reuse-artifact",
                     "restore-approved",
@@ -3166,6 +3297,8 @@ def main(
             )
         elif args.command == "recover-pending":
             output = _recover_pending_command(args, now=now)
+        elif args.command == "discard-rejected-pending":
+            output = _discard_rejected_pending_command(args, now=now)
         elif args.command == "reuse-artifact":
             output = _reuse_artifact_command(args, now=now)
         elif args.command == "restore-approved":

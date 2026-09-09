@@ -344,6 +344,27 @@ def recover_pending_args(
     ]
 
 
+def discard_rejected_pending_args(
+    paths: dict[str, Path],
+    database: Path,
+    *,
+    confirm: str = "sync_conflict",
+) -> list[str]:
+    return [
+        "discard-rejected-pending",
+        "--manifest",
+        str(paths["manifest"]),
+        "--project",
+        "project-1",
+        "--state-file",
+        str(paths["state"]),
+        "--database-file",
+        str(database),
+        "--confirm",
+        confirm,
+    ]
+
+
 def write_pending_recovery_fixture(
     tmp_path: Path,
 ) -> tuple[dict[str, Path], Path, QwenProjectContextArtifact]:
@@ -462,6 +483,21 @@ def write_pending_recovery_fixture(
     return paths, database, approved
 
 
+def write_pending_discard_fixture(
+    tmp_path: Path,
+) -> tuple[dict[str, Path], Path]:
+    paths, database, _approved = write_pending_recovery_fixture(tmp_path)
+    with sqlite3.connect(database) as connection:
+        active_sync_id = connection.execute(
+            "SELECT sync_id FROM project_sync_generations WHERE source_cursor = 1"
+        ).fetchone()
+    assert active_sync_id is not None
+    state = json.loads(paths["state"].read_text(encoding="utf-8"))
+    state["last_sync_id"] = active_sync_id[0]
+    write_json(paths["state"], state)
+    return paths, database
+
+
 def recovery_snapshot(
     paths: dict[str, Path], database: Path
 ) -> dict[Path, tuple[bool, bytes]]:
@@ -490,6 +526,151 @@ def database_snapshot(database: Path) -> dict[Path, tuple[bool, bytes]]:
             Path(str(database) + "-journal"),
         )
     }
+
+
+def test_discard_rejected_pending_only_clears_pending(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths, database = write_pending_discard_fixture(tmp_path)
+    state_before = json.loads(paths["state"].read_text(encoding="utf-8"))
+    database_before = database_snapshot(database)
+
+    assert (
+        main(
+            discard_rejected_pending_args(paths, database),
+            now=lambda: NOW,
+        )
+        == 0
+    )
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "pending_discarded",
+        "project_id": "project-1",
+        "abandoned_pending_cursor": 2,
+    }
+    assert json.loads(paths["state"].read_text(encoding="utf-8")) == {
+        **state_before,
+        "pending": None,
+    }
+    assert database_snapshot(database) == database_before
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "wrong_confirm",
+        "missing_pending",
+        "active_cursor",
+        "active_hash",
+        "active_sync_id",
+        "pending_generation",
+        "pending_audit",
+    ],
+)
+def test_discard_rejected_pending_denies_unproven_state(
+    tmp_path: Path,
+    capsys,
+    case: str,
+) -> None:
+    paths, database = write_pending_discard_fixture(tmp_path)
+    state = json.loads(paths["state"].read_text(encoding="utf-8"))
+    pending = state["pending"]
+    assert isinstance(pending, dict)
+    confirm = "sync_conflict"
+    if case == "wrong_confirm":
+        confirm = "force"
+    elif case == "missing_pending":
+        state["pending"] = None
+        write_json(paths["state"], state)
+    else:
+        with sqlite3.connect(database) as connection:
+            if case == "active_cursor":
+                connection.execute(
+                    "UPDATE project_sync_generations SET source_cursor = 9"
+                )
+            elif case == "active_hash":
+                connection.execute(
+                    "UPDATE project_sync_generations SET content_hash = ?",
+                    ("b" * 64,),
+                )
+            elif case == "active_sync_id":
+                connection.execute(
+                    "UPDATE project_sync_generations SET sync_id = 'other-sync'"
+                )
+            elif case == "pending_generation":
+                row = connection.execute(
+                    "SELECT * FROM project_sync_generations"
+                ).fetchone()
+                connection.execute(
+                    "INSERT INTO project_sync_generations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "project-1",
+                        "generation-2",
+                        pending["sync_id"],
+                        pending["source_cursor"],
+                        row[4],
+                        row[5],
+                        row[6],
+                    ),
+                )
+            elif case == "pending_audit":
+                connection.execute(
+                    "INSERT INTO project_sync_audits VALUES (?, ?)",
+                    (pending["sync_id"], "project-1"),
+                )
+            else:
+                raise AssertionError(case)
+    before_state = paths["state"].read_bytes()
+    before_database = database_snapshot(database)
+
+    assert (
+        main(
+            discard_rejected_pending_args(
+                paths,
+                database,
+                confirm=confirm,
+            ),
+            now=lambda: NOW,
+        )
+        == 1
+    )
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "pending_discard_denied",
+    }
+    assert paths["state"].read_bytes() == before_state
+    assert database_snapshot(database) == before_database
+
+
+def test_discard_rejected_pending_refuses_active_lifecycle(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths, database = write_pending_discard_fixture(tmp_path)
+    assert lifecycle.begin_run(
+        "project-1",
+        root=sync_cli.LIFECYCLE_ROOT,
+        now=lambda: NOW,
+    ).status == "started"
+    before_state = paths["state"].read_bytes()
+    before_database = database_snapshot(database)
+
+    assert (
+        main(
+            discard_rejected_pending_args(paths, database),
+            now=lambda: NOW,
+        )
+        == 1
+    )
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "pending_discard_denied",
+    }
+    assert paths["state"].read_bytes() == before_state
+    assert database_snapshot(database) == before_database
 
 
 def test_recover_pending_rebuilds_active_artifacts_and_checkpoints(

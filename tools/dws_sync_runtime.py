@@ -41,6 +41,7 @@ COMMANDS = (
     "host-import",
     "complete-host-import",
     "pending",
+    "discard-rejected-pending",
     "recover-pending",
     "reuse-artifact",
     "restore-approved",
@@ -114,6 +115,7 @@ def dispatch(
     *,
     input_stream: object | None = None,
     unattended: bool = False,
+    confirm: str | None = None,
 ) -> int:
     from tools import dws_project_sync as cli
 
@@ -121,6 +123,8 @@ def dispatch(
         raise ValueError("runtime_command_invalid")
     if unattended and command != "reuse-artifact":
         raise ValueError("unattended_command_invalid")
+    if confirm is not None and command != "discard-rejected-pending":
+        raise ValueError("confirmation_command_invalid")
     if command == "collect-direct":
         config, project = _load_host_import_config(root)
         runner = _core_runner(root, config, project)
@@ -152,6 +156,7 @@ def dispatch(
         "complete-host-import",
         "reuse-artifact",
         "restore-approved",
+        "discard-rejected-pending",
     }:
         config, _project = _load_host_import_config(root)
         token = None
@@ -167,6 +172,7 @@ def dispatch(
         "complete-host-import",
         "pending",
         "push",
+        "discard-rejected-pending",
         "recover-pending",
         "reuse-artifact",
         "restore-approved",
@@ -201,6 +207,7 @@ def dispatch(
         argv += ["--context-file", str(config.context_artifact)]
     if command in {
         "artifact",
+        "discard-rejected-pending",
         "push",
         "recover-pending",
         "reuse-artifact",
@@ -209,6 +216,13 @@ def dispatch(
         argv += ["--state-file", str(config.state)]
     if command == "recover-pending":
         argv += ["--database-file", str(runtime_database(root))]
+    if command == "discard-rejected-pending":
+        argv += [
+            "--database-file",
+            str(runtime_database(root)),
+            "--confirm",
+            "" if confirm is None else confirm,
+        ]
     if command == "push":
         if dry_run:
             argv += ["--dry-run"]
@@ -266,8 +280,14 @@ def main(
     commands.add_parser("serve")
     for command in COMMANDS:
         sub = commands.add_parser(command)
-        if command not in {"begin", "recover-pending"}:
+        if command not in {
+            "begin",
+            "discard-rejected-pending",
+            "recover-pending",
+        }:
             sub.add_argument("--run-token", required=True)
+        if command == "discard-rejected-pending":
+            sub.add_argument("--confirm", required=True)
         if command == "push":
             sub.add_argument("--dry-run", action="store_true")
         if command == "reuse-artifact":
@@ -312,6 +332,8 @@ def main(
             dispatch_options = {}
             if getattr(args, "unattended", False):
                 dispatch_options["unattended"] = True
+            if args.command == "discard-rejected-pending":
+                dispatch_options["confirm"] = args.confirm
             return dispatch(
                 root, args.command, getattr(args, "run_token", None),
                 getattr(args, "dry_run", False), selected_protector,

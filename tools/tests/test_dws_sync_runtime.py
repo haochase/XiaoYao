@@ -898,6 +898,86 @@ def test_recover_pending_runtime_parser_does_not_require_run_token(
     ) == 0
 
 
+def test_discard_rejected_pending_maps_fixed_inputs_without_exposing_token(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from tools import dws_project_sync
+    from tools import dws_sync_runtime as wrapper
+
+    manifest, dws = inputs(tmp_path)
+    prepare_runtime(tmp_path, manifest, "project-1", dws, Protector())
+    observed = []
+    monkeypatch.setattr(
+        dws_project_sync,
+        "main",
+        lambda argv, **kwargs: observed.append((argv, kwargs)) or 0,
+    )
+    monkeypatch.setenv("COMPANION_DWS_SYNC_TOKEN", "ambient-secret")
+
+    assert wrapper.dispatch(
+        tmp_path,
+        "discard-rejected-pending",
+        None,
+        False,
+        Protector(),
+        confirm="sync_conflict",
+    ) == 0
+
+    argv, kwargs = observed[0]
+    assert argv == [
+        "discard-rejected-pending",
+        "--project",
+        "project-1",
+        "--manifest",
+        str(manifest),
+        "--state-file",
+        str(tmp_path / ".private/dws-runtime/sync-state.json"),
+        "--database-file",
+        str(tmp_path / ".private/dws-runtime/companion.db"),
+        "--confirm",
+        "sync_conflict",
+    ]
+    assert "COMPANION_DWS_SYNC_TOKEN" not in kwargs["environ"]
+
+
+def test_discard_rejected_pending_runtime_parser_requires_confirmation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from tools import dws_sync_runtime as wrapper
+
+    observed = []
+    monkeypatch.setattr(
+        wrapper,
+        "dispatch",
+        lambda root, command, run_token, dry_run, protector, **kwargs: (
+            observed.append((root, command, run_token, dry_run, kwargs)) or 0
+        ),
+    )
+
+    assert wrapper.main(
+        ["discard-rejected-pending", "--confirm", "sync_conflict"],
+        root=tmp_path,
+        protector=Protector(),
+    ) == 0
+    assert observed == [
+        (
+            tmp_path,
+            "discard-rejected-pending",
+            None,
+            False,
+            {"confirm": "sync_conflict"},
+        )
+    ]
+    with pytest.raises(SystemExit, match="2"):
+        wrapper.main(
+            ["discard-rejected-pending"],
+            root=tmp_path,
+            protector=Protector(),
+        )
+
+
 def test_check_missing_config_prints_no_private_details(tmp_path: Path, capsys) -> None:
     from tools.dws_sync_runtime import main
 
