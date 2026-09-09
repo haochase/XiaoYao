@@ -287,6 +287,7 @@ class PendingSync(BaseModel):
     content_hash: str
     sync_id: str
     completion_claims_hash: str = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    context_semantic_hash: str | None = None
     failure_type: Literal["sync_conflict"] | None = None
 
     @field_validator("content_hash")
@@ -308,6 +309,13 @@ class PendingSync(BaseModel):
             raise ValueError("completion_claims_hash_invalid")
         return value
 
+    @field_validator("context_semantic_hash")
+    @classmethod
+    def validate_context_semantic_hash(cls, value: str | None) -> str | None:
+        if value is not None and _SHA256.fullmatch(value) is None:
+            raise ValueError("context_semantic_hash_invalid")
+        return value
+
 
 def _pending_identity_matches(
     pending: PendingSync,
@@ -318,6 +326,32 @@ def _pending_identity_matches(
         and pending.sync_id == envelope.sync_id
         and pending.completion_claims_hash
         == _completion_claims_hash(envelope.completed_retrieval_claims)
+    )
+
+
+def _context_semantic_hash(context: ProjectContextPackage) -> str:
+    return hashlib.sha256(
+        _canonical_bytes(
+            context.model_dump(mode="json", exclude={"generated_at"})
+        )
+    ).hexdigest()
+
+
+def _pending_rebuild_allowed(
+    pending: PendingSync,
+    envelope: SyncEnvelope,
+) -> bool:
+    return (
+        pending.failure_type == "sync_conflict"
+        and pending.context_semantic_hash is not None
+        and hmac.compare_digest(
+            pending.context_semantic_hash,
+            _context_semantic_hash(envelope.context),
+        )
+        and hmac.compare_digest(
+            pending.completion_claims_hash,
+            _completion_claims_hash(envelope.completed_retrieval_claims),
+        )
     )
 
 
@@ -1952,7 +1986,10 @@ def _artifact_command(
             )
             if (
                 not _pending_identity_matches(state.pending, pending_envelope)
-                and state.pending.failure_type != "sync_conflict"
+                and not _pending_rebuild_allowed(
+                    state.pending,
+                    pending_envelope,
+                )
             ):
                 raise ValueError("pending_sync_conflict")
         encoded = _canonical_bytes(selected.model_dump(mode="json"))
@@ -2056,7 +2093,10 @@ def _reuse_artifact_command(
         )
         if (
             not _pending_identity_matches(state.pending, pending_envelope)
-            and state.pending.failure_type != "sync_conflict"
+            and not _pending_rebuild_allowed(
+                state.pending,
+                pending_envelope,
+            )
         ):
             raise ValueError("pending_sync_conflict")
     encoded = _canonical_bytes(selected.model_dump(mode="json"))
@@ -2826,7 +2866,7 @@ def _push_command(
         rebuild_pending = False
         if state.pending is not None:
             if not _pending_identity_matches(state.pending, envelope):
-                if state.pending.failure_type != "sync_conflict":
+                if not _pending_rebuild_allowed(state.pending, envelope):
                     raise ValueError("pending_sync_conflict")
                 rebuild_pending = True
             if (
@@ -2845,6 +2885,7 @@ def _push_command(
             completion_claims_hash=_completion_claims_hash(
                 envelope.completed_retrieval_claims
             ),
+            context_semantic_hash=_context_semantic_hash(envelope.context),
         )
         if state.pending is None or rebuild_pending:
             _atomic_write(

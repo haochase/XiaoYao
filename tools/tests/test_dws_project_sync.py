@@ -1249,6 +1249,12 @@ def artifact_hash(artifact: QwenProjectContextArtifact) -> str:
     return digest(canonical(artifact.model_dump(mode="json")))
 
 
+def context_semantic_hash_for_test(value: ProjectContextPackage) -> str:
+    payload = value.model_dump(mode="json")
+    payload.pop("generated_at")
+    return digest(canonical(payload))
+
+
 def semantic_state(
     selected: DwsSourceBundle,
     approved: QwenProjectContextArtifact,
@@ -6844,6 +6850,9 @@ def test_sync_conflict_marks_pending_and_allows_rebuild_after_source_change(
     failed_state = SyncCliState.model_validate_json(paths["state"].read_bytes())
     assert failed_state.pending is not None
     assert failed_state.pending.failure_type == "sync_conflict"
+    assert failed_state.pending.context_semantic_hash == (
+        context_semantic_hash_for_test(context())
+    )
     first_sync_id = failed_state.pending.sync_id
 
     selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
@@ -6870,6 +6879,107 @@ def test_sync_conflict_marks_pending_and_allows_rebuild_after_source_change(
         paths["state"].read_text(encoding="utf-8")
     )["last_sync_id"]
     assert request_sync_id != first_sync_id
+
+
+def test_sync_conflict_rejects_rebuild_when_candidate_context_changes(
+    tmp_path: Path, capsys
+) -> None:
+    paths = write_push_inputs(tmp_path)
+
+    def rejected(request, *, timeout):  # type: ignore[no-untyped-def]
+        raise HTTPError(
+            request.full_url,
+            409,
+            "private",
+            {},
+            io.BytesIO(b'{"detail":"sync_conflict"}'),
+        )
+
+    assert main(
+        push_args(paths),
+        urlopen=rejected,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 1
+    capsys.readouterr()
+
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    changed = rehash_bundle(
+        selected.model_copy(
+            update={
+                "records": (
+                    selected.records[0].model_copy(update={"source_version": "v2"}),
+                )
+            }
+        )
+    )
+    write_json(paths["sources"], changed.model_dump(mode="json"))
+    changed_artifact = QwenProjectContextArtifact(
+        schema_version=1,
+        context=context(excerpt="方案 B。"),
+    )
+    write_json(paths["context"], changed_artifact.model_dump(mode="json"))
+
+    assert main(
+        push_args(paths),
+        urlopen=RecordingUrlOpen(),
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "pending_sync_conflict",
+    }
+
+
+def test_legacy_sync_conflict_pending_without_context_summary_fails_closed(
+    tmp_path: Path, capsys
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    attempts = 0
+
+    def rejected_then_success(request, *, timeout):  # type: ignore[no-untyped-def]
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise HTTPError(
+                request.full_url,
+                409,
+                "private",
+                {},
+                io.BytesIO(b'{"detail":"sync_conflict"}'),
+            )
+        return RecordingUrlOpen()(request, timeout=timeout)
+
+    assert main(
+        push_args(paths),
+        urlopen=rejected_then_success,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 1
+    capsys.readouterr()
+    state = json.loads(paths["state"].read_text(encoding="utf-8"))
+    state["pending"].pop("context_semantic_hash", None)
+    write_json(paths["state"], state)
+
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    changed = rehash_bundle(
+        selected.model_copy(
+            update={
+                "records": (
+                    selected.records[0].model_copy(update={"source_version": "v2"}),
+                )
+            }
+        )
+    )
+    write_json(paths["sources"], changed.model_dump(mode="json"))
+
+    assert main(
+        push_args(paths),
+        urlopen=rejected_then_success,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "pending_sync_conflict",
+    }
 
 
 def test_push_rolls_back_approved_when_state_promotion_interrupts(
