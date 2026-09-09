@@ -63,7 +63,7 @@ def test_windows_awake_api_failure_rebuilds_baseline(
     guard = _windows_guard(
         tmp_path,
         monkeypatch,
-        AwakeTimeApi([100, 100, None, 100]),
+        AwakeTimeApi([100, 100, 100, None, 100]),
         [0],
     )
 
@@ -106,6 +106,30 @@ def test_windows_awake_api_is_not_selected_after_initial_failure(
     assert not result.immediate_sync_required
     assert result.reason == "normal"
     assert awake_api.calls == 1
+
+
+def test_windows_probe_sample_is_not_the_first_awake_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = _windows_guard(
+        tmp_path,
+        monkeypatch,
+        AwakeTimeApi([100, 700, 701]),
+        [0],
+    )
+
+    guard.check(
+        wall_now=NOW + timedelta(seconds=600),
+        monotonic_now=100,
+    )
+    result = guard.check(
+        wall_now=NOW + timedelta(seconds=1201),
+        monotonic_now=701,
+    )
+
+    assert result.immediate_sync_required
+    assert result.reason == "resume_detected"
 
 
 def test_long_awake_interval_is_normal_idle(tmp_path: Path) -> None:

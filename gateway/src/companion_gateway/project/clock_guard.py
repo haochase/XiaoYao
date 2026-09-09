@@ -50,11 +50,7 @@ class ProjectClockGuard:
         self._repository = repository
         self._sync_interval_seconds = float(sync_interval_seconds)
         self._monotonic = monotonic
-        self._awake_time, self._initial_awake_sample = (
-            (awake_time, None)
-            if awake_time is not None
-            else _select_system_awake_time()
-        )
+        self._awake_time = awake_time or _select_system_awake_time()
         self._last_wall: datetime | None = None
         self._last_monotonic: float | None = None
         self._last_awake: float | None = None
@@ -161,24 +157,20 @@ class ProjectClockGuard:
     def _read_awake(self, value: float | None) -> float | None:
         if value is not None:
             return _validate_awake(value)
-        with self._lock:
-            if self._initial_awake_sample is not None:
-                sample = self._initial_awake_sample
-                self._initial_awake_sample = None
-                return sample
         try:
             return _validate_awake(self._awake_time())
         except _AwakeTimeUnavailable:
             return None
 
 
-def _select_system_awake_time() -> tuple[Callable[[], float], float | None]:
+def _select_system_awake_time() -> Callable[[], float]:
     if sys.platform != "win32":
-        return time.monotonic, None
+        return time.monotonic
     try:
-        return _windows_awake_time, _windows_awake_time()
+        _windows_awake_time()
     except _AwakeTimeUnavailable:
-        return time.monotonic, None
+        return time.monotonic
+    return _windows_awake_time
 
 
 def _windows_awake_time() -> float:
