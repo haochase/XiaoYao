@@ -247,6 +247,21 @@ def _run_round(
             "manual_refresh_required",
             "artifact_required",
         }:
+            release_status = _release(dispatch, root, run_token, protector)
+            if release_status != "aborted":
+                return (
+                    _result(
+                        "failed",
+                        command,
+                        details,
+                        error_type="release_failed",
+                        manual_refresh_required=True,
+                        rerun_count=rerun_count,
+                        release_status=release_status,
+                    ),
+                    details,
+                    None,
+                )
             return (
                 _result(
                     "awaiting_artifact",
@@ -254,7 +269,7 @@ def _run_round(
                     details,
                     manual_refresh_required=True,
                     rerun_count=rerun_count,
-                    release_status=_release(dispatch, root, run_token, protector),
+                    release_status=release_status,
                 ),
                 details,
                 None,
@@ -263,16 +278,29 @@ def _run_round(
             next_token = _text(payload, "run_token")
             if rerun_count == 0 and next_token:
                 return None, details, next_token
+            if next_token:
+                return (
+                    _failure(
+                        dispatch,
+                        root,
+                        next_token,
+                        protector,
+                        command,
+                        details,
+                        "unexpected_status",
+                        rerun_count,
+                    ),
+                    details,
+                    None,
+                )
             return (
-                _failure(
-                    dispatch,
-                    root,
-                    run_token,
-                    protector,
+                _result(
+                    "failed",
                     command,
                     details,
-                    "unexpected_status",
-                    rerun_count,
+                    error_type="unexpected_status",
+                    rerun_count=rerun_count,
+                    release_status="failed",
                 ),
                 details,
                 None,

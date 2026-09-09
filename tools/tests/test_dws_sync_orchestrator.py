@@ -210,7 +210,50 @@ def test_run_once_aborts_second_rerun_as_an_unexpected_lifecycle_state() -> None
     assert output.stage == "end"
     assert output.error_type == "unexpected_status"
     assert output.rerun_count == 1
-    assert observed[-1][:3] == ("abort", "second-token", False)
+    assert observed[-1][:3] == ("abort", "third-token", False)
+
+
+def test_run_once_does_not_abort_an_old_token_when_second_rerun_has_no_token() -> None:
+    output, observed = run_with(
+        [
+            result("started", run_token="first-token"),
+            result("collected"),
+            result("pending_fetched"),
+            result("artifact_reused"),
+            result("synced"),
+            result("rerun", run_token="second-token"),
+            result("collected"),
+            result("pending_fetched"),
+            result("artifact_reused"),
+            result("synced"),
+            result("rerun", run_token=None),
+        ]
+    )
+
+    assert output.status == "failed"
+    assert output.stage == "end"
+    assert output.error_type == "unexpected_status"
+    assert output.release_status == "failed"
+    assert [item[0] for item in observed][-1] == "end"
+
+
+def test_run_once_reports_failed_release_for_manual_refresh() -> None:
+    output, observed = run_with(
+        [
+            result("started", run_token="private-token"),
+            result("collected", active_sources=1, failed_sources=0),
+            result("pending_fetched"),
+            result("manual_refresh_required"),
+            CommandResult(1, {"status": "error", "error_type": "sync_failed"}),
+        ]
+    )
+
+    assert output.status == "failed"
+    assert output.stage == "reuse-artifact"
+    assert output.error_type == "release_failed"
+    assert output.manual_refresh_required
+    assert output.release_status == "failed"
+    assert observed[-1][:3] == ("abort", "private-token", False)
 
 
 def test_run_once_preserves_main_error_when_abort_fails() -> None:

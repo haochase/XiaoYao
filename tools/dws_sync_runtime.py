@@ -362,6 +362,8 @@ def main(
             run_result = run_once(root, selected_protector)
             result = run_result.to_dict()
             print(json.dumps(result))
+            if result["status"] == "awaiting_artifact":
+                return 2
             return 1 if result["status"] == "failed" else 0
         else:
             dispatch_options = {}

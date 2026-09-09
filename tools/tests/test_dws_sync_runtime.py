@@ -1172,6 +1172,36 @@ def test_run_once_runtime_emits_one_sanitized_json_result(
 
 
 @pytest.mark.parametrize(
+    ("status", "expected_exit"),
+    (
+        ("completed", 0),
+        ("coalesced", 0),
+        ("awaiting_artifact", 2),
+        ("failed", 1),
+    ),
+)
+def test_run_once_runtime_uses_status_specific_exit_codes(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    status: str,
+    expected_exit: int,
+) -> None:
+    from tools import dws_sync_runtime as wrapper
+
+    class FakeResult:
+        def to_dict(self) -> dict[str, object]:
+            return {"status": status, "manual_refresh_required": status == "awaiting_artifact"}
+
+    monkeypatch.setattr(
+        wrapper, "run_once", lambda *_args: FakeResult(), raising=False
+    )
+
+    assert wrapper.main(["run-once"], root=tmp_path, protector=Protector()) == expected_exit
+    assert json.loads(capsys.readouterr().out)["status"] == status
+
+
+@pytest.mark.parametrize(
     "argv",
     (
         ["run-once", "--project", "project-1"],
