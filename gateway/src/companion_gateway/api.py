@@ -13,6 +13,7 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
 from starlette.websockets import WebSocketDisconnect
 
@@ -122,6 +123,7 @@ from companion_gateway.project.protection import (
 from companion_gateway.project.query_facade import (
     RepositoryBackedProjectQueryFacade,
 )
+from companion_gateway.project.ops_api import project_conflicts, project_summary
 from companion_gateway.project.repository import ProjectMemoryRepository
 from companion_gateway.project.service import (
     ProjectContextUnavailable,
@@ -611,6 +613,14 @@ def create_app(
         interval_seconds=settings.task_scheduler_interval_seconds,
     )
     app = FastAPI(title="XiaoYao Voice Gateway", version="0.1.0")
+    app.mount(
+        "/project",
+        StaticFiles(
+            directory=Path(__file__).resolve().parents[2] / "static" / "project",
+            html=True,
+        ),
+        name="project-ops",
+    )
     app.state.repository = repository
     app.state.service = service
     app.state.task_executor = task_executor
@@ -850,6 +860,29 @@ def create_app(
         except ProjectContextUnavailable as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"conflicts": jsonable_encoder(conflicts)}
+
+    @app.get("/v1/projects/{project_id}/ops/summary")
+    def project_ops_summary(request: Request, project_id: str) -> dict[str, object]:
+        authorize_project_context(request, project_id, require_review=True)
+        try:
+            return jsonable_encoder(
+                project_summary(
+                    project_memory,
+                    project_id,
+                    now=project_clock(),
+                    sync_repository=project_sync_repository,
+                )
+            )
+        except ProjectContextUnavailable as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/v1/projects/{project_id}/ops/conflicts")
+    def project_ops_conflicts(request: Request, project_id: str) -> dict[str, object]:
+        authorize_project_context(request, project_id, require_review=True)
+        try:
+            return {"conflicts": jsonable_encoder(project_conflicts(project_memory, project_id))}
+        except ProjectContextUnavailable as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/v1/projects/conflicts/{candidate_id}/review")
     def review_project_conflict(
