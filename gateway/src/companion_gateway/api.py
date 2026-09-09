@@ -13,7 +13,6 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
 from starlette.websockets import WebSocketDisconnect
 
@@ -340,6 +339,8 @@ def create_app(
     project_memory_service: ProjectMemoryService | None = None,
     project_clock: Callable[[], datetime] = utc_now,
     project_monotonic: Callable[[], float] = time.monotonic,
+    project_ops_snapshot_reader=None,
+    project_ops_sync_repository=None,
     feishu_chat_listener=None,
     memory_clock: Callable[[], datetime] = utc_now,
     vision_clock: Callable[[], datetime] = utc_now,
@@ -607,20 +608,14 @@ def create_app(
         )
     else:
         project_memory = project_memory_service
+    ops_snapshot_reader = project_ops_snapshot_reader or project_query_facade
+    ops_sync_repository = project_ops_sync_repository or project_sync_repository
     project_authenticator = ProjectApiAuthenticator(settings.project_api_principals)
     medication_scheduler = MedicationScheduler(
         service=medication_service,
         interval_seconds=settings.task_scheduler_interval_seconds,
     )
     app = FastAPI(title="XiaoYao Voice Gateway", version="0.1.0")
-    app.mount(
-        "/project",
-        StaticFiles(
-            directory=Path(__file__).resolve().parents[2] / "static" / "project",
-            html=True,
-        ),
-        name="project-ops",
-    )
     app.state.repository = repository
     app.state.service = service
     app.state.task_executor = task_executor
@@ -648,6 +643,8 @@ def create_app(
     app.state.project_memory_repository = project_repository
     app.state.project_query_facade = project_query_facade
     app.state.project_sync_repository = project_sync_repository
+    app.state.project_ops_snapshot_reader = ops_snapshot_reader
+    app.state.project_ops_sync_repository = ops_sync_repository
     app.state.project_api_authenticator = project_authenticator
     app.state.project_clock = project_clock
     if voice_delivery_service is not None:
@@ -870,7 +867,8 @@ def create_app(
                     project_memory,
                     project_id,
                     now=project_clock(),
-                    sync_repository=project_sync_repository,
+                    snapshot_reader=ops_snapshot_reader,
+                    sync_repository=ops_sync_repository,
                 )
             )
         except ProjectContextUnavailable as exc:

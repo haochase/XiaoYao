@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any
 
 from companion_gateway.project.models import ConflictCandidate, ConflictStatus
+from companion_gateway.project.sync_models import SourceSyncStatus
 
 
 def _evidence(candidate: ConflictCandidate) -> dict[str, Any] | None:
@@ -23,7 +24,6 @@ def redact_conflict(candidate: ConflictCandidate) -> dict[str, Any]:
         "decision_id": candidate.decision_id,
         "active_text": candidate.active_decision_text,
         "proposed_text": candidate.proposed_decision_text,
-        "observed_text": candidate.observed_text,
         "reason": candidate.reason,
         "status": candidate.status.value,
         "created_at": candidate.created_at,
@@ -39,6 +39,7 @@ def project_summary(
     project_id: str,
     *,
     now: datetime,
+    snapshot_reader: Any = None,
     sync_repository: Any = None,
 ) -> dict[str, Any]:
     context = project_memory.get_context(project_id)
@@ -47,29 +48,32 @@ def project_summary(
     for candidate in conflicts:
         counts[candidate.status.value] = counts.get(candidate.status.value, 0) + 1
 
-    source_keys = {
-        (source.source_type, source.source_id)
-        for source in context.source_refs
-    }
-    source_keys.update(
-        (source.source_type, source.source_id)
-        for decision in context.active_decisions
-        for source in decision.source_refs
+    clock_status, snapshot = _runtime_status(
+        project_id,
+        snapshot_reader=snapshot_reader,
+        sync_repository=sync_repository,
     )
-
-    clock_status = "normal"
-    last_success_at = context.generated_at
-    if sync_repository is not None:
-        try:
-            if sync_repository.project_requires_clock_resync(project_id):
-                clock_status = "resync_required"
-        except (AttributeError, RuntimeError, ValueError):
-            pass
+    sources = () if snapshot is None else snapshot.sources
+    states = () if snapshot is None else snapshot.source_states
+    states_by_key = {
+        (state.source_type, state.source_id_hash): state for state in states
+    }
+    active_states = tuple(
+        states_by_key[(source.source_type, source.source_id_hash)]
+        for source in sources
+        if (
+            (source.source_type, source.source_id_hash) in states_by_key
+            and states_by_key[(source.source_type, source.source_id_hash)].status
+            is SourceSyncStatus.ACTIVE
+        )
+    )
     return {
         "project_name": context.project_name,
-        "source_count": len(source_keys),
+        "source_count": len(active_states),
         "freshness_seconds": context.freshness_seconds,
-        "last_success_at_present": last_success_at is not None,
+        "last_success_at_present": any(
+            state.last_success_at is not None for state in active_states
+        ),
         "clock_status": clock_status,
         "active_decision_count": len(context.active_decisions),
         "candidate_counts": counts,
@@ -77,7 +81,40 @@ def project_summary(
         "rejected_candidate_count": counts.get(ConflictStatus.REJECTED.value, 0),
         "accepted_candidate_count": counts.get(ConflictStatus.ACCEPTED.value, 0),
         "refreshed_at": now,
-    }
+}
+
+
+def _runtime_status(
+    project_id: str,
+    *,
+    snapshot_reader: Any,
+    sync_repository: Any,
+) -> tuple[str, Any | None]:
+    if snapshot_reader is None or sync_repository is None:
+        return "unavailable", None
+    try:
+        clock_state = sync_repository.load_clock_state()
+    except Exception:
+        return "unavailable", None
+    if clock_state.clock_untrusted:
+        return "clock_untrusted", _read_snapshot(snapshot_reader, project_id)
+    try:
+        needs_sync = sync_repository.project_requires_clock_resync(project_id)
+    except Exception:
+        return "unavailable", None
+    snapshot = _read_snapshot(snapshot_reader, project_id)
+    if needs_sync:
+        return "needs_sync", snapshot
+    if snapshot is None:
+        return "unavailable", None
+    return "normal", snapshot
+
+
+def _read_snapshot(snapshot_reader: Any, project_id: str) -> Any | None:
+    try:
+        return snapshot_reader.get(project_id)
+    except Exception:
+        return None
 
 
 def project_conflicts(project_memory: Any, project_id: str) -> tuple[dict[str, Any], ...]:

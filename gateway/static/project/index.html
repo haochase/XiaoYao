@@ -19,7 +19,6 @@
   <section id="runtime"><h2>设备/运行状态</h2><p class="muted">等待状态刷新。</p></section>
   <script>
     (() => {
-      const projectId = "project-1";
       const request = (path, options) => fetch(path, { credentials: "same-origin", ...options }).then((response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return response.json();
@@ -28,7 +27,7 @@
       const error = (value) => { document.querySelector("#runtime").innerHTML = `<h2>设备/运行状态</h2><p class="error">${escape(value.message)}</p>`; };
       const review = (candidate, action) => {
         if (!window.confirm(action === "accept" ? "确认接受此候选？" : "确认拒绝此候选？")) return;
-        request(`/v1/projects/conflicts/${encodeURIComponent(candidate.candidate_id)}/review`, {
+        request(`/api/conflicts/${encodeURIComponent(candidate.candidate_id)}/review`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action, change_reason: action === "accept" ? "审核台确认" : "审核台拒绝" })
         }).then(load).catch(error);
@@ -48,7 +47,7 @@
         });
       };
       const status = (value) => { document.querySelector("#status").innerHTML = `<h2>状态</h2><p>${escape(value.project_name)}：${escape(value.source_count)} 个来源，${escape(value.active_decision_count)} 项有效决策，时钟 ${escape(value.clock_status)}</p>`; };
-      const load = () => Promise.all([request(`/v1/projects/${projectId}/ops/summary`), request(`/v1/projects/${projectId}/ops/conflicts`)]).then(([summary, conflicts]) => { status(summary); candidates(conflicts.conflicts || []); }).catch(error);
+      const load = () => Promise.all([request("/api/summary"), request("/api/conflicts")]).then(([summary, conflicts]) => { status(summary); candidates(conflicts.conflicts || []); }).catch(error);
       load();
     })();
   </script>
