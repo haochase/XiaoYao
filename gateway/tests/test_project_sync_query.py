@@ -426,8 +426,10 @@ def test_stale_task_source_does_not_block_decision_answer(tmp_path: Path) -> Non
 @pytest.mark.parametrize(
     ("source_error", "expected_error"),
     [
-        ("source_stale", "source_stale"),
-        ("clock_untrusted", "source_stale"),
+        ("source_stale", "source_expired"),
+        ("source_expired", "source_expired"),
+        ("clock_resync_required", "clock_resync_required"),
+        ("clock_untrusted", "clock_untrusted"),
         ("source_unavailable", "source_unavailable"),
         ("project_not_synced", "source_unavailable"),
     ],
@@ -552,7 +554,7 @@ def test_missing_evidence_creates_one_idempotent_retrieval_request(
     assert request.expires_at == NOW + timedelta(seconds=1800)
 
 
-def test_missing_evidence_without_usable_document_source_fails_stale(
+def test_missing_evidence_without_usable_document_source_reports_expired(
     tmp_path: Path,
 ) -> None:
     document = evidence_source("document-stale")
@@ -568,7 +570,7 @@ def test_missing_evidence_without_usable_document_source_fails_stale(
         retrieval_writer=repository,
     )
 
-    with pytest.raises(ProjectContextUnavailable, match="source_stale"):
+    with pytest.raises(ProjectContextUnavailable, match="source_expired"):
         service.answer(PROJECT_ID, "为什么选择方案B", kind=AnswerKind.FACT)
 
     assert repository.list_retrieval_requests(PROJECT_ID) == ()

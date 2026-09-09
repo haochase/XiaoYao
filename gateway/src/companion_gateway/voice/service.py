@@ -331,8 +331,14 @@ class VoiceTurnService:
                     now=self._clock(),
                 )
             except ProjectContextUnavailable as exc:
-                if str(exc) == "source_stale":
+                if str(exc) in {"source_expired", "source_stale"}:
                     return ResolvedVoiceIntent("相关项目资料已过期，请先同步。")
+                if str(exc) == "clock_resync_required":
+                    return ResolvedVoiceIntent("设备刚从休眠恢复，请先同步项目资料。")
+                if str(exc) == "clock_untrusted":
+                    return ResolvedVoiceIntent("设备时间异常，请校准时间后再同步。")
+                if str(exc) == "context_expired":
+                    return ResolvedVoiceIntent("项目摘要已过期，请先刷新项目资料。")
                 if str(exc) == "evidence_pending":
                     return ResolvedVoiceIntent(
                         "后台正在同步补充证据，请稍后再试。"

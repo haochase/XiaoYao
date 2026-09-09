@@ -206,10 +206,7 @@ class ProjectMemoryService:
                 else None
             )
         except ProjectSourceUnavailable as exc:
-            label = str(exc)
-            if label in {"source_stale", "clock_untrusted"}:
-                raise ProjectContextUnavailable("source_stale") from None
-            raise ProjectContextUnavailable("source_unavailable") from None
+            self._raise_context_unavailable(exc)
         if self._query_integration_enabled and pinned_snapshot is None:
             raise ProjectContextUnavailable("source_unavailable")
         if pinned_snapshot is None:
@@ -322,7 +319,14 @@ class ProjectMemoryService:
 
         source_hashes = tuple(sorted(source_refs_by_hash))
         if not source_hashes:
-            raise ProjectContextUnavailable("source_stale")
+            has_queryable_source = any(
+                source.source_type
+                in {SyncSourceType.DOCUMENT, SyncSourceType.MEETING_NOTE}
+                for source in snapshot.sources
+            )
+            raise ProjectContextUnavailable(
+                "source_expired" if has_queryable_source else "source_unavailable"
+            )
         query_hash = hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()
         request_material = "\0".join(
             (
@@ -333,19 +337,22 @@ class ProjectMemoryService:
             )
         ).encode("utf-8")
         request_id = "ret_" + hashlib.sha256(request_material).hexdigest()[:32]
-        self._retrieval_writer.save_retrieval_request(
-            RetrievalRequest(
-                request_id=request_id,
-                project_id=project_id,
-                query_hash=query_hash,
-                source_id_hashes=source_hashes,
-                status=RetrievalRequestStatus.PENDING,
-                created_at=timestamp,
-                expires_at=timestamp
-                + timedelta(seconds=self._retrieval_ttl_seconds),
-            ),
-            expected_generation_id=snapshot.generation_id,
-        )
+        try:
+            self._retrieval_writer.save_retrieval_request(
+                RetrievalRequest(
+                    request_id=request_id,
+                    project_id=project_id,
+                    query_hash=query_hash,
+                    source_id_hashes=source_hashes,
+                    status=RetrievalRequestStatus.PENDING,
+                    created_at=timestamp,
+                    expires_at=timestamp
+                    + timedelta(seconds=self._retrieval_ttl_seconds),
+                ),
+                expected_generation_id=snapshot.generation_id,
+            )
+        except ProjectSourceUnavailable as exc:
+            self._raise_context_unavailable(exc)
         raise ProjectContextUnavailable("evidence_pending")
 
     def _usable_evidence_sources(
@@ -373,7 +380,9 @@ class ProjectMemoryService:
                     timestamp,
                     snapshot,
                 )
-            except ProjectContextUnavailable:
+            except ProjectContextUnavailable as exc:
+                if str(exc) in {"clock_resync_required", "clock_untrusted"}:
+                    raise
                 continue
             source_refs_by_hash[source.source_id_hash] = source_ref
         return source_refs_by_hash
@@ -413,10 +422,20 @@ class ProjectMemoryService:
                 now=timestamp,
             )
         except ProjectSourceUnavailable as exc:
-            label = str(exc)
-            if label in {"source_stale", "clock_untrusted"}:
-                raise ProjectContextUnavailable("source_stale") from None
-            raise ProjectContextUnavailable("source_unavailable") from None
+            self._raise_context_unavailable(exc)
+
+    @staticmethod
+    def _raise_context_unavailable(exc: ProjectSourceUnavailable) -> None:
+        label = str(exc)
+        if label == "source_stale":
+            raise ProjectContextUnavailable("source_expired") from None
+        if label in {
+            "source_expired",
+            "clock_resync_required",
+            "clock_untrusted",
+        }:
+            raise ProjectContextUnavailable(label) from None
+        raise ProjectContextUnavailable("source_unavailable") from None
 
     def current_decision(
         self, project_id: str, decision_id: str, *, now: datetime | None = None
@@ -501,10 +520,7 @@ class ProjectMemoryService:
             try:
                 snapshot = self._snapshot_reader.get(project_id)
             except ProjectSourceUnavailable as exc:
-                label = str(exc)
-                if label in {"source_stale", "clock_untrusted"}:
-                    raise ProjectContextUnavailable("source_stale") from None
-                raise ProjectContextUnavailable("source_unavailable") from None
+                self._raise_context_unavailable(exc)
             if snapshot is None:
                 raise ProjectContextUnavailable("source_unavailable")
             snapshot_context = self._require_package_fresh(snapshot.context, timestamp)

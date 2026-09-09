@@ -158,6 +158,22 @@ ProjectIdentifier = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
 ]
+
+_PROJECT_RECOVERY_DETAILS = frozenset(
+    {
+        "source_expired",
+        "clock_resync_required",
+        "clock_untrusted",
+        "context_expired",
+        "evidence_pending",
+    }
+)
+
+
+def _project_context_unavailable_status(detail: str) -> int:
+    return 409 if detail in _PROJECT_RECOVERY_DETAILS else 404
+
+
 async def _sleep_between_tts_frames(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
@@ -788,7 +804,7 @@ def create_app(
                 now=project_clock(),
             )
         except ProjectContextUnavailable as exc:
-            status_code = 409 if str(exc) == "context_expired" else 404
+            status_code = _project_context_unavailable_status(str(exc))
             raise HTTPException(status_code=status_code, detail=str(exc)) from exc
         return {"answer": jsonable_encoder(answer)}
 
@@ -810,7 +826,7 @@ def create_app(
                 now=project_clock(),
             )
         except ProjectContextUnavailable as exc:
-            status_code = 409 if str(exc) == "context_expired" else 404
+            status_code = _project_context_unavailable_status(str(exc))
             raise HTTPException(status_code=status_code, detail=str(exc)) from exc
         except ProjectMemoryError as exc:
             status_code = 403 if str(exc) == "source_scope_mismatch" else 409

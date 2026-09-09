@@ -319,7 +319,7 @@ def test_independent_device_app_refreshes_shared_sqlite_and_fails_closed(
         )
 
     assert blocked.status_code == 404
-    assert blocked.json()["detail"] == "source_stale"
+    assert blocked.json()["detail"] == "source_unavailable"
     active = repository.load_active_generation(PROJECT_ID)
     assert active is not None
     assert active.context.active_decisions == ()
@@ -434,7 +434,7 @@ def test_device_retrieval_request_is_visible_to_sync_repository(
         PROJECT_ID,
         RetrievalRequestStatus.PENDING,
     )
-    assert response.status_code == 404
+    assert response.status_code == 409
     assert response.json()["detail"] == "evidence_pending"
     assert len(requests) == 1
     assert requests[0].source_id_hashes == (digest("doc-1"),)
@@ -536,7 +536,10 @@ def test_approved_decision_obeys_shared_clock_recovery(
         seconds=100 if clock_event == "rollback" else 1101
     )
     monotonic["value"] = 101.0
-    with pytest.raises(ProjectContextUnavailable, match="^source_stale$"):
+    expected_error = (
+        "clock_untrusted" if clock_event == "rollback" else "clock_resync_required"
+    )
+    with pytest.raises(ProjectContextUnavailable, match=f"^{expected_error}$"):
         if operation == "answer":
             service.answer(
                 PROJECT_ID, "terminal plan", kind=AnswerKind.DECISION_CHECK
@@ -599,8 +602,13 @@ def test_device_clock_recovery_is_shared_until_successful_sync(
             headers=headers,
         )
         shared = repository.load_clock_state()
-        assert blocked.status_code == 404
-        assert blocked.json()["detail"] == "source_stale"
+        expected_detail = (
+            "clock_untrusted"
+            if clock_event == "rollback"
+            else "clock_resync_required"
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"] == expected_detail
         assert shared.clock_untrusted is (clock_event == "rollback")
         assert shared.needs_sync
         assert writer.status(PROJECT_ID, now=wall["value"]).health is (
@@ -675,7 +683,7 @@ def test_other_project_sync_does_not_release_clock_recovery(
     )
     assert not repository.load_clock_state().needs_sync
     reader.require_sources_fresh(PROJECT_ID, (source_ref(),), now=wall["value"])
-    with pytest.raises(ProjectSourceUnavailable, match="source_stale"):
+    with pytest.raises(ProjectSourceUnavailable, match="clock_resync_required"):
         reader.require_sources_fresh(second_id, (source_ref(),), now=wall["value"])
     assert writer.status(second_id, now=wall["value"]).health is (
         ProjectSyncHealth.STALE
@@ -719,8 +727,8 @@ def test_new_device_process_uses_persisted_wall_clock_baseline(
         )
 
     state = repository.load_clock_state()
-    assert blocked.status_code == 404
-    assert blocked.json()["detail"] == "source_stale"
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"] == "clock_untrusted"
     assert state.clock_untrusted
     assert state.needs_sync
 
@@ -772,8 +780,8 @@ def test_new_process_detects_rollback_from_persisted_query_high_watermark(
             headers=headers,
         )
 
-    assert blocked.status_code == 404
-    assert blocked.json()["detail"] == "source_stale"
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"] == "clock_untrusted"
     state = repository.load_clock_state()
     assert state.clock_untrusted
     assert state.needs_sync
@@ -821,8 +829,8 @@ def test_device_resume_sets_shared_needs_sync_without_persisting_monotonic(
 
     state = repository.load_clock_state()
     assert first.status_code == 200
-    assert resumed.status_code == 404
-    assert resumed.json()["detail"] == "source_stale"
+    assert resumed.status_code == 409
+    assert resumed.json()["detail"] == "clock_resync_required"
     assert state.needs_sync
     assert not state.clock_untrusted
     assert not hasattr(state, "monotonic")

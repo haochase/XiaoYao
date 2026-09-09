@@ -1279,8 +1279,13 @@ def test_project_query_intent_fails_closed_without_project_memory() -> None:
 @pytest.mark.parametrize(
     ("error_label", "expected_text"),
     [
-        ("source_stale", "相关项目资料已过期，请先同步。"),
+        ("source_expired", "相关项目资料已过期，请先同步。"),
+        ("clock_resync_required", "设备刚从休眠恢复，请先同步项目资料。"),
+        ("clock_untrusted", "设备时间异常，请校准时间后再同步。"),
+        ("context_expired", "项目摘要已过期，请先刷新项目资料。"),
         ("evidence_pending", "后台正在同步补充证据，请稍后再试。"),
+        ("source_unavailable", "暂时无法确认项目记忆，请稍后再试。"),
+        ("source_stale", "相关项目资料已过期，请先同步。"),
     ],
 )
 def test_project_query_intent_maps_source_aware_failures(
