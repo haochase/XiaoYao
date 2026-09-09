@@ -6813,6 +6813,65 @@ def test_failed_send_retains_pending_and_retry_reuses_identity(
     assert json.loads(sent.request.data)["sync_id"] == pending["sync_id"]
 
 
+def test_sync_conflict_marks_pending_and_allows_rebuild_after_source_change(
+    tmp_path: Path, capsys
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    attempts = 0
+
+    def rejected_then_success(request, *, timeout):  # type: ignore[no-untyped-def]
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise HTTPError(
+                request.full_url,
+                409,
+                "private",
+                {},
+                io.BytesIO(b'{"detail":"sync_conflict"}'),
+            )
+        return RecordingUrlOpen()(request, timeout=timeout)
+
+    assert main(
+        push_args(paths),
+        urlopen=rejected_then_success,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "sync_conflict",
+    }
+    failed_state = SyncCliState.model_validate_json(paths["state"].read_bytes())
+    assert failed_state.pending is not None
+    assert failed_state.pending.failure_type == "sync_conflict"
+    first_sync_id = failed_state.pending.sync_id
+
+    selected = DwsSourceBundle.model_validate_json(paths["sources"].read_bytes())
+    changed = selected.model_copy(
+        update={
+            "records": (
+                selected.records[0].model_copy(update={"source_version": "v2"}),
+            )
+        }
+    )
+    write_json(paths["sources"], rehash_bundle(changed).model_dump(mode="json"))
+
+    assert main(
+        push_args(paths),
+        urlopen=rejected_then_success,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+    ) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "synced"
+    assert output["outcome"] == "applied"
+    request_sync_id = json.loads(
+        # RecordingUrlOpen is used by the second call; its request is not
+        # needed for the behavior assertion, only the promoted state is.
+        paths["state"].read_text(encoding="utf-8")
+    )["last_sync_id"]
+    assert request_sync_id != first_sync_id
+
+
 def test_push_rolls_back_approved_when_state_promotion_interrupts(
     tmp_path: Path,
     capsys,

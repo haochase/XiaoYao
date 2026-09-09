@@ -287,6 +287,7 @@ class PendingSync(BaseModel):
     content_hash: str
     sync_id: str
     completion_claims_hash: str = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    failure_type: Literal["sync_conflict"] | None = None
 
     @field_validator("content_hash")
     @classmethod
@@ -306,6 +307,18 @@ class PendingSync(BaseModel):
         if _SHA256.fullmatch(value) is None:
             raise ValueError("completion_claims_hash_invalid")
         return value
+
+
+def _pending_identity_matches(
+    pending: PendingSync,
+    envelope: SyncEnvelope,
+) -> bool:
+    return (
+        pending.content_hash == envelope.content_hash
+        and pending.sync_id == envelope.sync_id
+        and pending.completion_claims_hash
+        == _completion_claims_hash(envelope.completed_retrieval_claims)
+    )
 
 
 class SyncCliState(BaseModel):
@@ -1938,12 +1951,8 @@ def _artifact_command(
                 now=now(),
             )
             if (
-                pending_envelope.content_hash != state.pending.content_hash
-                or pending_envelope.sync_id != state.pending.sync_id
-                or _completion_claims_hash(
-                    pending_envelope.completed_retrieval_claims
-                )
-                != state.pending.completion_claims_hash
+                not _pending_identity_matches(state.pending, pending_envelope)
+                and state.pending.failure_type != "sync_conflict"
             ):
                 raise ValueError("pending_sync_conflict")
         encoded = _canonical_bytes(selected.model_dump(mode="json"))
@@ -2046,12 +2055,8 @@ def _reuse_artifact_command(
             now=now(),
         )
         if (
-            pending_envelope.content_hash != state.pending.content_hash
-            or pending_envelope.sync_id != state.pending.sync_id
-            or _completion_claims_hash(
-                pending_envelope.completed_retrieval_claims
-            )
-            != state.pending.completion_claims_hash
+            not _pending_identity_matches(state.pending, pending_envelope)
+            and state.pending.failure_type != "sync_conflict"
         ):
             raise ValueError("pending_sync_conflict")
     encoded = _canonical_bytes(selected.model_dump(mode="json"))
@@ -2818,14 +2823,16 @@ def _push_command(
             source_cursor=cursor,
             now=now(),
         )
+        rebuild_pending = False
         if state.pending is not None:
-            if state.pending.content_hash != envelope.content_hash:
-                raise ValueError("pending_sync_conflict")
-            if state.pending.completion_claims_hash != _completion_claims_hash(
-                envelope.completed_retrieval_claims
+            if not _pending_identity_matches(state.pending, envelope):
+                if state.pending.failure_type != "sync_conflict":
+                    raise ValueError("pending_sync_conflict")
+                rebuild_pending = True
+            if (
+                state.pending.sync_id != envelope.sync_id
+                and not rebuild_pending
             ):
-                raise ValueError("pending_sync_conflict")
-            if state.pending.sync_id != envelope.sync_id:
                 raise ValueError("state_file_invalid")
         encoded = _canonical_bytes(envelope.model_dump(mode="json"))
         if len(encoded) > MAX_PAYLOAD_BYTES:
@@ -2839,7 +2846,7 @@ def _push_command(
                 envelope.completed_retrieval_claims
             ),
         )
-        if state.pending is None:
+        if state.pending is None or rebuild_pending:
             _atomic_write(
                 state_path,
                 _canonical_bytes(
@@ -2861,13 +2868,32 @@ def _push_command(
             method="POST",
         )
         started = monotonic()
-        response_payload = _gateway_request(
-            request,
-            opener=opener,
-            parse=lambda raw: _validate_response(raw, envelope=envelope),
-            monotonic=monotonic,
-            sleep=sleep,
-        )
+        try:
+            response_payload = _gateway_request(
+                request,
+                opener=opener,
+                parse=lambda raw: _validate_response(raw, envelope=envelope),
+                monotonic=monotonic,
+                sleep=sleep,
+            )
+        except ValueError as exc:
+            if str(exc) == "sync_conflict":
+                try:
+                    _atomic_write(
+                        state_path,
+                        _canonical_bytes(
+                            state.model_copy(
+                                update={
+                                    "pending": pending.model_copy(
+                                        update={"failure_type": "sync_conflict"}
+                                    )
+                                }
+                            ).model_dump()
+                        ),
+                    )
+                except BaseException:
+                    raise ValueError("private_file_write_failed") from None
+            raise
         assert isinstance(response_payload, dict)
         duration_ms = max(0, int((monotonic() - started) * 1000))
         promoted = SyncCliState(
