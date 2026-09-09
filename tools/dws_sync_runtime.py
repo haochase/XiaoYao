@@ -22,6 +22,7 @@ from tools.dws_project_sync import CommandResult
 from tools.dws_sync.core_trust import resolve_trusted_dws_core
 from tools.dws_sync.launch import resolve_dws_launch
 from tools.dws_sync.manifest import DwsManifest, DwsProjectManifest
+from tools.dws_sync.orchestrator import run_once
 from tools.dws_sync.runner import DwsCommandRunner
 from tools.dws_sync.runtime import (
     CONFIG_NAME,
@@ -306,6 +307,7 @@ def main(
     commands.add_parser("check")
     commands.add_parser("check-core")
     commands.add_parser("serve")
+    commands.add_parser("run-once")
     for command in COMMANDS:
         sub = commands.add_parser(command)
         if command not in {
@@ -356,6 +358,11 @@ def main(
                 host="127.0.0.1", port=8731, proxy_headers=False, access_log=False,
             )
             return 0
+        elif args.command == "run-once":
+            run_result = run_once(root, selected_protector)
+            result = run_result.to_dict()
+            print(json.dumps(result))
+            return 1 if result["status"] == "failed" else 0
         else:
             dispatch_options = {}
             if getattr(args, "unattended", False):

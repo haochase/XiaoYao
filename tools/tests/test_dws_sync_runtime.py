@@ -1128,3 +1128,63 @@ def test_dispatch_result_return_annotation_resolves_at_runtime() -> None:
     assert get_type_hints(wrapper.dispatch_result)["return"] is (
         dws_project_sync.CommandResult
     )
+
+
+def test_run_once_runtime_emits_one_sanitized_json_result(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from tools import dws_sync_runtime as wrapper
+
+    class FakeResult:
+        def to_dict(self) -> dict[str, object]:
+            return {
+                "status": "completed",
+                "stage": "end",
+                "project_id": "project-1",
+                "outcome": "applied",
+                "project_status": "healthy",
+                "active_sources": 1,
+                "failed_sources": 0,
+                "accepted_sources": 1,
+                "error_type": None,
+                "manual_refresh_required": False,
+                "rerun_count": 0,
+            }
+
+    observed = []
+    monkeypatch.setattr(
+        wrapper,
+        "run_once",
+        lambda root, protector: observed.append((root, protector)) or FakeResult(),
+        raising=False,
+    )
+
+    assert wrapper.main(["run-once"], root=tmp_path, protector=Protector()) == 0
+    output = capsys.readouterr().out
+    assert output.count("\n") == 1
+    assert json.loads(output)["status"] == "completed"
+    assert "token" not in output
+    assert len(observed) == 1
+    assert observed[0][0] == tmp_path
+    assert isinstance(observed[0][1], Protector)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ["run-once", "--project", "project-1"],
+        ["run-once", "--run-token", "private-token"],
+        ["run-once", "--profile", "private-profile"],
+        ["run-once", "--url", "http://127.0.0.1:8731"],
+    ),
+)
+def test_run_once_runtime_rejects_all_user_supplied_execution_inputs(
+    tmp_path: Path,
+    argv: list[str],
+) -> None:
+    from tools import dws_sync_runtime as wrapper
+
+    with pytest.raises(SystemExit, match="2"):
+        wrapper.main(argv, root=tmp_path, protector=Protector())
