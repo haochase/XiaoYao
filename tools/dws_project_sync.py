@@ -2796,10 +2796,56 @@ def _pending_discard_denied() -> None:
     raise ValueError("pending_discard_denied")
 
 
+def _discard_database_identity(path: Path) -> tuple[int, int, int, int]:
+    try:
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or getattr(info, "st_file_attributes", 0) & 1024
+            or info.st_nlink != 1
+        ):
+            _pending_discard_denied()
+    except ValueError:
+        raise
+    except OSError:
+        _pending_discard_denied()
+    return _database_file_identity(info)
+
+
+def _discard_sqlite_authorizer(
+    action: int,
+    first: str | None,
+    second: str | None,
+    database: str | None,
+    trigger: str | None,
+) -> int:
+    if action == sqlite3.SQLITE_PRAGMA and first == "data_version" and second is None:
+        return sqlite3.SQLITE_OK
+    return _recovery_sqlite_authorizer(
+        action,
+        first,
+        second,
+        database,
+        trigger,
+    )
+
+
+def _discard_data_version(connection: sqlite3.Connection) -> int:
+    row = connection.execute("PRAGMA data_version").fetchone()
+    if (
+        row is None
+        or len(row) != 1
+        or isinstance(row[0], bool)
+        or not isinstance(row[0], int)
+    ):
+        _pending_discard_denied()
+    return row[0]
+
+
 def _discard_rejected_pending_inner(
     args: argparse.Namespace,
     database_path: Path,
-    database_handle: int,
     manifest_path: Path,
     state_path: Path,
 ) -> dict[str, object]:
@@ -2810,14 +2856,14 @@ def _discard_rejected_pending_inner(
     if pending is None or state.last_cursor < 1:
         _pending_discard_denied()
 
-    database_snapshot = _recovery_database_snapshot(
-        database_path, database_handle
-    )
+    database_identity = _discard_database_identity(database_path)
+    state_write: _RecoverableAtomicWrite | None = None
     uri = f"{database_path.as_uri()}?mode=ro"
     try:
         with closing(sqlite3.connect(uri, uri=True)) as connection:
-            connection.set_authorizer(_recovery_sqlite_authorizer)
+            connection.set_authorizer(_discard_sqlite_authorizer)
             connection.execute("PRAGMA query_only=ON")
+            initial_data_version = _discard_data_version(connection)
             connection.execute("BEGIN")
             active_rows = connection.execute(
                 """
@@ -2853,18 +2899,29 @@ def _discard_rejected_pending_inner(
             ).fetchone()
             if generation_count != (0,) or audit_count != (0,):
                 _pending_discard_denied()
-    except ValueError:
-        raise
-    except (OSError, sqlite3.Error):
+            if _discard_database_identity(database_path) != database_identity:
+                _pending_discard_denied()
+            promoted = state.model_copy(update={"pending": None})
+            state_write = _RecoverableAtomicWrite(
+                state_path,
+                _canonical_bytes(promoted.model_dump()),
+            )
+            state_write.apply()
+            connection.execute("COMMIT")
+            if (
+                _discard_data_version(connection) != initial_data_version
+                or _discard_database_identity(database_path) != database_identity
+            ):
+                _pending_discard_denied()
+    except BaseException as exc:
+        if state_write is not None:
+            try:
+                state_write.rollback()
+            except BaseException:
+                raise ValueError("private_file_write_failed") from None
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
         _pending_discard_denied()
-
-    if (
-        _recovery_database_snapshot(database_path, database_handle)
-        != database_snapshot
-    ):
-        _pending_discard_denied()
-    promoted = state.model_copy(update={"pending": None})
-    _atomic_write(state_path, _canonical_bytes(promoted.model_dump()))
     return {
         "status": "pending_discarded",
         "project_id": project.project_id,
@@ -2893,14 +2950,12 @@ def _discard_rejected_pending_command(
                 args.database_file,
                 (manifest_path, state_path),
             )
-            with _recovery_database_guard(database_path) as database_handle:
-                return _discard_rejected_pending_inner(
-                    args,
-                    database_path,
-                    database_handle,
-                    manifest_path,
-                    state_path,
-                )
+            return _discard_rejected_pending_inner(
+                args,
+                database_path,
+                manifest_path,
+                state_path,
+            )
     except ValueError as exc:
         if str(exc) == "private_file_write_failed":
             raise

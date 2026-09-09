@@ -665,6 +665,173 @@ def test_discard_rejected_pending_allows_historical_active_sync_id_drift(
     assert database_snapshot(database) == database_before
 
 
+def test_discard_rejected_pending_allows_active_wal_connection(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths, database = write_pending_discard_fixture(tmp_path)
+    state_before = json.loads(paths["state"].read_text(encoding="utf-8"))
+    writer = sqlite3.connect(database)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute(
+            "UPDATE project_sync_generations SET content_hash = content_hash"
+        )
+        writer.commit()
+        assert Path(str(database) + "-wal").is_file()
+        assert Path(str(database) + "-shm").is_file()
+        database_before = tuple(writer.iterdump())
+        changes_before = writer.total_changes
+
+        assert (
+            main(
+                discard_rejected_pending_args(paths, database),
+                now=lambda: NOW,
+            )
+            == 0
+        )
+
+        assert json.loads(capsys.readouterr().out)["status"] == "pending_discarded"
+        assert json.loads(paths["state"].read_text(encoding="utf-8")) == {
+            **state_before,
+            "pending": None,
+        }
+        assert tuple(writer.iterdump()) == database_before
+        assert writer.total_changes == changes_before
+        assert writer.execute("SELECT 1").fetchone() == (1,)
+    finally:
+        writer.close()
+
+
+def test_discard_rejected_pending_rolls_back_on_data_version_change(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths, database = write_pending_discard_fixture(tmp_path)
+    state_before = paths["state"].read_bytes()
+    writer = sqlite3.connect(database)
+    real_atomic_write = sync_cli._atomic_write
+    changed = False
+
+    def write_then_change_database(path: Path, data: bytes) -> None:
+        nonlocal changed
+        real_atomic_write(path, data)
+        if path == paths["state"] and not changed:
+            changed = True
+            writer.execute(
+                "INSERT INTO project_sync_audits VALUES (?, ?)",
+                ("unrelated-concurrent-sync", "project-2"),
+            )
+            writer.commit()
+
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        monkeypatch.setattr(sync_cli, "_atomic_write", write_then_change_database)
+
+        assert (
+            main(
+                discard_rejected_pending_args(paths, database),
+                now=lambda: NOW,
+            )
+            == 1
+        )
+
+        assert changed is True
+        assert json.loads(capsys.readouterr().out) == {
+            "status": "error",
+            "error_type": "pending_discard_denied",
+        }
+        assert paths["state"].read_bytes() == state_before
+        assert writer.execute(
+            "SELECT COUNT(*) FROM project_sync_audits WHERE sync_id = ?",
+            ("unrelated-concurrent-sync",),
+        ).fetchone() == (1,)
+    finally:
+        writer.close()
+
+
+def test_discard_rejected_pending_rolls_back_on_final_database_identity_change(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths, database = write_pending_discard_fixture(tmp_path)
+    state_before = paths["state"].read_bytes()
+    database_before = database_snapshot(database)
+    real_identity = sync_cli._discard_database_identity
+    identity_calls = 0
+
+    def change_identity_after_state_write(path: Path) -> tuple[int, int, int, int]:
+        nonlocal identity_calls
+        identity_calls += 1
+        identity = real_identity(path)
+        if identity_calls == 3:
+            return (identity[0], identity[1], identity[2] + 1, identity[3])
+        return identity
+
+    monkeypatch.setattr(
+        sync_cli,
+        "_discard_database_identity",
+        change_identity_after_state_write,
+    )
+
+    assert (
+        main(
+            discard_rejected_pending_args(paths, database),
+            now=lambda: NOW,
+        )
+        == 1
+    )
+
+    assert identity_calls == 3
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "pending_discard_denied",
+    }
+    assert paths["state"].read_bytes() == state_before
+    assert database_snapshot(database) == database_before
+
+
+def test_discard_rejected_pending_rolls_back_state_write_failure(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    paths, database = write_pending_discard_fixture(tmp_path)
+    state_before = paths["state"].read_bytes()
+    database_before = database_snapshot(database)
+    real_atomic_write = sync_cli._atomic_write
+    failed = False
+
+    def replace_then_fail(path: Path, data: bytes) -> None:
+        nonlocal failed
+        real_atomic_write(path, data)
+        if path == paths["state"] and not failed:
+            failed = True
+            raise OSError("private state write interrupted")
+
+    monkeypatch.setattr(sync_cli, "_atomic_write", replace_then_fail)
+
+    assert (
+        main(
+            discard_rejected_pending_args(paths, database),
+            now=lambda: NOW,
+        )
+        == 1
+    )
+
+    assert failed is True
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "error",
+        "error_type": "pending_discard_denied",
+    }
+    assert paths["state"].read_bytes() == state_before
+    assert database_snapshot(database) == database_before
+
+
 def test_discard_rejected_pending_refuses_active_lifecycle(
     tmp_path: Path,
     capsys,
