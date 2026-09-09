@@ -4,7 +4,6 @@ from datetime import datetime
 from typing import Any
 
 from companion_gateway.project.models import ConflictCandidate, ConflictStatus
-from companion_gateway.project.sync_models import SourceSyncStatus
 
 
 def _evidence(candidate: ConflictCandidate) -> dict[str, Any] | None:
@@ -53,26 +52,13 @@ def project_summary(
         snapshot_reader=snapshot_reader,
         sync_repository=sync_repository,
     )
-    sources = () if snapshot is None else snapshot.sources
     states = () if snapshot is None else snapshot.source_states
-    states_by_key = {
-        (state.source_type, state.source_id_hash): state for state in states
-    }
-    active_states = tuple(
-        states_by_key[(source.source_type, source.source_id_hash)]
-        for source in sources
-        if (
-            (source.source_type, source.source_id_hash) in states_by_key
-            and states_by_key[(source.source_type, source.source_id_hash)].status
-            is SourceSyncStatus.ACTIVE
-        )
-    )
     return {
         "project_name": context.project_name,
-        "source_count": len(active_states),
+        "source_count": len(states),
         "freshness_seconds": context.freshness_seconds,
         "last_success_at_present": any(
-            state.last_success_at is not None for state in active_states
+            state.last_success_at is not None for state in states
         ),
         "clock_status": clock_status,
         "active_decision_count": len(context.active_decisions),

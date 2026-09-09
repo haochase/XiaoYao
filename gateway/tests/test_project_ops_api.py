@@ -22,6 +22,7 @@ HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 class _SnapshotReader:
     def __init__(self) -> None:
         self.raise_error = False
+        self.source_status = SourceSyncStatus.ACTIVE
 
     def get(self, project_id: str):  # type: ignore[no-untyped-def]
         assert project_id == "project-1"
@@ -38,7 +39,7 @@ class _SnapshotReader:
                 SimpleNamespace(
                     source_type=SyncSourceType.MEETING_NOTE,
                     source_id_hash="source-1",
-                    status=SourceSyncStatus.ACTIVE,
+                    status=self.source_status,
                     last_success_at=NOW,
                 ),
             ),
@@ -182,6 +183,20 @@ def test_ops_summary_keeps_untrusted_clock_when_snapshot_is_unavailable(
 
     assert response.status_code == 200
     assert response.json()["clock_status"] == "clock_untrusted"
+
+
+@pytest.mark.parametrize("status", [SourceSyncStatus.STALE, SourceSyncStatus.FAILED])
+def test_ops_summary_keeps_current_sources_with_historical_success(
+    client: TestClient,
+    status: SourceSyncStatus,
+) -> None:
+    client.app.state.project_ops_snapshot_reader.source_status = status
+
+    response = client.get("/v1/projects/project-1/ops/summary", headers=HEADERS)
+
+    assert response.status_code == 200
+    assert response.json()["source_count"] == 1
+    assert response.json()["last_success_at_present"] is True
 
 
 def test_ops_conflicts_redact_source_identity_and_limit_excerpt(client: TestClient) -> None:
