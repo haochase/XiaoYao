@@ -43,6 +43,7 @@ class RepositoryBackedProjectQueryFacade:
         sync_interval_seconds: float = 300.0,
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        awake_time: Callable[[], float] | None = None,
     ) -> None:
         if not callable(identity_digest):
             raise TypeError("identity_digest must be callable")
@@ -65,6 +66,7 @@ class RepositoryBackedProjectQueryFacade:
             repository,
             sync_interval_seconds=sync_interval_seconds,
             monotonic=monotonic,
+            awake_time=awake_time,
         )
         self._registry = ProjectSnapshotRegistry()
         self._hydrator = ProjectSnapshotHydrator(protector)

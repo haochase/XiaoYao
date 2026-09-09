@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ctypes
 import math
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -28,6 +30,7 @@ class ProjectClockGuard:
         *,
         sync_interval_seconds: float,
         monotonic: Callable[[], float] = time.monotonic,
+        awake_time: Callable[[], float] | None = None,
     ) -> None:
         if (
             not isinstance(sync_interval_seconds, (int, float))
@@ -38,11 +41,15 @@ class ProjectClockGuard:
             raise ValueError("sync_interval_seconds_invalid")
         if not callable(monotonic):
             raise ValueError("monotonic_invalid")
+        if awake_time is not None and not callable(awake_time):
+            raise ValueError("awake_time_invalid")
         self._repository = repository
         self._sync_interval_seconds = float(sync_interval_seconds)
         self._monotonic = monotonic
+        self._awake_time = awake_time or _system_awake_time
         self._last_wall: datetime | None = None
         self._last_monotonic: float | None = None
+        self._last_awake: float | None = None
         self._local_sync_request = False
         self._lock = RLock()
 
@@ -51,9 +58,11 @@ class ProjectClockGuard:
         *,
         wall_now: datetime,
         monotonic_now: float | None = None,
+        awake_now: float | None = None,
     ) -> ClockCheckResult:
         _require_aware(wall_now)
         sample = self._read_monotonic(monotonic_now)
+        awake_sample = self._read_awake(awake_now)
         shared = self._repository.observe_wall_clock(
             wall_now,
             rollback_threshold_seconds=CLOCK_ROLLBACK_THRESHOLD_SECONDS,
@@ -65,9 +74,15 @@ class ProjectClockGuard:
         ] = "normal"
 
         with self._lock:
-            if self._last_wall is not None and self._last_monotonic is not None:
+            if (
+                self._last_wall is not None
+                and self._last_monotonic is not None
+                and self._last_awake is not None
+            ):
                 wall_elapsed = (wall_now - self._last_wall).total_seconds()
                 monotonic_elapsed = sample - self._last_monotonic
+                awake_elapsed = awake_sample - self._last_awake
+                elapsed = max(wall_elapsed, monotonic_elapsed)
                 recently_synced = (
                     shared.trusted_wall_at is not None
                     and shared.trusted_wall_at > self._last_wall
@@ -80,13 +95,15 @@ class ProjectClockGuard:
                     detected_reason = "clock_rollback"
                 elif (
                     not recently_synced
-                    and max(wall_elapsed, monotonic_elapsed)
-                    > 2 * self._sync_interval_seconds
+                    and elapsed > 2 * self._sync_interval_seconds
+                    and awake_elapsed
+                    < elapsed - self._sync_interval_seconds
                 ):
                     detected_sync = True
                     detected_reason = "resume_detected"
             self._last_wall = wall_now
             self._last_monotonic = sample
+            self._last_awake = awake_sample
 
         if detected_sync:
             shared = self._repository.mark_clock_state(
@@ -109,12 +126,20 @@ class ProjectClockGuard:
             reason=reason,
         )
 
-    def reset_local(self, *, wall_now: datetime, monotonic_now: float) -> None:
+    def reset_local(
+        self,
+        *,
+        wall_now: datetime,
+        monotonic_now: float,
+        awake_now: float | None = None,
+    ) -> None:
         _require_aware(wall_now)
         sample = _validate_monotonic(monotonic_now)
+        awake_sample = self._read_awake(awake_now)
         with self._lock:
             self._last_wall = wall_now
             self._last_monotonic = sample
+            self._last_awake = awake_sample
             self._local_sync_request = False
 
     def consume_local_sync_request(self) -> bool:
@@ -127,6 +152,24 @@ class ProjectClockGuard:
         return _validate_monotonic(
             self._monotonic() if value is None else value
         )
+
+    def _read_awake(self, value: float | None) -> float:
+        return _validate_awake(
+            self._awake_time() if value is None else value
+        )
+
+
+def _system_awake_time() -> float:
+    if sys.platform == "win32":
+        try:
+            elapsed_100ns = ctypes.c_ulonglong()
+            if ctypes.windll.kernel32.QueryUnbiasedInterruptTime(
+                ctypes.byref(elapsed_100ns)
+            ):
+                return elapsed_100ns.value / 10_000_000
+        except (AttributeError, OSError):
+            pass
+    return time.monotonic()
 
 
 def _require_aware(value: datetime) -> None:
@@ -142,6 +185,17 @@ def _validate_monotonic(value: float) -> float:
         or value < 0
     ):
         raise ValueError("monotonic_invalid")
+    return float(value)
+
+
+def _validate_awake(value: float) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError("awake_time_invalid")
     return float(value)
 
 

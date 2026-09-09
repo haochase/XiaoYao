@@ -191,6 +191,7 @@ class ProjectSyncService:
         source_freshness_seconds: int = 1800,
         clock_skew_seconds: float = 300.0,
         monotonic: Callable[[], float] = time.monotonic,
+        awake_time: Callable[[], float] | None = None,
     ) -> None:
         if (
             not isinstance(sync_interval_seconds, (int, float))
@@ -240,6 +241,7 @@ class ProjectSyncService:
             repository,
             sync_interval_seconds=sync_interval_seconds,
             monotonic=monotonic,
+            awake_time=awake_time,
         )
 
     def apply(
@@ -498,11 +500,13 @@ class ProjectSyncService:
         *,
         wall_now: datetime,
         monotonic_now: float | None = None,
+        awake_now: float | None = None,
     ) -> ClockCheckResult:
         try:
             return self._clock_guard.check(
                 wall_now=wall_now,
                 monotonic_now=monotonic_now,
+                awake_now=awake_now,
             )
         except ValueError as exc:
             raise ProjectSyncValidationError(str(exc)) from None

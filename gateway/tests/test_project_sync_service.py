@@ -953,17 +953,43 @@ def test_old_client_fetched_at_remains_valid_provenance(tmp_path: Path) -> None:
     assert stored.source_states[0].last_success_at == NOW
 
 
-def test_resume_detection_requests_one_immediate_sync(tmp_path: Path) -> None:
+def test_long_awake_interval_does_not_request_immediate_sync(
+    tmp_path: Path,
+) -> None:
     service, _, _, _ = sync_service(tmp_path)
 
-    first = service.recheck_clock(wall_now=NOW, monotonic_now=100)
-    resumed = service.recheck_clock(
+    first = service.recheck_clock(
+        wall_now=NOW,
+        monotonic_now=100,
+        awake_now=100,
+    )
+    idle = service.recheck_clock(
         wall_now=NOW + timedelta(seconds=601),
         monotonic_now=701,
+        awake_now=701,
     )
 
     assert first.reason == "normal"
     assert not first.immediate_sync_required
+    assert idle.reason == "normal"
+    assert not idle.immediate_sync_required
+    assert not service.consume_immediate_sync_request()
+
+
+def test_resume_detection_requests_one_immediate_sync(tmp_path: Path) -> None:
+    service, _, _, _ = sync_service(tmp_path)
+
+    service.recheck_clock(
+        wall_now=NOW,
+        monotonic_now=100,
+        awake_now=100,
+    )
+    resumed = service.recheck_clock(
+        wall_now=NOW + timedelta(seconds=601),
+        monotonic_now=701,
+        awake_now=101,
+    )
+
     assert resumed.reason == "resume_detected"
     assert resumed.immediate_sync_required
     assert not resumed.clock_untrusted
