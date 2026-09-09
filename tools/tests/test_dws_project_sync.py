@@ -563,7 +563,6 @@ def test_discard_rejected_pending_only_clears_pending(
         "missing_pending",
         "active_cursor",
         "active_hash",
-        "active_sync_id",
         "pending_generation",
         "pending_audit",
     ],
@@ -593,10 +592,6 @@ def test_discard_rejected_pending_denies_unproven_state(
                 connection.execute(
                     "UPDATE project_sync_generations SET content_hash = ?",
                     ("b" * 64,),
-                )
-            elif case == "active_sync_id":
-                connection.execute(
-                    "UPDATE project_sync_generations SET sync_id = 'other-sync'"
                 )
             elif case == "pending_generation":
                 row = connection.execute(
@@ -642,6 +637,32 @@ def test_discard_rejected_pending_denies_unproven_state(
     }
     assert paths["state"].read_bytes() == before_state
     assert database_snapshot(database) == before_database
+
+
+def test_discard_rejected_pending_allows_historical_active_sync_id_drift(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    paths, database = write_pending_discard_fixture(tmp_path)
+    state_before = json.loads(paths["state"].read_text(encoding="utf-8"))
+    state_before["last_sync_id"] = "historical-client-sync"
+    write_json(paths["state"], state_before)
+    database_before = database_snapshot(database)
+
+    assert (
+        main(
+            discard_rejected_pending_args(paths, database),
+            now=lambda: NOW,
+        )
+        == 0
+    )
+
+    assert json.loads(capsys.readouterr().out)["status"] == "pending_discarded"
+    assert json.loads(paths["state"].read_text(encoding="utf-8")) == {
+        **state_before,
+        "pending": None,
+    }
+    assert database_snapshot(database) == database_before
 
 
 def test_discard_rejected_pending_refuses_active_lifecycle(

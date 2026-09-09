@@ -2821,8 +2821,7 @@ def _discard_rejected_pending_inner(
             connection.execute("BEGIN")
             active_rows = connection.execute(
                 """
-                SELECT generation.source_cursor, generation.content_hash,
-                       generation.sync_id
+                SELECT generation.source_cursor, generation.content_hash
                 FROM project_active_generations AS active
                 JOIN project_sync_generations AS generation
                   ON generation.project_id = active.project_id
@@ -2835,7 +2834,6 @@ def _discard_rejected_pending_inner(
                 (
                     state.last_cursor,
                     state.last_content_hash,
-                    state.last_sync_id,
                 )
             ]:
                 _pending_discard_denied()
