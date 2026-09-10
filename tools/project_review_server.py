@@ -187,29 +187,35 @@ def create_review_app(
             raise HTTPException(status_code=422, detail="review_request_invalid") from None
         if not isinstance(request_payload, dict):
             raise HTTPException(status_code=422, detail="review_request_invalid")
+        review_body = _review_body(request_payload)
         payload = _proxy(
             f"/v1/projects/conflicts/{candidate_id}/review",
             private_root=private_root,
             protector=selected_protector,
             opener=selected_opener,
             upstream=upstream,
-            body=_review_body(request_payload),
+            body=review_body,
         )
         candidate = payload.get("candidate")
         version = payload.get("version")
+        expected_status = "accepted" if review_body["action"] == "accept" else "rejected"
         if (
             not isinstance(candidate, dict)
             or candidate.get("candidate_id") != candidate_id
-            or candidate.get("status") not in {"accepted", "rejected"}
-            or not isinstance(version, dict)
-            or not isinstance(version.get("version"), int)
+            or candidate.get("status") != expected_status
         ):
             raise HTTPException(status_code=503, detail="review_service_unavailable")
-        return {
+        response: dict[str, Any] = {
             "candidate_id": candidate_id,
             "status": candidate["status"],
-            "version": version["version"],
         }
+        if expected_status == "accepted":
+            if not isinstance(version, dict) or type(version.get("version")) is not int:
+                raise HTTPException(status_code=503, detail="review_service_unavailable")
+            response["version"] = version["version"]
+        elif "version" in payload:
+            raise HTTPException(status_code=503, detail="review_service_unavailable")
+        return response
 
     return app
 

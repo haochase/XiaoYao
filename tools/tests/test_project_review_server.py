@@ -8,6 +8,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tools.project_review_server import create_review_app
@@ -244,6 +245,160 @@ def test_review_bff_proxies_a_valid_review_without_exposing_upstream_data(
             b'{"action": "accept", "change_reason": "\\u786e\\u8ba4"}',
         )
     ]
+
+
+def test_review_bff_accepts_a_rejected_candidate_without_a_version(tmp_path: Path) -> None:
+    def reject_opener(request, *, timeout: float):  # type: ignore[no-untyped-def]
+        assert timeout == 5.0
+        return _Response(
+            request.full_url,
+            {"candidate": {"candidate_id": "candidate-1", "status": "rejected"}},
+        )
+
+    app = create_review_app(
+        private_root=_private_root(tmp_path),
+        protector=_Protector(),
+        opener=reject_opener,
+    )
+    client = TestClient(app, headers={"Host": "localhost:8724"})
+
+    response = client.post(
+        "/api/conflicts/candidate-1/review",
+        headers={"Origin": "http://localhost:8724"},
+        json={"action": "reject", "change_reason": "保留原决策"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "candidate_id": "candidate-1",
+        "status": "rejected",
+    }
+
+
+_MISSING = object()
+
+
+@pytest.mark.parametrize(
+    ("action", "candidate", "version"),
+    [
+        pytest.param(
+            "accept",
+            {"candidate_id": "candidate-other", "status": "accepted"},
+            {"version": 2},
+            id="candidate-id-mismatch",
+        ),
+        pytest.param(
+            "accept",
+            {"candidate_id": "candidate-1", "status": "rejected"},
+            {"version": 2},
+            id="accept-status-mismatch",
+        ),
+        pytest.param(
+            "reject",
+            {"candidate_id": "candidate-1", "status": "accepted"},
+            _MISSING,
+            id="reject-status-mismatch",
+        ),
+        pytest.param(
+            "accept",
+            {"candidate_id": "candidate-1", "status": "accepted"},
+            _MISSING,
+            id="accept-version-missing",
+        ),
+        pytest.param(
+            "accept",
+            {"candidate_id": "candidate-1", "status": "accepted"},
+            {},
+            id="accept-version-value-missing",
+        ),
+        pytest.param(
+            "accept",
+            {"candidate_id": "candidate-1", "status": "accepted"},
+            {"version": False},
+            id="accept-version-false",
+        ),
+        pytest.param(
+            "accept",
+            {"candidate_id": "candidate-1", "status": "accepted"},
+            {"version": True},
+            id="accept-version-true",
+        ),
+        pytest.param(
+            "accept",
+            {"candidate_id": "candidate-1", "status": "accepted"},
+            {"version": "2"},
+            id="accept-version-string",
+        ),
+        pytest.param(
+            "accept",
+            {"candidate_id": "candidate-1", "status": "accepted"},
+            {"version": 2.0},
+            id="accept-version-float",
+        ),
+        pytest.param(
+            "reject",
+            {"candidate_id": "candidate-1", "status": "rejected"},
+            None,
+            id="reject-version-null",
+        ),
+        pytest.param(
+            "reject",
+            {"candidate_id": "candidate-1", "status": "rejected"},
+            {"version": 2},
+            id="reject-version-object",
+        ),
+    ],
+)
+def test_review_bff_fails_closed_for_invalid_upstream_review_responses(
+    tmp_path: Path,
+    action: str,
+    candidate: dict[str, Any],
+    version: object,
+) -> None:
+    def response_opener(request, *, timeout: float):  # type: ignore[no-untyped-def]
+        assert timeout == 5.0
+        payload: dict[str, Any] = {"candidate": candidate}
+        if version is not _MISSING:
+            payload["version"] = version
+        return _Response(request.full_url, payload)
+
+    app = create_review_app(
+        private_root=_private_root(tmp_path),
+        protector=_Protector(),
+        opener=response_opener,
+    )
+    client = TestClient(app, headers={"Host": "localhost:8724"})
+
+    response = client.post(
+        "/api/conflicts/candidate-1/review",
+        headers={"Origin": "http://localhost:8724"},
+        json={"action": action, "change_reason": "审核"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "review_service_unavailable"}
+
+
+@pytest.mark.parametrize("action", [None, True, False, "approve", ""])
+def test_review_bff_rejects_invalid_actions_before_proxying(
+    tmp_path: Path, action: object
+) -> None:
+    calls: list[tuple[str, str, bytes | None]] = []
+    app = create_review_app(
+        private_root=_private_root(tmp_path),
+        protector=_Protector(),
+        opener=_opener(calls),
+    )
+    client = TestClient(app, headers={"Host": "localhost:8724"})
+
+    response = client.post(
+        "/api/conflicts/candidate-1/review",
+        headers={"Origin": "http://localhost:8724"},
+        json={"action": action, "change_reason": "审核"},
+    )
+
+    assert response.status_code == 422
+    assert calls == []
 
 
 def test_review_bff_rejects_malformed_json_before_proxying(tmp_path: Path) -> None:

@@ -239,3 +239,8 @@ def test_ops_page_is_local_and_does_not_handle_tokens(client: TestClient) -> Non
     assert "localStorage" not in html
     assert "<script src=\"http" not in html
     assert "暂无待确认项" in html
+    assert "window.confirm" not in html
+    assert "confirmReview" in html
+    assert '"取消"' in html
+    assert 'aria-busy' in html
+    assert 'dataset.submitting' in html

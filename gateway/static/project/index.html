@@ -9,6 +9,8 @@
     section { margin: 16px 0; padding: 16px; border: 1px solid #d7dde3; border-radius: 6px; background: #fff; }
     h1, h2 { margin-top: 0; } article { padding: 12px 0; border-top: 1px solid #e4e8eb; }
     button { margin-right: 8px; padding: 6px 10px; border: 1px solid #aab5be; border-radius: 4px; background: #fff; }
+    .review-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .review-controls button { margin-right: 0; }
     .muted { color: #687580; } .error { color: #a52a2a; }
   </style>
 </head>
@@ -25,12 +27,67 @@
       });
       const escape = (value) => String(value ?? "").replace(/[&<>\"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" })[char]);
       const error = (value) => { document.querySelector("#runtime").innerHTML = `<h2>设备/运行状态</h2><p class="error">${escape(value.message)}</p>`; };
-      const review = (candidate, action) => {
-        if (!window.confirm(action === "accept" ? "确认接受此候选？" : "确认拒绝此候选？")) return;
+      const unlockControls = (controls) => {
+        controls.dataset.submitting = "false";
+        controls.removeAttribute("aria-busy");
+        controls.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+      };
+      const showReload = (controls, value) => {
+        unlockControls(controls);
+        controls.replaceChildren();
+        const reload = document.createElement("button"); reload.textContent = "重新加载";
+        reload.addEventListener("click", () => {
+          if (controls.dataset.submitting === "true") return;
+          controls.dataset.submitting = "true";
+          controls.setAttribute("aria-busy", "true");
+          reload.disabled = true;
+          load().catch((loadError) => { unlockControls(controls); error(loadError); });
+        });
+        controls.appendChild(reload);
+        reload.focus();
+        error(value);
+      };
+      const review = (candidate, action, controls) => {
+        if (controls.dataset.submitting === "true") return;
+        controls.dataset.submitting = "true";
+        controls.setAttribute("aria-busy", "true");
+        controls.querySelectorAll("button").forEach((button) => { button.disabled = true; });
         request(`/api/conflicts/${encodeURIComponent(candidate.candidate_id)}/review`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action, change_reason: action === "accept" ? "审核台确认" : "审核台拒绝" })
-        }).then(load).catch(error);
+        }).then(
+          () => load().catch((value) => showReload(controls, value)),
+          (value) => { unlockControls(controls); error(value); }
+        );
+      };
+      const reviewControls = (candidate) => {
+        const controls = document.createElement("div");
+        controls.className = "review-controls";
+        controls.setAttribute("role", "group");
+        controls.setAttribute("aria-label", "候选审核操作");
+        const renderActions = (focusAction) => {
+          controls.replaceChildren();
+          controls.dataset.submitting = "false";
+          controls.removeAttribute("aria-busy");
+          [["accept", "接受"], ["reject", "拒绝"]].forEach(([action, label]) => {
+            const button = document.createElement("button"); button.textContent = label;
+            button.addEventListener("click", () => confirmReview(candidate, action, label, controls));
+            controls.appendChild(button);
+            if (action === focusAction) button.focus();
+          });
+        };
+        const confirmReview = (item, action, label, root) => {
+          root.replaceChildren();
+          const prompt = document.createElement("span"); prompt.textContent = `确认${label}此候选？`;
+          const submit = document.createElement("button"); submit.textContent = `确认${label}`;
+          submit.addEventListener("click", () => review(item, action, root));
+          const cancel = document.createElement("button"); cancel.textContent = "取消";
+          cancel.addEventListener("click", () => renderActions(action));
+          root.append(prompt, submit, cancel);
+          submit.focus();
+        };
+        renderActions();
+        return controls;
       };
       const candidates = (items) => {
         const root = document.querySelector("#candidates"); root.innerHTML = "<h2>待确认候选</h2>";
@@ -39,16 +96,13 @@
         pending.forEach((item) => {
           const card = document.createElement("article");
           card.textContent = `${item.active_text} -> ${item.proposed_text}：${item.reason}`;
-          [["accept", "接受"], ["reject", "拒绝"]].forEach(([action, label]) => {
-            const button = document.createElement("button"); button.textContent = label;
-            button.addEventListener("click", () => review(item, action)); card.appendChild(button);
-          });
+          card.appendChild(reviewControls(item));
           root.appendChild(card);
         });
       };
       const status = (value) => { document.querySelector("#status").innerHTML = `<h2>状态</h2><p>${escape(value.project_name)}：${escape(value.source_count)} 个来源，${escape(value.active_decision_count)} 项有效决策，时钟 ${escape(value.clock_status)}</p>`; };
-      const load = () => Promise.all([request("/api/summary"), request("/api/conflicts")]).then(([summary, conflicts]) => { status(summary); candidates(conflicts.conflicts || []); }).catch(error);
-      load();
+      const load = () => Promise.all([request("/api/summary"), request("/api/conflicts")]).then(([summary, conflicts]) => { status(summary); candidates(conflicts.conflicts || []); });
+      load().catch(error);
     })();
   </script>
 </body>
