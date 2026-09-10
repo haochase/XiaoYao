@@ -13,3 +13,23 @@ examples:
       en: |-
         Process the DwsSourceBundle supplied by this sync workflow into internal context JSON.
         Do not fetch other data, call DWS, write files, or push to the gateway.
+  - id: pre-meeting
+    title:
+      zh: 生成会前项目要点
+      en: Build pre-meeting project points
+    description:
+      zh: 从已验证项目记忆生成带来源的会前要点
+      en: Build sourced pre-meeting points from validated project memory
+    prompt:
+      zh: 请按会前合同处理本次流程提供的已验证项目记忆。
+      en: Process the validated project memory using the pre-meeting contract.
+  - id: post-meeting
+    title:
+      zh: 生成会后审核报告
+      en: Build post-meeting review report
+    description:
+      zh: 根据项目记忆和真实审核快照生成会后报告
+      en: Build a post-meeting report from project memory and the real review snapshot
+    prompt:
+      zh: 请按会后合同处理已验证项目记忆和本轮审核快照。
+      en: Process the validated project memory and review snapshot using the post-meeting contract.

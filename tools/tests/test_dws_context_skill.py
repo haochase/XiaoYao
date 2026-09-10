@@ -40,6 +40,8 @@ def test_package_contains_only_public_self_contained_skill(tmp_path: Path) -> No
             "hui-anchor-dws-project-context-v1/SKILL.md",
             "hui-anchor-dws-project-context-v1/.skill-metadata.yaml",
             "hui-anchor-dws-project-context-v1/contract.md",
+            "hui-anchor-dws-project-context-v1/pre-meeting-contract.md",
+            "hui-anchor-dws-project-context-v1/post-meeting-contract.md",
         }
         skill = archive.read("hui-anchor-dws-project-context-v1/SKILL.md")
         assert b"name: hui-anchor-dws-project-context-v1" in skill
@@ -53,6 +55,26 @@ def test_package_is_deterministic_and_refuses_overwrite(tmp_path: Path) -> None:
     assert first.read_bytes() == second.read_bytes()
     with pytest.raises(FileExistsError):
         package_skill(first)
+
+
+def test_skill_routes_pre_and_post_meeting_modes_to_separate_contracts() -> None:
+    root = (
+        Path(__file__).resolve().parents[2]
+        / "skills"
+        / "hui-anchor-dws-project-context-v1"
+    )
+    skill = (root / "SKILL.md").read_text(encoding="utf-8")
+    pre = (root / "pre-meeting-contract.md").read_text(encoding="utf-8")
+    post = (root / "post-meeting-contract.md").read_text(encoding="utf-8")
+
+    assert "pre-meeting-contract.md" in skill
+    assert "post-meeting-contract.md" in skill
+    assert "PreMeetingArtifact.model_validate" in pre
+    assert "validate_pre_meeting_artifact" in pre
+    assert "PostMeetingArtifact.model_validate" in post
+    assert "validate_post_meeting_artifact" in post
+    assert "不得推测审批状态" in post
+    assert "会后模式需同时提供" in skill
 
 
 def test_package_rejects_c_drive_output() -> None:
@@ -153,3 +175,25 @@ def test_manual_prompt_generates_new_artifact_for_changed_source() -> None:
     assert "连续非标题正文 excerpt" in normalized
     assert "最长 150 字" in normalized
     assert "不得拼接" in normalized
+
+
+def test_t4_prompt_keeps_three_outputs_in_one_qwenwork_session() -> None:
+    prompt = read_prompt("qwenwork-t4-project-artifacts.md")
+    normalized = " ".join(prompt.replace("`", "").split())
+
+    assert "只在当前对话" in prompt
+    assert "不得新建、分叉或并行创建其他对话" in prompt
+    assert normalized.index("项目记忆") < normalized.index("会前要点")
+    assert normalized.index("会前要点") < normalized.index("会后审核报告")
+    assert "PreMeetingArtifact.model_validate" in prompt
+    assert "validate_pre_meeting_artifact" in prompt
+    assert "PostMeetingArtifact.model_validate" in prompt
+    assert "validate_post_meeting_artifact" in prompt
+    assert "Session ID" in prompt
+    assert "不可获得就报告 session_id_unavailable" in normalized
+    assert "不得输出凭据" in prompt
+    assert "只继承其门禁、生命周期步骤与失败处理" in prompt
+    assert "end=completed 后继续" in normalized
+    assert "用户可见的最终输出延迟到三个阶段全部结束" in prompt
+    assert r"E:\haochase\xiaoqian\小千项目文档\submission\t4" in prompt
+    assert "必须位于 Git 工作树之外" in prompt

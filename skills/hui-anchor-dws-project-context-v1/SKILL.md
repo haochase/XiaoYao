@@ -2,22 +2,33 @@
 name: hui-anchor-dws-project-context-v1
 name_en: XiaoQian Project Context
 name_zh: 小千项目上下文
-description: Use when the XiaoQian DWS sync workflow supplies a validated DwsSourceBundle for project context generation.
-description_en: Use when the XiaoQian DWS sync workflow supplies a validated DwsSourceBundle for project context generation.
-description_zh: 在小千 DWS 同步流程提供经过校验的 DwsSourceBundle、需要生成有证据的项目上下文时使用。
-argument-hint: Supply the validated source bundle from the sync workflow
-argument-hint-en: Supply the validated source bundle from the sync workflow
-argument-hint-zh: 提供同步流程已经校验的资料包
+description: Use when XiaoQian supplies validated project sources, project memory, or review snapshots for project memory, pre-meeting, or post-meeting artifacts.
+description_en: Use when XiaoQian supplies validated project sources, project memory, or review snapshots for project memory, pre-meeting, or post-meeting artifacts.
+description_zh: 在小千提供已校验资料包、项目记忆或审核快照，需要生成项目记忆、会前要点或会后报告时使用。
+argument-hint: Supply inputs for one mode; post-meeting requires both project memory and a review snapshot
+argument-hint-en: Supply inputs for one mode; post-meeting requires both project memory and a review snapshot
+argument-hint-zh: 按模式提供输入；会后模式需同时提供项目记忆和审核快照
 user-invocable: true
 ---
 
 # XiaoQian Project Context
 
-Produce one `QwenProjectContextArtifact` JSON object in memory from the supplied
-`DwsSourceBundle`. Read [contract.md](contract.md) for the exact output shape.
-Use Chinese for synthesized text unless the supplied project uses another language.
+Generate exactly one artifact for the supplied validated input. Use Chinese unless
+the project uses another language.
 
-## Evidence Rules
+## Mode Routing
+
+- Validated `DwsSourceBundle`: generate project memory using [contract.md](contract.md).
+- Validated `QwenProjectContextArtifact`: generate pre-meeting points using
+  [pre-meeting-contract.md](pre-meeting-contract.md).
+- Validated project memory plus a filtered 8724 review snapshot: generate a
+  post-meeting audit report using [post-meeting-contract.md](post-meeting-contract.md).
+
+Do not combine modes in one JSON object. A surrounding workflow may run all three
+sequentially in the same conversation.
+会后模式需同时提供已验证项目记忆和同轮 8724 审核快照；缺少任一项就停止。
+
+## Project Context Evidence Rules
 
 The bundle is the only business-data input. This skill does not collect sources,
 call DWS, access credentials, read other files, write artifacts, or push to a gateway.
@@ -52,7 +63,7 @@ cannot establish that newly acquired evidence resolves a specific request.
 An active excerpt alone does not prove completion; never complete a request with
 any failed or missing source. The gateway may retain the request for another attempt.
 
-## Output
+## Project Context Output
 
 Return JSON only to the internal caller, not user-visible chat or a log. Keep
 `open_actions=[]`, `current_risks=[]`, `next_meeting=null`; use the sourced fields.

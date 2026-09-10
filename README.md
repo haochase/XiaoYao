@@ -37,6 +37,11 @@ current decision without storing project documents or model credentials on the
 device. Stale, unauthorized, or unsupported facts fail closed instead of being
 guessed.
 
+The same QwenWork Skill package also defines source-bound pre-meeting points and
+review-bound post-meeting reports. Pre-meeting output can only select facts from
+validated project memory; post-meeting accepted, rejected, and pending sections
+must match the local review snapshot before the workflow records success.
+
 The existing `hui-anchor` branch, project IDs, and
 `hui-anchor-dws-project-context-v1` Skill ID remain compatibility identifiers;
 XiaoQian is the product display name.

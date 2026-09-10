@@ -10,7 +10,13 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 SKILL_NAME = "hui-anchor-dws-project-context-v1"
 SKILL_ROOT = Path(__file__).resolve().parents[1] / "skills" / SKILL_NAME
-FILES = ("SKILL.md", ".skill-metadata.yaml", "contract.md")
+FILES = (
+    "SKILL.md",
+    ".skill-metadata.yaml",
+    "contract.md",
+    "pre-meeting-contract.md",
+    "post-meeting-contract.md",
+)
 
 
 def package_skill(output: Path) -> None:
