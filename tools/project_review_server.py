@@ -12,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, StringConstraints
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 if str(ROOT / "gateway" / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "gateway" / "src"))
 

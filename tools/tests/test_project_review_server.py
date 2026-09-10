@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -12,6 +15,7 @@ from tools.project_review_server import create_review_app
 
 TOKEN = b"review-token"
 PROJECT_ID = "project-fixed"
+SERVER_SCRIPT = Path(__file__).resolve().parents[1] / "project_review_server.py"
 
 
 class _Protector:
@@ -19,6 +23,29 @@ class _Protector:
         assert project_id == PROJECT_ID
         assert protected == b"protected"
         return TOKEN
+
+
+def test_review_server_imports_when_run_outside_the_repository(tmp_path: Path) -> None:
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import runpy; "
+                f"runpy.run_path({str(SERVER_SCRIPT)!r}, run_name='review_server_probe')"
+            ),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 class _Response:
