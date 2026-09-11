@@ -944,6 +944,13 @@ class ProjectSyncRepository:
             self._assert_protection_access(connection)
             active = self._load_active_row(connection, envelope.project_id)
             stored_context = self._load_context(connection, envelope.project_id)
+            allowed_source_tombstone_removal_ids = (
+                self._allowed_source_tombstone_removal_ids(
+                    stored_context,
+                    envelope.context,
+                    envelope.tombstones,
+                )
+            )
             reviewed_decision_ids = self._reviewed_decision_ids(
                 connection, envelope.project_id
             )
@@ -968,6 +975,10 @@ class ProjectSyncRepository:
                     stored_context,
                     effective_context,
                     sources=envelope.sources,
+                    tombstones=envelope.tombstones,
+                    allowed_source_tombstone_removal_ids=(
+                        allowed_source_tombstone_removal_ids
+                    ),
                     allow_additions=(
                         envelope.source_cursor > active_cursor
                         and envelope.content_hash != active_hash
@@ -1003,6 +1014,10 @@ class ProjectSyncRepository:
                     stored_context,
                     effective_context,
                     sources=envelope.sources,
+                    tombstones=envelope.tombstones,
+                    allowed_source_tombstone_removal_ids=(
+                        allowed_source_tombstone_removal_ids
+                    ),
                 )
                 self._validate_source_heads(connection, candidate)
             outcome: Literal["applied", "degraded"] = (
@@ -2122,6 +2137,8 @@ class ProjectSyncRepository:
         candidate: ProjectContextPackage,
         *,
         sources: tuple[SourceSnapshot, ...],
+        tombstones: tuple[SourceTombstone, ...] = (),
+        allowed_source_tombstone_removal_ids: frozenset[str] | None = None,
         allow_additions: bool = False,
     ) -> None:
         if stored is None:
@@ -2135,9 +2152,29 @@ class ProjectSyncRepository:
         candidate_by_id = ProjectSyncRepository._decisions_by_id(
             candidate.active_decisions
         )
+        if allowed_source_tombstone_removal_ids is None:
+            allowed_source_tombstone_removal_ids = (
+                ProjectSyncRepository._allowed_source_tombstone_removal_ids(
+                    stored,
+                    candidate,
+                    tombstones,
+                )
+            )
         if any(
-            candidate_by_id.get(decision_id) != decision
+            candidate_by_id[decision_id] != decision
             for decision_id, decision in stored_by_id.items()
+            if decision_id in candidate_by_id
+        ):
+            raise SyncConflict("decision_change_requires_review")
+        tombstone_keys = ProjectSyncRepository._tombstone_source_keys(tombstones)
+        if any(
+            decision_id not in allowed_source_tombstone_removal_ids
+            or not ProjectSyncRepository._is_source_tombstone_removal_eligible(
+                decision,
+                tombstone_keys,
+            )
+            for decision_id, decision in stored_by_id.items()
+            if decision_id not in candidate_by_id
         ):
             raise SyncConflict("decision_change_requires_review")
         additions = tuple(
@@ -2162,6 +2199,72 @@ class ProjectSyncRepository:
                 validate_source_refs(candidate, sources, decision.source_refs)
             except ValueError:
                 raise SyncConflict("context_conflict") from None
+
+    @staticmethod
+    def _allowed_source_tombstone_removal_ids(
+        stored: ProjectContextPackage | None,
+        candidate: ProjectContextPackage,
+        tombstones: tuple[SourceTombstone, ...],
+    ) -> frozenset[str]:
+        if stored is None or stored.permission_scope != candidate.permission_scope:
+            return frozenset()
+        candidate_ids = {
+            decision.decision_id for decision in candidate.active_decisions
+        }
+        tombstone_keys = ProjectSyncRepository._tombstone_source_keys(tombstones)
+        removed_ids = frozenset(
+            decision_id
+            for decision_id, decision in ProjectSyncRepository._decisions_by_id(
+                stored.active_decisions
+            ).items()
+            if decision_id not in candidate_ids
+        )
+        if any(
+            not ProjectSyncRepository._is_source_tombstone_removal_eligible(
+                decision,
+                tombstone_keys,
+            )
+            for decision_id, decision in ProjectSyncRepository._decisions_by_id(
+                stored.active_decisions
+            ).items()
+            if decision_id in removed_ids
+        ):
+            raise SyncConflict("decision_change_requires_review")
+        return removed_ids
+
+    @staticmethod
+    def _tombstone_source_keys(
+        tombstones: tuple[SourceTombstone, ...],
+    ) -> frozenset[tuple[str, str, str]]:
+        return frozenset(
+            (
+                tombstone.source_type.value,
+                tombstone.source_id,
+                tombstone.permission_scope,
+            )
+            for tombstone in tombstones
+            if tombstone.status
+            in {SourceSyncStatus.DELETED, SourceSyncStatus.REVOKED}
+        )
+
+    @staticmethod
+    def _is_source_tombstone_removal_eligible(
+        decision: DecisionCard,
+        tombstone_keys: frozenset[tuple[str, str, str]],
+    ) -> bool:
+        return (
+            decision.approval_ref is None
+            and bool(decision.source_refs)
+            and any(
+                (
+                    reference.source_type,
+                    reference.source_id,
+                    reference.permission_scope,
+                )
+                in tombstone_keys
+                for reference in decision.source_refs
+            )
+        )
 
     @staticmethod
     def _reject_duplicate_decision_content(

@@ -1886,7 +1886,7 @@ def test_same_failed_cursor_and_hash_cannot_bootstrap_decisions(
         )
 
 
-def test_commit_rejects_removing_decision_when_its_source_is_revoked(
+def test_commit_allows_removing_source_backed_decision_for_matching_tombstone(
     tmp_path: Path,
 ) -> None:
     snapshot = active_snapshot()
@@ -1903,7 +1903,96 @@ def test_commit_rejects_removing_decision_when_its_source_is_revoked(
     repository.commit(
         sync_commit(cursor=1, package=original, snapshots=(snapshot,))
     )
-    revoked_at = NOW + timedelta(minutes=1)
+    retired_at = NOW + timedelta(minutes=1)
+
+    result = repository.commit(
+        sync_commit(
+            cursor=2,
+            content_hash=HASH_B,
+            package=context(
+                generated_at=retired_at,
+                source_refs=(),
+                active_decisions=(),
+            ),
+            snapshots=(),
+            tombstones=(
+                SourceTombstone(
+                    source_type=SyncSourceType.DOCUMENT,
+                    source_id="real-source-id",
+                    status=SourceSyncStatus.DELETED,
+                    occurred_at=retired_at,
+                    permission_scope="project:demo",
+                ),
+            ),
+            states=(
+                source_state(
+                    source_version=None,
+                    content_hash=None,
+                    status=SourceSyncStatus.DELETED,
+                    last_attempt_at=retired_at,
+                    last_success_at=None,
+                ),
+            ),
+            protected_sources=(),
+            protected_chunks=(),
+        )
+    )
+
+    stored = repository.load_active_generation("project-1")
+    assert result.outcome == "applied"
+    assert stored is not None
+    assert stored.context.active_decisions == ()
+    assert stored.protected_chunks == ()
+
+
+def test_commit_rejects_removing_approved_decision_for_matching_tombstone(
+    tmp_path: Path,
+) -> None:
+    snapshot = active_snapshot()
+    source_backed = source_backed_decision("decision-1", snapshot)
+    original = context(
+        source_refs=(),
+        active_decisions=(source_backed,),
+    )
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    repository.commit(
+        sync_commit(cursor=1, package=original, snapshots=(snapshot,))
+    )
+    memory = ProjectMemoryService(
+        repository=ProjectMemoryRepository(tmp_path / "project-memory.db"),
+        clock=lambda: NOW,
+    )
+    conflict, _ = memory.propose_conflict_from_statement(
+        "project-1",
+        "decision-1 must change",
+        proposed_decision_text="human-approved decision",
+        now=NOW,
+    )
+    _, approved = memory.review_conflict(
+        conflict.candidate_id,
+        reviewer_id="owner-1",
+        action="accept",
+        change_reason="human review",
+        now=NOW,
+    )
+    approved_context = memory.get_context("project-1")
+    assert approved_context.active_decisions[0].approval_ref == approved.approval_ref
+    assert approved_context.active_decisions[0].source_refs == ()
+    before = repository.load_active_generation("project-1")
+    assert before is not None
+    with sqlite3.connect(tmp_path / "project-memory.db") as connection:
+        audits_before = connection.execute(
+            """
+            SELECT sync_id, project_id, started_at, finished_at, outcome,
+                   source_counts_json, chunk_count, duration_ms, error_type
+            FROM project_sync_audits
+            WHERE project_id = ?
+            ORDER BY sync_id
+            """,
+            ("project-1",),
+        ).fetchall()
+    retired_at = NOW + timedelta(minutes=1)
 
     with pytest.raises(SyncConflict, match="decision_change_requires_review"):
         repository.commit(
@@ -1911,7 +2000,7 @@ def test_commit_rejects_removing_decision_when_its_source_is_revoked(
                 cursor=2,
                 content_hash=HASH_B,
                 package=context(
-                    generated_at=revoked_at,
+                    generated_at=retired_at,
                     source_refs=(),
                     active_decisions=(),
                 ),
@@ -1921,7 +2010,7 @@ def test_commit_rejects_removing_decision_when_its_source_is_revoked(
                         source_type=SyncSourceType.DOCUMENT,
                         source_id="real-source-id",
                         status=SourceSyncStatus.REVOKED,
-                        occurred_at=revoked_at,
+                        occurred_at=retired_at,
                         permission_scope="project:demo",
                     ),
                 ),
@@ -1930,7 +2019,7 @@ def test_commit_rejects_removing_decision_when_its_source_is_revoked(
                         source_version=None,
                         content_hash=None,
                         status=SourceSyncStatus.REVOKED,
-                        last_attempt_at=revoked_at,
+                        last_attempt_at=retired_at,
                         last_success_at=None,
                     ),
                 ),
@@ -1939,9 +2028,106 @@ def test_commit_rejects_removing_decision_when_its_source_is_revoked(
             )
         )
 
-    stored = repository.load_active_generation("project-1")
-    assert stored is not None
-    assert stored.context == original
+    after = repository.load_active_generation("project-1")
+    assert after is not None
+    assert after.generation_id == before.generation_id
+    assert after.source_cursor == before.source_cursor
+    assert after.context == before.context
+    with sqlite3.connect(tmp_path / "project-memory.db") as connection:
+        audits_after = connection.execute(
+            """
+            SELECT sync_id, project_id, started_at, finished_at, outcome,
+                   source_counts_json, chunk_count, duration_ms, error_type
+            FROM project_sync_audits
+            WHERE project_id = ?
+            ORDER BY sync_id
+            """,
+            ("project-1",),
+        ).fetchall()
+    assert audits_after == audits_before
+
+
+@pytest.mark.parametrize(
+    ("case", "should_allow"),
+    [
+        ("approval", False),
+        ("empty_refs", False),
+        ("wrong_source", False),
+        ("wrong_permission", False),
+        ("no_tombstone", False),
+        ("one_of_many_sources", True),
+    ],
+)
+def test_context_conflicts_limits_tombstone_decision_removal(
+    case: str,
+    should_allow: bool,
+) -> None:
+    snapshot = active_snapshot()
+    decision = source_backed_decision("decision-1", snapshot)
+    tombstones: tuple[SourceTombstone, ...] = (
+        SourceTombstone(
+            source_type=SyncSourceType.DOCUMENT,
+            source_id="real-source-id",
+            status=SourceSyncStatus.REVOKED,
+            occurred_at=NOW + timedelta(minutes=1),
+            permission_scope="project:demo",
+        ),
+    )
+    if case == "approval":
+        approval = HumanApprovalRef(
+            candidate_id="candidate-1",
+            reviewer_id="owner-1",
+            approved_at=NOW,
+            reason="human decision",
+            decision_text=decision.decision_text,
+            permission_scope="project:demo",
+        )
+        decision = decision.model_copy(update={"approval_ref": approval})
+    elif case == "empty_refs":
+        decision = decision.model_copy(update={"source_refs": ()})
+    elif case == "wrong_source":
+        tombstones = (
+            tombstones[0].model_copy(update={"source_id": "other-source-id"}),
+        )
+    elif case == "wrong_permission":
+        tombstones = (
+            tombstones[0].model_copy(update={"permission_scope": "project:other"}),
+        )
+    elif case == "no_tombstone":
+        tombstones = ()
+    elif case == "one_of_many_sources":
+        decision = decision.model_copy(
+            update={
+                "source_refs": (
+                    *decision.source_refs,
+                    evidence_ref(source_id="other-source-id"),
+                )
+            }
+        )
+    stored = context().model_copy(
+        update={"source_refs": (), "active_decisions": (decision,)}
+    )
+    candidate = context(
+        generated_at=NOW + timedelta(minutes=1),
+        source_refs=(),
+        active_decisions=(),
+    )
+
+    if should_allow:
+        ProjectSyncRepository._check_context_conflicts(
+            stored,
+            candidate,
+            sources=(),
+            tombstones=tombstones,
+        )
+    else:
+        with pytest.raises(SyncConflict, match="decision_change_requires_review"):
+            ProjectSyncRepository._check_context_conflicts(
+                stored,
+                candidate,
+                sources=(),
+                tombstones=tombstones,
+            )
 
 
 @pytest.mark.parametrize("status", ["failed", "stale"])
