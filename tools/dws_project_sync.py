@@ -1346,8 +1346,8 @@ def _record_gateway_diagnostic(
     try:
         callback(
             {
-                "status_code": status,
-                "error_type": error_type,
+                "status": status,
+                "detail": error_type,
                 "retryable": retryable,
             }
         )

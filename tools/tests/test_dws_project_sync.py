@@ -4502,8 +4502,8 @@ def test_gateway_reports_safe_http_diagnostic_without_changing_public_error(
     assert json.loads(capsys.readouterr().out)["error_type"] == "sync_conflict"
     assert diagnostics == [
         {
-            "status_code": 409,
-            "error_type": "sync_conflict",
+            "status": 409,
+            "detail": "sync_conflict",
             "retryable": False,
         }
     ]
@@ -4650,8 +4650,8 @@ def test_gateway_retries_retryable_http_error_without_exposing_body(
     assert closed == 3
     assert diagnostics == [
         {
-            "status_code": 503,
-            "error_type": "http_error",
+            "status": 503,
+            "detail": "http_error",
             "retryable": True,
         }
     ] * 3
