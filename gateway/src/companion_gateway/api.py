@@ -13,7 +13,14 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    StrictBool,
+    StringConstraints,
+    ValidationError,
+    field_validator,
+)
 from starlette.websockets import WebSocketDisconnect
 
 from companion_gateway.audio.bridge import AudioFrameRejected, AudioQueueFull
@@ -129,7 +136,10 @@ from companion_gateway.project.service import (
     ProjectMemoryError,
     ProjectMemoryService,
 )
-from companion_gateway.project.sync_repository import ProjectSyncRepository
+from companion_gateway.project.sync_repository import (
+    ProjectSyncRepository,
+    SyncConflict,
+)
 from companion_gateway.domain.tasks import InvalidTaskTransition, TaskEventType
 from companion_gateway.service import TaskService
 from companion_gateway.settings import Settings, load_environment_file
@@ -158,6 +168,15 @@ ProjectQueryText = Annotated[
 ProjectIdentifier = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
+]
+DecisionSplitPreconditionToken = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    ),
 ]
 
 _PROJECT_RECOVERY_DETAILS = frozenset(
@@ -250,6 +269,21 @@ class ConflictReviewRequest(BaseModel):
 
     action: Literal["accept", "reject"]
     change_reason: ProjectQueryText
+
+
+class DecisionSplitMigrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    precondition_token: DecisionSplitPreconditionToken
+    reason: ProjectQueryText
+    confirmed: StrictBool
+
+    @field_validator("confirmed")
+    @classmethod
+    def require_confirmation(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("decision split migration must be confirmed")
+        return value
 
 
 class UnsupportedDeviceControl(ValueError):
@@ -881,6 +915,55 @@ def create_app(
             return {"conflicts": jsonable_encoder(project_conflicts(project_memory, project_id))}
         except ProjectContextUnavailable as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/v1/projects/{project_id}/ops/decision-split-migration")
+    def preview_decision_split_migration(
+        request: Request,
+        project_id: str,
+    ) -> object:
+        authorize_project_context(request, project_id, require_review=True)
+        if ops_sync_repository is None:
+            raise HTTPException(
+                status_code=409,
+                detail="decision_split_candidate_unavailable",
+            )
+        try:
+            preview = ops_sync_repository.preview_decision_split_migration(
+                project_id
+            )
+        except SyncConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return jsonable_encoder(preview)
+
+    @app.post("/v1/projects/{project_id}/decision-split-migrations")
+    def apply_decision_split_migration(
+        request: Request,
+        project_id: str,
+        body: DecisionSplitMigrationRequest,
+    ) -> dict[str, object]:
+        principal = authorize_project_context(
+            request,
+            project_id,
+            require_review=True,
+        )
+        if ops_sync_repository is None:
+            raise HTTPException(
+                status_code=409,
+                detail="decision_split_candidate_unavailable",
+            )
+        try:
+            audit = ops_sync_repository.apply_decision_split_migration(
+                project_id=project_id,
+                precondition_token=body.precondition_token,
+                reviewer_id=principal.principal_id,
+                reason=body.reason,
+                migrated_at=project_clock(),
+            )
+        except SyncConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"migration": jsonable_encoder(audit)}
 
     @app.post("/v1/projects/conflicts/{candidate_id}/review")
     def review_project_conflict(

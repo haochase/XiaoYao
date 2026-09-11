@@ -15,6 +15,9 @@ from typing import Literal
 from companion_gateway.project.evidence_validation import validate_source_refs
 from companion_gateway.project.models import (
     DecisionCard,
+    DecisionSplitMigrationAudit,
+    DecisionSplitMigrationDecisionPreview,
+    DecisionSplitMigrationPreview,
     DecisionStatus,
     DecisionVersion,
     ProjectContextPackage,
@@ -36,7 +39,7 @@ from companion_gateway.project.sync_models import (
 )
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 class SyncConflict(RuntimeError):
@@ -117,6 +120,13 @@ class SharedClockState:
     clock_untrusted: bool
     needs_sync: bool
     reason: Literal["normal", "resume_detected", "clock_rollback"]
+
+
+@dataclass(frozen=True)
+class _DecisionSplitMigrationCandidate:
+    preview: DecisionSplitMigrationPreview
+    legacy_version: DecisionVersion
+    after_context: ProjectContextPackage
 
 
 class _SyncCommitTransaction:
@@ -307,6 +317,22 @@ class ProjectSyncRepository:
                     chunk_count INTEGER NOT NULL,
                     duration_ms INTEGER NOT NULL,
                     error_type TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS project_decision_migration_audits (
+                    migration_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    legacy_decision_id TEXT NOT NULL,
+                    base_version INTEGER NOT NULL,
+                    retirement_version INTEGER NOT NULL,
+                    active_generation_id TEXT NOT NULL,
+                    reviewer_id TEXT NOT NULL,
+                    migrated_at TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    replacement_decision_ids_json TEXT NOT NULL,
+                    before_context_hash TEXT NOT NULL,
+                    after_context_hash TEXT NOT NULL,
+                    UNIQUE(project_id, legacy_decision_id, retirement_version)
                 );
 
                 CREATE TABLE IF NOT EXISTS project_retrieval_requests (
@@ -1100,6 +1126,433 @@ class ProjectSyncRepository:
                 connection,
                 project_id,
             )
+
+    def preview_decision_split_migration(
+        self,
+        project_id: str,
+    ) -> DecisionSplitMigrationPreview:
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            return self._decision_split_candidate(connection, project_id).preview
+
+    def apply_decision_split_migration(
+        self,
+        *,
+        project_id: str,
+        precondition_token: str,
+        reviewer_id: str,
+        reason: str,
+        migrated_at: datetime,
+    ) -> DecisionSplitMigrationAudit:
+        self._validate_decision_split_apply(
+            project_id=project_id,
+            precondition_token=precondition_token,
+            reviewer_id=reviewer_id,
+            reason=reason,
+            migrated_at=migrated_at,
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            replayed = self._decision_split_audit_for_token(
+                connection,
+                project_id,
+                precondition_token,
+            )
+            if replayed is not None:
+                return replayed
+            candidate = self._decision_split_candidate(connection, project_id)
+            preview = candidate.preview
+            if not hmac.compare_digest(
+                precondition_token,
+                preview.precondition_token,
+            ):
+                raise SyncConflict("decision_split_precondition_stale")
+            migration_id = (
+                "mig_"
+                + hashlib.sha256(
+                    f"decision-split\0{precondition_token}".encode("utf-8")
+                ).hexdigest()[:32]
+            )
+            audit = DecisionSplitMigrationAudit(
+                migration_id=migration_id,
+                project_id=project_id,
+                legacy_decision_id=preview.legacy.decision_id,
+                base_version=preview.legacy.version,
+                retirement_version=preview.retirement_version,
+                active_generation_id=preview.active_generation_id,
+                reviewer_id=reviewer_id,
+                migrated_at=migrated_at,
+                reason=reason,
+                replacement_decision_ids=tuple(
+                    item.decision_id for item in preview.replacements
+                ),
+                before_context_hash=preview.before_context_hash,
+                after_context_hash=preview.after_context_hash,
+            )
+            retirement = DecisionVersion(
+                decision_id=preview.legacy.decision_id,
+                version=preview.retirement_version,
+                replaces_version=preview.legacy.version,
+                change_reason=reason,
+                decision_text=candidate.legacy_version.decision_text,
+                proposed_by=reviewer_id,
+                status=DecisionStatus.SUPERSEDED,
+                migration_audit_id=migration_id,
+            )
+            connection.execute(
+                """
+                INSERT INTO project_versions(
+                    project_id, decision_id, version, payload_json
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    retirement.decision_id,
+                    retirement.version,
+                    retirement.model_dump_json(),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO project_decision_migration_audits(
+                    migration_id, project_id, legacy_decision_id,
+                    base_version, retirement_version, active_generation_id,
+                    reviewer_id, migrated_at, reason,
+                    replacement_decision_ids_json,
+                    before_context_hash, after_context_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    audit.migration_id,
+                    audit.project_id,
+                    audit.legacy_decision_id,
+                    audit.base_version,
+                    audit.retirement_version,
+                    audit.active_generation_id,
+                    audit.reviewer_id,
+                    _datetime_text(audit.migrated_at),
+                    audit.reason,
+                    _canonical_json(list(audit.replacement_decision_ids)),
+                    audit.before_context_hash,
+                    audit.after_context_hash,
+                ),
+            )
+            context_json = _canonical_json(
+                candidate.after_context.model_dump(mode="json")
+            )
+            updated_context = connection.execute(
+                """
+                UPDATE project_contexts SET payload_json = ?
+                WHERE project_id = ?
+                """,
+                (context_json, project_id),
+            )
+            if updated_context.rowcount != 1:
+                raise SyncConflict("decision_split_precondition_stale")
+            updated_generation = connection.execute(
+                """
+                UPDATE project_sync_generations SET context_json = ?
+                WHERE project_id = ? AND generation_id = ?
+                  AND EXISTS (
+                    SELECT 1 FROM project_active_generations AS active
+                    WHERE active.project_id = project_sync_generations.project_id
+                      AND active.generation_id = project_sync_generations.generation_id
+                  )
+                """,
+                (context_json, project_id, preview.active_generation_id),
+            )
+            if updated_generation.rowcount != 1:
+                raise SyncConflict("decision_split_precondition_stale")
+            return audit
+
+    def get_decision_split_migration_audit(
+        self,
+        migration_id: str,
+    ) -> DecisionSplitMigrationAudit | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM project_decision_migration_audits
+                WHERE migration_id = ?
+                """,
+                (migration_id,),
+            ).fetchone()
+        return _decision_split_audit_from_row(row) if row is not None else None
+
+    @staticmethod
+    def _validate_decision_split_apply(
+        *,
+        project_id: str,
+        precondition_token: str,
+        reviewer_id: str,
+        reason: str,
+        migrated_at: datetime,
+    ) -> None:
+        if not isinstance(project_id, str) or not project_id.strip():
+            raise ValueError("decision_split_project_id_invalid")
+        if (
+            not isinstance(precondition_token, str)
+            or len(precondition_token) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in precondition_token
+            )
+        ):
+            raise SyncConflict("decision_split_precondition_stale")
+        if (
+            not isinstance(reviewer_id, str)
+            or not reviewer_id.strip()
+            or len(reviewer_id) > 256
+        ):
+            raise ValueError("decision_split_reviewer_invalid")
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
+            raise ValueError("decision_split_reason_invalid")
+        if migrated_at.tzinfo is None or migrated_at.utcoffset() is None:
+            raise ValueError("decision_split_migrated_at_invalid")
+
+    def _decision_split_candidate(
+        self,
+        connection: sqlite3.Connection,
+        project_id: str,
+    ) -> _DecisionSplitMigrationCandidate:
+        active = self._load_active_row(connection, project_id)
+        stored_context = self._load_context(connection, project_id)
+        if active is None or stored_context is None:
+            raise SyncConflict("decision_split_candidate_unavailable")
+        try:
+            generation_context = ProjectContextPackage.model_validate_json(
+                active["context_json"]
+            )
+        except ValueError:
+            raise SyncConflict("decision_split_context_diverged") from None
+        stored_context_json = _canonical_json(
+            stored_context.model_dump(mode="json")
+        )
+        generation_context_json = _canonical_json(
+            generation_context.model_dump(mode="json")
+        )
+        if stored_context_json != generation_context_json:
+            raise SyncConflict("decision_split_context_diverged")
+        decisions = stored_context.active_decisions
+        if len(decisions) != 3 or any(
+            item.status is not DecisionStatus.ACTIVE for item in decisions
+        ):
+            raise SyncConflict("decision_split_candidate_unavailable")
+        legacy_cards = tuple(
+            item for item in decisions if item.approval_ref is not None
+        )
+        replacements = tuple(
+            item
+            for item in decisions
+            if item.approval_ref is None and bool(item.source_refs)
+        )
+        if len(legacy_cards) != 1 or len(replacements) != 2:
+            raise SyncConflict("decision_split_candidate_unavailable")
+        legacy = legacy_cards[0]
+        if legacy.source_refs:
+            raise SyncConflict("decision_split_candidate_unavailable")
+        if (
+            len({item.decision_id for item in replacements}) != 2
+            or len(
+                {
+                    self._normalize_decision_value(item.topic)
+                    for item in replacements
+                }
+            )
+            != 2
+            or legacy.decision_id in {item.decision_id for item in replacements}
+        ):
+            raise SyncConflict("decision_split_candidate_unavailable")
+        version_histories = self._decision_version_histories(
+            connection,
+            project_id,
+            tuple(item.decision_id for item in decisions),
+        )
+        legacy_history = version_histories.get(legacy.decision_id, ())
+        if len(legacy_history) != 2:
+            raise SyncConflict("decision_split_candidate_unavailable")
+        legacy_initial, legacy_version = legacy_history
+        if (
+            legacy_initial.version != 1
+            or legacy_initial.replaces_version is not None
+            or legacy_initial.status is not DecisionStatus.SUPERSEDED
+            or not legacy_initial.evidence_refs
+            or legacy_initial.approval_ref is not None
+            or legacy_initial.migration_audit_id is not None
+            or legacy_initial.decision_text is None
+            or legacy_version.version != 2
+            or legacy_version.replaces_version != 1
+            or legacy_version.status is not DecisionStatus.ACTIVE
+            or legacy_version.approval_ref is None
+            or legacy_version.evidence_refs
+            or legacy_version.migration_audit_id is not None
+            or legacy_version.decision_text != legacy.decision_text
+            or legacy_version.approval_ref != legacy.approval_ref
+        ):
+            raise SyncConflict("decision_split_candidate_unavailable")
+        for replacement in replacements:
+            history = version_histories.get(replacement.decision_id, ())
+            if len(history) != 1:
+                raise SyncConflict("decision_split_candidate_unavailable")
+            version = history[0]
+            if (
+                version.version != 1
+                or version.replaces_version is not None
+                or version.status is not DecisionStatus.ACTIVE
+                or not version.evidence_refs
+                or version.approval_ref is not None
+                or version.migration_audit_id is not None
+                or version.decision_text != replacement.decision_text
+                or version.evidence_refs != replacement.source_refs
+            ):
+                raise SyncConflict("decision_split_candidate_unavailable")
+        if self._has_proposed_legacy_conflict(
+            connection,
+            project_id,
+            legacy.decision_id,
+        ):
+            raise SyncConflict("decision_split_candidate_unavailable")
+        after_context = ProjectContextPackage.model_validate(
+            {
+                **stored_context.model_dump(),
+                "active_decisions": replacements,
+            }
+        )
+        before_context_hash = hashlib.sha256(
+            stored_context_json.encode("utf-8")
+        ).hexdigest()
+        after_context_hash = hashlib.sha256(
+            _canonical_json(after_context.model_dump(mode="json")).encode("utf-8")
+        ).hexdigest()
+        generation_id = str(active["generation_id"])
+        replacement_previews = tuple(
+            DecisionSplitMigrationDecisionPreview(
+                decision_id=item.decision_id,
+                topic=item.topic,
+                version=1,
+            )
+            for item in replacements
+        )
+        retirement_version = legacy_version.version + 1
+        token = _decision_split_precondition_token(
+            project_id=project_id,
+            active_generation_id=generation_id,
+            legacy_decision_id=legacy.decision_id,
+            base_version=legacy_version.version,
+            retirement_version=retirement_version,
+            replacement_decision_ids=tuple(
+                item.decision_id for item in replacement_previews
+            ),
+            before_context_hash=before_context_hash,
+            after_context_hash=after_context_hash,
+        )
+        return _DecisionSplitMigrationCandidate(
+            preview=DecisionSplitMigrationPreview(
+                project_id=project_id,
+                active_generation_id=generation_id,
+                legacy=DecisionSplitMigrationDecisionPreview(
+                    decision_id=legacy.decision_id,
+                    topic=legacy.topic,
+                    version=legacy_version.version,
+                ),
+                retirement_version=retirement_version,
+                replacements=replacement_previews,
+                before_context_hash=before_context_hash,
+                after_context_hash=after_context_hash,
+                precondition_token=token,
+            ),
+            legacy_version=legacy_version,
+            after_context=after_context,
+        )
+
+    @staticmethod
+    def _decision_version_histories(
+        connection: sqlite3.Connection,
+        project_id: str,
+        decision_ids: tuple[str, ...],
+    ) -> dict[str, tuple[DecisionVersion, ...]]:
+        placeholders = ", ".join("?" for _ in decision_ids)
+        rows = connection.execute(
+            f"""
+            SELECT project_id, decision_id, version, payload_json
+            FROM project_versions
+            WHERE project_id = ? AND decision_id IN ({placeholders})
+            ORDER BY decision_id, version
+            """,
+            (project_id, *decision_ids),
+        ).fetchall()
+        requested_ids = frozenset(decision_ids)
+        histories: dict[str, list[DecisionVersion]] = {}
+        try:
+            for row in rows:
+                row_project_id = str(row["project_id"])
+                row_decision_id = str(row["decision_id"])
+                row_version = int(row["version"])
+                payload = DecisionVersion.model_validate_json(
+                    row["payload_json"]
+                )
+                if (
+                    row_project_id != project_id
+                    or row_decision_id not in requested_ids
+                    or payload.decision_id != row_decision_id
+                    or payload.version != row_version
+                ):
+                    raise ValueError("decision version row mismatch")
+                histories.setdefault(row_decision_id, []).append(payload)
+        except (TypeError, ValueError):
+            raise SyncConflict("decision_split_candidate_unavailable") from None
+        return {
+            decision_id: tuple(history)
+            for decision_id, history in histories.items()
+        }
+
+    @staticmethod
+    def _has_proposed_legacy_conflict(
+        connection: sqlite3.Connection,
+        project_id: str,
+        legacy_decision_id: str,
+    ) -> bool:
+        rows = connection.execute(
+            "SELECT payload_json FROM project_conflicts"
+        ).fetchall()
+        try:
+            return any(
+                payload.get("project_id") == project_id
+                and payload.get("decision_id") == legacy_decision_id
+                and payload.get("status", "proposed") == "proposed"
+                for payload in (json.loads(row["payload_json"]) for row in rows)
+            )
+        except (TypeError, ValueError):
+            raise SyncConflict("decision_split_candidate_unavailable") from None
+
+    @staticmethod
+    def _decision_split_audit_for_token(
+        connection: sqlite3.Connection,
+        project_id: str,
+        precondition_token: str,
+    ) -> DecisionSplitMigrationAudit | None:
+        rows = connection.execute(
+            """
+            SELECT * FROM project_decision_migration_audits
+            WHERE project_id = ? ORDER BY migrated_at, migration_id
+            """,
+            (project_id,),
+        ).fetchall()
+        for row in rows:
+            audit = _decision_split_audit_from_row(row)
+            token = _decision_split_precondition_token(
+                project_id=audit.project_id,
+                active_generation_id=audit.active_generation_id,
+                legacy_decision_id=audit.legacy_decision_id,
+                base_version=audit.base_version,
+                retirement_version=audit.retirement_version,
+                replacement_decision_ids=audit.replacement_decision_ids,
+                before_context_hash=audit.before_context_hash,
+                after_context_hash=audit.after_context_hash,
+            )
+            if hmac.compare_digest(precondition_token, token):
+                return audit
+        return None
 
     def _load_active_generation_from_connection(
         self,
@@ -2673,6 +3126,53 @@ class ProjectSyncRepository:
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _decision_split_precondition_token(
+    *,
+    project_id: str,
+    active_generation_id: str,
+    legacy_decision_id: str,
+    base_version: int,
+    retirement_version: int,
+    replacement_decision_ids: tuple[str, ...],
+    before_context_hash: str,
+    after_context_hash: str,
+) -> str:
+    material = {
+        "active_generation_id": active_generation_id,
+        "after_context_hash": after_context_hash,
+        "base_version": base_version,
+        "before_context_hash": before_context_hash,
+        "legacy_decision_id": legacy_decision_id,
+        "project_id": project_id,
+        "replacement_decisions": [
+            {"decision_id": decision_id, "version": 1}
+            for decision_id in replacement_decision_ids
+        ],
+        "retirement_version": retirement_version,
+    }
+    return hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
+
+
+def _decision_split_audit_from_row(
+    row: sqlite3.Row,
+) -> DecisionSplitMigrationAudit:
+    replacement_ids = json.loads(str(row["replacement_decision_ids_json"]))
+    return DecisionSplitMigrationAudit(
+        migration_id=str(row["migration_id"]),
+        project_id=str(row["project_id"]),
+        legacy_decision_id=str(row["legacy_decision_id"]),
+        base_version=int(row["base_version"]),
+        retirement_version=int(row["retirement_version"]),
+        active_generation_id=str(row["active_generation_id"]),
+        reviewer_id=str(row["reviewer_id"]),
+        migrated_at=_parse_datetime(str(row["migrated_at"])),
+        reason=str(row["reason"]),
+        replacement_decision_ids=tuple(str(item) for item in replacement_ids),
+        before_context_hash=str(row["before_context_hash"]),
+        after_context_hash=str(row["after_context_hash"]),
+    )
 
 
 def _completion_claims_hash(envelope: SyncEnvelope) -> str:

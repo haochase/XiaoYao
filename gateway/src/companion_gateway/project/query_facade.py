@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -70,7 +71,7 @@ class RepositoryBackedProjectQueryFacade:
         )
         self._registry = ProjectSnapshotRegistry()
         self._hydrator = ProjectSnapshotHydrator(protector)
-        self._cache_keys: dict[str, tuple[str, int]] = {}
+        self._cache_keys: dict[str, tuple[str, int, str]] = {}
         self._protection_configured = False
         self._lock = RLock()
 
@@ -91,7 +92,19 @@ class RepositoryBackedProjectQueryFacade:
                     self._cache_keys.pop(project_id, None)
                     self._registry.remove(project_id)
                     return None
-                key = (active.generation_id, active.source_cursor)
+                context_hash = hashlib.sha256(
+                    json.dumps(
+                        active.context.model_dump(mode="json"),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+                key = (
+                    active.generation_id,
+                    active.source_cursor,
+                    context_hash,
+                )
                 cached = self._registry.get(project_id)
                 if cached is not None and self._cache_keys.get(project_id) == key:
                     return cached

@@ -163,6 +163,7 @@ class DecisionVersion(BaseModel):
     status: DecisionStatus = DecisionStatus.PROPOSED
     evidence_refs: tuple[EvidenceRef, ...] = ()
     approval_ref: HumanApprovalRef | None = None
+    migration_audit_id: str | None = Field(default=None, max_length=128)
 
     _decision_id = field_validator("decision_id")(
         lambda value: _require_non_blank(value, "decision_id")
@@ -188,11 +189,28 @@ class DecisionVersion(BaseModel):
         if value is not None
         else value
     )
+    _migration_audit_id = field_validator("migration_audit_id")(
+        lambda value: _require_non_blank(value, "migration_audit_id")
+        if value is not None
+        else value
+    )
 
     @model_validator(mode="after")
     def validate_active_approval(self) -> "DecisionVersion":
-        if not self.evidence_refs and self.approval_ref is None:
-            raise ValueError("decision version requires evidence_refs or approval_ref")
+        evidence_basis_count = sum(
+            (
+                bool(self.evidence_refs),
+                self.approval_ref is not None,
+                self.migration_audit_id is not None,
+            )
+        )
+        if evidence_basis_count != 1:
+            raise ValueError("decision version requires exactly one evidence basis")
+        if self.migration_audit_id is not None:
+            if self.status is not DecisionStatus.SUPERSEDED:
+                raise ValueError("migration audit requires superseded status")
+            if self.approved_by is not None or self.approved_at is not None:
+                raise ValueError("migration audit version cannot have approval")
         if self.approval_ref is not None and (
             self.approval_ref.reviewer_id != self.approved_by
             or self.approval_ref.approved_at != self.approved_at
@@ -207,6 +225,81 @@ class DecisionVersion(BaseModel):
             if self.approved_by is not None or self.approved_at is not None:
                 raise ValueError("proposed decision version cannot have approval")
         return self
+
+
+class DecisionSplitMigrationDecisionPreview(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    decision_id: str = Field(min_length=1, max_length=128)
+    topic: str = Field(min_length=1, max_length=512)
+    version: int = Field(ge=1)
+
+    _migration_decision_id = field_validator("decision_id")(
+        lambda value: _require_non_blank(value, "decision_id")
+    )
+    _migration_topic = field_validator("topic")(
+        lambda value: _require_non_blank(value, "topic")
+    )
+
+
+class DecisionSplitMigrationPreview(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    project_id: str = Field(min_length=1, max_length=128)
+    active_generation_id: str = Field(min_length=1, max_length=128)
+    legacy: DecisionSplitMigrationDecisionPreview
+    retirement_version: int = Field(ge=2)
+    replacements: tuple[DecisionSplitMigrationDecisionPreview, ...] = Field(
+        min_length=2,
+        max_length=2,
+    )
+    before_context_hash: str = Field(min_length=64, max_length=64)
+    after_context_hash: str = Field(min_length=64, max_length=64)
+    precondition_token: str = Field(min_length=64, max_length=64)
+
+
+class DecisionSplitMigrationAudit(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    migration_id: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(min_length=1, max_length=128)
+    legacy_decision_id: str = Field(min_length=1, max_length=128)
+    base_version: int = Field(ge=1)
+    retirement_version: int = Field(ge=2)
+    active_generation_id: str = Field(min_length=1, max_length=128)
+    reviewer_id: str = Field(min_length=1, max_length=256)
+    migrated_at: datetime
+    reason: str = Field(min_length=1, max_length=2000)
+    replacement_decision_ids: tuple[str, ...] = Field(min_length=2, max_length=2)
+    before_context_hash: str = Field(min_length=64, max_length=64)
+    after_context_hash: str = Field(min_length=64, max_length=64)
+
+    @field_validator(
+        "migration_id",
+        "project_id",
+        "legacy_decision_id",
+        "active_generation_id",
+        "reviewer_id",
+        "reason",
+        "before_context_hash",
+        "after_context_hash",
+    )
+    @classmethod
+    def validate_migration_text(cls, value: str) -> str:
+        return _require_non_blank(value, "migration field")
+
+    @field_validator("replacement_decision_ids")
+    @classmethod
+    def validate_replacement_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        for value in values:
+            _require_non_blank(value, "replacement_decision_id")
+        if len(set(values)) != len(values):
+            raise ValueError("replacement decision ids must differ")
+        return values
+
+    _migrated_at = field_validator("migrated_at")(
+        lambda value: _require_aware(value, "migrated_at")
+    )
 
 
 class ProjectContextPackage(BaseModel):

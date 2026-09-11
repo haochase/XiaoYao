@@ -11,6 +11,8 @@ import pytest
 
 from companion_gateway.project.models import (
     DecisionCard,
+    DecisionStatus,
+    DecisionVersion,
     EvidenceRef,
     HumanApprovalRef,
     ProjectContextPackage,
@@ -341,6 +343,89 @@ def repository_at(tmp_path: Path) -> ProjectSyncRepository:
     return ProjectSyncRepository(tmp_path / "project-memory.db")
 
 
+def decision_split_state(
+    tmp_path: Path,
+) -> tuple[ProjectSyncRepository, ProjectMemoryService, ProjectContextPackage]:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    initial = context()
+    repository.commit(sync_commit(cursor=1, package=initial))
+    memory = ProjectMemoryService(
+        repository=ProjectMemoryRepository(tmp_path / "project-memory.db"),
+        clock=lambda: NOW,
+    )
+    candidate, _ = memory.propose_conflict_from_statement(
+        "project-1",
+        "发布方案改成方案 A",
+        proposed_decision_text="采用方案 A",
+        now=NOW,
+    )
+    memory.review_conflict(
+        candidate.candidate_id,
+        reviewer_id="owner-1",
+        action="accept",
+        change_reason="负责人批准组合决策",
+        now=NOW,
+    )
+    source = active_snapshot()
+    first = source_backed_decision("decision-split-1", source)
+    second = source_backed_decision("decision-split-2", source)
+    three_card_context = initial.model_copy(
+        update={
+            "generated_at": NOW + timedelta(minutes=1),
+            "active_decisions": (
+                initial.active_decisions[0],
+                first,
+                second,
+            ),
+        }
+    )
+    repository.commit(
+        sync_commit(
+            cursor=2,
+            content_hash=HASH_B,
+            package=three_card_context,
+        )
+    )
+    active = repository.load_active_generation("project-1")
+    assert active is not None
+    return repository, memory, active.context
+
+
+def replace_split_context(
+    tmp_path: Path,
+    package: ProjectContextPackage,
+    *,
+    update_project_context: bool = True,
+    update_generation_context: bool = True,
+) -> None:
+    payload = json.dumps(
+        package.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    with sqlite3.connect(tmp_path / "project-memory.db") as connection:
+        if update_project_context:
+            connection.execute(
+                "UPDATE project_contexts SET payload_json = ? WHERE project_id = ?",
+                (payload, "project-1"),
+            )
+        if update_generation_context:
+            connection.execute(
+                """
+                UPDATE project_sync_generations SET context_json = ?
+                WHERE project_id = ? AND generation_id = ?
+                """,
+                (payload, "project-1", "generation-2"),
+            )
+
+
+def database_dump(database_path: Path) -> tuple[str, ...]:
+    with sqlite3.connect(database_path) as connection:
+        return tuple(connection.iterdump())
+
+
 def failed_only_sync_commit(
     *,
     cursor: int,
@@ -512,7 +597,7 @@ def test_initialize_serializes_schema_migrations_and_records_version(
     with sqlite3.connect(database_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM project_sync_schema WHERE singleton_id = 1"
-        ).fetchone() == (2,)
+        ).fetchone() == (3,)
 
 
 def test_protected_rows_persist_and_validate_protector_version(tmp_path: Path) -> None:
@@ -3102,6 +3187,604 @@ def test_audit_mismatch_rolls_back_commit(
     with sqlite3.connect(tmp_path / "project-memory.db") as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM project_sync_audits"
+        ).fetchone() == (0,)
+
+
+def test_decision_version_requires_exactly_one_migration_basis() -> None:
+    migrated = DecisionVersion(
+        decision_id="decision-1",
+        version=3,
+        replaces_version=2,
+        change_reason="拆分组合决策",
+        decision_text="采用方案 A",
+        proposed_by="reviewer-1",
+        status=DecisionStatus.SUPERSEDED,
+        migration_audit_id="mig-1",
+    )
+
+    assert migrated.approved_by is None
+    assert migrated.approved_at is None
+    assert migrated.evidence_refs == ()
+    assert migrated.approval_ref is None
+    with pytest.raises(ValueError, match="migration audit"):
+        DecisionVersion.model_validate(
+            {**migrated.model_dump(), "status": DecisionStatus.ACTIVE}
+        )
+    with pytest.raises(ValueError, match="exactly one"):
+        DecisionVersion.model_validate(
+            {**migrated.model_dump(), "evidence_refs": (evidence_ref(),)}
+        )
+
+
+def test_decision_split_preview_is_redacted_and_token_is_stable(
+    tmp_path: Path,
+) -> None:
+    repository, _, active_context = decision_split_state(tmp_path)
+
+    first = repository.preview_decision_split_migration("project-1")
+    second = repository.preview_decision_split_migration("project-1")
+
+    assert first == second
+    assert first.project_id == "project-1"
+    assert first.active_generation_id == "generation-2"
+    assert first.legacy.decision_id == "decision-1"
+    assert first.legacy.version == 2
+    assert first.retirement_version == 3
+    assert tuple(item.decision_id for item in first.replacements) == (
+        "decision-split-1",
+        "decision-split-2",
+    )
+    assert all(item.version == 1 for item in first.replacements)
+    assert len(first.precondition_token) == 64
+    assert first.before_context_hash != first.after_context_hash
+    serialized = first.model_dump_json()
+    assert active_context.active_decisions[0].topic in serialized
+    assert "decision_text" not in serialized
+    assert "source_id" not in serialized
+    assert "reviewer" not in serialized
+
+
+def test_decision_split_apply_preserves_history_and_audits_context_change(
+    tmp_path: Path,
+) -> None:
+    repository, _, _ = decision_split_state(tmp_path)
+    memory = ProjectMemoryRepository(tmp_path / "project-memory.db")
+    before_versions = memory.list_versions("project-1", "decision-1")
+    preview = repository.preview_decision_split_migration("project-1")
+
+    audit = repository.apply_decision_split_migration(
+        project_id="project-1",
+        precondition_token=preview.precondition_token,
+        reviewer_id="reviewer-1",
+        reason="将组合决策拆分为两个独立来源决策",
+        migrated_at=NOW + timedelta(minutes=2),
+    )
+
+    active = repository.load_active_generation("project-1")
+    stored_context = memory.get_context("project-1")
+    versions = memory.list_versions("project-1", "decision-1")
+    assert active is not None
+    assert stored_context == active.context
+    assert tuple(item.decision_id for item in active.context.active_decisions) == (
+        "decision-split-1",
+        "decision-split-2",
+    )
+    assert versions[:2] == before_versions
+    assert [item.version for item in versions] == [1, 2, 3]
+    assert versions[-1].status is DecisionStatus.SUPERSEDED
+    assert versions[-1].replaces_version == 2
+    assert versions[-1].decision_text == before_versions[-1].decision_text
+    assert versions[-1].migration_audit_id == audit.migration_id
+    assert versions[-1].evidence_refs == ()
+    assert versions[-1].approval_ref is None
+    assert versions[-1].approved_by is None
+    assert versions[-1].approved_at is None
+    assert audit.project_id == "project-1"
+    assert audit.legacy_decision_id == "decision-1"
+    assert audit.base_version == 2
+    assert audit.retirement_version == 3
+    assert audit.active_generation_id == "generation-2"
+    assert audit.reviewer_id == "reviewer-1"
+    assert audit.reason == "将组合决策拆分为两个独立来源决策"
+    assert audit.migrated_at == NOW + timedelta(minutes=2)
+    assert audit.replacement_decision_ids == (
+        "decision-split-1",
+        "decision-split-2",
+    )
+    assert audit.before_context_hash == preview.before_context_hash
+    assert audit.after_context_hash == preview.after_context_hash
+    assert repository.get_decision_split_migration_audit(audit.migration_id) == audit
+
+
+def test_decision_split_apply_replay_is_idempotent(tmp_path: Path) -> None:
+    repository, _, _ = decision_split_state(tmp_path)
+    preview = repository.preview_decision_split_migration("project-1")
+    arguments = {
+        "project_id": "project-1",
+        "precondition_token": preview.precondition_token,
+        "reviewer_id": "reviewer-1",
+        "reason": "拆分组合决策",
+        "migrated_at": NOW + timedelta(minutes=2),
+    }
+
+    first = repository.apply_decision_split_migration(**arguments)
+    replayed = repository.apply_decision_split_migration(**arguments)
+
+    assert replayed == first
+    with sqlite3.connect(tmp_path / "project-memory.db") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_decision_migration_audits"
+        ).fetchone() == (1,)
+        assert connection.execute(
+            """
+            SELECT COUNT(*) FROM project_versions
+            WHERE project_id = 'project-1'
+              AND decision_id = 'decision-1'
+              AND version = 3
+            """
+        ).fetchone() == (1,)
+
+
+@pytest.mark.parametrize(
+    "invalid_state",
+    [
+        "card_count",
+        "legacy_version",
+        "legacy_linkage",
+        "replacement_version",
+        "replacement_linkage",
+        "replacement_status",
+        "replacement_source",
+        "duplicate_topic",
+    ],
+)
+def test_decision_split_preview_rejects_invalid_candidate_states(
+    tmp_path: Path,
+    invalid_state: str,
+) -> None:
+    repository, _, active_context = decision_split_state(tmp_path)
+    memory = ProjectMemoryRepository(tmp_path / "project-memory.db")
+    if invalid_state == "card_count":
+        replace_split_context(
+            tmp_path,
+            active_context.model_copy(
+                update={"active_decisions": active_context.active_decisions[:2]}
+            ),
+        )
+    elif invalid_state == "legacy_version":
+        with sqlite3.connect(tmp_path / "project-memory.db") as connection:
+            connection.execute(
+                """
+                DELETE FROM project_versions
+                WHERE project_id = ? AND decision_id = ? AND version = 2
+                """,
+                ("project-1", "decision-1"),
+            )
+    elif invalid_state == "legacy_linkage":
+        legacy = memory.list_versions("project-1", "decision-1")[-1]
+        memory.save_version(
+            "project-1",
+            legacy.model_copy(update={"replaces_version": None}),
+        )
+    elif invalid_state == "replacement_version":
+        replacement = memory.list_versions("project-1", "decision-split-1")[-1]
+        extra = replacement.model_copy(
+            update={
+                "version": 2,
+                "replaces_version": 1,
+                "status": DecisionStatus.SUPERSEDED,
+            }
+        )
+        memory.save_version("project-1", extra)
+    elif invalid_state == "replacement_linkage":
+        replacement = memory.list_versions("project-1", "decision-split-1")[-1]
+        memory.save_version(
+            "project-1",
+            replacement.model_copy(update={"replaces_version": 1}),
+        )
+    elif invalid_state == "replacement_status":
+        changed = active_context.active_decisions[1].model_copy(
+            update={"status": DecisionStatus.PROPOSED}
+        )
+        replace_split_context(
+            tmp_path,
+            active_context.model_copy(
+                update={
+                    "active_decisions": (
+                        active_context.active_decisions[0],
+                        changed,
+                        active_context.active_decisions[2],
+                    )
+                }
+            ),
+        )
+    elif invalid_state == "replacement_source":
+        replacement = memory.list_versions("project-1", "decision-split-1")[-1]
+        approval = HumanApprovalRef(
+            candidate_id="approved-replacement",
+            reviewer_id="owner-1",
+            approved_at=NOW,
+            reason=replacement.change_reason,
+            decision_text=replacement.decision_text,
+            permission_scope="project:demo",
+        )
+        approved = replacement.model_copy(
+            update={
+                "evidence_refs": (),
+                "approval_ref": approval,
+                "approved_by": approval.reviewer_id,
+                "approved_at": approval.approved_at,
+            }
+        )
+        memory.save_version("project-1", approved)
+    else:
+        duplicate_topic = active_context.active_decisions[1].topic.upper()
+        changed = active_context.active_decisions[2].model_copy(
+            update={"topic": f" {duplicate_topic} "}
+        )
+        replace_split_context(
+            tmp_path,
+            active_context.model_copy(
+                update={
+                    "active_decisions": (
+                        active_context.active_decisions[0],
+                        active_context.active_decisions[1],
+                        changed,
+                    )
+                }
+            ),
+        )
+
+    with pytest.raises(SyncConflict, match="decision_split_candidate_unavailable"):
+        repository.preview_decision_split_migration("project-1")
+
+
+def test_decision_split_preview_rejects_context_divergence(tmp_path: Path) -> None:
+    repository, _, active_context = decision_split_state(tmp_path)
+    replace_split_context(
+        tmp_path,
+        active_context.model_copy(update={"project_name": "不同的项目上下文"}),
+        update_project_context=False,
+    )
+
+    with pytest.raises(SyncConflict, match="decision_split_context_diverged"):
+        repository.preview_decision_split_migration("project-1")
+
+
+def test_decision_split_preview_rejects_legacy_proposed_conflict(
+    tmp_path: Path,
+) -> None:
+    repository, memory, _ = decision_split_state(tmp_path)
+    memory.propose_conflict_from_statement(
+        "project-1",
+        "发布方案再改成方案 C",
+        proposed_decision_text="采用方案 C",
+        now=NOW + timedelta(minutes=2),
+    )
+
+    with pytest.raises(SyncConflict, match="decision_split_candidate_unavailable"):
+        repository.preview_decision_split_migration("project-1")
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing_legacy_v1", "sql_payload_version_mismatch", "extra_replacement_version"],
+)
+def test_decision_split_rejects_corrupt_version_history_for_preview_and_apply(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    repository, _, _ = decision_split_state(tmp_path)
+    preview = repository.preview_decision_split_migration("project-1")
+    database_path = tmp_path / "project-memory.db"
+    with sqlite3.connect(database_path) as connection:
+        if corruption == "missing_legacy_v1":
+            connection.execute(
+                """
+                DELETE FROM project_versions
+                WHERE project_id = ? AND decision_id = ? AND version = 1
+                """,
+                ("project-1", "decision-1"),
+            )
+        elif corruption == "sql_payload_version_mismatch":
+            connection.execute(
+                """
+                UPDATE project_versions SET version = 7
+                WHERE project_id = ? AND decision_id = ? AND version = 2
+                """,
+                ("project-1", "decision-1"),
+            )
+        else:
+            payload = connection.execute(
+                """
+                SELECT payload_json FROM project_versions
+                WHERE project_id = ? AND decision_id = ? AND version = 1
+                """,
+                ("project-1", "decision-split-1"),
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO project_versions(
+                    project_id, decision_id, version, payload_json
+                ) VALUES (?, ?, ?, ?)
+                """,
+                ("project-1", "decision-split-1", 2, payload),
+            )
+    corrupted = database_dump(database_path)
+
+    with pytest.raises(SyncConflict, match="decision_split_candidate_unavailable"):
+        repository.preview_decision_split_migration("project-1")
+    with pytest.raises(SyncConflict, match="decision_split_candidate_unavailable"):
+        repository.apply_decision_split_migration(
+            project_id="project-1",
+            precondition_token=preview.precondition_token,
+            reviewer_id="reviewer-1",
+            reason="拆分组合决策",
+            migrated_at=NOW + timedelta(minutes=2),
+        )
+
+    assert database_dump(database_path) == corrupted
+
+
+@pytest.mark.parametrize(
+    ("trigger_table", "trigger_event"),
+    [
+        ("project_versions", "INSERT"),
+        ("project_decision_migration_audits", "INSERT"),
+        ("project_contexts", "UPDATE"),
+        ("project_sync_generations", "UPDATE"),
+    ],
+)
+def test_decision_split_failure_rolls_back_every_step(
+    tmp_path: Path,
+    trigger_table: str,
+    trigger_event: str,
+) -> None:
+    repository, _, _ = decision_split_state(tmp_path)
+    preview = repository.preview_decision_split_migration("project-1")
+    database_path = tmp_path / "project-memory.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            f"""
+            CREATE TRIGGER fail_decision_split_step
+            BEFORE {trigger_event} ON {trigger_table}
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated_decision_split_failure');
+            END
+            """
+        )
+    before = database_dump(database_path)
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="simulated_decision_split_failure",
+    ):
+        repository.apply_decision_split_migration(
+            project_id="project-1",
+            precondition_token=preview.precondition_token,
+            reviewer_id="reviewer-1",
+            reason="拆分组合决策",
+            migrated_at=NOW + timedelta(minutes=2),
+        )
+
+    assert database_dump(database_path) == before
+
+
+def test_decision_split_apply_rejects_stale_token_without_writes(
+    tmp_path: Path,
+) -> None:
+    repository, _, _ = decision_split_state(tmp_path)
+    database_path = tmp_path / "project-memory.db"
+    before = database_dump(database_path)
+
+    with pytest.raises(SyncConflict, match="decision_split_precondition_stale"):
+        repository.apply_decision_split_migration(
+            project_id="project-1",
+            precondition_token="0" * 64,
+            reviewer_id="reviewer-1",
+            reason="拆分组合决策",
+            migrated_at=NOW + timedelta(minutes=2),
+        )
+
+    assert database_dump(database_path) == before
+
+
+def test_first_two_card_sync_after_migration_is_applied_then_unchanged(
+    tmp_path: Path,
+) -> None:
+    repository, _, _ = decision_split_state(tmp_path)
+    preview = repository.preview_decision_split_migration("project-1")
+    repository.apply_decision_split_migration(
+        project_id="project-1",
+        precondition_token=preview.precondition_token,
+        reviewer_id="reviewer-1",
+        reason="拆分组合决策",
+        migrated_at=NOW + timedelta(minutes=2),
+    )
+    migrated = repository.load_active_generation("project-1")
+    assert migrated is not None
+    refreshed_context = migrated.context.model_copy(
+        update={"generated_at": NOW + timedelta(minutes=3)}
+    )
+
+    first = repository.commit(
+        sync_commit(
+            cursor=3,
+            content_hash=HASH_C,
+            package=refreshed_context,
+        )
+    )
+    second = repository.commit(
+        sync_commit(
+            cursor=4,
+            content_hash=HASH_C,
+            package=refreshed_context.model_copy(
+                update={"generated_at": NOW + timedelta(minutes=4)}
+            ),
+            outcome="unchanged",
+        )
+    )
+
+    assert first.outcome == "applied"
+    assert second.outcome == "unchanged"
+    active = repository.load_active_generation("project-1")
+    assert active is not None
+    assert active.source_cursor == 4
+    assert tuple(item.decision_id for item in active.context.active_decisions) == (
+        "decision-split-1",
+        "decision-split-2",
+    )
+
+
+def test_sync_and_decision_split_migration_serialize_without_lost_update(
+    tmp_path: Path,
+) -> None:
+    repository, _, active_context = decision_split_state(tmp_path)
+    preview = repository.preview_decision_split_migration("project-1")
+    source_backed_legacy = context().active_decisions[0]
+    incoming_context = active_context.model_copy(
+        update={
+            "generated_at": NOW + timedelta(minutes=3),
+            "active_decisions": (
+                source_backed_legacy,
+                *active_context.active_decisions[1:],
+            ),
+        }
+    )
+    incoming_sync = sync_commit(
+        cursor=3,
+        content_hash=HASH_C,
+        package=incoming_context,
+    )
+    barrier = threading.Barrier(2)
+    results: list[tuple[str, object]] = []
+
+    def migrate() -> None:
+        barrier.wait(timeout=5)
+        try:
+            results.append(
+                (
+                    "migration",
+                    repository.apply_decision_split_migration(
+                        project_id="project-1",
+                        precondition_token=preview.precondition_token,
+                        reviewer_id="reviewer-1",
+                        reason="拆分组合决策",
+                        migrated_at=NOW + timedelta(minutes=2),
+                    ),
+                )
+            )
+        except BaseException as exc:
+            results.append(("migration_error", exc))
+
+    def synchronize() -> None:
+        barrier.wait(timeout=5)
+        try:
+            results.append(("sync", repository.commit(incoming_sync)))
+        except BaseException as exc:
+            results.append(("sync_error", exc))
+
+    workers = [threading.Thread(target=migrate), threading.Thread(target=synchronize)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert all(not worker.is_alive() for worker in workers)
+    successes = [name for name, _ in results if not name.endswith("_error")]
+    errors = [value for name, value in results if name.endswith("_error")]
+    assert len(successes) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], SyncConflict)
+    active = repository.load_active_generation("project-1")
+    assert active is not None
+    with sqlite3.connect(tmp_path / "project-memory.db") as connection:
+        audit_count = connection.execute(
+            "SELECT COUNT(*) FROM project_decision_migration_audits"
+        ).fetchone()[0]
+    if successes == ["migration"]:
+        assert len(active.context.active_decisions) == 2
+        assert active.generation_id == "generation-2"
+        assert audit_count == 1
+    else:
+        assert len(active.context.active_decisions) == 3
+        assert active.generation_id == "generation-3"
+        assert audit_count == 0
+
+
+def test_review_and_decision_split_migration_serialize_without_lost_update(
+    tmp_path: Path,
+) -> None:
+    repository, memory, _ = decision_split_state(tmp_path)
+    preview = repository.preview_decision_split_migration("project-1")
+    conflict, _ = memory.propose_conflict_from_statement(
+        "project-1",
+        "发布方案改成方案 C",
+        proposed_decision_text="采用方案 C",
+        now=NOW + timedelta(minutes=2),
+    )
+    barrier = threading.Barrier(2)
+    results: list[tuple[str, object]] = []
+
+    def migrate() -> None:
+        barrier.wait(timeout=5)
+        try:
+            results.append(
+                (
+                    "migration",
+                    repository.apply_decision_split_migration(
+                        project_id="project-1",
+                        precondition_token=preview.precondition_token,
+                        reviewer_id="migration-reviewer",
+                        reason="拆分组合决策",
+                        migrated_at=NOW + timedelta(minutes=3),
+                    ),
+                )
+            )
+        except BaseException as exc:
+            results.append(("migration_error", exc))
+
+    def review() -> None:
+        barrier.wait(timeout=5)
+        try:
+            results.append(
+                (
+                    "review",
+                    memory.review_conflict(
+                        conflict.candidate_id,
+                        reviewer_id="decision-reviewer",
+                        action="accept",
+                        change_reason="批准方案 C",
+                        now=NOW + timedelta(minutes=3),
+                    ),
+                )
+            )
+        except BaseException as exc:
+            results.append(("review_error", exc))
+
+    workers = [threading.Thread(target=migrate), threading.Thread(target=review)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert [name for name, _ in results if name == "review"] == ["review"]
+    migration_errors = [
+        value for name, value in results if name == "migration_error"
+    ]
+    assert len(migration_errors) == 1
+    assert isinstance(migration_errors[0], SyncConflict)
+    context_after = memory.get_context("project-1")
+    versions = ProjectMemoryRepository(
+        tmp_path / "project-memory.db"
+    ).list_versions("project-1", "decision-1")
+    assert context_after.active_decisions[0].decision_text == "采用方案 C"
+    assert versions[-1].version == 3
+    assert versions[-1].status is DecisionStatus.ACTIVE
+    with sqlite3.connect(tmp_path / "project-memory.db") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_decision_migration_audits"
         ).fetchone() == (0,)
 
 
