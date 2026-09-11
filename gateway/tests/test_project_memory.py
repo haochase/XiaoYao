@@ -177,6 +177,45 @@ def context(*, generated_at: datetime = NOW, decisions: tuple[DecisionCard, ...]
     )
 
 
+def approved_combined_service(
+    *approved_texts: str,
+    source_decisions: tuple[DecisionCard, ...] = (),
+) -> tuple[ProjectMemoryService, tuple[DecisionCard, ...]]:
+    candidates = tuple(
+        decision(f"待批准的组合决策{index}").model_copy(
+            update={
+                "decision_id": f"decision-approved-{index}",
+                "topic": f"待批准组合{index}",
+                "source_refs": (source(f"meeting-approved-{index}"),),
+            }
+        )
+        for index, _text in enumerate(approved_texts, start=1)
+    )
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(*candidates, *source_decisions)))
+    for candidate, text in zip(candidates, approved_texts, strict=True):
+        conflict, _ = service.propose_conflict_from_statement(
+            "project-1",
+            candidate.topic,
+            proposed_decision_text=text,
+            now=NOW,
+        )
+        service.review_conflict(
+            conflict.candidate_id,
+            reviewer_id="owner-1",
+            action="accept",
+            change_reason="负责人批准组合决策",
+            now=NOW,
+        )
+    return (
+        service,
+        tuple(
+            service.current_decision("project-1", item.decision_id, now=NOW)
+            for item in candidates
+        ),
+    )
+
+
 def test_fact_answer_uses_fresh_context_and_returns_sources() -> None:
     service = ProjectMemoryService(clock=lambda: NOW)
     service.replace_context(context(decisions=(decision(),)))
@@ -223,6 +262,115 @@ def test_answer_rejects_a_single_generic_chinese_fragment_overlap() -> None:
             kind=AnswerKind.DECISION_CHECK,
             now=NOW,
         )
+
+
+def test_approved_decision_clause_answers_a_strong_query() -> None:
+    service, (approved,) = approved_combined_service(
+        "桌面终端采用固定方案；会前提醒默认提前10分钟。"
+    )
+
+    answer = service.answer(
+        "project-1",
+        "会前提醒默认提前多久",
+        kind=AnswerKind.DECISION_CHECK,
+        now=NOW,
+    )
+
+    assert answer.text == f"当前有效决策：{approved.decision_text}"
+    assert answer.approval_ref == approved.approval_ref
+
+
+@pytest.mark.parametrize("query", ("当前方案",))
+def test_approved_decision_clause_rejects_short_weak_queries(query: str) -> None:
+    service, _ = approved_combined_service(
+        "桌面终端采用固定方案；会前提醒默认提前10分钟。"
+    )
+
+    with pytest.raises(ProjectContextUnavailable, match="source_not_found"):
+        service.answer(
+            "project-1",
+            query,
+            kind=AnswerKind.DECISION_CHECK,
+            now=NOW,
+        )
+
+
+@pytest.mark.parametrize("query", ("提醒", "会前提醒"))
+def test_approved_decision_clause_does_not_downgrade_exact_substrings(
+    monkeypatch: pytest.MonkeyPatch,
+    query: str,
+) -> None:
+    service, _ = approved_combined_service(
+        "桌面终端采用固定方案；会前提醒默认提前10分钟。"
+    )
+    monkeypatch.setattr(
+        ProjectMemoryService,
+        "_matches_exactly",
+        staticmethod(lambda _decision, _query: False),
+    )
+
+    with pytest.raises(ProjectContextUnavailable, match="source_not_found"):
+        service.answer(
+            "project-1",
+            query,
+            kind=AnswerKind.DECISION_CHECK,
+            now=NOW,
+        )
+
+
+def test_tied_approved_decision_clause_candidates_fail_closed() -> None:
+    service, _ = approved_combined_service(
+        "桌面终端采用固定方案；会前提醒默认提前10分钟。",
+        "桌面终端采用固定方案；会前提醒默认提前10分钟。",
+    )
+
+    with pytest.raises(ProjectContextUnavailable, match="source_not_found"):
+        service.answer(
+            "project-1",
+            "会前提醒默认提前多久",
+            kind=AnswerKind.DECISION_CHECK,
+            now=NOW,
+        )
+
+
+def test_source_backed_decision_does_not_use_approved_clause_fallback() -> None:
+    source_backed = decision(
+        "桌面终端采用固定方案；会前提醒默认提前10分钟。"
+    ).model_copy(update={"topic": "人工批准组合"})
+    service = ProjectMemoryService(clock=lambda: NOW)
+    service.replace_context(context(decisions=(source_backed,)))
+
+    with pytest.raises(ProjectContextUnavailable, match="source_not_found"):
+        service.answer(
+            "project-1",
+            "会前提醒默认提前多久",
+            kind=AnswerKind.DECISION_CHECK,
+            now=NOW,
+        )
+
+
+def test_topic_fragment_match_wins_over_approved_clause_match() -> None:
+    topic_match = decision("主题匹配优先").model_copy(
+        update={
+            "decision_id": "decision-topic-match",
+            "topic": "会前提醒默认提前设置",
+            "source_refs": (source("meeting-topic-match"),),
+        }
+    )
+    service, _ = approved_combined_service(
+        "桌面终端采用固定方案；会前提醒默认提前10分钟。",
+        source_decisions=(topic_match,),
+    )
+
+    answer = service.answer(
+        "project-1",
+        "会前提醒默认提前多久",
+        kind=AnswerKind.DECISION_CHECK,
+        now=NOW,
+    )
+
+    assert answer.text == "当前有效决策：主题匹配优先"
+    assert answer.source_refs == (source("meeting-topic-match"),)
 
 
 def test_exact_decision_wins_over_an_earlier_fragment_candidate() -> None:

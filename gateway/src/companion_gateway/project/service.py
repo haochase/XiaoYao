@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from threading import RLock
 from typing import Callable, Literal, Protocol
@@ -859,7 +860,10 @@ class ProjectMemoryService:
         scored_matches = tuple(
             (score, item)
             for item in active_decisions
-            if (score := cls._fragment_match_score(item, normalized_query)) is not None
+            if (
+                score := cls._active_decision_match_score(item, normalized_query)
+            )
+            is not None
         )
         if not scored_matches:
             return None
@@ -886,6 +890,45 @@ class ProjectMemoryService:
         if not topic_matches or len(total_matches) < 2:
             return None
         return len(topic_matches), len(total_matches)
+
+    @classmethod
+    def _active_decision_match_score(
+        cls,
+        decision: DecisionCard,
+        query: str,
+    ) -> tuple[int, ...] | None:
+        topic_score = cls._fragment_match_score(decision, query)
+        if topic_score is not None:
+            return 1, *topic_score
+        clause_score = cls._approved_clause_match_score(decision, query)
+        if clause_score is not None:
+            return 0, clause_score
+        return None
+
+    @classmethod
+    def _approved_clause_match_score(
+        cls,
+        decision: DecisionCard,
+        query: str,
+    ) -> int | None:
+        if decision.approval_ref is None:
+            return None
+        query_fragments = cls._chinese_bigrams(query)
+        if len(query_fragments) < 4:
+            return None
+        best_score: int | None = None
+        for clause in re.split(r"[；。！？]", decision.decision_text):
+            normalized_clause = cls._normalize(clause)
+            if not normalized_clause:
+                continue
+            match_count = len(
+                query_fragments & cls._chinese_bigrams(normalized_clause)
+            )
+            if match_count < 4 or match_count * 100 < len(query_fragments) * 60:
+                continue
+            if best_score is None or match_count > best_score:
+                best_score = match_count
+        return best_score
 
     @staticmethod
     def _require_source_scope(
