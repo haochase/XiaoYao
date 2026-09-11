@@ -1218,3 +1218,88 @@ def test_run_once_runtime_rejects_all_user_supplied_execution_inputs(
 
     with pytest.raises(SystemExit, match="2"):
         wrapper.main(argv, root=tmp_path, protector=Protector())
+
+
+@pytest.mark.parametrize(
+    ("command", "method", "status", "expected_exit"),
+    (
+        ("session-start", "start_session", "active", 0),
+        ("session-start", "start_session", "failed", 1),
+        ("session-tick", "tick_session", "active", 0),
+        ("session-status", "session_status", "attention_required", 2),
+        ("session-stop", "stop_session", "stopped", 0),
+        ("session-resume", "resume_session", "failed", 1),
+    ),
+)
+def test_session_runtime_commands_emit_one_sanitized_json_and_map_exit_codes(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    command: str,
+    method: str,
+    status: str,
+    expected_exit: int,
+) -> None:
+    from tools import dws_sync_runtime as wrapper
+
+    observed: list[tuple[Path, Protector]] = []
+
+    class FakeResult:
+        def to_dict(self) -> dict[str, object]:
+            return {
+                "status": status,
+                "started_at": "2026-09-11T09:00:00+00:00",
+                "expires_at": "2026-09-11T11:00:00+00:00",
+                "next_due_at": None,
+                "stage": "push",
+                "error_type": "sync_failed" if status == "failed" else None,
+                "release_status": "aborted",
+                "token": "must-not-print",
+            }
+
+    def fake(root: Path, protector: Protector | None = None) -> FakeResult:
+        if protector is not None:
+            observed.append((root, protector))
+        return FakeResult()
+
+    monkeypatch.setattr(wrapper.session, method, fake)
+
+    assert (
+        wrapper.main([command], root=tmp_path, protector=Protector())
+        == expected_exit
+    )
+    output = capsys.readouterr().out
+    assert output.count("\n") == 1
+    payload = json.loads(output)
+    assert payload["status"] == status
+    assert "token" not in payload
+    if method in {"start_session", "tick_session"}:
+        assert observed == [(tmp_path, observed[0][1])]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ["session-start", "--project", "project-1"],
+        ["session-tick", "--profile", "private-profile"],
+        ["session-status", "--url", "http://127.0.0.1:8731"],
+        ["session-stop", "--run-token", "private-token"],
+        ["session-resume", "--project", "project-1"],
+    ),
+)
+def test_session_runtime_rejects_all_user_supplied_execution_inputs(
+    tmp_path: Path,
+    argv: list[str],
+    capsys,
+) -> None:
+    from tools import dws_sync_runtime as wrapper
+
+    assert wrapper.main(argv, root=tmp_path, protector=Protector()) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.count("\n") == 1
+    assert json.loads(captured.out) == {
+        "status": "failed",
+        "error_type": "session_arguments_invalid",
+    }
+    assert all(value not in captured.out for value in argv[1:])

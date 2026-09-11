@@ -24,6 +24,7 @@ from tools.dws_sync.launch import resolve_dws_launch
 from tools.dws_sync.manifest import DwsManifest, DwsProjectManifest
 from tools.dws_sync.orchestrator import run_once
 from tools.dws_sync.runner import DwsCommandRunner
+from tools.dws_sync import session
 from tools.dws_sync.runtime import (
     CONFIG_NAME,
     RUNTIME_NAME,
@@ -51,6 +52,24 @@ COMMANDS = (
     "push",
     "end",
     "abort",
+)
+
+SESSION_COMMANDS = (
+    "session-start",
+    "session-tick",
+    "session-status",
+    "session-stop",
+    "session-resume",
+)
+
+_SESSION_OUTPUT_KEYS = (
+    "status",
+    "started_at",
+    "expires_at",
+    "next_due_at",
+    "stage",
+    "error_type",
+    "release_status",
 )
 
 
@@ -292,12 +311,60 @@ def build_app(root: Path, protector: ContentProtector):
     return create_sync_app(settings)
 
 
+def _session_payload(result: object) -> dict[str, object]:
+    try:
+        payload = result.to_dict()  # type: ignore[attr-defined]
+    except Exception:
+        return {"status": "failed", "error_type": "session_result_invalid"}
+    if not isinstance(payload, dict) or not isinstance(payload.get("status"), str):
+        return {"status": "failed", "error_type": "session_result_invalid"}
+    return {key: payload.get(key) for key in _SESSION_OUTPUT_KEYS}
+
+
+def _session_exit_code(payload: dict[str, object]) -> int:
+    status = payload.get("status")
+    if status == "attention_required":
+        return 2
+    return 1 if status == "failed" else 0
+
+
+def _run_session_command(
+    command: str,
+    root: Path,
+    protector: ContentProtector,
+) -> object:
+    if command == "session-start":
+        return session.start_session(root, protector)
+    if command == "session-tick":
+        return session.tick_session(root, protector)
+    if command == "session-status":
+        return session.session_status(root)
+    if command == "session-stop":
+        return session.stop_session(root)
+    if command == "session-resume":
+        return session.resume_session(root)
+    raise ValueError("session_command_invalid")
+
+
+def _session_arguments_supplied(argv: Sequence[str] | None) -> bool:
+    values = sys.argv[1:] if argv is None else list(argv)
+    return bool(values and values[0] in SESSION_COMMANDS and len(values) > 1)
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
     root: Path = ROOT,
     protector: ContentProtector | None = None,
 ) -> int:
+    if _session_arguments_supplied(argv):
+        print(
+            json.dumps(
+                {"status": "failed", "error_type": "session_arguments_invalid"},
+                separators=(",", ":"),
+            )
+        )
+        return 1
     parser = argparse.ArgumentParser(description="Private local DWS sync runtime")
     commands = parser.add_subparsers(dest="command", required=True)
     prepare = commands.add_parser("prepare")
@@ -308,6 +375,8 @@ def main(
     commands.add_parser("check-core")
     commands.add_parser("serve")
     commands.add_parser("run-once")
+    for command in SESSION_COMMANDS:
+        commands.add_parser(command)
     for command in COMMANDS:
         sub = commands.add_parser(command)
         if command not in {
@@ -365,6 +434,12 @@ def main(
             if result["status"] == "awaiting_artifact":
                 return 2
             return 1 if result["status"] == "failed" else 0
+        elif args.command in SESSION_COMMANDS:
+            payload = _session_payload(
+                _run_session_command(args.command, root, selected_protector)
+            )
+            print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+            return _session_exit_code(payload)
         else:
             dispatch_options = {}
             if getattr(args, "unattended", False):
