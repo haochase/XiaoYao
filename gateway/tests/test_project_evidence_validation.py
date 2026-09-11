@@ -2,12 +2,79 @@ from datetime import UTC, datetime
 
 import pytest
 
-from companion_gateway.project.evidence_validation import validate_sourced_context
-from companion_gateway.project.models import DecisionCard, HumanApprovalRef, ProjectContextPackage
+from companion_gateway.project.evidence_validation import (
+    validate_source_refs,
+    validate_sourced_context,
+)
+from companion_gateway.project.models import (
+    DecisionCard,
+    EvidenceRef,
+    HumanApprovalRef,
+    ProjectContextPackage,
+)
 from companion_gateway.project.service import ProjectMemoryError, ProjectMemoryService
+from companion_gateway.project.sync_models import (
+    EvidenceChunk,
+    SourceSnapshot,
+    SourceSyncStatus,
+    SyncSourceType,
+)
 
 
 NOW = datetime(2026, 9, 5, 8, tzinfo=UTC)
+HASH_A = "a" * 64
+HASH_B = "b" * 64
+
+
+def active_source() -> SourceSnapshot:
+    return SourceSnapshot(
+        source_type=SyncSourceType.DOCUMENT,
+        source_id="doc-1",
+        source_title="Decision document",
+        source_url="dingtalk://doc/doc-1",
+        source_version="v1",
+        source_time=NOW,
+        fetched_at=NOW,
+        permission_scope="project:demo",
+        permission_hash=HASH_A,
+        status=SourceSyncStatus.ACTIVE,
+        chunks=(
+            EvidenceChunk(
+                chunk_id=HASH_B,
+                source_id="doc-1",
+                source_version="v1",
+                ordinal=0,
+                text="Use plan B for the terminal rollout.",
+                start_offset=0,
+                end_offset=36,
+                content_hash=HASH_A,
+            ),
+        ),
+        content_hash=HASH_B,
+    )
+
+
+def source_ref(**updates: object) -> EvidenceRef:
+    values: dict[str, object] = {
+        "source_type": "document",
+        "source_id": "doc-1",
+        "source_title": "Decision document",
+        "source_url": "dingtalk://doc/doc-1",
+        "source_time": NOW,
+        "excerpt": "Use plan B",
+        "permission_scope": "project:demo",
+    }
+    values.update(updates)
+    return EvidenceRef(**values)
+
+
+def sourced_context() -> ProjectContextPackage:
+    return ProjectContextPackage(
+        project_id="project-1",
+        project_name="demo",
+        generated_at=NOW,
+        permission_scope="project:demo",
+    )
 
 
 def approved_context() -> ProjectContextPackage:
@@ -30,6 +97,55 @@ def approved_context() -> ProjectContextPackage:
 def test_sourced_context_rejects_external_human_approval() -> None:
     with pytest.raises(ValueError, match="external_approval_forbidden"):
         validate_sourced_context(approved_context(), ())
+
+
+def test_source_refs_accept_exact_active_source() -> None:
+    validate_source_refs(sourced_context(), (active_source(),), (source_ref(),))
+
+
+@pytest.mark.parametrize(
+    ("reference", "source", "expected"),
+    [
+        (
+            source_ref(source_title="Forged title"),
+            active_source(),
+            "source_ref_mismatch",
+        ),
+        (
+            source_ref(source_id="not-in-envelope"),
+            active_source(),
+            "source_ref_mismatch",
+        ),
+        (
+            source_ref(excerpt="not in the source"),
+            active_source(),
+            "source_excerpt_mismatch",
+        ),
+        (
+            source_ref(permission_scope="project:other"),
+            active_source(),
+            "source_ref_mismatch",
+        ),
+        (
+            source_ref(),
+            active_source().model_copy(
+                update={
+                    "status": SourceSyncStatus.FAILED,
+                    "chunks": (),
+                    "content_hash": None,
+                }
+            ),
+            "source_ref_mismatch",
+        ),
+    ],
+)
+def test_source_refs_reject_noncurrent_or_mismatched_sources(
+    reference: EvidenceRef,
+    source: SourceSnapshot,
+    expected: str,
+) -> None:
+    with pytest.raises(ValueError, match=expected):
+        validate_source_refs(sourced_context(), (source,), (reference,))
 
 
 def test_replace_context_rejects_external_human_approval() -> None:

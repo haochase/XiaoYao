@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -13,12 +15,14 @@ from companion_gateway.project.auth import (
 )
 from companion_gateway.project.index import ProjectSnapshotRegistry
 from companion_gateway.project.models import (
+    ConflictStatus,
     DecisionCard,
     EvidenceRef,
     ProjectContextPackage,
     SourcedFact,
 )
 from companion_gateway.project.repository import ProjectMemoryRepository
+from companion_gateway.project.service import ProjectMemoryService
 from companion_gateway.project.protection_state import (
     ProtectionStateError,
     initialize_repository_protection,
@@ -38,6 +42,7 @@ from companion_gateway.project.sync_models import (
 from companion_gateway.project.sync_repository import (
     ProjectSyncRepository,
     SyncCommit,
+    SyncConflict,
 )
 from companion_gateway.project.sync_service import (
     ProjectSourceUnavailable,
@@ -109,6 +114,53 @@ class ReversibleProtector:
 class CommitFailingRepository(ProjectSyncRepository):
     def commit(self, candidate: SyncCommit):  # type: ignore[no-untyped-def]
         raise RuntimeError("commit_failed")
+
+
+class CommitFailingConnection:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def __enter__(self):  # type: ignore[no-untyped-def]
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, *args):  # type: ignore[no-untyped-def]
+        return self._connection.__exit__(*args)
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        return getattr(self._connection, name)
+
+    def commit(self) -> None:
+        raise sqlite3.OperationalError("sqlite_commit_failed")
+
+
+class CommitAfterActivationFailingRepository(ProjectSyncRepository):
+    def __init__(self, database_path: Path) -> None:
+        super().__init__(database_path)
+        self.fail_commits = False
+
+    def _connect(self):  # type: ignore[no-untyped-def]
+        connection = super()._connect()
+        return (
+            CommitFailingConnection(connection)
+            if self.fail_commits
+            else connection
+        )
+
+
+class BlockingRegistry(ProjectSnapshotRegistry):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_next_swap = False
+        self.activation_started = threading.Event()
+        self.allow_activation = threading.Event()
+
+    def swap(self, project_id, snapshot):  # type: ignore[no-untyped-def]
+        if self.block_next_swap:
+            self.activation_started.set()
+            assert self.allow_activation.wait(timeout=5)
+            self.block_next_swap = False
+        return super().swap(project_id, snapshot)
 
 
 def evidence_chunk(
@@ -605,6 +657,319 @@ def test_sync_accepts_first_decision_after_failed_only_history(
     assert result.outcome == "applied"
     assert stored is not None
     assert stored.context.active_decisions == (decision,)
+
+
+def test_sync_hydrates_effective_reviewed_context_after_source_backed_addition(
+    tmp_path: Path,
+) -> None:
+    service, repository, _, registry = sync_service(tmp_path)
+    original = DecisionCard(
+        decision_id="decision-1",
+        project_id=PROJECT_ID,
+        topic="terminal plan",
+        decision_text="Use plan B",
+        rationale="Stable rollout",
+        owner="project-owner",
+        decided_at=NOW,
+        source_refs=(DOCUMENT_REF,),
+        status="active",
+        confidence=0.9,
+    )
+    first = envelope()
+    first = first.model_copy(
+        update={
+            "context": first.context.model_copy(
+                update={"active_decisions": (original,)}
+            )
+        }
+    )
+    first = first.model_copy(
+        update={"content_hash": compute_envelope_content_hash(first)}
+    )
+    service.apply(first, principal=PRINCIPAL, now=NOW)
+
+    memory_repository = ProjectMemoryRepository(tmp_path / "project-memory.db")
+    memory = ProjectMemoryService(repository=memory_repository, clock=lambda: NOW)
+    conflict, _ = memory.propose_conflict_from_statement(
+        PROJECT_ID,
+        "The terminal plan must change",
+        proposed_decision_text="Use plan A",
+        now=NOW,
+    )
+    _, reviewed = memory.review_conflict(
+        conflict.candidate_id,
+        reviewer_id="project-owner",
+        action="accept",
+        change_reason="human review",
+        now=NOW,
+    )
+
+    applied_at = NOW + timedelta(minutes=1)
+    addition = DecisionCard(
+        decision_id="decision-2",
+        project_id=PROJECT_ID,
+        topic="delivery sequence",
+        decision_text="Deliver the prototype",
+        rationale="Current source",
+        owner="project-owner",
+        decided_at=applied_at,
+        source_refs=(DOCUMENT_REF,),
+        status="active",
+        confidence=0.9,
+    )
+    second = envelope(
+        cursor=2,
+        generated_at=applied_at,
+        sources=(active_document(fetched_at=applied_at),),
+    )
+    second = second.model_copy(
+        update={
+            "context": second.context.model_copy(
+                update={"active_decisions": (original, addition)}
+            )
+        }
+    )
+    second = second.model_copy(
+        update={"content_hash": compute_envelope_content_hash(second)}
+    )
+
+    result = service.apply(second, principal=PRINCIPAL, now=applied_at)
+
+    stored = repository.load_active_generation(PROJECT_ID)
+    runtime = registry.get(PROJECT_ID)
+    assert stored is not None
+    assert runtime is not None
+    assert result.generation_id == stored.generation_id == runtime.generation_id
+    assert runtime.context == stored.context
+    assert runtime.evidence_index.context == stored.context
+    decisions = {item.decision_id: item for item in stored.context.active_decisions}
+    assert decisions["decision-1"].approval_ref == reviewed.approval_ref
+    assert decisions["decision-1"].source_refs == ()
+    assert decisions["decision-2"] == addition
+    assert [
+        version.version
+        for version in memory_repository.list_versions(PROJECT_ID, "decision-1")
+    ] == [1, 2]
+    assert [
+        version.version
+        for version in memory_repository.list_versions(PROJECT_ID, "decision-2")
+    ] == [1]
+
+
+def test_sync_holds_sqlite_write_lock_through_registry_activation(
+    tmp_path: Path,
+) -> None:
+    registry = BlockingRegistry()
+    service, repository, _, _ = sync_service(tmp_path, registry=registry)
+    original = DecisionCard(
+        decision_id="decision-1",
+        project_id=PROJECT_ID,
+        topic="terminal plan",
+        decision_text="Use plan B",
+        rationale="Stable rollout",
+        owner="project-owner",
+        decided_at=NOW,
+        source_refs=(DOCUMENT_REF,),
+        status="active",
+        confidence=0.9,
+    )
+    first = envelope()
+    first = first.model_copy(
+        update={
+            "context": first.context.model_copy(
+                update={"active_decisions": (original,)}
+            )
+        }
+    )
+    first = first.model_copy(
+        update={"content_hash": compute_envelope_content_hash(first)}
+    )
+    service.apply(first, principal=PRINCIPAL, now=NOW)
+
+    database_path = tmp_path / "project-memory.db"
+    memory_repository = ProjectMemoryRepository(database_path)
+    memory = ProjectMemoryService(repository=memory_repository, clock=lambda: NOW)
+    accepted_candidate, _ = memory.propose_conflict(
+        PROJECT_ID,
+        decision_id="decision-1",
+        observed_text="Change terminal plan",
+        proposed_decision_text="Use plan A",
+        reason="first review",
+        evidence_refs=(DOCUMENT_REF,),
+        now=NOW,
+    )
+    stale_candidate, _ = memory.propose_conflict(
+        PROJECT_ID,
+        decision_id="decision-1",
+        observed_text="Change terminal plan again",
+        proposed_decision_text="Use plan C",
+        reason="second review",
+        evidence_refs=(DOCUMENT_REF,),
+        now=NOW,
+    )
+    _, approved = memory.review_conflict(
+        accepted_candidate.candidate_id,
+        reviewer_id="project-owner",
+        action="accept",
+        change_reason="approved before sync",
+        now=NOW,
+    )
+    reviewed_context = memory_repository.get_context(PROJECT_ID)
+    assert reviewed_context is not None
+    reviewed_versions = memory_repository.list_versions(PROJECT_ID, "decision-1")
+
+    applied_at = NOW + timedelta(minutes=1)
+    addition = DecisionCard(
+        decision_id="decision-2",
+        project_id=PROJECT_ID,
+        topic="delivery sequence",
+        decision_text="Deliver the prototype",
+        rationale="Current source",
+        owner="project-owner",
+        decided_at=applied_at,
+        source_refs=(DOCUMENT_REF,),
+        status="active",
+        confidence=0.9,
+    )
+    second = envelope(cursor=2, generated_at=applied_at)
+    second = second.model_copy(
+        update={
+            "context": second.context.model_copy(
+                update={"active_decisions": (original, addition)}
+            )
+        }
+    )
+    second = second.model_copy(
+        update={"content_hash": compute_envelope_content_hash(second)}
+    )
+
+    registry.block_next_swap = True
+    sync_results = []
+    sync_errors: list[BaseException] = []
+
+    def apply_sync() -> None:
+        try:
+            sync_results.append(
+                service.apply(second, principal=PRINCIPAL, now=applied_at)
+            )
+        except BaseException as error:
+            sync_errors.append(error)
+
+    sync_thread = threading.Thread(target=apply_sync)
+    sync_thread.start()
+    assert registry.activation_started.wait(timeout=5)
+
+    reviewed = stale_candidate.model_copy(
+        update={
+            "status": ConflictStatus.ACCEPTED,
+            "reviewed_by": "project-owner",
+            "reviewed_at": applied_at,
+            "review_reason": "stale concurrent review",
+        }
+    )
+    review_attempted = threading.Event()
+    review_finished = threading.Event()
+    review_results: list[str] = []
+    review_errors: list[BaseException] = []
+
+    def apply_review() -> None:
+        try:
+            review_attempted.set()
+            result = ProjectMemoryRepository(database_path).commit_conflict_review(
+                reviewed_candidate=reviewed,
+                expected_base_version=stale_candidate.base_version,
+                expected_active_decision_text=stale_candidate.active_decision_text,
+                updated_context=reviewed_context,
+                previous_version=reviewed_versions[0],
+                new_version=reviewed_versions[-1],
+            )
+            review_results.append(result)
+        except BaseException as error:
+            review_errors.append(error)
+        finally:
+            review_finished.set()
+
+    review_thread = threading.Thread(target=apply_review)
+    review_thread.start()
+    assert review_attempted.wait(timeout=5)
+    try:
+        assert not review_finished.wait(timeout=0.2)
+    finally:
+        registry.allow_activation.set()
+        sync_thread.join(timeout=5)
+        review_thread.join(timeout=5)
+
+    assert not sync_thread.is_alive()
+    assert not review_thread.is_alive()
+    assert sync_errors == []
+    assert review_errors == []
+    assert review_results == ["stale"]
+    stored = repository.load_active_generation(PROJECT_ID)
+    runtime = registry.get(PROJECT_ID)
+    context = memory_repository.get_context(PROJECT_ID)
+    assert stored is not None
+    assert runtime is not None
+    assert context == stored.context == runtime.context
+    assert runtime.evidence_index.context == stored.context
+    assert sync_results[0].generation_id == stored.generation_id == runtime.generation_id
+    decisions = {item.decision_id: item for item in stored.context.active_decisions}
+    assert decisions["decision-1"].approval_ref == approved.approval_ref
+    assert decisions["decision-2"] == addition
+
+
+def test_rejected_same_id_change_keeps_active_runtime_snapshot(tmp_path: Path) -> None:
+    service, repository, _, registry = sync_service(tmp_path)
+    original = DecisionCard(
+        decision_id="decision-1",
+        project_id=PROJECT_ID,
+        topic="terminal plan",
+        decision_text="Use plan B",
+        rationale="Stable rollout",
+        owner="project-owner",
+        decided_at=NOW,
+        source_refs=(DOCUMENT_REF,),
+        status="active",
+        confidence=0.9,
+    )
+    first = envelope()
+    first = first.model_copy(
+        update={
+            "context": first.context.model_copy(
+                update={"active_decisions": (original,)}
+            )
+        }
+    )
+    first = first.model_copy(
+        update={"content_hash": compute_envelope_content_hash(first)}
+    )
+    first_result = service.apply(first, principal=PRINCIPAL, now=NOW)
+    before = registry.get(PROJECT_ID)
+    assert before is not None
+
+    attempted_at = NOW + timedelta(minutes=1)
+    changed = original.model_copy(update={"decision_text": "Use plan A"})
+    second = envelope(cursor=2, generated_at=attempted_at)
+    second = second.model_copy(
+        update={
+            "context": second.context.model_copy(
+                update={"active_decisions": (changed,)}
+            )
+        }
+    )
+    second = second.model_copy(
+        update={"content_hash": compute_envelope_content_hash(second)}
+    )
+
+    with pytest.raises(SyncConflict, match="decision_change_requires_review"):
+        service.apply(second, principal=PRINCIPAL, now=attempted_at)
+
+    stored = repository.load_active_generation(PROJECT_ID)
+    runtime = registry.get(PROJECT_ID)
+    assert stored is not None
+    assert stored.generation_id == first_result.generation_id
+    assert runtime == before
+    assert runtime is not None
+    assert runtime.context == stored.context
 
 
 def test_sync_accepts_sourced_fact_with_active_exact_excerpt(tmp_path: Path) -> None:
@@ -1195,6 +1560,138 @@ def test_commit_failure_prevents_snapshot_swap(tmp_path: Path) -> None:
         service.apply(envelope(), principal=PRINCIPAL, now=NOW)
 
     assert registry.get(PROJECT_ID) is None
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("unprotect", "unprotect_failed"),
+        ("index", "index_failed"),
+    ],
+)
+def test_final_runtime_snapshot_failure_rolls_back_commit(
+    tmp_path: Path,
+    monkeypatch,
+    failure: str,
+    message: str,
+) -> None:
+    service, repository, protector, registry = sync_service(tmp_path)
+    first = service.apply(envelope(), principal=PRINCIPAL, now=NOW)
+    before = repository.load_active_generation(PROJECT_ID)
+    before_runtime = registry.get(PROJECT_ID)
+    assert before is not None
+    assert before_runtime is not None
+
+    applied_at = NOW + timedelta(minutes=1)
+    addition = DecisionCard(
+        decision_id="decision-2",
+        project_id=PROJECT_ID,
+        topic="delivery sequence",
+        decision_text="Deliver the prototype",
+        rationale="Current source",
+        owner="project-owner",
+        decided_at=applied_at,
+        source_refs=(DOCUMENT_REF,),
+        status="active",
+        confidence=0.9,
+    )
+    candidate = envelope(cursor=2, generated_at=applied_at)
+    candidate = candidate.model_copy(
+        update={
+            "context": candidate.context.model_copy(
+                update={"active_decisions": (addition,)}
+            )
+        }
+    )
+    candidate = candidate.model_copy(
+        update={"content_hash": compute_envelope_content_hash(candidate)}
+    )
+    if failure == "unprotect":
+        protector.fail_unprotect = True
+    else:
+        def fail_index(*args, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("index_failed")
+
+        monkeypatch.setattr(
+            "companion_gateway.project.snapshot_loader.ProjectEvidenceIndex",
+            fail_index,
+        )
+
+    with pytest.raises(RuntimeError, match=message):
+        service.apply(candidate, principal=PRINCIPAL, now=applied_at)
+
+    stored = repository.load_active_generation(PROJECT_ID)
+    assert stored is not None
+    assert stored.generation_id == first.generation_id
+    assert stored.source_cursor == before.source_cursor
+    assert stored.context == before.context
+    assert stored.source_states == before.source_states
+    assert registry.get(PROJECT_ID) == before_runtime
+    assert ProjectMemoryRepository(
+        tmp_path / "project-memory.db"
+    ).list_versions(PROJECT_ID, "decision-2") == []
+    with sqlite3.connect(tmp_path / "project-memory.db") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_sync_audits WHERE project_id = ?",
+            (PROJECT_ID,),
+        ).fetchone() == (1,)
+
+
+def test_sqlite_commit_failure_restores_registry_activation(tmp_path: Path) -> None:
+    repository = CommitAfterActivationFailingRepository(
+        tmp_path / "project-memory.db"
+    )
+    service, _, _, registry = sync_service(tmp_path, repository=repository)
+    first = service.apply(envelope(), principal=PRINCIPAL, now=NOW)
+    before = repository.load_active_generation(PROJECT_ID)
+    before_runtime = registry.get(PROJECT_ID)
+    assert before is not None
+    assert before_runtime is not None
+
+    applied_at = NOW + timedelta(minutes=1)
+    addition = DecisionCard(
+        decision_id="decision-2",
+        project_id=PROJECT_ID,
+        topic="delivery sequence",
+        decision_text="Deliver the prototype",
+        rationale="Current source",
+        owner="project-owner",
+        decided_at=applied_at,
+        source_refs=(DOCUMENT_REF,),
+        status="active",
+        confidence=0.9,
+    )
+    candidate = envelope(cursor=2, generated_at=applied_at)
+    candidate = candidate.model_copy(
+        update={
+            "context": candidate.context.model_copy(
+                update={"active_decisions": (addition,)}
+            )
+        }
+    )
+    candidate = candidate.model_copy(
+        update={"content_hash": compute_envelope_content_hash(candidate)}
+    )
+    repository.fail_commits = True
+
+    with pytest.raises(sqlite3.OperationalError, match="sqlite_commit_failed"):
+        service.apply(candidate, principal=PRINCIPAL, now=applied_at)
+
+    stored = repository.load_active_generation(PROJECT_ID)
+    assert stored is not None
+    assert stored.generation_id == first.generation_id
+    assert stored.source_cursor == before.source_cursor
+    assert stored.context == before.context
+    assert stored.source_states == before.source_states
+    assert registry.get(PROJECT_ID) == before_runtime
+    assert ProjectMemoryRepository(
+        tmp_path / "project-memory.db"
+    ).list_versions(PROJECT_ID, "decision-2") == []
+    with sqlite3.connect(tmp_path / "project-memory.db") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_sync_audits WHERE project_id = ?",
+            (PROJECT_ID,),
+        ).fetchone() == (1,)
 
 
 def test_retained_payload_decryption_failure_prevents_commit(tmp_path: Path) -> None:

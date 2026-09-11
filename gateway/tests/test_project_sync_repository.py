@@ -12,6 +12,7 @@ import pytest
 from companion_gateway.project.models import (
     DecisionCard,
     EvidenceRef,
+    HumanApprovalRef,
     ProjectContextPackage,
 )
 from companion_gateway.project.repository import ProjectMemoryRepository
@@ -128,6 +129,37 @@ def active_snapshot(**updates: object) -> SourceSnapshot:
     }
     values.update(updates)
     return SourceSnapshot(**values)
+
+
+def source_backed_reference(snapshot: SourceSnapshot) -> EvidenceRef:
+    assert snapshot.source_time is not None
+    return EvidenceRef(
+        source_type=snapshot.source_type,
+        source_id=snapshot.source_id,
+        source_title=snapshot.source_title,
+        source_url=snapshot.source_url,
+        source_time=snapshot.source_time,
+        excerpt=snapshot.chunks[0].text,
+        permission_scope=snapshot.permission_scope,
+    )
+
+
+def source_backed_decision(
+    decision_id: str,
+    snapshot: SourceSnapshot,
+) -> DecisionCard:
+    return DecisionCard(
+        decision_id=decision_id,
+        project_id="project-1",
+        topic=f"topic-{decision_id}",
+        decision_text=f"decision-{decision_id}",
+        rationale="source-backed",
+        owner="owner-1",
+        decided_at=NOW,
+        source_refs=(source_backed_reference(snapshot),),
+        status="active",
+        confidence=0.9,
+    )
 
 
 def source_state(**updates: object) -> SourceState:
@@ -1061,11 +1093,18 @@ def test_commit_allows_first_sourced_decision_after_failed_only_history(
         chunk_content_hash=HASH_B,
         observed_at=success_at,
     )
+    decision = source_backed_decision("decision-1", active[0])
+    sourced_context = context(
+        generated_at=NOW + timedelta(minutes=2),
+        source_refs=(),
+        active_decisions=(decision,),
+    )
 
     result = repository.commit(
         sync_commit(
             cursor=3,
             content_hash=HASH_B,
+            package=sourced_context,
             snapshots=(active[0],),
             states=(active[1],),
             protected_sources=(active[2],),
@@ -1076,7 +1115,7 @@ def test_commit_allows_first_sourced_decision_after_failed_only_history(
     stored = repository.load_active_generation("project-1")
     assert result.outcome == "applied"
     assert stored is not None
-    assert stored.context.active_decisions == context().active_decisions
+    assert stored.context.active_decisions == (decision,)
     with sqlite3.connect(database_path) as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM project_source_versions WHERE project_id = ?",
@@ -1122,36 +1161,347 @@ def test_commit_rejects_initial_decision_without_failed_generation(
         )
 
 
-@pytest.mark.parametrize(
-    ("stored_package", "candidate_package"),
-    [
-        (
-            context(active_decisions=()),
-            context(),
-        ),
-        (
-            context(),
-            context(
-                active_decisions=(
-                    context().active_decisions[0].model_copy(
-                        update={"decision_text": "改用方案 A"}
-                    ),
-                )
-            ),
-        ),
-    ],
-)
-def test_commit_rejects_decision_addition_or_change_after_source_success(
+def test_commit_rejects_same_id_decision_change_after_source_success(
     tmp_path: Path,
-    stored_package: ProjectContextPackage,
-    candidate_package: ProjectContextPackage,
 ) -> None:
     repository = repository_at(tmp_path)
     repository.initialize()
-    repository.commit(sync_commit(cursor=1, package=stored_package))
+    repository.commit(sync_commit(cursor=1))
 
     with pytest.raises(SyncConflict, match="decision_change_requires_review"):
-        repository.commit(sync_commit(cursor=2, package=candidate_package))
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                package=context(
+                    active_decisions=(
+                        context().active_decisions[0].model_copy(
+                            update={"decision_text": "改用方案 A"}
+                        ),
+                    )
+                ),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "added_ids",
+    [
+        ("decision-2",),
+        ("decision-2", "decision-3"),
+    ],
+)
+def test_commit_allows_pure_source_backed_decision_additions(
+    tmp_path: Path,
+    added_ids: tuple[str, ...],
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    snapshot = active_snapshot()
+    original = context(source_refs=(), active_decisions=())
+    repository.commit(
+        sync_commit(cursor=1, package=original, snapshots=(snapshot,))
+    )
+    additions = tuple(
+        source_backed_decision(decision_id, snapshot) for decision_id in added_ids
+    )
+    candidate = original.model_copy(
+        update={
+            "generated_at": NOW + timedelta(minutes=1),
+            "active_decisions": additions,
+        }
+    )
+
+    result = repository.commit(
+        sync_commit(
+            cursor=2,
+            content_hash=HASH_B,
+            package=candidate,
+            snapshots=(snapshot,),
+        )
+    )
+
+    stored = repository.load_active_generation("project-1")
+    assert result.outcome == "applied"
+    assert stored is not None
+    assert stored.context.active_decisions == additions
+    memory = ProjectMemoryRepository(tmp_path / "project-memory.db")
+    for decision_id in added_ids:
+        assert [
+            version.version
+            for version in memory.list_versions("project-1", decision_id)
+        ] == [1]
+
+
+def test_commit_preserves_reviewed_v2_while_adding_source_backed_v1(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    snapshot = active_snapshot()
+    original_decision = source_backed_decision("decision-1", snapshot)
+    original = context(
+        source_refs=(),
+        active_decisions=(original_decision,),
+    )
+    repository.commit(
+        sync_commit(cursor=1, package=original, snapshots=(snapshot,))
+    )
+    memory_repository = ProjectMemoryRepository(tmp_path / "project-memory.db")
+    memory = ProjectMemoryService(repository=memory_repository, clock=lambda: NOW)
+    conflict, _ = memory.propose_conflict_from_statement(
+        "project-1",
+        "decision-1 must change",
+        proposed_decision_text="reviewed decision-1",
+        now=NOW,
+    )
+    _, reviewed = memory.review_conflict(
+        conflict.candidate_id,
+        reviewer_id="owner-1",
+        action="accept",
+        change_reason="human review",
+        now=NOW,
+    )
+    addition = source_backed_decision("decision-2", snapshot)
+    candidate = original.model_copy(
+        update={
+            "generated_at": NOW + timedelta(minutes=1),
+            "active_decisions": (original_decision, addition),
+        }
+    )
+
+    repository.commit(
+        sync_commit(
+            cursor=2,
+            content_hash=HASH_B,
+            package=candidate,
+            snapshots=(snapshot,),
+        )
+    )
+
+    stored = repository.load_active_generation("project-1")
+    assert stored is not None
+    decisions = {item.decision_id: item for item in stored.context.active_decisions}
+    assert decisions["decision-1"].approval_ref == reviewed.approval_ref
+    assert decisions["decision-1"].source_refs == ()
+    assert decisions["decision-2"] == addition
+    assert [
+        version.version
+        for version in memory_repository.list_versions("project-1", "decision-1")
+    ] == [1, 2]
+    assert [
+        version.version
+        for version in memory_repository.list_versions("project-1", "decision-2")
+    ] == [1]
+
+
+@pytest.mark.parametrize(
+    "invalid_kind",
+    ["missing_refs", "non_active", "duplicate_id"],
+)
+def test_commit_rejects_invalid_pure_additions(
+    tmp_path: Path,
+    invalid_kind: str,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    snapshot = active_snapshot()
+    original = context(source_refs=(), active_decisions=())
+    first = repository.commit(
+        sync_commit(cursor=1, package=original, snapshots=(snapshot,))
+    )
+    addition = source_backed_decision("decision-2", snapshot)
+    if invalid_kind == "missing_refs":
+        addition = addition.model_copy(update={"source_refs": ()})
+    elif invalid_kind == "non_active":
+        addition = addition.model_copy(update={"status": "proposed"})
+    candidate_decisions = (
+        (addition, addition)
+        if invalid_kind == "duplicate_id"
+        else (addition,)
+    )
+    candidate = original.model_copy(
+        update={
+            "generated_at": NOW + timedelta(minutes=1),
+            "active_decisions": candidate_decisions,
+        }
+    )
+
+    with pytest.raises(SyncConflict, match="decision_change_requires_review"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                package=candidate,
+                snapshots=(snapshot,),
+            )
+        )
+
+    stored = repository.load_active_generation("project-1")
+    assert stored is not None
+    assert stored.generation_id == first.generation_id
+    assert stored.context == original
+    assert ProjectMemoryRepository(
+        tmp_path / "project-memory.db"
+    ).list_versions("project-1", "decision-2") == []
+
+
+def test_commit_rejects_source_backed_addition_with_mismatched_reference(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    snapshot = active_snapshot()
+    original = context(source_refs=(), active_decisions=())
+    first = repository.commit(
+        sync_commit(cursor=1, package=original, snapshots=(snapshot,))
+    )
+    addition = source_backed_decision("decision-2", snapshot).model_copy(
+        update={
+            "source_refs": (
+                source_backed_reference(snapshot).model_copy(
+                    update={"source_title": "forged"}
+                ),
+            )
+        }
+    )
+    candidate = original.model_copy(
+        update={
+            "generated_at": NOW + timedelta(minutes=1),
+            "active_decisions": (addition,),
+        }
+    )
+
+    with pytest.raises(SyncConflict, match="context_conflict"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                package=candidate,
+                snapshots=(snapshot,),
+            )
+        )
+
+    stored = repository.load_active_generation("project-1")
+    assert stored is not None
+    assert stored.generation_id == first.generation_id
+    assert stored.context == original
+
+
+def test_commit_rejects_reusing_legacy_tombstoned_decision_id(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    snapshot = active_snapshot()
+    original_decision = source_backed_decision("decision-1", snapshot)
+    original = context(
+        source_refs=(),
+        active_decisions=(original_decision,),
+    )
+    repository.commit(
+        sync_commit(cursor=1, package=original, snapshots=(snapshot,))
+    )
+    legacy_context = original.model_copy(
+        update={
+            "generated_at": NOW + timedelta(minutes=1),
+            "active_decisions": (),
+        }
+    )
+    database_path = tmp_path / "project-memory.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE project_contexts SET payload_json = ? WHERE project_id = ?",
+            (legacy_context.model_dump_json(), "project-1"),
+        )
+        connection.execute(
+            """
+            UPDATE project_sync_generations
+            SET context_json = ?
+            WHERE project_id = ?
+            """,
+            (legacy_context.model_dump_json(), "project-1"),
+        )
+    before = repository.load_active_generation("project-1")
+    assert before is not None
+    versions_before = ProjectMemoryRepository(database_path).list_versions(
+        "project-1", "decision-1"
+    )
+    reused = source_backed_decision("decision-1", snapshot).model_copy(
+        update={"decision_text": "new decision text"}
+    )
+    candidate = legacy_context.model_copy(
+        update={
+            "generated_at": NOW + timedelta(minutes=2),
+            "active_decisions": (reused,),
+        }
+    )
+
+    with pytest.raises(SyncConflict, match="decision_change_requires_review"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                package=candidate,
+                snapshots=(snapshot,),
+            )
+        )
+
+    stored = repository.load_active_generation("project-1")
+    assert stored is not None
+    assert stored.generation_id == before.generation_id
+    assert stored.source_cursor == before.source_cursor
+    assert stored.context == legacy_context
+    assert ProjectMemoryRepository(database_path).list_versions(
+        "project-1", "decision-1"
+    ) == versions_before
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_sync_audits WHERE project_id = ?",
+            ("project-1",),
+        ).fetchone() == (1,)
+
+
+def test_commit_rejects_source_backed_addition_with_external_approval(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    snapshot = active_snapshot()
+    original = context(source_refs=(), active_decisions=())
+    first = repository.commit(
+        sync_commit(cursor=1, package=original, snapshots=(snapshot,))
+    )
+    addition = source_backed_decision("decision-2", snapshot)
+    approval = HumanApprovalRef(
+        candidate_id="candidate-2",
+        reviewer_id="owner-1",
+        approved_at=NOW,
+        reason="external approval",
+        decision_text=addition.decision_text,
+        permission_scope="project:demo",
+    )
+    candidate = original.model_copy(
+        update={
+            "generated_at": NOW + timedelta(minutes=1),
+            "active_decisions": (
+                addition.model_copy(update={"approval_ref": approval}),
+            ),
+        }
+    )
+
+    with pytest.raises(ValueError, match="external_approval_forbidden"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                package=candidate,
+                snapshots=(snapshot,),
+            )
+        )
+
+    stored = repository.load_active_generation("project-1")
+    assert stored is not None
+    assert stored.generation_id == first.generation_id
 
 
 def test_commit_rejects_initial_decision_without_active_success(
@@ -1161,7 +1511,7 @@ def test_commit_rejects_initial_decision_without_active_success(
     repository.initialize()
     repository.commit(failed_only_sync_commit(cursor=1))
 
-    with pytest.raises(SyncConflict, match="decision_change_requires_review"):
+    with pytest.raises(SyncConflict, match="context_conflict"):
         repository.commit(
             failed_only_sync_commit(
                 cursor=2,
@@ -1188,7 +1538,7 @@ def test_commit_rejects_initial_decision_without_current_success(
         observed_at=NOW,
     )
 
-    with pytest.raises(SyncConflict, match="decision_change_requires_review"):
+    with pytest.raises(SyncConflict, match="context_conflict"):
         repository.commit(
             sync_commit(
                 cursor=2,
@@ -1277,10 +1627,11 @@ def test_same_failed_cursor_and_hash_cannot_bootstrap_decisions(
         )
 
 
-def test_commit_allows_removing_decision_when_its_source_is_revoked(
+def test_commit_rejects_removing_decision_when_its_source_is_revoked(
     tmp_path: Path,
 ) -> None:
-    reference = evidence_ref(source_id="real-source-id")
+    snapshot = active_snapshot()
+    reference = source_backed_reference(snapshot)
     decision = context().active_decisions[0].model_copy(
         update={"source_refs": (reference,)}
     )
@@ -1290,43 +1641,48 @@ def test_commit_allows_removing_decision_when_its_source_is_revoked(
     )
     repository = repository_at(tmp_path)
     repository.initialize()
-    repository.commit(sync_commit(cursor=1, package=original))
+    repository.commit(
+        sync_commit(cursor=1, package=original, snapshots=(snapshot,))
+    )
     revoked_at = NOW + timedelta(minutes=1)
 
-    result = repository.commit(
-        sync_commit(
-            cursor=2,
-            content_hash=HASH_B,
-            package=context(
-                generated_at=revoked_at,
-                source_refs=(),
-                active_decisions=(),
-            ),
-            snapshots=(),
-            tombstones=(
-                SourceTombstone(
-                    source_type=SyncSourceType.DOCUMENT,
-                    source_id="real-source-id",
-                    status=SourceSyncStatus.REVOKED,
-                    occurred_at=revoked_at,
-                    permission_scope="project:demo",
+    with pytest.raises(SyncConflict, match="decision_change_requires_review"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                package=context(
+                    generated_at=revoked_at,
+                    source_refs=(),
+                    active_decisions=(),
                 ),
-            ),
-            states=(
-                source_state(
-                    source_version=None,
-                    content_hash=None,
-                    status=SourceSyncStatus.REVOKED,
-                    last_attempt_at=revoked_at,
-                    last_success_at=None,
+                snapshots=(),
+                tombstones=(
+                    SourceTombstone(
+                        source_type=SyncSourceType.DOCUMENT,
+                        source_id="real-source-id",
+                        status=SourceSyncStatus.REVOKED,
+                        occurred_at=revoked_at,
+                        permission_scope="project:demo",
+                    ),
                 ),
-            ),
-            protected_sources=(),
-            protected_chunks=(),
+                states=(
+                    source_state(
+                        source_version=None,
+                        content_hash=None,
+                        status=SourceSyncStatus.REVOKED,
+                        last_attempt_at=revoked_at,
+                        last_success_at=None,
+                    ),
+                ),
+                protected_sources=(),
+                protected_chunks=(),
+            )
         )
-    )
 
-    assert result.outcome == "applied"
+    stored = repository.load_active_generation("project-1")
+    assert stored is not None
+    assert stored.context == original
 
 
 @pytest.mark.parametrize("status", ["failed", "stale"])

@@ -6,12 +6,15 @@ import json
 import secrets
 import sqlite3
 from collections import Counter
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
+from companion_gateway.project.evidence_validation import validate_source_refs
 from companion_gateway.project.models import (
+    DecisionCard,
     DecisionStatus,
     DecisionVersion,
     ProjectContextPackage,
@@ -24,6 +27,7 @@ from companion_gateway.project.sync_models import (
     RetrievalRequestStatus,
     RetrievalSourceBaseline,
     SourceTombstone,
+    SourceSnapshot,
     SourceState,
     SourceSyncStatus,
     SyncAudit,
@@ -76,6 +80,12 @@ class SyncCommit:
     protected_sources: tuple[ProtectedSourceRecord, ...]
     protected_chunks: tuple[ProtectedChunkRecord, ...]
     audit: SyncAudit
+    prepare_effective_generation: (
+        Callable[[StoredProjectGeneration], object] | None
+    ) = None
+    activate_effective_generation: (
+        Callable[[object], Callable[[], None]] | None
+    ) = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +94,7 @@ class SyncCommitResult:
     generation_id: str
     source_cursor: int
     completed_retrieval_request_ids: tuple[str, ...]
+    prepared_result: object | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +117,57 @@ class SharedClockState:
     clock_untrusted: bool
     needs_sync: bool
     reason: Literal["normal", "resume_detected", "clock_rollback"]
+
+
+class _SyncCommitTransaction:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+        self._activation_registered = False
+        self._restore_activation: Callable[[], None] | None = None
+
+    def __enter__(self) -> "_SyncCommitTransaction":
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+        except BaseException:
+            self.connection.close()
+            raise
+        return self
+
+    def activate(self, restore: Callable[[], None] | None) -> None:
+        if self._activation_registered:
+            raise RuntimeError("sync_activation_already_registered")
+        self._activation_registered = True
+        self._restore_activation = restore
+
+    def __exit__(  # type: ignore[no-untyped-def]
+        self,
+        exc_type,
+        exc_value,
+        traceback,
+    ) -> bool:
+        try:
+            if exc_type is not None:
+                self._rollback_after_activation()
+                return False
+            try:
+                self.connection.commit()
+            except BaseException:
+                self._rollback_after_activation()
+                raise
+            self._restore_activation = None
+            return False
+        finally:
+            self.connection.close()
+
+    def _rollback_after_activation(self) -> None:
+        try:
+            restore = self._restore_activation
+            self._restore_activation = None
+            if restore is not None:
+                restore()
+        finally:
+            if self.connection.in_transaction:
+                self.connection.rollback()
 
 
 class ProjectSyncRepository:
@@ -837,8 +899,22 @@ class ProjectSyncRepository:
     def commit(self, candidate: SyncCommit) -> SyncCommitResult:
         self._validate_candidate(candidate)
         envelope = candidate.envelope
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        with _SyncCommitTransaction(self._connect()) as transaction:
+            connection = transaction.connection
+
+            def finalize(result: SyncCommitResult) -> SyncCommitResult:
+                prepared_result = self._prepare_effective_generation(
+                    connection,
+                    candidate,
+                )
+                transaction.activate(
+                    self._activate_effective_generation(
+                        candidate,
+                        prepared_result,
+                    )
+                )
+                return replace(result, prepared_result=prepared_result)
+
             self._assert_protection_access(connection)
             active = self._load_active_row(connection, envelope.project_id)
             stored_context = self._load_context(connection, envelope.project_id)
@@ -850,6 +926,12 @@ class ProjectSyncRepository:
                 envelope.context,
                 reviewed_decision_ids,
             )
+            self._reject_historical_decision_id_reuse(
+                connection,
+                envelope.project_id,
+                stored_context,
+                effective_context,
+            )
             if active is not None:
                 active_cursor = int(active["source_cursor"])
                 active_hash = str(active["content_hash"])
@@ -859,15 +941,10 @@ class ProjectSyncRepository:
                 self._check_context_conflicts(
                     stored_context,
                     effective_context,
-                    envelope.tombstones,
-                    allow_initial_decisions=(
+                    sources=envelope.sources,
+                    allow_additions=(
                         envelope.source_cursor > active_cursor
                         and envelope.content_hash != active_hash
-                        and self._is_first_successful_bootstrap(
-                            connection,
-                            candidate,
-                            stored_context,
-                        )
                     ),
                 )
                 if envelope.source_cursor == active_cursor:
@@ -883,21 +960,23 @@ class ProjectSyncRepository:
                         active,
                     )
                     self._validate_audit(candidate, stored_result.outcome)
-                    return stored_result
+                    return finalize(stored_result)
                 if envelope.content_hash == active_hash:
                     self._validate_audit(candidate, "unchanged")
-                    return self._commit_unchanged(
-                        connection,
-                        candidate,
-                        active,
-                        effective_context,
+                    return finalize(
+                        self._commit_unchanged(
+                            connection,
+                            candidate,
+                            active,
+                            effective_context,
+                        )
                     )
 
             if active is None:
                 self._check_context_conflicts(
                     stored_context,
                     effective_context,
-                    envelope.tombstones,
+                    sources=envelope.sources,
                 )
                 self._validate_source_heads(connection, candidate)
             outcome: Literal["applied", "degraded"] = (
@@ -1001,12 +1080,14 @@ class ProjectSyncRepository:
                 """,
                 (envelope.project_id, candidate.generation_id),
             )
-        return SyncCommitResult(
-            outcome=outcome,
-            generation_id=candidate.generation_id,
-            source_cursor=envelope.source_cursor,
-            completed_retrieval_request_ids=completed,
-        )
+            return finalize(
+                SyncCommitResult(
+                    outcome=outcome,
+                    generation_id=candidate.generation_id,
+                    source_cursor=envelope.source_cursor,
+                    completed_retrieval_request_ids=completed,
+                )
+            )
 
     def load_active_generation(
         self,
@@ -1015,26 +1096,36 @@ class ProjectSyncRepository:
         with self._connect() as connection:
             connection.execute("BEGIN")
             self._assert_protection_access(connection)
-            generation = self._load_active_row(connection, project_id)
-            if generation is None:
-                return None
-            state_rows = connection.execute(
-                """
-                SELECT * FROM project_source_states
-                WHERE project_id = ? AND generation_id = ?
-                ORDER BY source_type, source_id_hash
-                """,
-                (project_id, generation["generation_id"]),
-            ).fetchall()
-            chunk_rows = connection.execute(
-                """
-                SELECT * FROM project_evidence_chunks
-                WHERE project_id = ? AND generation_id = ?
-                ORDER BY source_type, source_id_hash, ordinal, chunk_id
-                """,
-                (project_id, generation["generation_id"]),
-            ).fetchall()
-            self._assert_protected_row_versions(state_rows, chunk_rows)
+            return self._load_active_generation_from_connection(
+                connection,
+                project_id,
+            )
+
+    def _load_active_generation_from_connection(
+        self,
+        connection: sqlite3.Connection,
+        project_id: str,
+    ) -> StoredProjectGeneration | None:
+        generation = self._load_active_row(connection, project_id)
+        if generation is None:
+            return None
+        state_rows = connection.execute(
+            """
+            SELECT * FROM project_source_states
+            WHERE project_id = ? AND generation_id = ?
+            ORDER BY source_type, source_id_hash
+            """,
+            (project_id, generation["generation_id"]),
+        ).fetchall()
+        chunk_rows = connection.execute(
+            """
+            SELECT * FROM project_evidence_chunks
+            WHERE project_id = ? AND generation_id = ?
+            ORDER BY source_type, source_id_hash, ordinal, chunk_id
+            """,
+            (project_id, generation["generation_id"]),
+        ).fetchall()
+        self._assert_protected_row_versions(state_rows, chunk_rows)
         return StoredProjectGeneration(
             project_id=project_id,
             generation_id=str(generation["generation_id"]),
@@ -1054,6 +1145,30 @@ class ProjectSyncRepository:
                 _protected_chunk_from_row(row) for row in chunk_rows
             ),
         )
+
+    def _prepare_effective_generation(
+        self,
+        connection: sqlite3.Connection,
+        candidate: SyncCommit,
+    ) -> object | None:
+        prepare = candidate.prepare_effective_generation
+        if prepare is None:
+            return None
+        generation = self._load_active_generation_from_connection(
+            connection,
+            candidate.envelope.project_id,
+        )
+        if generation is None:
+            raise SyncConflict("active_generation_missing")
+        return prepare(generation)
+
+    @staticmethod
+    def _activate_effective_generation(
+        candidate: SyncCommit,
+        prepared_result: object | None,
+    ) -> Callable[[], None] | None:
+        activate = candidate.activate_effective_generation
+        return activate(prepared_result) if activate is not None else None
 
     def _assert_protected_row_versions(
         self,
@@ -1411,6 +1526,39 @@ class ProjectSyncRepository:
         )
 
     @staticmethod
+    def _reject_historical_decision_id_reuse(
+        connection: sqlite3.Connection,
+        project_id: str,
+        stored: ProjectContextPackage | None,
+        effective: ProjectContextPackage,
+    ) -> None:
+        stored_ids = (
+            {
+                decision.decision_id
+                for decision in stored.active_decisions
+            }
+            if stored is not None
+            else set()
+        )
+        additions = {
+            decision.decision_id
+            for decision in effective.active_decisions
+            if decision.decision_id not in stored_ids
+        }
+        if not additions:
+            return
+        placeholders = ", ".join("?" for _ in additions)
+        rows = connection.execute(
+            f"""
+            SELECT decision_id FROM project_versions
+            WHERE project_id = ? AND decision_id IN ({placeholders})
+            """,
+            (project_id, *sorted(additions)),
+        ).fetchall()
+        if rows:
+            raise SyncConflict("decision_change_requires_review")
+
+    @staticmethod
     def _preserve_reviewed_decisions(
         stored: ProjectContextPackage | None,
         candidate: ProjectContextPackage,
@@ -1519,82 +1667,55 @@ class ProjectSyncRepository:
     def _check_context_conflicts(
         stored: ProjectContextPackage | None,
         candidate: ProjectContextPackage,
-        tombstones: tuple[SourceTombstone, ...],
         *,
-        allow_initial_decisions: bool = False,
+        sources: tuple[SourceSnapshot, ...],
+        allow_additions: bool = False,
     ) -> None:
         if stored is None:
+            ProjectSyncRepository._decisions_by_id(candidate.active_decisions)
             return
         if stored.permission_scope != candidate.permission_scope:
             raise SyncConflict("permission_conflict")
-        if stored.active_decisions == candidate.active_decisions:
-            return
-        if (
-            allow_initial_decisions
-            and not stored.active_decisions
-            and candidate.active_decisions
-        ):
-            return
-        candidate_ids = {item.decision_id for item in candidate.active_decisions}
-        retained = tuple(
-            item
-            for item in stored.active_decisions
-            if item.decision_id in candidate_ids
+        stored_by_id = ProjectSyncRepository._decisions_by_id(
+            stored.active_decisions
         )
-        tombstoned_sources = {
-            (item.source_type.value, item.source_id, item.permission_scope)
-            for item in tombstones
-        }
-        removed = tuple(
-            item
-            for item in stored.active_decisions
-            if item.decision_id not in candidate_ids
+        candidate_by_id = ProjectSyncRepository._decisions_by_id(
+            candidate.active_decisions
         )
-        if (
-            candidate.active_decisions != retained
-            or not removed
-            or any(
-                not any(
-                    (
-                        reference.source_type,
-                        reference.source_id,
-                        reference.permission_scope,
-                    )
-                    in tombstoned_sources
-                    for reference in decision.source_refs
-                )
-                for decision in removed
-            )
+        if any(
+            candidate_by_id.get(decision_id) != decision
+            for decision_id, decision in stored_by_id.items()
         ):
             raise SyncConflict("decision_change_requires_review")
+        additions = tuple(
+            decision
+            for decision in candidate.active_decisions
+            if decision.decision_id not in stored_by_id
+        )
+        if additions and not allow_additions:
+            raise SyncConflict("decision_change_requires_review")
+        for decision in additions:
+            if (
+                decision.status is not DecisionStatus.ACTIVE
+                or decision.approval_ref is not None
+                or not decision.source_refs
+            ):
+                raise SyncConflict("decision_change_requires_review")
+            try:
+                validate_source_refs(candidate, sources, decision.source_refs)
+            except ValueError:
+                raise SyncConflict("context_conflict") from None
 
     @staticmethod
-    def _is_first_successful_bootstrap(
-        connection: sqlite3.Connection,
-        candidate: SyncCommit,
-        stored: ProjectContextPackage | None,
-    ) -> bool:
-        if (
-            stored is None
-            or stored.permission_scope != candidate.envelope.context.permission_scope
-            or stored.active_decisions
-            or not candidate.envelope.context.active_decisions
-            or not any(
-                state.status is SourceSyncStatus.ACTIVE
-                and state.last_success_at == candidate.audit.finished_at
-                for state in candidate.source_states
-            )
-        ):
-            return False
-        source_version = connection.execute(
-            """
-            SELECT 1 FROM project_source_versions
-            WHERE project_id = ?
-            LIMIT 1
-            """,
-            (candidate.envelope.project_id,),
-        ).fetchone()
-        return source_version is None
+    def _decisions_by_id(
+        decisions: tuple[DecisionCard, ...],
+    ) -> dict[str, DecisionCard]:
+        result: dict[str, DecisionCard] = {}
+        for decision in decisions:
+            if decision.decision_id in result:
+                raise SyncConflict("decision_change_requires_review")
+            result[decision.decision_id] = decision
+        return result
 
     @staticmethod
     def _validate_source_heads(

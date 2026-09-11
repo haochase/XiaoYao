@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from companion_gateway.project.models import ProjectContextPackage
+from companion_gateway.project.models import EvidenceRef, ProjectContextPackage
 from companion_gateway.project.sync_models import (
     SourceSnapshot,
     SourceSyncStatus,
@@ -26,11 +26,6 @@ def validate_sourced_context(
     ):
         raise ValueError("context_fact_unreferenced")
 
-    active_sources = {
-        (source.source_type, source.source_id): source
-        for source in sources
-        if source.status is SourceSyncStatus.ACTIVE
-    }
     sourced_facts = (*context.sourced_actions, *context.sourced_risks)
     if context.sourced_next_meeting is not None:
         sourced_facts += (context.sourced_next_meeting,)
@@ -47,6 +42,19 @@ def validate_sourced_context(
             for reference in fact.source_refs
         ),
     )
+    validate_source_refs(context, sources, references)
+
+
+def validate_source_refs(
+    context: ProjectContextPackage,
+    sources: Iterable[SourceSnapshot],
+    references: Iterable[EvidenceRef],
+) -> None:
+    active_sources = {
+        (source.source_type, source.source_id): source
+        for source in sources
+        if source.status is SourceSyncStatus.ACTIVE
+    }
 
     for reference in references:
         try:

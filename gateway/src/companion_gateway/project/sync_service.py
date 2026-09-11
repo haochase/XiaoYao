@@ -9,6 +9,7 @@ from collections import Counter
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from threading import RLock
+from typing import cast
 
 from companion_gateway.project.auth import (
     ProjectApiAuthenticator,
@@ -21,8 +22,6 @@ from companion_gateway.project.clock_guard import (
 )
 from companion_gateway.project.evidence_validation import validate_sourced_context
 from companion_gateway.project.index import (
-    EvidenceSource,
-    ProjectEvidenceIndex,
     ProjectRuntimeSnapshot,
     ProjectSnapshotRegistry,
 )
@@ -287,12 +286,37 @@ class ProjectSyncService:
                 states,
                 generated_id,
             )
-            runtime_snapshot = self._candidate_snapshot(
-                envelope,
-                active,
-                states,
-                generated_id,
-            )
+
+            def prepare_effective_generation(
+                generation: StoredProjectGeneration,
+            ) -> ProjectRuntimeSnapshot:
+                try:
+                    return self._snapshot_hydrator.snapshot(generation)
+                except SnapshotHydrationError:
+                    raise ProjectSyncValidationError(
+                        "protected_content_invalid"
+                    ) from None
+
+            def activate_effective_generation(
+                prepared_result: object,
+            ) -> Callable[[], None]:
+                runtime_snapshot = cast(
+                    ProjectRuntimeSnapshot,
+                    prepared_result,
+                )
+                previous = self._registry.swap(
+                    envelope.project_id,
+                    runtime_snapshot,
+                )
+
+                def restore_activation() -> None:
+                    if previous is None:
+                        self._registry.remove(envelope.project_id)
+                    else:
+                        self._registry.swap(envelope.project_id, previous)
+
+                return restore_activation
+
             audit = SyncAudit(
                 sync_id=envelope.sync_id,
                 project_id=envelope.project_id,
@@ -314,19 +338,10 @@ class ProjectSyncService:
                     protected_sources=protected_sources,
                     protected_chunks=protected_chunks,
                     audit=audit,
+                    prepare_effective_generation=prepare_effective_generation,
+                    activate_effective_generation=activate_effective_generation,
                 )
             )
-            if runtime_snapshot.generation_id != committed.generation_id:
-                runtime_snapshot = ProjectRuntimeSnapshot(
-                    project_id=runtime_snapshot.project_id,
-                    generation_id=committed.generation_id,
-                    context=runtime_snapshot.context,
-                    source_states=runtime_snapshot.source_states,
-                    sources=runtime_snapshot.sources,
-                    chunks=runtime_snapshot.chunks,
-                    evidence_index=runtime_snapshot.evidence_index,
-                )
-            self._registry.swap(envelope.project_id, runtime_snapshot)
             self._reset_clock(now, baseline_monotonic)
 
         current_status = self.status(envelope.project_id, now=now)
@@ -711,113 +726,6 @@ class ProjectSyncService:
         if not plaintext:
             raise ProjectSyncValidationError("protected_content_empty")
         return self._protector.protect(project_id, plaintext)
-
-    def _candidate_snapshot(
-        self,
-        envelope: SyncEnvelope,
-        active: StoredProjectGeneration | None,
-        states: tuple[SourceState, ...],
-        generation_id: str,
-    ) -> ProjectRuntimeSnapshot:
-        if active is not None and envelope.content_hash == active.content_hash:
-            sources, chunks = self._decrypt_generation(active, None)
-            runtime_states = self._unchanged_runtime_states(
-                envelope,
-                active,
-                states,
-            )
-            context = envelope.context
-            runtime_generation_id = active.generation_id
-        else:
-            retained_keys = {
-                (source.source_type, _source_id_hash(source.source_id))
-                for source in envelope.sources
-                if source.status in {
-                    SourceSyncStatus.FAILED,
-                    SourceSyncStatus.STALE,
-                }
-            }
-            retained_sources, retained_chunks = self._decrypt_generation(
-                active,
-                retained_keys,
-            )
-            current_sources = tuple(
-                EvidenceSource(
-                    source_type=source.source_type,
-                    source_id=source.source_id,
-                    source_id_hash=_source_id_hash(source.source_id),
-                    source_title=source.source_title,
-                    source_url=source.source_url,
-                    source_version=source.source_version,
-                    source_time=source.source_time,
-                    permission_hash=source.permission_hash,
-                    content_hash=source.content_hash,
-                )
-                for source in envelope.sources
-                if source.status is SourceSyncStatus.ACTIVE
-            )
-            current_chunks = tuple(
-                chunk
-                for source in envelope.sources
-                if source.status is SourceSyncStatus.ACTIVE
-                for chunk in source.chunks
-            )
-            sources = current_sources + retained_sources
-            chunks = current_chunks + retained_chunks
-            runtime_states = states
-            context = envelope.context
-            runtime_generation_id = generation_id
-        sources = tuple(
-            sorted(
-                sources,
-                key=lambda item: (item.source_type.value, item.source_id_hash),
-            )
-        )
-        chunks = tuple(
-            sorted(
-                chunks,
-                key=lambda item: (
-                    item.source_id,
-                    item.source_version,
-                    item.ordinal,
-                    item.chunk_id,
-                ),
-            )
-        )
-        evidence_index = ProjectEvidenceIndex(context, sources, chunks)
-        return ProjectRuntimeSnapshot(
-            project_id=envelope.project_id,
-            generation_id=runtime_generation_id,
-            context=context,
-            source_states=runtime_states,
-            sources=sources,
-            chunks=chunks,
-            evidence_index=evidence_index,
-        )
-
-    def _decrypt_generation(
-        self,
-        active: StoredProjectGeneration | None,
-        keys: set[tuple[SyncSourceType, str]] | None,
-    ) -> tuple[tuple[EvidenceSource, ...], tuple[EvidenceChunk, ...]]:
-        if active is None:
-            return (), ()
-        try:
-            return self._snapshot_hydrator.evidence(active, keys)
-        except SnapshotHydrationError:
-            raise ProjectSyncValidationError(
-                "protected_content_invalid"
-            ) from None
-
-    @staticmethod
-    def _unchanged_runtime_states(
-        envelope: SyncEnvelope,
-        active: StoredProjectGeneration,
-        incoming: tuple[SourceState, ...],
-    ) -> tuple[SourceState, ...]:
-        if envelope.source_cursor <= active.source_cursor:
-            return active.source_states
-        return incoming
 
     @staticmethod
     def _expected_outcome(
