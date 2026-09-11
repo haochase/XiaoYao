@@ -972,6 +972,85 @@ def test_rejected_same_id_change_keeps_active_runtime_snapshot(tmp_path: Path) -
     assert runtime.context == stored.context
 
 
+def test_rejected_duplicate_hardware_decision_keeps_sync_state_unchanged(
+    tmp_path: Path,
+) -> None:
+    service, repository, _, registry = sync_service(tmp_path)
+    hardware = DecisionCard(
+        decision_id="hardware-1",
+        project_id=PROJECT_ID,
+        topic="hardware combination",
+        decision_text="Use ESP32-S3 with the ES7210 microphone array",
+        rationale="Stable voice hardware",
+        owner="project-owner",
+        decided_at=NOW,
+        source_refs=(DOCUMENT_REF,),
+        status="active",
+        confidence=0.9,
+    )
+    first = envelope()
+    first = first.model_copy(
+        update={
+            "context": first.context.model_copy(
+                update={"active_decisions": (hardware,)}
+            )
+        }
+    )
+    first = first.model_copy(
+        update={"content_hash": compute_envelope_content_hash(first)}
+    )
+    first_result = service.apply(first, principal=PRINCIPAL, now=NOW)
+    before_stored = repository.load_active_generation(PROJECT_ID)
+    before_runtime = registry.get(PROJECT_ID)
+    assert before_stored is not None
+    assert before_runtime is not None
+
+    attempted_at = NOW + timedelta(minutes=1)
+    regenerated = hardware.model_copy(
+        update={
+            "decision_id": "hardware-2",
+            "topic": "hardware regeneration",
+            "decision_text": (
+                "Use ESP32-S3 with the ES7210 microphone array for the voice "
+                "demo."
+            ),
+            "decided_at": attempted_at,
+        }
+    )
+    second = envelope(cursor=2, generated_at=attempted_at)
+    second = second.model_copy(
+        update={
+            "context": second.context.model_copy(
+                update={"active_decisions": (hardware, regenerated)}
+            )
+        }
+    )
+    second = second.model_copy(
+        update={"content_hash": compute_envelope_content_hash(second)}
+    )
+
+    with pytest.raises(SyncConflict, match="decision_change_requires_review"):
+        service.apply(second, principal=PRINCIPAL, now=attempted_at)
+
+    stored = repository.load_active_generation(PROJECT_ID)
+    runtime = registry.get(PROJECT_ID)
+    assert stored is not None
+    assert stored.generation_id == first_result.generation_id
+    assert stored.source_cursor == before_stored.source_cursor
+    assert stored.context == before_stored.context
+    assert runtime == before_runtime
+    memory = ProjectMemoryRepository(tmp_path / "project-memory.db")
+    assert [
+        version.version for version in memory.list_versions(PROJECT_ID, "hardware-1")
+    ] == [1]
+    assert memory.list_versions(PROJECT_ID, "hardware-2") == []
+    with sqlite3.connect(tmp_path / "project-memory.db") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_sync_audits WHERE project_id = ?",
+            (PROJECT_ID,),
+        ).fetchone() == (1,)
+
+
 def test_sync_accepts_sourced_fact_with_active_exact_excerpt(tmp_path: Path) -> None:
     service, repository, _, _ = sync_service(tmp_path)
     candidate = envelope()

@@ -1232,6 +1232,180 @@ def test_commit_allows_pure_source_backed_decision_additions(
         ] == [1]
 
 
+def test_commit_rejects_source_backed_addition_with_duplicate_normalized_topic(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    snapshot = active_snapshot()
+    existing = source_backed_decision("hardware-1", snapshot).model_copy(
+        update={
+            "topic": "Hardware Plan",
+            "decision_text": "Use the audio board for the hardware rollout.",
+        }
+    )
+    original = context(source_refs=(), active_decisions=(existing,))
+    repository.commit(
+        sync_commit(cursor=1, package=original, snapshots=(snapshot,))
+    )
+    addition = source_backed_decision("hardware-2", snapshot).model_copy(
+        update={
+            "topic": "  hardware\tplan  ",
+            "decision_text": "Use the microphone board for the next demo.",
+        }
+    )
+    candidate = original.model_copy(
+        update={
+            "generated_at": NOW + timedelta(minutes=1),
+            "active_decisions": (existing, addition),
+        }
+    )
+
+    with pytest.raises(SyncConflict, match="decision_change_requires_review"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                package=candidate,
+                snapshots=(snapshot,),
+            )
+        )
+
+
+def test_commit_rejects_source_backed_addition_when_text_contains_active_decision(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    snapshot = active_snapshot()
+    existing = source_backed_decision("hardware-1", snapshot).model_copy(
+        update={
+            "topic": "hardware baseline",
+            "decision_text": "Use ESP32-S3 audio board with ES7210 microphone",
+        }
+    )
+    original = context(source_refs=(), active_decisions=(existing,))
+    repository.commit(
+        sync_commit(cursor=1, package=original, snapshots=(snapshot,))
+    )
+    addition = source_backed_decision("hardware-2", snapshot).model_copy(
+        update={
+            "topic": "hardware regeneration",
+            "decision_text": (
+                "Recommended build: use esp32-s3 audio board with "
+                "\nes7210 microphone for the voice demo."
+            ),
+        }
+    )
+    candidate = original.model_copy(
+        update={
+            "generated_at": NOW + timedelta(minutes=1),
+            "active_decisions": (existing, addition),
+        }
+    )
+
+    with pytest.raises(SyncConflict, match="decision_change_requires_review"):
+        repository.commit(
+            sync_commit(
+                cursor=2,
+                content_hash=HASH_B,
+                package=candidate,
+                snapshots=(snapshot,),
+            )
+        )
+
+
+def test_commit_allows_source_backed_addition_when_contained_text_is_too_short(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    snapshot = active_snapshot()
+    existing = source_backed_decision("hardware-1", snapshot).model_copy(
+        update={"topic": "hardware baseline", "decision_text": "ESP32"}
+    )
+    original = context(source_refs=(), active_decisions=(existing,))
+    repository.commit(
+        sync_commit(cursor=1, package=original, snapshots=(snapshot,))
+    )
+    addition = source_backed_decision("hardware-2", snapshot).model_copy(
+        update={
+            "topic": "voice board",
+            "decision_text": "Use ESP32-S3 for the next voice prototype.",
+        }
+    )
+    candidate = original.model_copy(
+        update={
+            "generated_at": NOW + timedelta(minutes=1),
+            "active_decisions": (existing, addition),
+        }
+    )
+
+    result = repository.commit(
+        sync_commit(
+            cursor=2,
+            content_hash=HASH_B,
+            package=candidate,
+            snapshots=(snapshot,),
+        )
+    )
+
+    stored = repository.load_active_generation("project-1")
+    assert result.outcome == "applied"
+    assert stored is not None
+    assert stored.context.active_decisions == (existing, addition)
+
+
+def test_commit_allows_independent_hardware_and_reminder_additions(
+    tmp_path: Path,
+) -> None:
+    repository = repository_at(tmp_path)
+    repository.initialize()
+    snapshot = active_snapshot()
+    hardware = source_backed_decision("hardware-1", snapshot).model_copy(
+        update={
+            "topic": "hardware rollout",
+            "decision_text": "Use the ESP32-S3 audio board for the demo.",
+        }
+    )
+    original = context(source_refs=(), active_decisions=(hardware,))
+    repository.commit(
+        sync_commit(cursor=1, package=original, snapshots=(snapshot,))
+    )
+    reminder = source_backed_decision("reminder-1", snapshot).model_copy(
+        update={
+            "topic": "customer review reminder",
+            "decision_text": "Send a reminder before the next customer review.",
+        }
+    )
+    follow_up = source_backed_decision("follow-up-1", snapshot).model_copy(
+        update={
+            "topic": "release owner",
+            "decision_text": "Assign the release checklist to the hardware lead.",
+        }
+    )
+    candidate = original.model_copy(
+        update={
+            "generated_at": NOW + timedelta(minutes=1),
+            "active_decisions": (hardware, reminder, follow_up),
+        }
+    )
+
+    result = repository.commit(
+        sync_commit(
+            cursor=2,
+            content_hash=HASH_B,
+            package=candidate,
+            snapshots=(snapshot,),
+        )
+    )
+
+    stored = repository.load_active_generation("project-1")
+    assert result.outcome == "applied"
+    assert stored is not None
+    assert stored.context.active_decisions == (hardware, reminder, follow_up)
+
+
 def test_commit_preserves_reviewed_v2_while_adding_source_backed_v1(
     tmp_path: Path,
 ) -> None:

@@ -1694,6 +1694,10 @@ class ProjectSyncRepository:
         )
         if additions and not allow_additions:
             raise SyncConflict("decision_change_requires_review")
+        ProjectSyncRepository._reject_duplicate_decision_content(
+            stored.active_decisions,
+            additions,
+        )
         for decision in additions:
             if (
                 decision.status is not DecisionStatus.ACTIVE
@@ -1705,6 +1709,38 @@ class ProjectSyncRepository:
                 validate_source_refs(candidate, sources, decision.source_refs)
             except ValueError:
                 raise SyncConflict("context_conflict") from None
+
+    @staticmethod
+    def _reject_duplicate_decision_content(
+        stored: tuple[DecisionCard, ...],
+        additions: tuple[DecisionCard, ...],
+    ) -> None:
+        normalized_stored = tuple(
+            (
+                ProjectSyncRepository._normalize_decision_value(decision.topic),
+                ProjectSyncRepository._normalize_decision_value(
+                    decision.decision_text
+                ),
+            )
+            for decision in stored
+        )
+        for addition in additions:
+            addition_topic = ProjectSyncRepository._normalize_decision_value(
+                addition.topic
+            )
+            addition_text = ProjectSyncRepository._normalize_decision_value(
+                addition.decision_text
+            )
+            for stored_topic, stored_text in normalized_stored:
+                if addition_topic == stored_topic:
+                    raise SyncConflict("decision_change_requires_review")
+                shorter, longer = sorted((addition_text, stored_text), key=len)
+                if len(shorter) >= 12 and shorter in longer:
+                    raise SyncConflict("decision_change_requires_review")
+
+    @staticmethod
+    def _normalize_decision_value(value: str) -> str:
+        return "".join(value.split()).casefold()
 
     @staticmethod
     def _decisions_by_id(
