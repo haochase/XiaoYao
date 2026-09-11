@@ -16,6 +16,21 @@ user-invocable: true
 Generate exactly one artifact for the supplied validated input. Use Chinese unless
 the project uses another language.
 
+## Atomic DecisionCard Rules
+
+以下规则仅适用于用 DwsSourceBundle 生成项目记忆/DecisionCard：
+
+每个 DecisionCard 只能表达一个可独立提问、独立审批、独立变化的主题
+硬件选型和会前提醒时间必须生成不同的 DecisionCard
+来源未明确支持的主题必须省略，不得依据模型常识拆分或补写
+已有组合人工批准不得自动迁移为两张分别批准的 DecisionCard
+
+`Generate exactly one artifact` 指一个 JSON artifact，不限制 `active_decisions`
+卡片数量。同一 active 来源段落可以支持多张卡，但每张卡必须有自身连续 excerpt，
+禁止拼接。拆分后每张卡按自身 `decision_text` 重新计算稳定 `decision_id`；不得为
+沿用旧 ID 保留组合文本。Skill 只能使用当前 DwsSourceBundle，不能读取或复制历史
+`approval_ref`；无来源依据时省略。当前组合 v2 不属于本任务迁移对象。
+
 ## Mode Routing
 
 - Validated `DwsSourceBundle`: generate project memory using [contract.md](contract.md).

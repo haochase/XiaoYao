@@ -51,6 +51,19 @@ topic 512, decision_text/rationale 2000, owner 256 characters. Generate decision
 `source_type + "\n" + source_id + "\n" + decision_text` (literal newline separators).
 This stable identifier is a derived local key, not a fabricated upstream resource ID.
 
+## Atomic DecisionCard Rules
+
+每个 DecisionCard 只能表达一个可独立提问、独立审批、独立变化的主题
+硬件选型和会前提醒时间必须生成不同的 DecisionCard
+来源未明确支持的主题必须省略，不得依据模型常识拆分或补写
+已有组合人工批准不得自动迁移为两张分别批准的 DecisionCard
+
+`Generate exactly one artifact` 指一个 JSON artifact，不限制 `active_decisions`
+卡片数量。同一 active 来源段落可以支持多张卡，但每张卡必须有自身连续 excerpt，
+禁止拼接。拆分后每张卡按自身 `decision_text` 重新计算稳定 `decision_id`；不得为
+沿用旧 ID 保留组合文本。Skill 只能使用当前 DwsSourceBundle，不能读取或复制历史
+`approval_ref`；无来源依据时省略。当前组合 v2 不属于本任务迁移对象。
+
 In the repository, `tools.dws_project_sync.QwenProjectContextArtifact` and
 `tools.dws_sync.adapters.DwsSourceBundle` are the executable schema authority.
 The caller validates your output and exact reference binding before any write.

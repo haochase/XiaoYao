@@ -35,14 +35,22 @@ def test_repository_readme_introduces_xiaoqian_product_layer() -> None:
 def test_package_contains_only_public_self_contained_skill(tmp_path: Path) -> None:
     target = tmp_path / "context-skill.zip"
     package_skill(target)
+    skill_root = (
+        Path(__file__).resolve().parents[2]
+        / "skills"
+        / "hui-anchor-dws-project-context-v1"
+    )
+    packaged_files = {
+        "hui-anchor-dws-project-context-v1/SKILL.md": "SKILL.md",
+        "hui-anchor-dws-project-context-v1/.skill-metadata.yaml": ".skill-metadata.yaml",
+        "hui-anchor-dws-project-context-v1/contract.md": "contract.md",
+        "hui-anchor-dws-project-context-v1/pre-meeting-contract.md": "pre-meeting-contract.md",
+        "hui-anchor-dws-project-context-v1/post-meeting-contract.md": "post-meeting-contract.md",
+    }
     with ZipFile(target) as archive:
-        assert set(archive.namelist()) == {
-            "hui-anchor-dws-project-context-v1/SKILL.md",
-            "hui-anchor-dws-project-context-v1/.skill-metadata.yaml",
-            "hui-anchor-dws-project-context-v1/contract.md",
-            "hui-anchor-dws-project-context-v1/pre-meeting-contract.md",
-            "hui-anchor-dws-project-context-v1/post-meeting-contract.md",
-        }
+        assert set(archive.namelist()) == set(packaged_files)
+        for archive_name, file_name in packaged_files.items():
+            assert archive.read(archive_name) == (skill_root / file_name).read_bytes()
         skill = archive.read("hui-anchor-dws-project-context-v1/SKILL.md")
         assert b"name: hui-anchor-dws-project-context-v1" in skill
         assert b"contract.md" in skill
@@ -86,6 +94,49 @@ def read_prompt(name: str) -> str:
     return (
         Path(__file__).resolve().parents[2] / "prompts" / name
     ).read_text(encoding="utf-8")
+
+
+def test_generation_entrypoints_require_atomic_decision_cards() -> None:
+    root = Path(__file__).resolve().parents[2]
+    entrypoints = (
+        root / "skills/hui-anchor-dws-project-context-v1/contract.md",
+        root / "skills/hui-anchor-dws-project-context-v1/SKILL.md",
+        root / "prompts/qwenwork-dws-project-manual-refresh.md",
+        root / "prompts/qwenwork-t4-project-artifacts.md",
+    )
+    fixed_rules = (
+        "每个 DecisionCard 只能表达一个可独立提问、独立审批、独立变化的主题",
+        "硬件选型和会前提醒时间必须生成不同的 DecisionCard",
+        "来源未明确支持的主题必须省略，不得依据模型常识拆分或补写",
+        "已有组合人工批准不得自动迁移为两张分别批准的 DecisionCard",
+    )
+
+    for entrypoint in entrypoints:
+        normalized = " ".join(entrypoint.read_text(encoding="utf-8").split())
+        for rule in fixed_rules:
+            assert rule in normalized
+
+
+def test_skill_scopes_atomic_decision_rules_to_dws_project_memory_mode() -> None:
+    root = Path(__file__).resolve().parents[2]
+    skill = (
+        root / "skills/hui-anchor-dws-project-context-v1/SKILL.md"
+    ).read_text(encoding="utf-8")
+    normalized = " ".join(skill.split())
+    scope = "以下规则仅适用于用 DwsSourceBundle 生成项目记忆/DecisionCard："
+    routes = (
+        "Validated `DwsSourceBundle`: generate project memory using [contract.md](contract.md).",
+        "Validated `QwenProjectContextArtifact`: generate pre-meeting points using "
+        "[pre-meeting-contract.md](pre-meeting-contract.md).",
+        "Validated project memory plus a filtered 8724 review snapshot: generate a "
+        "post-meeting audit report using "
+        "[post-meeting-contract.md](post-meeting-contract.md).",
+    )
+
+    assert scope in normalized
+    assert normalized.index(scope) < normalized.index("每个 DecisionCard")
+    positions = [normalized.index(route) for route in routes]
+    assert positions == sorted(positions)
 
 
 def test_unattended_prompt_uses_direct_core_without_host_payload() -> None:
