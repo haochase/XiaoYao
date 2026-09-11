@@ -101,7 +101,40 @@
         });
       };
       const status = (value) => { document.querySelector("#status").innerHTML = `<h2>状态</h2><p>${escape(value.project_name)}：${escape(value.source_count)} 个来源，${escape(value.active_decision_count)} 项有效决策，时钟 ${escape(value.clock_status)}</p>`; };
-      const load = () => Promise.all([request("/api/summary"), request("/api/conflicts")]).then(([summary, conflicts]) => { status(summary); candidates(conflicts.conflicts || []); });
+      const sessionAction = (path, controls) => {
+        if (controls.dataset.submitting === "true") return;
+        controls.dataset.submitting = "true";
+        controls.setAttribute("aria-busy", "true");
+        controls.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+        request(path, { method: "POST" }).then(() => request("/api/session")).then(
+          (value) => sessionStatus(value),
+          (value) => { unlockControls(controls); error(value); }
+        );
+      };
+      const sessionStatus = (value) => {
+        const root = document.querySelector("#runtime");
+        const title = document.createElement("h2"); title.textContent = "会议会话";
+        const description = document.createElement("p");
+        const labels = { active: "进行中", attention_required: "等待人工处理", stopped: "已结束", expired: "已到期", inactive: "未开始", failed: "状态不可用" };
+        description.textContent = labels[value.status] || "状态不可用";
+        if (value.status === "active" && value.expires_at) description.textContent += `，结束时间 ${value.expires_at}`;
+        if (value.error_type) description.textContent += `，上轮 ${value.error_type}`;
+        const controls = document.createElement("div"); controls.className = "review-controls";
+        controls.setAttribute("role", "group"); controls.setAttribute("aria-label", "会议会话操作");
+        const action = (label, path) => {
+          const button = document.createElement("button"); button.textContent = label;
+          button.addEventListener("click", () => sessionAction(path, controls));
+          controls.appendChild(button);
+        };
+        if (["inactive", "stopped", "expired"].includes(value.status)) action("开始会话", "/api/session/start");
+        if (value.status === "active") action("结束会话", "/api/session/stop");
+        if (value.status === "attention_required") {
+          action("恢复续期", "/api/session/resume");
+          action("结束会话", "/api/session/stop");
+        }
+        root.replaceChildren(title, description, controls);
+      };
+      const load = () => Promise.all([request("/api/summary"), request("/api/conflicts"), request("/api/session")]).then(([summary, conflicts, sessionValue]) => { status(summary); candidates(conflicts.conflicts || []); sessionStatus(sessionValue); });
       load().catch(error);
     })();
   </script>

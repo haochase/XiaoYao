@@ -101,7 +101,9 @@ test("review confirmation restores focus and submits once", async () => {
     if (failGet) return Promise.reject(new Error("refresh failed"));
     const payload = url === "/api/summary"
       ? { project_name: "固定项目", source_count: 1, active_decision_count: 1, clock_status: "normal" }
-      : { conflicts: [{
+      : url === "/api/session"
+        ? { status: "inactive", expires_at: null, error_type: null }
+        : { conflicts: [{
           candidate_id: "candidate-1",
           active_text: "当前方案",
           proposed_text: "候选方案",
@@ -158,4 +160,55 @@ test("review confirmation restores focus and submits once", async () => {
   await flush();
   assert.equal(calls.filter(({ options }) => options.method === "POST").length, 1);
   assert.equal(controls.children[0].disabled, false);
+});
+
+test("meeting session controls start once and switch to stop", async () => {
+  const html = fs.readFileSync(PAGE, "utf8");
+  const script = html.match(/<script>\s*([\s\S]*?)\s*<\/script>/)[1];
+  const document = new Document();
+  const calls = [];
+  let started = false;
+  const fetch = (url, options = {}) => {
+    calls.push({ url, options });
+    let payload;
+    if (options.method === "POST" && url === "/api/session/start") {
+      started = true;
+      payload = {
+        status: "failed",
+        started_at: "2026-09-11T09:00:00+00:00",
+        expires_at: "2026-09-11T11:00:00+00:00",
+        next_due_at: "2026-09-11T09:05:00+00:00",
+        error_type: "sync_failed",
+      };
+    } else if (url === "/api/summary") {
+      payload = { project_name: "固定项目", source_count: 1, active_decision_count: 1, clock_status: "normal" };
+    } else if (url === "/api/conflicts") {
+      payload = { conflicts: [] };
+    } else {
+      payload = started
+        ? { status: "active", expires_at: "2026-09-11T11:00:00+00:00", error_type: "sync_failed" }
+        : { status: "inactive", expires_at: null, error_type: null };
+    }
+    return Promise.resolve({ ok: true, json: () => Promise.resolve(payload) });
+  };
+
+  vm.runInNewContext(script, { document, fetch, Promise, Error, JSON, String, encodeURIComponent });
+  await flush();
+  await flush();
+  await flush();
+
+  assert.ok(calls.some(({ url }) => url === "/api/session"));
+  const controls = document.roots.runtime.children[2];
+  const start = controls.children[0];
+  assert.equal(start.textContent, "开始会话");
+  start.click();
+  start.click();
+  await flush();
+  await flush();
+
+  const posts = calls.filter(({ options }) => options.method === "POST");
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, "/api/session/start");
+  assert.equal(calls.filter(({ url }) => url === "/api/session").length, 2);
+  assert.equal(document.roots.runtime.children[2].children[0].textContent, "结束会话");
 });

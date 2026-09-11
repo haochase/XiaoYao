@@ -18,6 +18,7 @@ if str(ROOT / "gateway" / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "gateway" / "src"))
 
 from companion_gateway.project.protection import ContentProtector, WindowsDpapiProtector
+from tools.dws_sync import session
 from tools.project_conflict_review import (
     PRIVATE_ROOT,
     _direct_urlopen,
@@ -32,6 +33,18 @@ ALLOWED_HOSTS = frozenset({"127.0.0.1:8724", "localhost:8724"})
 ALLOWED_ORIGINS = frozenset(f"http://{host}" for host in ALLOWED_HOSTS)
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _PAGE = ROOT / "gateway" / "static" / "project" / "index.html"
+_SESSION_STATUSES = frozenset(
+    {"active", "attention_required", "stopped", "expired", "inactive", "failed"}
+)
+_SESSION_FIELDS = (
+    "status",
+    "started_at",
+    "expires_at",
+    "next_due_at",
+    "stage",
+    "error_type",
+    "release_status",
+)
 
 Reason = StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)
 
@@ -122,12 +135,28 @@ def _conflicts(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [{field: item.get(field) for field in fields} for item in conflicts]
 
 
+def _session_payload(result: object) -> dict[str, Any]:
+    try:
+        payload = result.to_dict()  # type: ignore[attr-defined]
+    except Exception:
+        raise HTTPException(status_code=503, detail="review_service_unavailable") from None
+    if not isinstance(payload, dict) or payload.get("status") not in _SESSION_STATUSES:
+        raise HTTPException(status_code=503, detail="review_service_unavailable")
+    for field in _SESSION_FIELDS[1:]:
+        value = payload.get(field)
+        if value is not None and not isinstance(value, str):
+            raise HTTPException(status_code=503, detail="review_service_unavailable")
+    return {field: payload.get(field) for field in _SESSION_FIELDS}
+
+
 def create_review_app(
     *,
     private_root: Path = PRIVATE_ROOT,
     protector: ContentProtector | None = None,
     opener: Callable[..., object] | None = None,
     upstream: str = UPSTREAM,
+    session_root: Path = ROOT,
+    session_controller: object = session,
 ) -> FastAPI:
     if upstream != UPSTREAM:
         raise ValueError("review_upstream_invalid")
@@ -176,6 +205,48 @@ def create_review_app(
                 )
             )
         }
+
+    @app.get("/api/session")
+    def session_state() -> dict[str, Any]:
+        try:
+            result = session_controller.session_status(session_root)  # type: ignore[attr-defined]
+        except Exception:
+            raise HTTPException(
+                status_code=503, detail="review_service_unavailable"
+            ) from None
+        return _session_payload(result)
+
+    @app.post("/api/session/start")
+    def session_start() -> dict[str, Any]:
+        try:
+            result = session_controller.start_session(  # type: ignore[attr-defined]
+                session_root, selected_protector
+            )
+        except Exception:
+            raise HTTPException(
+                status_code=503, detail="review_service_unavailable"
+            ) from None
+        return _session_payload(result)
+
+    @app.post("/api/session/stop")
+    def session_stop() -> dict[str, Any]:
+        try:
+            result = session_controller.stop_session(session_root)  # type: ignore[attr-defined]
+        except Exception:
+            raise HTTPException(
+                status_code=503, detail="review_service_unavailable"
+            ) from None
+        return _session_payload(result)
+
+    @app.post("/api/session/resume")
+    def session_resume() -> dict[str, Any]:
+        try:
+            result = session_controller.resume_session(session_root)  # type: ignore[attr-defined]
+        except Exception:
+            raise HTTPException(
+                status_code=503, detail="review_service_unavailable"
+            ) from None
+        return _session_payload(result)
 
     @app.post("/api/conflicts/{candidate_id}/review")
     async def review(candidate_id: str, request: Request) -> dict[str, Any]:

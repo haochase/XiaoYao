@@ -6,6 +6,7 @@ import subprocess
 import sys
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -422,3 +423,118 @@ def test_review_bff_rejects_malformed_json_before_proxying(tmp_path: Path) -> No
 
     assert response.status_code == 422
     assert calls == []
+
+
+class _SessionController:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Path, object | None]] = []
+
+    @staticmethod
+    def _result(status: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            to_dict=lambda: {
+                "status": status,
+                "started_at": "2026-09-11T09:00:00+00:00",
+                "expires_at": "2026-09-11T11:00:00+00:00",
+                "next_due_at": "2026-09-11T09:05:00+00:00",
+                "stage": "end",
+                "error_type": None,
+                "release_status": None,
+                "token": "must-not-leak",
+            }
+        )
+
+    def session_status(self, root: Path) -> SimpleNamespace:
+        self.calls.append(("status", root, None))
+        return self._result("active")
+
+    def start_session(self, root: Path, protector: object) -> SimpleNamespace:
+        self.calls.append(("start", root, protector))
+        return self._result("active")
+
+    def stop_session(self, root: Path) -> SimpleNamespace:
+        self.calls.append(("stop", root, None))
+        return self._result("stopped")
+
+    def resume_session(self, root: Path) -> SimpleNamespace:
+        self.calls.append(("resume", root, None))
+        return self._result("active")
+
+
+def test_review_bff_exposes_only_sanitized_session_state_and_actions(
+    tmp_path: Path,
+) -> None:
+    controller = _SessionController()
+    protector = _Protector()
+    session_root = tmp_path / "session-root"
+    app = create_review_app(
+        private_root=_private_root(tmp_path),
+        protector=protector,
+        opener=_opener([]),
+        session_root=session_root,
+        session_controller=controller,
+    )
+    client = TestClient(app, headers={"Host": "localhost:8724"})
+    origin = {"Origin": "http://localhost:8724"}
+
+    responses = [
+        client.get("/api/session"),
+        client.post("/api/session/start", headers=origin),
+        client.post("/api/session/stop", headers=origin),
+        client.post("/api/session/resume", headers=origin),
+    ]
+
+    assert [response.status_code for response in responses] == [200, 200, 200, 200]
+    assert [response.json()["status"] for response in responses] == [
+        "active",
+        "active",
+        "stopped",
+        "active",
+    ]
+    assert all("token" not in response.json() for response in responses)
+    assert controller.calls == [
+        ("status", session_root, None),
+        ("start", session_root, protector),
+        ("stop", session_root, None),
+        ("resume", session_root, None),
+    ]
+
+
+def test_review_bff_rejects_cross_origin_session_actions(tmp_path: Path) -> None:
+    controller = _SessionController()
+    app = create_review_app(
+        private_root=_private_root(tmp_path),
+        protector=_Protector(),
+        opener=_opener([]),
+        session_root=tmp_path / "session-root",
+        session_controller=controller,
+    )
+    client = TestClient(app, headers={"Host": "localhost:8724"})
+
+    response = client.post(
+        "/api/session/start",
+        headers={"Origin": "http://example.invalid"},
+    )
+
+    assert response.status_code == 403
+    assert controller.calls == []
+
+
+def test_review_bff_fails_closed_for_invalid_session_result(tmp_path: Path) -> None:
+    controller = _SessionController()
+    controller.session_status = lambda _root: SimpleNamespace(  # type: ignore[method-assign]
+        to_dict=lambda: {"status": "unknown", "token": "must-not-leak"}
+    )
+    app = create_review_app(
+        private_root=_private_root(tmp_path),
+        protector=_Protector(),
+        opener=_opener([]),
+        session_root=tmp_path / "session-root",
+        session_controller=controller,
+    )
+    client = TestClient(app, headers={"Host": "localhost:8724"})
+
+    response = client.get("/api/session")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "review_service_unavailable"}
