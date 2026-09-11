@@ -98,6 +98,7 @@ function Assert-XiaoYaoBuildOutput {
         'CONFIG_XIAOYAO_WEBSOCKET_ONLY=y',
         'CONFIG_XIAOYAO_VAD_EVENTS=y',
         'CONFIG_XIAOYAO_PERSISTENT_CONTROL_CHANNEL=y',
+        'CONFIG_XIAOYAO_CONFLICT_CUE=y',
         'CONFIG_CAMERA_OV2640=y',
         'CONFIG_SPIRAM=y',
         ('CONFIG_OTA_URL="' + $ExpectedOtaUrl + '"')

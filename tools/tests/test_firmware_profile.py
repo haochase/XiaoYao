@@ -244,6 +244,7 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     assert "void Protocol::SendTtsDone()" in protocol_source
     websocket_source = websocket_source_path.read_text(encoding="utf-8")
     assert 'cJSON_AddBoolToObject(features, "vad_events", true);' in websocket_source
+    assert 'cJSON_AddBoolToObject(features, "conflict_cue", true);' in websocket_source
     build_source = build_path.read_text(encoding="utf-8")
     assert 'os.environ.get("XIAOYAO_IDF_SCRIPT")' in build_source
     assert "[sys.executable, idf_script]" in build_source
@@ -267,6 +268,9 @@ def test_public_xiaoyao_profile_selects_an_esp32s3_chinese_multinet_model() -> N
     assert "CONFIG_XIAOYAO_PERSISTENT_CONTROL_CHANNEL=y" in template["builds"][0][
         "sdkconfig_append"
     ]
+    assert "CONFIG_XIAOYAO_CONFLICT_CUE=y" in template["builds"][0][
+        "sdkconfig_append"
+    ]
     assert "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=50" in template["builds"][0][
         "sdkconfig_append"
     ]
@@ -280,6 +284,11 @@ def test_vendor_profile_contains_persistent_control_channel_boundaries() -> None
     assert "clock_ticks_ % 5 == 0" in firmware_profile._CLOCK_TICK_PROFILE
     assert "Suppressing repeated idle control channel error" in source
     assert "duplex wake-word input remains active" in source
+    assert "config XIAOYAO_CONFLICT_CUE" in source
+    assert (
+        'cJSON_AddBoolToObject(features, "conflict_cue", true);'
+        in firmware_profile._WEBSOCKET_FEATURE_PROFILE
+    )
     assert "class XiaoyaoWaveshareAudioCodec" in source
     assert (
         'strcmp(purpose->valuestring, "notification") == 0'
@@ -399,6 +408,7 @@ def test_firmware_build_script_requires_a_single_interpreter_and_profile_output(
     assert 'CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=50' in build_script
     assert 'CONFIG_XIAOYAO_WEBSOCKET_ONLY=y' in build_script
     assert 'CONFIG_XIAOYAO_VAD_EVENTS=y' in build_script
+    assert 'CONFIG_XIAOYAO_CONFLICT_CUE=y' in build_script
     assert 'CONFIG_SR_MN_CN_MULTINET6_QUANT=y' in build_script
     assert "Copy-Item -Force $idfExecutable $shimPath" not in build_script
     assert "& $python $idfScript fullclean" in build_script

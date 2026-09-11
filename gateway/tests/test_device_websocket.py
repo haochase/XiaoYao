@@ -33,7 +33,11 @@ CLIENT_ID = "client-test"
 DEVICE_TOKEN = "local-test-token"
 
 
-def hello_payload(*, vad_events: bool = False) -> dict[str, object]:
+def hello_payload(
+    *,
+    vad_events: bool = False,
+    conflict_cue: bool = False,
+) -> dict[str, object]:
     payload: dict[str, object] = {
         "type": "hello",
         "version": 1,
@@ -48,6 +52,8 @@ def hello_payload(*, vad_events: bool = False) -> dict[str, object]:
     }
     if vad_events:
         payload["features"]["vad_events"] = True
+    if conflict_cue:
+        payload["features"]["conflict_cue"] = True
     return payload
 
 
@@ -395,7 +401,7 @@ def test_conflict_tts_start_includes_device_cue(
         "/v1/devices/ws",
         headers=websocket_headers(),
     ) as websocket:
-        websocket.send_json(hello_payload())
+        websocket.send_json(hello_payload(conflict_cue=True))
         server_hello = websocket.receive_json()
         app.state.device_transport.send_tts_stream(
             server_hello["session_id"],
@@ -411,6 +417,34 @@ def test_conflict_tts_start_includes_device_cue(
             "cue": "conflict",
         }
         assert websocket.receive_bytes() == b"conflict-opus"
+        assert websocket.receive_json()["state"] == "stop"
+
+
+def test_conflict_tts_omits_device_cue_for_legacy_firmware(
+    client: TestClient,
+    app_and_sink,
+) -> None:
+    app, _ = app_and_sink
+
+    with client.websocket_connect(
+        "/v1/devices/ws",
+        headers=websocket_headers(),
+    ) as websocket:
+        websocket.send_json(hello_payload())
+        server_hello = websocket.receive_json()
+        app.state.device_transport.send_tts_stream(
+            server_hello["session_id"],
+            (b"legacy-conflict-opus",),
+            cue="conflict",
+        )
+
+        assert websocket.receive_json() == {
+            "type": "tts",
+            "state": "start",
+            "purpose": "conversation",
+            "session_id": server_hello["session_id"],
+        }
+        assert websocket.receive_bytes() == b"legacy-conflict-opus"
         assert websocket.receive_json()["state"] == "stop"
 
 

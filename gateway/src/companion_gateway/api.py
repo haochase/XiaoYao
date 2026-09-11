@@ -1236,7 +1236,7 @@ def create_app(
                             "purpose": message.purpose,
                             "session_id": message.session_id,
                         }
-                        if message.cue is not None:
+                        if message.cue is not None and session.hello.features.conflict_cue:
                             tts_start["cue"] = message.cue
                         await websocket.send_json(tts_start)
                         if message.purpose == "notification":

@@ -55,6 +55,16 @@ def test_device_hello_parses_vad_event_capability() -> None:
     assert hello.features.vad_events is True
 
 
+def test_device_hello_defaults_conflict_cue_off_and_parses_explicit_capability() -> None:
+    legacy = DeviceHello.model_validate(hello_payload())
+    capable_payload = hello_payload()
+    capable_payload["features"]["conflict_cue"] = True
+    capable = DeviceHello.model_validate(capable_payload)
+
+    assert legacy.features.conflict_cue is False
+    assert capable.features.conflict_cue is True
+
+
 def test_vad_control_accepts_only_speech_boundaries() -> None:
     start = device_models.VadControl.model_validate(
         {"type": "vad", "state": "start", "session_id": "ses_1"}

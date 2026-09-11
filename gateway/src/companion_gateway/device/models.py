@@ -16,6 +16,7 @@ class DeviceFeatures(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     vad_events: bool = False
+    conflict_cue: bool = False
 
 
 class DeviceHello(BaseModel):

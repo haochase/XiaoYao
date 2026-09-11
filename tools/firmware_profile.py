@@ -42,7 +42,7 @@ _KCONFIG_VAD_PROFILE = (
     "        Advertise VAD event support and send speech start and stop controls.\n\n"
     "choice\n"
 )
-_KCONFIG_PROFILE = _KCONFIG_VAD_PROFILE.replace(
+_KCONFIG_PERSISTENT_PROFILE = _KCONFIG_VAD_PROFILE.replace(
     "choice\n",
     "config XIAOYAO_PERSISTENT_CONTROL_CHANNEL\n"
     "    bool \"Keep a low-traffic control channel while idle\"\n"
@@ -51,6 +51,15 @@ _KCONFIG_PROFILE = _KCONFIG_VAD_PROFILE.replace(
     "    help\n"
     "        Connect after activation and reconnect while idle so reminders can\n"
     "        play without a wake word. Microphone audio remains disabled in idle.\n\n"
+    "choice\n",
+)
+_KCONFIG_PROFILE = _KCONFIG_PERSISTENT_PROFILE.replace(
+    "choice\n",
+    "config XIAOYAO_CONFLICT_CUE\n"
+    "    bool \"Advertise the project conflict light cue\"\n"
+    "    default n\n"
+    "    help\n"
+    "        Advertise only when this firmware includes the reviewed conflict LED path.\n\n"
     "choice\n",
 )
 _PROTOCOL_ANCHOR = (
@@ -282,6 +291,9 @@ _WEBSOCKET_FEATURE_PROFILE = (
     "    cJSON_AddBoolToObject(features, \"mcp\", true);\n"
     "#if CONFIG_XIAOYAO_VAD_EVENTS\n"
     "    cJSON_AddBoolToObject(features, \"vad_events\", true);\n"
+    "#endif\n"
+    "#if CONFIG_XIAOYAO_CONFLICT_CUE\n"
+    "    cJSON_AddBoolToObject(features, \"conflict_cue\", true);\n"
     "#endif\n"
     "    cJSON_AddItemToObject(root, \"features\", features);\n"
 )
@@ -651,6 +663,7 @@ def apply_vendor_profile(source_root: Path) -> None:
         previous_profiles=(
             _KCONFIG_WEBSOCKET_ONLY_PROFILE,
             _KCONFIG_VAD_PROFILE,
+            _KCONFIG_PERSISTENT_PROFILE,
         ),
     )
     _apply_exact_profile(
