@@ -9,6 +9,7 @@ import multiprocessing
 import os
 import re
 import sqlite3
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -4481,6 +4482,33 @@ def test_gateway_exposes_allowlisted_http_error_detail_and_closes_body(
     assert closed is True
 
 
+def test_gateway_reports_safe_http_diagnostic_without_changing_public_error(
+    tmp_path: Path, capsys
+) -> None:
+    paths = write_push_inputs(tmp_path)
+    diagnostics: list[Mapping[str, object]] = []
+    body = io.BytesIO(b'{"detail":"sync_conflict"}')
+
+    def rejected(request, *, timeout):  # type: ignore[no-untyped-def]
+        raise HTTPError(request.full_url, 409, "private", {}, body)
+
+    assert main(
+        push_args(paths),
+        urlopen=rejected,
+        environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
+        sleep=lambda _delay: None,
+        gateway_diagnostic=diagnostics.append,
+    ) == 1
+    assert json.loads(capsys.readouterr().out)["error_type"] == "sync_conflict"
+    assert diagnostics == [
+        {
+            "status_code": 409,
+            "error_type": "sync_conflict",
+            "retryable": False,
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -4586,6 +4614,7 @@ def test_gateway_retries_retryable_http_error_without_exposing_body(
     attempts = 0
     closed = 0
     private_detail = "private retry detail"
+    diagnostics: list[Mapping[str, object]] = []
 
     def rejected(request, *, timeout):  # type: ignore[no-untyped-def]
         nonlocal attempts
@@ -4612,12 +4641,20 @@ def test_gateway_retries_retryable_http_error_without_exposing_body(
         urlopen=rejected,
         environ={"COMPANION_DWS_SYNC_TOKEN": "private-token"},
         sleep=lambda _delay: None,
+        gateway_diagnostic=diagnostics.append,
     ) == 1
     public = capsys.readouterr().out
     assert json.loads(public)["error_type"] == "http_error"
     assert private_detail not in public
     assert attempts == 3
     assert closed == 3
+    assert diagnostics == [
+        {
+            "status_code": 503,
+            "error_type": "http_error",
+            "retryable": True,
+        }
+    ] * 3
 
 
 def test_gateway_invalid_response_is_not_retried_and_is_closed(

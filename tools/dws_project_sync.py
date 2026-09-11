@@ -147,6 +147,7 @@ _SAFE_GATEWAY_ERROR_TYPES = frozenset(
         "sync_proxy_headers_forbidden",
     }
 )
+_GatewayDiagnostic = Callable[[Mapping[str, object]], None]
 _PUBLIC_ERROR_TYPES = {
     "arguments_invalid",
     "approved_artifact_unavailable",
@@ -1327,6 +1328,33 @@ def _safe_gateway_error_type(
     return detail
 
 
+def _record_gateway_diagnostic(
+    callback: _GatewayDiagnostic | None,
+    *,
+    status_code: object,
+    error_type: str,
+    retryable: bool,
+) -> None:
+    if callback is None:
+        return
+    try:
+        status = int(status_code)
+    except (TypeError, ValueError, OverflowError):
+        status = 0
+    if not 100 <= status <= 599:
+        status = 0
+    try:
+        callback(
+            {
+                "status_code": status,
+                "error_type": error_type,
+                "retryable": retryable,
+            }
+        )
+    except Exception:
+        return
+
+
 def _gateway_request(
     request: Request,
     *,
@@ -1334,6 +1362,7 @@ def _gateway_request(
     parse: Callable[[bytes], object],
     monotonic: Callable[[], float],
     sleep: Callable[[float], None],
+    gateway_diagnostic: _GatewayDiagnostic | None = None,
 ) -> object:
     deadline = monotonic() + 30.0
     for attempt in range(3):
@@ -1352,15 +1381,32 @@ def _gateway_request(
             response = exc
             retryable = exc.code in _RETRYABLE_HTTP_STATUSES
             if not retryable:
-                raise ValueError(
-                    _safe_gateway_error_type(
-                        exc,
-                        deadline=deadline,
-                        monotonic=monotonic,
-                    )
-                ) from None
+                error_type = _safe_gateway_error_type(
+                    exc,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+                _record_gateway_diagnostic(
+                    gateway_diagnostic,
+                    status_code=exc.code,
+                    error_type=error_type,
+                    retryable=False,
+                )
+                raise ValueError(error_type) from None
             if attempt == 2:
+                _record_gateway_diagnostic(
+                    gateway_diagnostic,
+                    status_code=exc.code,
+                    error_type="http_error",
+                    retryable=True,
+                )
                 raise ValueError("http_error") from None
+            _record_gateway_diagnostic(
+                gateway_diagnostic,
+                status_code=exc.code,
+                error_type="http_error",
+                retryable=True,
+            )
         except (TimeoutError, URLError, OSError):
             retryable = True
             if attempt == 2:
@@ -1796,6 +1842,7 @@ def _pending_command_inner(
     monotonic: Callable[[], float],
     sleep: Callable[[float], None],
     now: Callable[[], datetime],
+    gateway_diagnostic: _GatewayDiagnostic | None = None,
 ) -> dict[str, object]:
     gateway = _gateway_base(args.gateway)
     manifest_path = _absolute_private_path(args.manifest, "manifest")
@@ -1833,6 +1880,7 @@ def _pending_command_inner(
         parse=lambda raw: _pending_response(raw, project.project_id),
         monotonic=monotonic,
         sleep=sleep,
+        gateway_diagnostic=gateway_diagnostic,
     )
     assert isinstance(pending, tuple)
     sources_by_hash: dict[str, DwsRetrievalSource] = {}
@@ -1901,6 +1949,7 @@ def _pending_command(
     monotonic: Callable[[], float],
     sleep: Callable[[float], None],
     now: Callable[[], datetime],
+    gateway_diagnostic: _GatewayDiagnostic | None = None,
 ) -> dict[str, object]:
     manifest = DwsManifest.load(
         _absolute_private_path(args.manifest, "manifest")
@@ -1928,6 +1977,7 @@ def _pending_command(
             monotonic=monotonic,
             sleep=sleep,
             now=now,
+            gateway_diagnostic=gateway_diagnostic,
         )
 
 
@@ -2979,6 +3029,7 @@ def _push_command(
     now: Callable[[], datetime],
     monotonic: Callable[[], float],
     sleep: Callable[[float], None],
+    gateway_diagnostic: _GatewayDiagnostic | None = None,
 ) -> dict[str, object]:
     gateway = _gateway_base(args.gateway)
     project, source_bundle, artifact, state_path = _read_push_inputs(args)
@@ -3105,6 +3156,7 @@ def _push_command(
                 parse=lambda raw: _validate_response(raw, envelope=envelope),
                 monotonic=monotonic,
                 sleep=sleep,
+                gateway_diagnostic=gateway_diagnostic,
             )
         except ValueError as exc:
             if str(exc) == "sync_conflict":
@@ -3256,6 +3308,7 @@ def execute(
     sleep: Callable[[float], None] = time.sleep,
     input_stream: object | None = None,
     direct_collection: bool = False,
+    gateway_diagnostic: _GatewayDiagnostic | None = None,
 ) -> CommandResult:
     actual_argv = list(sys.argv[1:] if argv is None else argv)
     if "--help" in actual_argv or "-h" in actual_argv:
@@ -3345,6 +3398,7 @@ def execute(
                 monotonic=monotonic,
                 sleep=sleep,
                 now=now,
+                gateway_diagnostic=gateway_diagnostic,
             )
         elif args.command == "artifact":
             output = _artifact_command(
@@ -3374,6 +3428,7 @@ def execute(
                 now=now,
                 monotonic=monotonic,
                 sleep=sleep,
+                gateway_diagnostic=gateway_diagnostic,
             )
     except (KeyboardInterrupt, SystemExit):
         output = {"status": "error", "error_type": "interrupted"}
@@ -3400,6 +3455,7 @@ def main(
     sleep: Callable[[float], None] = time.sleep,
     input_stream: object | None = None,
     direct_collection: bool = False,
+    gateway_diagnostic: _GatewayDiagnostic | None = None,
 ) -> int:
     result = execute(
         argv,
@@ -3411,6 +3467,7 @@ def main(
         sleep=sleep,
         input_stream=input_stream,
         direct_collection=direct_collection,
+        gateway_diagnostic=gateway_diagnostic,
     )
     _emit(result.payload)
     return result.exit_code
