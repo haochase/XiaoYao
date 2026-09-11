@@ -28,6 +28,10 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     scripts.mkdir()
     protocols = main / "protocols"
     protocols.mkdir()
+    audio = main / "audio"
+    audio.mkdir()
+    board = main / "boards" / "waveshare" / "esp32-s3-audio-board"
+    board.mkdir(parents=True)
     led = main / "led"
     led.mkdir()
     kconfig_path = main / "Kconfig.projbuild"
@@ -37,6 +41,16 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     protocol_source_path = protocols / "protocol.cc"
     websocket_source_path = protocols / "websocket_protocol.cc"
     build_path = scripts / "build.py"
+    (audio / "audio_service.cc").write_text(
+        firmware_profile._AUDIO_POWER_ANCHOR,
+        encoding="utf-8",
+    )
+    (board / "esp32-s3-audio_board.cc").write_text(
+        firmware_profile._WAVESHARE_BOARD_CLASS_ANCHOR
+        + firmware_profile._WAVESHARE_AMP_INIT_ANCHOR
+        + firmware_profile._WAVESHARE_CODEC_FACTORY_ANCHOR,
+        encoding="utf-8",
+    )
     (led / "led.h").write_text(
         "class Led {\npublic:\n"
         + firmware_profile._LED_INTERFACE_ANCHOR
@@ -93,7 +107,8 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
         "        ESP_LOGW(TAG, \"No protocol specified in the OTA config, using MQTT\");\n"
         "        protocol_ = std::make_unique<MqttProtocol>();\n"
         "    }\n"
-        "}\n"
+        + firmware_profile._NETWORK_ERROR_ANCHOR
+        + "}\n"
         "\n"
         "void Application::HandleStateChangedEvent() {\n"
         "    DeviceState new_state = state_machine_.GetState();\n"
@@ -190,7 +205,18 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     assert "protocol_->SendVadState(speaking);" in application
     assert "EnsureIdleControlChannel();" in application
     assert "clock_ticks_ % 5 == 0" in application
+    assert "Suppressing repeated idle control channel error" in application
+    assert "GetDeviceState() == kDeviceStateIdle" in application
     assert "notification_tts_ = notification;" in application
+    audio_service = (audio / "audio_service.cc").read_text(encoding="utf-8")
+    assert "CONFIG_XIAOYAO_PERSISTENT_CONTROL_CHANNEL" in audio_service
+    assert "codec_->EnableOutput(false);" in audio_service
+    assert "duplex wake-word input remains active" in audio_service
+    board_source = (board / "esp32-s3-audio_board.cc").read_text(encoding="utf-8")
+    assert "class XiaoyaoWaveshareAudioCodec" in board_source
+    assert "IO_EXPANDER_PIN_NUM_8, 0" in board_source
+    assert "IO_EXPANDER_PIN_NUM_8, enable ? 1 : 0" in board_source
+    assert "static XiaoyaoWaveshareAudioCodec audio_codec" in board_source
     assert "protocol_->SendTtsReady();" in application
     assert "protocol_->SendTtsDone();" in application
     assert "FinishNotificationIfPlaybackDrained();" in application
@@ -252,6 +278,9 @@ def test_vendor_profile_contains_persistent_control_channel_boundaries() -> None
     assert "config XIAOYAO_PERSISTENT_CONTROL_CHANNEL" in source
     assert "EnsureIdleControlChannel" in source
     assert "clock_ticks_ % 5 == 0" in firmware_profile._CLOCK_TICK_PROFILE
+    assert "Suppressing repeated idle control channel error" in source
+    assert "duplex wake-word input remains active" in source
+    assert "class XiaoyaoWaveshareAudioCodec" in source
     assert (
         'strcmp(purpose->valuestring, "notification") == 0'
         in firmware_profile._TTS_STATE_PROFILE

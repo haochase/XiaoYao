@@ -70,6 +70,96 @@ _PROTOCOL_PROFILE = (
     + _PROTOCOL_ANCHOR
     + "    #endif\n"
 )
+_NETWORK_ERROR_ANCHOR = (
+    "    protocol_->OnNetworkError([this](const std::string& message) {\n"
+    "        last_error_message_ = message;\n"
+    "        xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);\n"
+    "    });\n"
+)
+_NETWORK_ERROR_PROFILE = (
+    "    protocol_->OnNetworkError([this](const std::string& message) {\n"
+    "#if CONFIG_XIAOYAO_PERSISTENT_CONTROL_CHANNEL\n"
+    "        if (GetDeviceState() == kDeviceStateIdle) {\n"
+    "            ESP_LOGW(TAG, \"Suppressing repeated idle control channel error: %s\",\n"
+    "                     message.c_str());\n"
+    "            return;\n"
+    "        }\n"
+    "#endif\n"
+    "        last_error_message_ = message;\n"
+    "        xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);\n"
+    "    });\n"
+)
+_AUDIO_POWER_ANCHOR = (
+    "    if (output_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->output_enabled()) {\n"
+    "        // Keep TX clock when duplex RX is active; otherwise RX may stall on some boards.\n"
+    "        if (!(codec_->duplex() && codec_->input_enabled())) {\n"
+    "            codec_->EnableOutput(false);\n"
+    "        }\n"
+    "    }\n"
+)
+_AUDIO_POWER_PROFILE = (
+    "    if (output_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->output_enabled()) {\n"
+    "#if CONFIG_XIAOYAO_PERSISTENT_CONTROL_CHANNEL\n"
+    "        // Close the output codec while duplex wake-word input remains active.\n"
+    "        // The I2S channels stay enabled and playback reopens output on demand.\n"
+    "        codec_->EnableOutput(false);\n"
+    "#else\n"
+    "        // Keep TX clock when duplex RX is active; otherwise RX may stall on some boards.\n"
+    "        if (!(codec_->duplex() && codec_->input_enabled())) {\n"
+    "            codec_->EnableOutput(false);\n"
+    "        }\n"
+    "#endif\n"
+    "    }\n"
+)
+_WAVESHARE_BOARD_CLASS_ANCHOR = "class CustomBoard : public WifiBoard {\n"
+_WAVESHARE_BOARD_CLASS_PROFILE = (
+    "class XiaoyaoWaveshareAudioCodec : public BoxAudioCodec {\n"
+    "public:\n"
+    "    XiaoyaoWaveshareAudioCodec(void* i2c_bus,\n"
+    "                                 esp_io_expander_handle_t io_expander)\n"
+    "        : BoxAudioCodec(i2c_bus, AUDIO_INPUT_SAMPLE_RATE,\n"
+    "                        AUDIO_OUTPUT_SAMPLE_RATE, AUDIO_I2S_GPIO_MCLK,\n"
+    "                        AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS,\n"
+    "                        AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN,\n"
+    "                        AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR,\n"
+    "                        AUDIO_CODEC_ES7210_ADDR, AUDIO_INPUT_REFERENCE),\n"
+    "          io_expander_(io_expander) {}\n\n"
+    "    void EnableOutput(bool enable) override {\n"
+    "        if (enable == output_enabled()) {\n"
+    "            return;\n"
+    "        }\n"
+    "        if (enable) {\n"
+    "            BoxAudioCodec::EnableOutput(true);\n"
+    "        }\n"
+    "        if (io_expander_ != nullptr) {\n"
+    "            ESP_ERROR_CHECK(esp_io_expander_set_level(\n"
+    "                io_expander_, IO_EXPANDER_PIN_NUM_8, enable ? 1 : 0));\n"
+    "        }\n"
+    "        if (!enable) {\n"
+    "            BoxAudioCodec::EnableOutput(false);\n"
+    "        }\n"
+    "    }\n\n"
+    "private:\n"
+    "    esp_io_expander_handle_t io_expander_;\n"
+    "};\n\n"
+    "class CustomBoard : public WifiBoard {\n"
+)
+_WAVESHARE_AMP_INIT_ANCHOR = (
+    "        ret = esp_io_expander_set_level(io_expander, IO_EXPANDER_PIN_NUM_8, 1);"
+)
+_WAVESHARE_AMP_INIT_PROFILE = (
+    "        ret = esp_io_expander_set_level(io_expander, IO_EXPANDER_PIN_NUM_8, 0);\n"
+    "        ESP_ERROR_CHECK(ret);"
+)
+_WAVESHARE_CODEC_FACTORY_ANCHOR = (
+    "        static BoxAudioCodec audio_codec(i2c_bus_, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,\n"
+    "            AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR, AUDIO_CODEC_ES7210_ADDR, AUDIO_INPUT_REFERENCE);\n"
+    "            return &audio_codec;\n"
+)
+_WAVESHARE_CODEC_FACTORY_PROFILE = (
+    "        static XiaoyaoWaveshareAudioCodec audio_codec(i2c_bus_, io_expander);\n"
+    "        return &audio_codec;\n"
+)
 _SPEAKING_WAKE_WORD_ANCHOR = (
     "            if (listening_mode_ != kListeningModeRealtime) {\n"
     "                audio_service_.EnableVoiceProcessing(false);\n"
@@ -567,6 +657,39 @@ def apply_vendor_profile(source_root: Path) -> None:
         source_root / "main" / "application.cc",
         _PROTOCOL_ANCHOR,
         _PROTOCOL_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "application.cc",
+        _NETWORK_ERROR_ANCHOR,
+        _NETWORK_ERROR_PROFILE,
+    )
+    _apply_exact_profile(
+        source_root / "main" / "audio" / "audio_service.cc",
+        _AUDIO_POWER_ANCHOR,
+        _AUDIO_POWER_PROFILE,
+    )
+    waveshare_board = (
+        source_root
+        / "main"
+        / "boards"
+        / "waveshare"
+        / "esp32-s3-audio-board"
+        / "esp32-s3-audio_board.cc"
+    )
+    _apply_exact_profile(
+        waveshare_board,
+        _WAVESHARE_BOARD_CLASS_ANCHOR,
+        _WAVESHARE_BOARD_CLASS_PROFILE,
+    )
+    _apply_exact_profile(
+        waveshare_board,
+        _WAVESHARE_AMP_INIT_ANCHOR,
+        _WAVESHARE_AMP_INIT_PROFILE,
+    )
+    _apply_exact_profile(
+        waveshare_board,
+        _WAVESHARE_CODEC_FACTORY_ANCHOR,
+        _WAVESHARE_CODEC_FACTORY_PROFILE,
     )
     _apply_exact_profile(
         source_root / "main" / "application.cc",
