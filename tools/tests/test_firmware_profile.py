@@ -248,6 +248,9 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
     websocket_source = websocket_source_path.read_text(encoding="utf-8")
     assert 'cJSON_AddBoolToObject(features, "vad_events", true);' in websocket_source
     assert 'cJSON_AddBoolToObject(features, "conflict_cue", true);' in websocket_source
+    assert websocket_source.count(
+        'cJSON_AddBoolToObject(features, "conflict_cue", true);'
+    ) == 1
     build_source = build_path.read_text(encoding="utf-8")
     assert 'os.environ.get("XIAOYAO_IDF_SCRIPT")' in build_source
     assert "[sys.executable, idf_script]" in build_source
