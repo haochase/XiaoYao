@@ -287,6 +287,13 @@ _WEBSOCKET_FEATURE_ANCHOR = (
     "    cJSON_AddBoolToObject(features, \"mcp\", true);\n"
     "    cJSON_AddItemToObject(root, \"features\", features);\n"
 )
+_WEBSOCKET_FEATURE_VAD_PROFILE = (
+    "    cJSON_AddBoolToObject(features, \"mcp\", true);\n"
+    "#if CONFIG_XIAOYAO_VAD_EVENTS\n"
+    "    cJSON_AddBoolToObject(features, \"vad_events\", true);\n"
+    "#endif\n"
+    "    cJSON_AddItemToObject(root, \"features\", features);\n"
+)
 _WEBSOCKET_FEATURE_PROFILE = (
     "    cJSON_AddBoolToObject(features, \"mcp\", true);\n"
     "#if CONFIG_XIAOYAO_VAD_EVENTS\n"
@@ -809,6 +816,7 @@ def apply_vendor_profile(source_root: Path) -> None:
         source_root / "main" / "protocols" / "websocket_protocol.cc",
         _WEBSOCKET_FEATURE_ANCHOR,
         _WEBSOCKET_FEATURE_PROFILE,
+        previous_profiles=(_WEBSOCKET_FEATURE_VAD_PROFILE,),
     )
     _apply_exact_profile(
         source_root / "main" / "led" / "led.h",

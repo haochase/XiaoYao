@@ -181,6 +181,9 @@ def test_apply_vendor_profile_updates_known_upstream_boundaries(tmp_path: Path) 
         "std::string WebsocketProtocol::GetHelloMessage() {\n"
         "    cJSON* features = cJSON_CreateObject();\n"
         "    cJSON_AddBoolToObject(features, \"mcp\", true);\n"
+        "#if CONFIG_XIAOYAO_VAD_EVENTS\n"
+        "    cJSON_AddBoolToObject(features, \"vad_events\", true);\n"
+        "#endif\n"
         "    cJSON_AddItemToObject(root, \"features\", features);\n"
         "}\n",
         encoding="utf-8",
