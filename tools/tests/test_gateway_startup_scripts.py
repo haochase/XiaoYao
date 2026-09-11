@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import sys
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
@@ -259,3 +261,169 @@ def test_sync_runner_propagates_python_exit_code(tmp_path: Path) -> None:
     )
 
     assert completed.returncode == 37
+
+
+def test_session_renewal_runner_uses_fixed_runtime_command_and_private_temp() -> None:
+    runner = read_script("run-xiaoqian-session-renewal.ps1")
+
+    assert "[string]$PythonPath" in runner
+    assert "[switch]$Check" in runner
+    assert '"session-status"' in runner
+    assert '"session-tick"' in runner
+    assert 'Join-Path $projectRoot ".private\\dws-runtime\\tmp"' in runner
+    assert "$env:TEMP = $tempRoot" in runner
+    assert "$env:TMP = $tempRoot" in runner
+    assert "--project" not in runner
+    assert "--profile" not in runner
+    assert "--run-token" not in runner
+    assert "COMPANION_DWS_SYNC_TOKEN" not in runner
+
+
+@pytest.mark.parametrize(
+    ("runtime_exit", "expected_exit"),
+    ((0, 0), (1, 1), (2, 0)),
+)
+def test_session_renewal_runner_maps_runtime_exit_codes(
+    tmp_path: Path,
+    runtime_exit: int,
+    expected_exit: int,
+) -> None:
+    project = tmp_path / "renewal-runner-project"
+    scripts = project / "scripts"
+    tools = project / "tools"
+    scripts.mkdir(parents=True)
+    tools.mkdir()
+    shutil.copy2(SCRIPTS / "run-xiaoqian-session-renewal.ps1", scripts)
+    (tools / "dws_sync_runtime.py").write_text("# test double\n", encoding="ascii")
+    (project / ".private" / "dws-runtime").mkdir(parents=True)
+    fake_python = tmp_path / "fake-session-python.cmd"
+    fake_python.write_text(
+        "@echo off\r\n"
+        'if /I "%~nx1"=="dws_sync_runtime.py" if /I "%~2"=="session-tick" '
+        f"exit /b {runtime_exit}\r\n"
+        "exit /b 99\r\n",
+        encoding="ascii",
+    )
+
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-File",
+            str(scripts / "run-xiaoqian-session-renewal.ps1"),
+            "-PythonPath",
+            str(fake_python),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == expected_exit
+
+
+def test_session_renewal_registration_is_bounded_current_user_and_nonconcurrent() -> None:
+    registration = read_script("register-xiaoqian-session-renewal-task.ps1")
+
+    assert '$taskName = "Xiaoqian DWS Meeting Session Renewal"' in registration
+    assert "[string]$TaskName" not in registration
+    assert "[string]$PythonPath" in registration
+    assert "[switch]$WhatIf" in registration
+    assert "New-ScheduledTaskTrigger -Once" in registration
+    assert "New-TimeSpan -Minutes 5" in registration
+    assert "New-TimeSpan -Days 3650" in registration
+    assert "-MultipleInstances IgnoreNew" in registration
+    assert "New-TimeSpan -Minutes 20" in registration
+    assert "-LogonType Interactive" in registration
+    assert "-RunLevel Limited" in registration
+    assert "-StartWhenAvailable" not in registration
+    assert "run-xiaoqian-session-renewal.ps1" in registration
+    assert "-Check" in registration
+    assert "会锚-DWS项目资料同步" not in registration
+    assert "HuiAnchor" not in registration
+
+
+def test_session_renewal_registration_whatif_does_not_register(tmp_path: Path) -> None:
+    harness = tmp_path / "session-renewal-registration-harness.ps1"
+    harness.write_text(
+        f'''$ErrorActionPreference = "Stop"
+$registerScript = {powershell_literal(SCRIPTS / "register-xiaoqian-session-renewal-task.ps1")}
+$python = {powershell_literal(Path(sys.executable))}
+function Register-ScheduledTask {{ $global:registerCalls += 1 }}
+$global:registerCalls = 0
+$plan = & $registerScript -PythonPath $python -WhatIf
+[pscustomobject]@{{
+    register_calls = $global:registerCalls
+    task_name = $plan.task_name
+    interval_seconds = $plan.interval_seconds
+    duration_seconds = $plan.duration_seconds
+    execution_limit_seconds = $plan.execution_limit_seconds
+    multiple_instances = $plan.multiple_instances
+    logon_type = $plan.logon_type
+    run_level = $plan.run_level
+    will_register = $plan.will_register
+    exposes_principal_name = @($plan.PSObject.Properties.Name) -contains "principal_name"
+    exposes_principal_sid = @($plan.PSObject.Properties.Name) -contains "principal_sid"
+}} | ConvertTo-Json -Compress
+''',
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-File", str(harness)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "register_calls": 0,
+        "task_name": "Xiaoqian DWS Meeting Session Renewal",
+        "interval_seconds": 300,
+        "duration_seconds": 315360000,
+        "execution_limit_seconds": 1200,
+        "multiple_instances": "IgnoreNew",
+        "logon_type": "Interactive",
+        "run_level": "Limited",
+        "will_register": False,
+        "exposes_principal_name": False,
+        "exposes_principal_sid": False,
+    }
+
+
+def test_session_renewal_runner_accepts_attention_required_during_check(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "renewal-check-project"
+    scripts = project / "scripts"
+    tools = project / "tools"
+    scripts.mkdir(parents=True)
+    tools.mkdir()
+    shutil.copy2(SCRIPTS / "run-xiaoqian-session-renewal.ps1", scripts)
+    (tools / "dws_sync_runtime.py").write_text("# test double\n", encoding="ascii")
+    (project / ".private" / "dws-runtime").mkdir(parents=True)
+    fake_python = tmp_path / "fake-check-python.cmd"
+    fake_python.write_text(
+        "@echo off\r\n"
+        'if /I "%~nx1"=="dws_sync_runtime.py" if /I "%~2"=="session-status" '
+        "exit /b 2\r\n"
+        "exit /b 99\r\n",
+        encoding="ascii",
+    )
+
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-File",
+            str(scripts / "run-xiaoqian-session-renewal.ps1"),
+            "-PythonPath",
+            str(fake_python),
+            "-Check",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
