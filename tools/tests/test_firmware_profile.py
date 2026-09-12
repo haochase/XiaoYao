@@ -277,7 +277,7 @@ def test_public_xiaoyao_profile_selects_an_esp32s3_chinese_multinet_model() -> N
     assert "CONFIG_XIAOYAO_CONFLICT_CUE=y" in template["builds"][0][
         "sdkconfig_append"
     ]
-    assert "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=50" in template["builds"][0][
+    assert "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=30" in template["builds"][0][
         "sdkconfig_append"
     ]
 
@@ -411,7 +411,7 @@ def test_firmware_build_script_requires_a_single_interpreter_and_profile_output(
     assert "Unable to render the temporary XiaoYao profile" in build_script
     assert "$buildSdkconfig = Join-Path $xiaozhiRoot 'sdkconfig'" in build_script
     assert 'CONFIG_USE_CUSTOM_WAKE_WORD=y' in build_script
-    assert 'CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=50' in build_script
+    assert 'CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=30' in build_script
     assert 'CONFIG_XIAOYAO_WEBSOCKET_ONLY=y' in build_script
     assert 'CONFIG_XIAOYAO_VAD_EVENTS=y' in build_script
     assert 'CONFIG_XIAOYAO_CONFLICT_CUE=y' in build_script
